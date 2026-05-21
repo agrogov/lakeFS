@@ -6,15 +6,17 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	gooidc "github.com/coreos/go-oidc/v3/oidc"
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/sessions"
-	"github.com/treeverse/lakefs/pkg/authentication"
-	"github.com/treeverse/lakefs/pkg/authentication/apiclient"
 	"github.com/treeverse/lakefs/pkg/auth"
 	oidcencoding "github.com/treeverse/lakefs/pkg/auth/oidc/encoding"
+	"github.com/treeverse/lakefs/pkg/authentication"
+	"github.com/treeverse/lakefs/pkg/authentication/apiclient"
+	logging "github.com/treeverse/lakefs/pkg/logging"
 	"golang.org/x/oauth2"
 )
 
@@ -28,14 +30,17 @@ const (
 // NativeOIDCService implements authentication.Service for Azure Entra ID OIDC.
 // It handles the authorization code flow natively without an external auth service.
 type NativeOIDCService struct {
-	cfg       *SSOConfig
-	provider  *gooidc.Provider
-	oauth2Cfg oauth2.Config
+	cfg         *SSOConfig
+	provider    *gooidc.Provider
+	oauth2Cfg   oauth2.Config
+	authService groupManager
+	logger      logging.Logger
 }
 
 // NewNativeOIDCService constructs the service by performing OIDC discovery against
 // cfg.IssuerURL. This makes an HTTP request so the context should be alive.
-func NewNativeOIDCService(ctx context.Context, cfg *SSOConfig) (*NativeOIDCService, error) {
+// authService may be nil when group sync is disabled.
+func NewNativeOIDCService(ctx context.Context, cfg *SSOConfig, authService auth.Service, logger logging.Logger) (*NativeOIDCService, error) {
 	provider, err := gooidc.NewProvider(ctx, cfg.IssuerURL)
 	if err != nil {
 		return nil, fmt.Errorf("oidc: discover %s: %w", cfg.IssuerURL, err)
@@ -52,13 +57,18 @@ func NewNativeOIDCService(ctx context.Context, cfg *SSOConfig) (*NativeOIDCServi
 	}
 
 	return &NativeOIDCService{
-		cfg:       cfg,
-		provider:  provider,
-		oauth2Cfg: oauth2Cfg,
+		cfg:         cfg,
+		provider:    provider,
+		oauth2Cfg:   oauth2Cfg,
+		authService: authService,
+		logger:      logger,
 	}, nil
 }
 
-func (s *NativeOIDCService) IsExternalPrincipalsEnabled() bool { return false }
+func (s *NativeOIDCService) IsExternalPrincipalsEnabled() bool {
+	// External principals are managed through ACL groups, not through this service.
+	return false
+}
 
 func (s *NativeOIDCService) ExternalPrincipalLogin(_ context.Context, _ map[string]any) (*apiclient.ExternalPrincipal, error) {
 	return nil, authentication.ErrNotImplemented
@@ -113,8 +123,8 @@ func (s *NativeOIDCService) loginHandler(sessionStore sessions.Store) http.Handl
 
 // OauthCallback is called by the controller when the Azure callback lands on
 // /api/v1/oidc/callback. It validates state + nonce, exchanges the code for an
-// ID token, normalises the user ID claim (oid→sub), and stores claims in the
-// oidc_auth_session cookie so that upstream UserFromOIDCSession works unchanged.
+// ID token, normalises the user ID claim (oid→sub), stores claims in the
+// oidc_auth_session cookie, and optionally syncs group memberships.
 func (s *NativeOIDCService) OauthCallback(w http.ResponseWriter, r *http.Request, sessionStore sessions.Store) {
 	ctx := r.Context()
 
@@ -133,9 +143,22 @@ func (s *NativeOIDCService) OauthCallback(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Invalidate the flow session immediately after state is verified to prevent
+	// session-fixation attacks on subsequent error paths.
+	flowSess.Options.MaxAge = -1
+	if err = flowSess.Save(r, w); err != nil {
+		http.Error(w, "session error", http.StatusInternalServerError)
+		return
+	}
+
 	if errParam := r.URL.Query().Get("error"); errParam != "" {
-		desc := r.URL.Query().Get("error_description")
-		http.Error(w, fmt.Sprintf("IdP error: %s — %s", errParam, desc), http.StatusUnauthorized)
+		// Log IdP error details server-side; do not reflect attacker-controlled
+		// query-string values verbatim to the browser.
+		s.logger.WithFields(logging.Fields{
+			"error":             errParam,
+			"error_description": r.URL.Query().Get("error_description"),
+		}).Warn("IdP returned an error on callback")
+		http.Error(w, "authentication failed", http.StatusUnauthorized)
 		return
 	}
 
@@ -171,12 +194,14 @@ func (s *NativeOIDCService) OauthCallback(w http.ResponseWriter, r *http.Request
 	}
 
 	// Normalise: copy the configured user ID claim (e.g. "oid") into "sub" so that
-	// upstream UserFromOIDCSession (pkg/auth/request_auth.go:155) works unchanged.
+	// upstream UserFromOIDCSession (pkg/auth/request_auth.go) works unchanged.
 	if s.cfg.UserIDClaim != "sub" {
 		if val, ok := claims[s.cfg.UserIDClaim]; ok {
 			claims["sub"] = val
 		}
 	}
+
+	username, _ := claims["sub"].(string)
 
 	// Store verified claims in the OIDC auth session — the middleware reads this.
 	authSess, err := sessionStore.Get(r, auth.OIDCAuthSessionName)
@@ -190,20 +215,38 @@ func (s *NativeOIDCService) OauthCallback(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Expire the temporary flow session.
-	flowSess.Options.MaxAge = -1
-	_ = flowSess.Save(r, w)
+	// Sync group memberships from the token. Errors are non-fatal: the user is
+	// already authenticated at this point, so we log and continue.
+	if s.authService != nil && username != "" && s.cfg.SyncGroupsOnLogin {
+		tokenGroups := ExtractStringSlice(claims[s.cfg.GroupsClaim])
+		if syncErr := SyncGroups(ctx, s.authService, s.logger, username, tokenGroups, s.cfg); syncErr != nil {
+			s.logger.WithField("user", username).WithError(syncErr).Warn("group sync failed")
+		}
+	}
 
-	if next == "" || !strings.HasPrefix(next, "/") {
+	if next == "" {
 		next = "/"
+	} else {
+		// Guard against open-redirect via protocol-relative URLs (//host) or
+		// backslash tricks (/\host) accepted by some browsers.
+		u, parseErr := url.Parse(next)
+		if parseErr != nil || u.Host != "" || u.Scheme != "" || !strings.HasPrefix(u.Path, "/") {
+			next = "/"
+		}
 	}
 	http.Redirect(w, r, next, http.StatusFound)
 }
 
 // ValidateSTS handles the lakectl CLI SSO flow. It exchanges the authorization
 // code for an ID token and returns the user's external ID (the configured
-// user_id_claim, e.g. "oid"). State validation is the caller's responsibility.
-func (s *NativeOIDCService) ValidateSTS(ctx context.Context, code, redirectURI, _ string) (string, error) {
+// user_id_claim, e.g. "oid"). The state parameter is forwarded by the CLI but
+// cannot be verified server-side because state is generated by the CLI, not the
+// server. The CLI is responsible for verifying its own state value.
+func (s *NativeOIDCService) ValidateSTS(ctx context.Context, code, redirectURI, state string) (string, error) {
+	if state == "" {
+		return "", fmt.Errorf("oidc: ValidateSTS: state must not be empty")
+	}
+
 	// Use the redirect URI supplied by the CLI — it differs from the browser callback URL.
 	cfg := s.oauth2Cfg
 	cfg.RedirectURL = redirectURI
