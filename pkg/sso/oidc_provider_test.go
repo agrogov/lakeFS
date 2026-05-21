@@ -19,6 +19,7 @@ import (
 	"github.com/gorilla/sessions"
 	"github.com/treeverse/lakefs/pkg/auth"
 	oidcencoding "github.com/treeverse/lakefs/pkg/auth/oidc/encoding"
+	logging "github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/sso"
 )
 
@@ -154,7 +155,8 @@ func buildService(t *testing.T, mock *mockOIDCServer) *sso.NativeOIDCService {
 		FriendlyNameClaim: "preferred_username",
 		GroupsClaim:       "roles",
 	}
-	svc, err := sso.NewNativeOIDCService(context.Background(), cfg)
+	// Pass nil for authService and a no-op logger — group sync is not exercised here.
+	svc, err := sso.NewNativeOIDCService(context.Background(), cfg, nil, logging.Dummy())
 	if err != nil {
 		t.Fatalf("NewNativeOIDCService: %v", err)
 	}
@@ -272,7 +274,13 @@ func TestValidateSTS(t *testing.T) {
 	nonce := "unused-for-cli"
 	code := fmt.Sprintf("%s:%s", nonce, oid)
 
-	externalID, err := svc.ValidateSTS(context.Background(), code, mock.issuerURL()+"/token-unused", "")
+	// The redirect URI must match what the service was configured with; the mock token
+	// endpoint ignores it, but real IdPs validate it.
+	redirectURI := "http://localhost/api/v1/oidc/callback"
+	// state must be non-empty (CLI generates it; server rejects empty values).
+	state := "cli-state-value"
+
+	externalID, err := svc.ValidateSTS(context.Background(), code, redirectURI, state)
 	if err != nil {
 		t.Fatalf("ValidateSTS: %v", err)
 	}
