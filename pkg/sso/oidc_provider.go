@@ -230,6 +230,10 @@ func (s *NativeOIDCService) OauthCallback(w http.ResponseWriter, r *http.Request
 	}
 
 	code := r.URL.Query().Get("code")
+	if code == "" {
+		http.Error(w, "missing authorization code", http.StatusBadRequest)
+		return
+	}
 	token, err := s.oauth2Cfg.Exchange(ctx, code)
 	if err != nil {
 		http.Error(w, "token exchange failed", http.StatusUnauthorized)
