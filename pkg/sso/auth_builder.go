@@ -2,6 +2,7 @@ package sso
 
 import (
 	"context"
+	"sync"
 
 	"github.com/treeverse/lakefs/contrib/auth/acl"
 	"github.com/treeverse/lakefs/pkg/auth"
@@ -10,6 +11,17 @@ import (
 	"github.com/treeverse/lakefs/pkg/config"
 	"github.com/treeverse/lakefs/pkg/kv"
 	logging "github.com/treeverse/lakefs/pkg/logging"
+)
+
+// builtAuthService holds the auth.Service constructed by BuildAuthService so that
+// BuildAuthenticationService can pass it to NativeOIDCService for group sync without
+// changing the AuthenticationServiceBuilder function signature (and therefore run.go /
+// hooks.go). In production, run.go calls authServiceBuilder before
+// authenticationServiceBuilder, so the value is always populated in time.
+// The mutex makes reads and writes safe if tests exercise these builders concurrently.
+var (
+	builtAuthServiceMu sync.RWMutex
+	builtAuthService   auth.Service
 )
 
 // BuildAuthService is the AuthServiceBuilder for the lakefs-sso binary.
@@ -37,14 +49,8 @@ func BuildAuthService(ctx context.Context, cfg config.Config, logger logging.Log
 	}
 
 	svc := auth.NewMonitoredAuthService(aclService)
-	// Cache so BuildAuthenticationService can wire it into NativeOIDCService for group sync.
-	// run.go calls authServiceBuilder before authenticationServiceBuilder, so this is always
-	// populated by the time BuildAuthenticationService runs.
+	builtAuthServiceMu.Lock()
 	builtAuthService = svc
+	builtAuthServiceMu.Unlock()
 	return svc
 }
-
-// builtAuthService holds the auth.Service constructed by BuildAuthService so that
-// BuildAuthenticationService can pass it to NativeOIDCService without changing the
-// AuthenticationServiceBuilder function signature (and therefore run.go / hooks.go).
-var builtAuthService auth.Service

@@ -30,17 +30,20 @@ const (
 // NativeOIDCService implements authentication.Service for Azure Entra ID OIDC.
 // It handles the authorization code flow natively without an external auth service.
 type NativeOIDCService struct {
-	cfg         *SSOConfig
-	provider    *gooidc.Provider
-	oauth2Cfg   oauth2.Config
-	authService groupManager
-	logger      logging.Logger
+	cfg               *SSOConfig
+	provider          *gooidc.Provider
+	oauth2Cfg         oauth2.Config
+	authService       groupManager
+	logger            logging.Logger
+	logoutRedirectURL string
 }
 
 // NewNativeOIDCService constructs the service by performing OIDC discovery against
 // cfg.IssuerURL. This makes an HTTP request so the context should be alive.
 // authService may be nil when group sync is disabled.
-func NewNativeOIDCService(ctx context.Context, cfg *SSOConfig, authService auth.Service, logger logging.Logger) (*NativeOIDCService, error) {
+// logoutRedirectURL is where /logout redirects after clearing sessions (typically
+// auth.logout_redirect_url from the lakeFS config, e.g. Azure's end_session_endpoint).
+func NewNativeOIDCService(ctx context.Context, cfg *SSOConfig, authService auth.Service, logger logging.Logger, logoutRedirectURL string) (*NativeOIDCService, error) {
 	provider, err := gooidc.NewProvider(ctx, cfg.IssuerURL)
 	if err != nil {
 		return nil, fmt.Errorf("oidc: discover %s: %w", cfg.IssuerURL, err)
@@ -57,11 +60,12 @@ func NewNativeOIDCService(ctx context.Context, cfg *SSOConfig, authService auth.
 	}
 
 	return &NativeOIDCService{
-		cfg:         cfg,
-		provider:    provider,
-		oauth2Cfg:   oauth2Cfg,
-		authService: authService,
-		logger:      logger,
+		cfg:               cfg,
+		provider:          provider,
+		oauth2Cfg:         oauth2Cfg,
+		authService:       authService,
+		logger:            logger,
+		logoutRedirectURL: logoutRedirectURL,
 	}, nil
 }
 
@@ -74,11 +78,37 @@ func (s *NativeOIDCService) ExternalPrincipalLogin(_ context.Context, _ map[stri
 	return nil, authentication.ErrNotImplemented
 }
 
-// RegisterAdditionalRoutes registers the /oidc/login route that starts the OIDC flow.
-// The callback is handled by the swagger /api/v1/oidc/callback endpoint which delegates
-// to OauthCallback.
+// RegisterAdditionalRoutes registers SSO-specific routes on the root router.
+//
+// /oidc/login  — starts the authorization code flow.
+// /logout      — overrides the upstream logout handler to also clear oidc_auth_session
+//               so that OIDC users are fully signed out server-side. The upstream mount
+//               only clears internal_auth_session; chi gives explicit routes priority over
+//               mounts, so this registration shadows it for GET requests.
 func (s *NativeOIDCService) RegisterAdditionalRoutes(r *chi.Mux, sessionStore sessions.Store) {
 	r.Get("/oidc/login", s.loginHandler(sessionStore))
+	r.Get("/logout", s.logoutHandler(sessionStore))
+}
+
+// logoutHandler clears both the OIDC session and the internal auth session, then
+// redirects to logoutRedirectURL (typically Azure's end_session_endpoint).
+func (s *NativeOIDCService) logoutHandler(sessionStore sessions.Store) http.HandlerFunc {
+	sessionsToClear := []string{
+		auth.OIDCAuthSessionName,
+		auth.InternalAuthSessionName,
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		for _, name := range sessionsToClear {
+			sess, _ := sessionStore.Get(r, name)
+			sess.Options.MaxAge = -1
+			if err := sess.Save(r, w); err != nil {
+				s.logger.WithError(err).WithField("session", name).Error("logout: failed to clear session")
+				http.Error(w, "logout failed", http.StatusInternalServerError)
+				return
+			}
+		}
+		http.Redirect(w, r, s.logoutRedirectURL, http.StatusTemporaryRedirect)
+	}
 }
 
 // loginHandler generates state + nonce, stores them in a temporary session, and
@@ -217,10 +247,20 @@ func (s *NativeOIDCService) OauthCallback(w http.ResponseWriter, r *http.Request
 
 	// Sync group memberships from the token. Errors are non-fatal: the user is
 	// already authenticated at this point, so we log and continue.
-	if s.authService != nil && username != "" && s.cfg.SyncGroupsOnLogin {
-		tokenGroups := ExtractStringSlice(claims[s.cfg.GroupsClaim])
-		if syncErr := SyncGroups(ctx, s.authService, s.logger, username, tokenGroups, s.cfg); syncErr != nil {
-			s.logger.WithField("user", username).WithError(syncErr).Warn("group sync failed")
+	if s.authService != nil && username != "" && s.cfg.SyncGroupsOnLogin && s.cfg.GroupsClaim != "" {
+		rawGroups, claimPresent := claims[s.cfg.GroupsClaim]
+		if !claimPresent {
+			// Absent claim is distinct from an empty list. Skipping sync rather than
+			// silently stripping all managed memberships (e.g. misconfigured manifest).
+			s.logger.WithFields(logging.Fields{
+				"user":  username,
+				"claim": s.cfg.GroupsClaim,
+			}).Warn("group sync: groups claim absent from token, skipping sync")
+		} else {
+			tokenGroups := ExtractStringSlice(rawGroups)
+			if syncErr := SyncGroups(ctx, s.authService, s.logger, username, tokenGroups, s.cfg); syncErr != nil {
+				s.logger.WithField("user", username).WithError(syncErr).Warn("group sync failed")
+			}
 		}
 	}
 
