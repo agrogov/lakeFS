@@ -30,20 +30,17 @@ const (
 // NativeOIDCService implements authentication.Service for Azure Entra ID OIDC.
 // It handles the authorization code flow natively without an external auth service.
 type NativeOIDCService struct {
-	cfg               *SSOConfig
-	provider          *gooidc.Provider
-	oauth2Cfg         oauth2.Config
-	authService       groupManager
-	logger            logging.Logger
-	logoutRedirectURL string
+	cfg         *SSOConfig
+	provider    *gooidc.Provider
+	oauth2Cfg   oauth2.Config
+	authService groupManager
+	logger      logging.Logger
 }
 
 // NewNativeOIDCService constructs the service by performing OIDC discovery against
 // cfg.IssuerURL. This makes an HTTP request so the context should be alive.
 // authService may be nil when group sync is disabled.
-// logoutRedirectURL is where /logout redirects after clearing sessions (typically
-// auth.logout_redirect_url from the lakeFS config, e.g. Azure's end_session_endpoint).
-func NewNativeOIDCService(ctx context.Context, cfg *SSOConfig, authService auth.Service, logger logging.Logger, logoutRedirectURL string) (*NativeOIDCService, error) {
+func NewNativeOIDCService(ctx context.Context, cfg *SSOConfig, authService auth.Service, logger logging.Logger) (*NativeOIDCService, error) {
 	provider, err := gooidc.NewProvider(ctx, cfg.IssuerURL)
 	if err != nil {
 		return nil, fmt.Errorf("oidc: discover %s: %w", cfg.IssuerURL, err)
@@ -60,12 +57,11 @@ func NewNativeOIDCService(ctx context.Context, cfg *SSOConfig, authService auth.
 	}
 
 	return &NativeOIDCService{
-		cfg:               cfg,
-		provider:          provider,
-		oauth2Cfg:         oauth2Cfg,
-		authService:       authService,
-		logger:            logger,
-		logoutRedirectURL: logoutRedirectURL,
+		cfg:         cfg,
+		provider:    provider,
+		oauth2Cfg:   oauth2Cfg,
+		authService: authService,
+		logger:      logger,
 	}, nil
 }
 
@@ -78,43 +74,60 @@ func (s *NativeOIDCService) ExternalPrincipalLogin(_ context.Context, _ map[stri
 	return nil, authentication.ErrNotImplemented
 }
 
-// RegisterAdditionalRoutes registers SSO-specific routes on the root router.
+// RegisterAdditionalRoutes registers SSO-specific routes and middleware on the root router.
 //
-// /oidc/login  — starts the authorization code flow.
-// /logout      — overrides the upstream logout handler to also clear oidc_auth_session
-//               so that OIDC users are fully signed out server-side. The upstream mount
-//               only clears internal_auth_session; chi gives explicit routes priority over
-//               mounts, so this registration shadows it for GET requests.
+// /oidc/login  — starts the authorization code flow (browser) or CLI redirect.
+// logoutMiddleware — clears oidc_auth_session and oidc_flow_session on any /logout
+//
+//	request before the upstream logout handler runs. The upstream handler
+//	(registered via r.Mount) clears internal_auth_session and performs the
+//	redirect; chi v5 matches r.Mount before r.Get for the same path, so we use
+//	a middleware instead of a competing route.
 func (s *NativeOIDCService) RegisterAdditionalRoutes(r *chi.Mux, sessionStore sessions.Store) {
+	r.Use(s.logoutMiddleware(sessionStore))
 	r.Get("/oidc/login", s.loginHandler(sessionStore))
-	r.Get("/logout", s.logoutHandler(sessionStore))
 }
 
-// logoutHandler clears both the OIDC session and the internal auth session, then
-// redirects to logoutRedirectURL (typically Azure's end_session_endpoint).
-func (s *NativeOIDCService) logoutHandler(sessionStore sessions.Store) http.HandlerFunc {
+// logoutMiddleware clears OIDC-specific sessions on logout requests, then
+// delegates to the next handler (the upstream logout handler that clears
+// internal_auth_session and performs the redirect). Errors clearing individual
+// sessions are logged but do not abort the logout flow.
+func (s *NativeOIDCService) logoutMiddleware(sessionStore sessions.Store) func(http.Handler) http.Handler {
 	sessionsToClear := []string{
 		auth.OIDCAuthSessionName,
-		auth.InternalAuthSessionName,
+		oidcFlowSessionName,
 	}
-	return func(w http.ResponseWriter, r *http.Request) {
-		for _, name := range sessionsToClear {
-			sess, _ := sessionStore.Get(r, name)
-			sess.Options.MaxAge = -1
-			if err := sess.Save(r, w); err != nil {
-				s.logger.WithError(err).WithField("session", name).Error("logout: failed to clear session")
-				http.Error(w, "logout failed", http.StatusInternalServerError)
-				return
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/logout" {
+				for _, name := range sessionsToClear {
+					sess, _ := sessionStore.Get(r, name)
+					sess.Options.MaxAge = -1
+					if err := sess.Save(r, w); err != nil {
+						s.logger.WithError(err).WithField("session", name).Error("logout: failed to clear OIDC session")
+					}
+				}
 			}
-		}
-		http.Redirect(w, r, s.logoutRedirectURL, http.StatusTemporaryRedirect)
+			next.ServeHTTP(w, r)
+		})
 	}
 }
 
-// loginHandler generates state + nonce, stores them in a temporary session, and
-// redirects the browser to the Azure Entra ID authorization endpoint.
+// loginHandler handles the authorization code flow start.
+//
+// Browser flow (no redirect_uri param): generates state + nonce, stores them in a
+// temporary session cookie, then redirects to the IdP.
+//
+// CLI flow (redirect_uri param present): uses the caller-supplied state and the
+// CLI's local redirect URI. No session cookie is set — the CLI owns state
+// verification and nonce is skipped (ValidateSTS does not check nonce).
 func (s *NativeOIDCService) loginHandler(sessionStore sessions.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if redirectURI := r.URL.Query().Get("redirect_uri"); redirectURI != "" {
+			s.cliLoginRedirect(w, r, redirectURI)
+			return
+		}
+
 		state, err := randomToken(32)
 		if err != nil {
 			http.Error(w, "internal error", http.StatusInternalServerError)
@@ -149,6 +162,23 @@ func (s *NativeOIDCService) loginHandler(sessionStore sessions.Store) http.Handl
 
 		http.Redirect(w, r, s.oauth2Cfg.AuthCodeURL(state, opts...), http.StatusFound)
 	}
+}
+
+// cliLoginRedirect handles the CLI authorization code flow start. The CLI provides
+// its own redirect_uri (a local HTTP server) and state. No session cookie is set.
+func (s *NativeOIDCService) cliLoginRedirect(w http.ResponseWriter, r *http.Request, redirectURI string) {
+	state := r.URL.Query().Get("state")
+	if state == "" {
+		http.Error(w, "state is required for CLI flow", http.StatusBadRequest)
+		return
+	}
+	cfg := s.oauth2Cfg
+	cfg.RedirectURL = redirectURI
+	var opts []oauth2.AuthCodeOption
+	for k, v := range s.cfg.AuthorizeParams {
+		opts = append(opts, oauth2.SetAuthURLParam(k, v))
+	}
+	http.Redirect(w, r, cfg.AuthCodeURL(state, opts...), http.StatusFound)
 }
 
 // OauthCallback is called by the controller when the Azure callback lands on

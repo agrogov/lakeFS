@@ -22,14 +22,13 @@ auth:
   ui_config:
     # Primary login: go straight to Azure without showing the access-key form.
     login_url: "/oidc/login"
-    login_url_method: "redirect"
 
     # Fallback button on the login page for service accounts that use access keys.
     fallback_login_url: "/auth/login"
     fallback_login_label: "Login with Access Key"
 
-    # Sessions to clear on logout.  Must include oidc_auth_session so that the
-    # OIDC cookie is expired server-side when the user clicks logout.
+    # Cookies whose absence means "not logged in" — the UI uses this list to detect
+    # whether to show the login page.  Must include oidc_auth_session for SSO users.
     login_cookie_names:
       - "internal_auth_session"
       - "oidc_auth_session"

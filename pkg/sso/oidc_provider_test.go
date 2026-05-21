@@ -156,7 +156,7 @@ func buildService(t *testing.T, mock *mockOIDCServer) *sso.NativeOIDCService {
 		GroupsClaim:       "roles",
 	}
 	// Pass nil for authService and a no-op logger — group sync is not exercised here.
-	svc, err := sso.NewNativeOIDCService(context.Background(), cfg, nil, logging.Dummy(), "/auth/login")
+	svc, err := sso.NewNativeOIDCService(context.Background(), cfg, nil, logging.Dummy())
 	if err != nil {
 		t.Fatalf("NewNativeOIDCService: %v", err)
 	}

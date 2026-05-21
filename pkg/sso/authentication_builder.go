@@ -24,8 +24,7 @@ func BuildAuthenticationService(ctx context.Context, cfg config.Config, logger l
 	cachedSvc := builtAuthService
 	builtAuthServiceMu.RUnlock()
 
-	logoutRedirectURL := cfg.AuthConfig().GetBaseAuthConfig().LogoutRedirectURL
-	svc, err := NewNativeOIDCService(ctx, ssoCfg, cachedSvc, logger, logoutRedirectURL)
+	svc, err := NewNativeOIDCService(ctx, ssoCfg, cachedSvc, logger)
 	if err != nil {
 		return nil, err
 	}
