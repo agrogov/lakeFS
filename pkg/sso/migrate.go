@@ -42,7 +42,10 @@ func MigrateBasicToACL(ctx context.Context, kvStore kv.Store, secretStore crypt.
 	logger.WithField("username", user.Username).Info("migrate: found admin user in basicAuth partition")
 
 	// --- 2. Read credentials from basicAuth partition ---
-	// Credentials are keyed under "superAdmin" (not the real username) in basicAuth.
+	// BasicAuthService always stores credentials under the "superAdmin" KV key regardless
+	// of the actual username stored in the UserData proto (user.Username may be e.g. "admin").
+	// We scan under SuperAdminKey to find the credentials, then write them under the real
+	// username in the ACL partition. This intentional key-namespace mismatch is correct.
 	var credData model.CredentialData
 	credPrefix := model.CredentialPath(auth.SuperAdminKey, "")
 	it, err := kv.NewPrimaryIterator(ctx, kvStore, (&credData).ProtoReflect().Type(),

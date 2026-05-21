@@ -26,9 +26,9 @@ import (
 )
 
 func main() {
-	// Override the auth service factory with SSO-aware ACL implementation.
+	// Override both service factories with SSO-aware implementations.
 	lakefsCmd.SetAuthServiceBuilder(sso.BuildAuthService)
-	// Phase 1: SetAuthenticationServiceBuilder will be wired when NativeOIDCService is ready.
+	lakefsCmd.SetAuthenticationServiceBuilder(sso.BuildAuthenticationService)
 
 	// Register the sso-migrate subcommand.
 	lakefsCmd.GetRoot().AddCommand(newSSOmigrateCmd())
