@@ -3,7 +3,6 @@ package sso
 import (
 	"context"
 
-	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/authentication"
 	"github.com/treeverse/lakefs/pkg/config"
 	logging "github.com/treeverse/lakefs/pkg/logging"
@@ -12,13 +11,16 @@ import (
 // BuildAuthenticationService is the AuthenticationServiceBuilder for the lakefs-sso binary.
 // When SSO is enabled it returns a NativeOIDCService; otherwise it falls back to the
 // upstream default (DummyService or APIService when authentication_api.endpoint is set).
-func BuildAuthenticationService(ctx context.Context, cfg config.Config, logger logging.Logger, authService auth.Service) (authentication.Service, error) {
+//
+// builtAuthService (set by BuildAuthService) is passed in for group sync. run.go calls
+// authServiceBuilder before authenticationServiceBuilder, guaranteeing it is populated.
+func BuildAuthenticationService(ctx context.Context, cfg config.Config, logger logging.Logger) (authentication.Service, error) {
 	ssoCfg := LoadSSOConfig()
 	if !ssoCfg.Enabled {
 		return authentication.NewAuthenticationService(ctx, cfg, logger)
 	}
 
-	svc, err := NewNativeOIDCService(ctx, ssoCfg, authService, logger)
+	svc, err := NewNativeOIDCService(ctx, ssoCfg, builtAuthService, logger)
 	if err != nil {
 		return nil, err
 	}

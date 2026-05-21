@@ -36,5 +36,15 @@ func BuildAuthService(ctx context.Context, cfg config.Config, logger logging.Log
 		logger.WithError(err).Warn("acl setup skipped (may already exist)")
 	}
 
-	return auth.NewMonitoredAuthService(aclService)
+	svc := auth.NewMonitoredAuthService(aclService)
+	// Cache so BuildAuthenticationService can wire it into NativeOIDCService for group sync.
+	// run.go calls authServiceBuilder before authenticationServiceBuilder, so this is always
+	// populated by the time BuildAuthenticationService runs.
+	builtAuthService = svc
+	return svc
 }
+
+// builtAuthService holds the auth.Service constructed by BuildAuthService so that
+// BuildAuthenticationService can pass it to NativeOIDCService without changing the
+// AuthenticationServiceBuilder function signature (and therefore run.go / hooks.go).
+var builtAuthService auth.Service

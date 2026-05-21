@@ -14,18 +14,13 @@ import (
 type AuthServiceBuilder func(ctx context.Context, cfg config.Config, logger logging.Logger, kvStore kv.Store, metadataManager *auth.KVMetadataManager) auth.Service
 
 // AuthenticationServiceBuilder builds the authentication.Service used by the server.
-// authService is the already-constructed auth.Service (available for SSO implementations that
-// need to perform group sync on login). Upstream implementations that don't need it can ignore it.
-type AuthenticationServiceBuilder func(ctx context.Context, cfg config.Config, logger logging.Logger, authService auth.Service) (authentication.Service, error)
+type AuthenticationServiceBuilder func(ctx context.Context, cfg config.Config, logger logging.Logger) (authentication.Service, error)
 
 // authServiceBuilder defaults to the upstream auth.NewAuthService factory.
 var authServiceBuilder AuthServiceBuilder = auth.NewAuthService
 
 // authenticationServiceBuilder defaults to the upstream authentication.NewAuthenticationService factory.
-// The auth.Service parameter is unused by the default implementation.
-var authenticationServiceBuilder AuthenticationServiceBuilder = func(ctx context.Context, cfg config.Config, logger logging.Logger, _ auth.Service) (authentication.Service, error) {
-	return authentication.NewAuthenticationService(ctx, cfg, logger)
-}
+var authenticationServiceBuilder AuthenticationServiceBuilder = authentication.NewAuthenticationService
 
 // SetAuthServiceBuilder overrides the auth.Service factory. Call before Execute().
 func SetAuthServiceBuilder(b AuthServiceBuilder) { authServiceBuilder = b }
