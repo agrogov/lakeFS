@@ -39,7 +39,7 @@ The token is printed to stdout and can be stored in the LAKECTL_ACCESS_KEY_ID
 environment variable (with empty LAKECTL_SECRET_ACCESS_KEY) for subsequent
 lakectl commands, or written manually to ~/.lakectl.yaml.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			token, expiry, err := sso.BrowserLogin(cmd.Context(), endpoint)
+			token, expiry, err := sso.BrowserLogin(cmd.Context(), endpoint, ttl)
 			if err != nil {
 				return err
 			}

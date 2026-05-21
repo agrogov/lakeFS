@@ -156,7 +156,7 @@ func buildService(t *testing.T, mock *mockOIDCServer) *sso.NativeOIDCService {
 		GroupsClaim:       "roles",
 	}
 	// Pass nil for authService and a no-op logger — group sync is not exercised here.
-	svc, err := sso.NewNativeOIDCService(context.Background(), cfg, nil, logging.Dummy())
+	svc, err := sso.NewNativeOIDCService(context.Background(), cfg, nil, logging.Dummy(), "/auth/login")
 	if err != nil {
 		t.Fatalf("NewNativeOIDCService: %v", err)
 	}
@@ -286,6 +286,116 @@ func TestValidateSTS(t *testing.T) {
 	}
 	if externalID != oid {
 		t.Errorf("expected externalID=%s, got %s", oid, externalID)
+	}
+}
+
+// TestLogoutClearsOIDCSessions verifies that GET /logout clears the OIDC auth
+// session even when registered after r.Mount (chi v5 method-specific routes
+// override mALL endpoints set by Mount for that method).
+func TestLogoutClearsOIDCSessions(t *testing.T) {
+	mock := newMockOIDCServer(t)
+	defer mock.close()
+
+	svc := buildService(t, mock)
+	store := buildSessionStore()
+
+	// Simulate having an active OIDC session cookie.
+	seedReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	seedW := httptest.NewRecorder()
+	sess, _ := store.Get(seedReq, auth.OIDCAuthSessionName)
+	sess.Values["sub"] = "test-user"
+	_ = sess.Save(seedReq, seedW)
+	sessionCookies := seedW.Result().Cookies()
+
+	// Build a router that also has a /logout mount (simulating serve.go order).
+	r := chi.NewRouter()
+	r.Mount("/logout", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/auth/login", http.StatusTemporaryRedirect)
+	}))
+	// RegisterAdditionalRoutes is called after the mount — r.Get must shadow it.
+	svc.RegisterAdditionalRoutes(r, store)
+
+	req := httptest.NewRequest(http.MethodGet, "/logout", nil)
+	for _, c := range sessionCookies {
+		req.AddCookie(c)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("logout: expected 307, got %d", resp.StatusCode)
+	}
+	// Verify the OIDC session cookie was expired (Max-Age=-1).
+	expired := false
+	for _, c := range resp.Cookies() {
+		if c.Name == auth.OIDCAuthSessionName && c.MaxAge < 0 {
+			expired = true
+		}
+	}
+	if !expired {
+		t.Error("logout: oidc_auth_session was not expired in response cookies")
+	}
+}
+
+// TestCLILoginRedirect verifies the CLI flow (redirect_uri + state params).
+func TestCLILoginRedirect(t *testing.T) {
+	mock := newMockOIDCServer(t)
+	defer mock.close()
+
+	svc := buildService(t, mock)
+	store := buildSessionStore()
+
+	r := chi.NewRouter()
+	svc.RegisterAdditionalRoutes(r, store)
+
+	redirectURI := "http://127.0.0.1:9999"
+	state := "cli-state-abc"
+	req := httptest.NewRequest(http.MethodGet,
+		"/oidc/login?redirect_uri="+url.QueryEscape(redirectURI)+"&state="+url.QueryEscape(state), nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("cli login: expected 302, got %d", resp.StatusCode)
+	}
+	loc := resp.Header.Get("Location")
+	if !strings.Contains(loc, mock.issuerURL()+"/auth") {
+		t.Errorf("cli login: redirect not to IdP: %s", loc)
+	}
+	if !strings.Contains(loc, "state="+url.QueryEscape(state)) {
+		t.Errorf("cli login: state not in IdP URL: %s", loc)
+	}
+	if !strings.Contains(loc, "redirect_uri="+url.QueryEscape(redirectURI)) {
+		t.Errorf("cli login: redirect_uri not forwarded to IdP: %s", loc)
+	}
+	// CLI flow must not set a flow session cookie.
+	for _, c := range resp.Cookies() {
+		if c.Name == "oidc_flow_session" {
+			t.Error("cli login: unexpectedly set oidc_flow_session cookie")
+		}
+	}
+}
+
+// TestCLILoginRedirectRejectsNonLoopback verifies redirect_uri validation.
+func TestCLILoginRedirectRejectsNonLoopback(t *testing.T) {
+	mock := newMockOIDCServer(t)
+	defer mock.close()
+
+	svc := buildService(t, mock)
+	store := buildSessionStore()
+
+	r := chi.NewRouter()
+	svc.RegisterAdditionalRoutes(r, store)
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/oidc/login?redirect_uri=https://attacker.example&state=x", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for non-loopback redirect_uri, got %d", w.Code)
 	}
 }
 

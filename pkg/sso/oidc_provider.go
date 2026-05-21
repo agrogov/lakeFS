@@ -30,17 +30,20 @@ const (
 // NativeOIDCService implements authentication.Service for Azure Entra ID OIDC.
 // It handles the authorization code flow natively without an external auth service.
 type NativeOIDCService struct {
-	cfg         *SSOConfig
-	provider    *gooidc.Provider
-	oauth2Cfg   oauth2.Config
-	authService groupManager
-	logger      logging.Logger
+	cfg               *SSOConfig
+	provider          *gooidc.Provider
+	oauth2Cfg         oauth2.Config
+	authService       groupManager
+	logger            logging.Logger
+	logoutRedirectURL string
 }
 
 // NewNativeOIDCService constructs the service by performing OIDC discovery against
 // cfg.IssuerURL. This makes an HTTP request so the context should be alive.
 // authService may be nil when group sync is disabled.
-func NewNativeOIDCService(ctx context.Context, cfg *SSOConfig, authService auth.Service, logger logging.Logger) (*NativeOIDCService, error) {
+// logoutRedirectURL is where /logout redirects after clearing sessions (typically
+// Azure's end_session_endpoint, e.g. auth.logout_redirect_url from lakeFS config).
+func NewNativeOIDCService(ctx context.Context, cfg *SSOConfig, authService auth.Service, logger logging.Logger, logoutRedirectURL string) (*NativeOIDCService, error) {
 	provider, err := gooidc.NewProvider(ctx, cfg.IssuerURL)
 	if err != nil {
 		return nil, fmt.Errorf("oidc: discover %s: %w", cfg.IssuerURL, err)
@@ -57,11 +60,12 @@ func NewNativeOIDCService(ctx context.Context, cfg *SSOConfig, authService auth.
 	}
 
 	return &NativeOIDCService{
-		cfg:         cfg,
-		provider:    provider,
-		oauth2Cfg:   oauth2Cfg,
-		authService: authService,
-		logger:      logger,
+		cfg:               cfg,
+		provider:          provider,
+		oauth2Cfg:         oauth2Cfg,
+		authService:       authService,
+		logger:            logger,
+		logoutRedirectURL: logoutRedirectURL,
 	}, nil
 }
 
@@ -74,42 +78,39 @@ func (s *NativeOIDCService) ExternalPrincipalLogin(_ context.Context, _ map[stri
 	return nil, authentication.ErrNotImplemented
 }
 
-// RegisterAdditionalRoutes registers SSO-specific routes and middleware on the root router.
+// RegisterAdditionalRoutes registers SSO-specific routes on the root router.
 //
-// /oidc/login  — starts the authorization code flow (browser) or CLI redirect.
-// logoutMiddleware — clears oidc_auth_session and oidc_flow_session on any /logout
+// /oidc/login — starts the authorization code flow (browser or CLI).
+// /logout     — overrides the upstream mount for GET requests. In chi v5,
 //
-//	request before the upstream logout handler runs. The upstream handler
-//	(registered via r.Mount) clears internal_auth_session and performs the
-//	redirect; chi v5 matches r.Mount before r.Get for the same path, so we use
-//	a middleware instead of a competing route.
+//	r.Get registers a method-specific endpoint that overwrites the mGET
+//	slot set by the earlier r.Mount, so GET /logout is handled here and
+//	the upstream mount handler is shadowed for that method. The SSO handler
+//	clears all three sessions (oidc_auth, oidc_flow, internal_auth) and
+//	redirects to logoutRedirectURL in one response.
 func (s *NativeOIDCService) RegisterAdditionalRoutes(r *chi.Mux, sessionStore sessions.Store) {
-	r.Use(s.logoutMiddleware(sessionStore))
 	r.Get("/oidc/login", s.loginHandler(sessionStore))
+	r.Get("/logout", s.logoutHandler(sessionStore))
 }
 
-// logoutMiddleware clears OIDC-specific sessions on logout requests, then
-// delegates to the next handler (the upstream logout handler that clears
-// internal_auth_session and performs the redirect). Errors clearing individual
-// sessions are logged but do not abort the logout flow.
-func (s *NativeOIDCService) logoutMiddleware(sessionStore sessions.Store) func(http.Handler) http.Handler {
+// logoutHandler clears all login sessions and redirects to logoutRedirectURL.
+// Errors clearing individual sessions are logged but do not abort the logout
+// so the user is always signed out server-side and redirected.
+func (s *NativeOIDCService) logoutHandler(sessionStore sessions.Store) http.HandlerFunc {
 	sessionsToClear := []string{
 		auth.OIDCAuthSessionName,
 		oidcFlowSessionName,
+		auth.InternalAuthSessionName,
 	}
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/logout" {
-				for _, name := range sessionsToClear {
-					sess, _ := sessionStore.Get(r, name)
-					sess.Options.MaxAge = -1
-					if err := sess.Save(r, w); err != nil {
-						s.logger.WithError(err).WithField("session", name).Error("logout: failed to clear OIDC session")
-					}
-				}
+	return func(w http.ResponseWriter, r *http.Request) {
+		for _, name := range sessionsToClear {
+			sess, _ := sessionStore.Get(r, name)
+			sess.Options.MaxAge = -1
+			if err := sess.Save(r, w); err != nil {
+				s.logger.WithError(err).WithField("session", name).Error("logout: failed to clear session")
 			}
-			next.ServeHTTP(w, r)
-		})
+		}
+		http.Redirect(w, r, s.logoutRedirectURL, http.StatusTemporaryRedirect)
 	}
 }
 
@@ -166,7 +167,13 @@ func (s *NativeOIDCService) loginHandler(sessionStore sessions.Store) http.Handl
 
 // cliLoginRedirect handles the CLI authorization code flow start. The CLI provides
 // its own redirect_uri (a local HTTP server) and state. No session cookie is set.
+// redirect_uri is restricted to loopback addresses (127.0.0.1) so that an
+// attacker cannot redirect authorization codes to an external host.
 func (s *NativeOIDCService) cliLoginRedirect(w http.ResponseWriter, r *http.Request, redirectURI string) {
+	if !strings.HasPrefix(redirectURI, "http://127.0.0.1:") {
+		http.Error(w, "redirect_uri must target http://127.0.0.1:<port>", http.StatusBadRequest)
+		return
+	}
 	state := r.URL.Query().Get("state")
 	if state == "" {
 		http.Error(w, "state is required for CLI flow", http.StatusBadRequest)
