@@ -104,9 +104,9 @@ var runCmd = &cobra.Command{
 		authMetadataManager := auth.NewKVMetadataManager(version.Version, installationID, baseCfg.Database.Type, kvStore)
 		idGen := &actions.DecreasingIDGenerator{}
 
-		authService := auth.NewAuthService(ctx, cfg, logger, kvStore, authMetadataManager)
+		authService := authServiceBuilder(ctx, cfg, logger, kvStore, authMetadataManager)
 
-		authenticationService, err := authentication.NewAuthenticationService(ctx, cfg, logger)
+		authenticationService, err := authenticationServiceBuilder(ctx, cfg, logger)
 		if err != nil {
 			logger.WithError(err).Fatal("failed to create authentication service")
 		}
