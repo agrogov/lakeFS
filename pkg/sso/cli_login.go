@@ -19,7 +19,8 @@ import (
 // It starts a local HTTP server to receive the IdP callback, opens a browser
 // to the lakeFS OIDC login endpoint, waits for the authorization code, then
 // exchanges it via the lakeFS STS endpoint and returns a JWT token + expiry.
-func BrowserLogin(ctx context.Context, endpoint string) (token string, tokenExpiry int64, err error) {
+// ttlSeconds controls the token lifetime (capped at the server's maximum).
+func BrowserLogin(ctx context.Context, endpoint string, ttlSeconds int) (token string, tokenExpiry int64, err error) {
 	state, err := randomToken(32)
 	if err != nil {
 		return "", 0, fmt.Errorf("sso: generate state: %w", err)
@@ -69,6 +70,9 @@ func BrowserLogin(ctx context.Context, endpoint string) (token string, tokenExpi
 		case codeCh <- code:
 		default:
 		}
+		// Shut down after the first successful callback so the browser
+		// does not leave an open local port.
+		go func() { _ = srv.Shutdown(context.Background()) }()
 	})
 
 	go func() {
@@ -79,9 +83,16 @@ func BrowserLogin(ctx context.Context, endpoint string) (token string, tokenExpi
 			}
 		}
 	}()
-	defer srv.Shutdown(ctx) //nolint:errcheck
+	// Use a fresh context for shutdown so it succeeds even when ctx is cancelled.
+	defer func() { _ = srv.Shutdown(context.Background()) }()
 
 	endpoint = strings.TrimRight(endpoint, "/")
+
+	normalizedEndpoint, err := apiutil.NormalizeLakeFSEndpoint(endpoint)
+	if err != nil {
+		return "", 0, fmt.Errorf("sso: normalize endpoint: %w", err)
+	}
+
 	loginURL, err := buildLoginURL(endpoint, redirectURI, state)
 	if err != nil {
 		return "", 0, fmt.Errorf("sso: build login URL: %w", err)
@@ -102,20 +113,17 @@ func BrowserLogin(ctx context.Context, endpoint string) (token string, tokenExpi
 		return "", 0, ctx.Err()
 	}
 
-	normalizedEndpoint, err := apiutil.NormalizeLakeFSEndpoint(endpoint)
-	if err != nil {
-		return "", 0, fmt.Errorf("sso: normalize endpoint: %w", err)
-	}
-
 	client, err := apigen.NewClientWithResponses(normalizedEndpoint)
 	if err != nil {
 		return "", 0, fmt.Errorf("sso: create lakeFS client: %w", err)
 	}
 
+	ttl := int64(ttlSeconds)
 	resp, err := client.StsLoginWithResponse(ctx, apigen.StsLoginJSONRequestBody{
 		Code:        code,
 		State:       state,
 		RedirectUri: redirectURI,
+		TtlSeconds:  &ttl,
 	})
 	if err != nil {
 		return "", 0, fmt.Errorf("sso: STS login request: %w", err)
