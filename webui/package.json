@@ -53,7 +53,6 @@
     "react-syntax-highlighter": "^15.5.0",
     "rehype-raw": "^7.0.0",
     "rehype-react": "^8.0.0",
-    "rehype-sanitize": "^6.0.0",
     "rehype-wrap": "^1.1.0",
     "remark": "^14.0.2",
     "remark-gfm": "^4.0.0",
@@ -111,11 +110,5 @@
     "vite": "^7.3.1",
     "vite-plugin-eslint2": "^5.0.4",
     "vitest": "^3.2.4"
-  },
-  "allowScripts": {
-    "@parcel/watcher": true,
-    "@swc/core": true,
-    "esbuild": true,
-    "fsevents": true
   }
 }

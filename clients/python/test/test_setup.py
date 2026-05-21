@@ -45,7 +45,6 @@ class TestSetup(unittest.TestCase):
                 last_name = '',
                 email = '',
                 company_name = '',
-                country = '',
                 feature_updates = True,
                 security_updates = True
             )

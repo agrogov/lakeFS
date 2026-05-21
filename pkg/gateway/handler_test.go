@@ -59,51 +59,6 @@ func testPathWithTrailingSlash(t *testing.T, result *http.Response) {
 	assert.Contains(t, result.Header, "X-Amz-Request-Id")
 }
 
-// TestListObjectsMalformedPrefixStatus asserts that a prefix the gateway cannot resolve is reported
-// as 400 Bad Request, as the S3 API does, and not as 403 Access Denied. ListObjects fails closed on
-// an unresolvable prefix by returning the resolve error from RequiredPermissions, so the request is
-// rejected before it is authorized; RepoOperationHandler is responsible for mapping that error to a
-// client error rather than to a denial.
-func TestListObjectsMalformedPrefixStatus(t *testing.T) {
-	for _, tt := range []struct {
-		name   string
-		prefix string
-	}{
-		{name: "bare separator", prefix: "%2F"},
-		{name: "empty first component", prefix: "%2F%2Ffoo"},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			result := setupTest(t, http.MethodGet,
-				"/"+repoName+"?list-type=2&prefix="+tt.prefix+"&delimiter=%2F", nil)
-			assert.Equal(t, http.StatusBadRequest, result.StatusCode)
-		})
-	}
-}
-
-// TestBucketSubResourceStatusUnchanged pins the end-to-end status of the bucket-level sub-resources
-// served by ListObjects. RequiredPermissions runs before Handle demuxes them, so deriving the
-// permission from the prefix alone would reject a prefix these operations ignore: ?location and
-// ?versioning would go from 200 to 400, and ?uploads from 501 to 400.
-func TestBucketSubResourceStatusUnchanged(t *testing.T) {
-	for _, tt := range []struct {
-		name  string
-		query string
-		want  int
-	}{
-		{name: "location", query: "location", want: http.StatusOK},
-		{name: "location with malformed prefix", query: "location&prefix=%2F", want: http.StatusOK},
-		{name: "versioning", query: "versioning", want: http.StatusOK},
-		{name: "versioning with malformed prefix", query: "versioning&prefix=%2F", want: http.StatusOK},
-		// ListMultipartUploads rejects prefix, delimiter and encoding-type as not implemented.
-		{name: "uploads with prefix", query: "uploads&prefix=%2F", want: http.StatusNotImplemented},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			result := setupTest(t, http.MethodGet, "/"+repoName+"?"+tt.query, nil)
-			assert.Equal(t, tt.want, result.StatusCode)
-		})
-	}
-}
-
 func TestContextCancellation(t *testing.T) {
 	h, _ := testutil.GetBasicHandler(t, &testutil.FakeAuthService{
 		BareDomain:      "example.com",

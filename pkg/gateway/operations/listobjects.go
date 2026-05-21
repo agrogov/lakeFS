@@ -2,7 +2,6 @@ package operations
 
 import (
 	"errors"
-	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -35,88 +34,26 @@ const (
 	QueryParamDelimiter    = "delimiter"
 )
 
-// errUnhandledBucketGetKind backs the tripwires in RequiredPermissions and Handle. It is a sentinel
-// so the tripwire is assertable with errors.Is, and deliberately not path.ErrPathMalformed:
-// RepoOperationHandler maps that to 400, and an unhandled kind must fail closed with 403 instead.
-var errUnhandledBucketGetKind = errors.New("unhandled bucket GET kind")
-
 type ListObjects struct{}
 
-// bucketGetKind is the operation a GET on a bucket resolves to. Every decision about such a
-// request (the permission it requires and the handler it reaches) must derive from the same
-// classifyBucketGet result, so the two cannot disagree.
-type bucketGetKind int
-
-const (
-	// bucketGetInvalid is the zero value. classifyBucketGet returns it only alongside a non-nil
-	// error, so a caller that acts on the kind without checking the error cannot mistake it for a
-	// real operation.
-	bucketGetInvalid bucketGetKind = iota
-	bucketGetLocation
-	bucketGetMultipartUploads
-	bucketGetVersioning
-	bucketGetBranches
-	bucketGetObjects
-)
-
-// classifyBucketGet is a pure function of the request, so it is safe to evaluate more than once.
-// The resolved prefix is meaningful only for the listing kinds; the bucket sub-resources do not
-// read it.
-//
-// The unsupported sub-resources handled by HandleUnsupported are deliberately not classified here:
-// that check is gated on gateways.s3.verify_unsupported, and when it is disabled those requests fall
-// through to ListV1 and genuinely are listings.
-func classifyBucketGet(req *http.Request) (bucketGetKind, path.ResolvedPath, error) {
-	query := req.URL.Query()
-	switch {
-	case query.Has("location"):
-		return bucketGetLocation, path.ResolvedPath{}, nil
-	case query.Has("uploads"):
-		return bucketGetMultipartUploads, path.ResolvedPath{}, nil
-	case query.Has("versioning"):
-		return bucketGetVersioning, path.ResolvedPath{}, nil
-	}
-
-	prefix, err := path.ResolvePath(query.Get(QueryParamPrefix))
-	switch {
-	case err != nil:
-		return bucketGetInvalid, path.ResolvedPath{}, err
-	case prefix.WithPath:
-		return bucketGetObjects, prefix, nil
-	default:
-		return bucketGetBranches, prefix, nil
-	}
-}
-
 func (controller *ListObjects) RequiredPermissions(req *http.Request, repoID string) (permissions.Node, error) {
-	kind, _, err := classifyBucketGet(req)
-	if err != nil {
-		// The operation being requested cannot be determined, so neither can the permission it
-		// requires. Fail closed rather than assuming an object listing.
-		logging.FromContext(req.Context()).WithError(err).
-			WithField("path", req.URL.Query().Get(QueryParamPrefix)).
-			Error("could not resolve path for prefix")
-		return permissions.Node{}, err
+	// check if we're listing files in a branch, or listing branches
+	params := req.URL.Query()
+	delimiter := params.Get("delimiter")
+	prefix := params.Get("prefix")
+	if delimiter == "/" && !strings.Contains(prefix, "/") {
+		return permissions.Node{
+			Permission: permissions.Permission{
+				Action:   permissions.ListBranchesAction,
+				Resource: permissions.RepoArn(repoID),
+			},
+		}, nil
 	}
 
-	var action string
-	switch kind {
-	case bucketGetBranches:
-		action = permissions.ListBranchesAction
-	case bucketGetLocation, bucketGetMultipartUploads, bucketGetVersioning, bucketGetObjects:
-		// GetBucketLocation, ListMultipartUploads and GetBucketVersioning read bucket-level state
-		// rather than branches and return no branch names, so they require fs:ListObjects, as an
-		// object listing does.
-		action = permissions.ListObjectsAction
-	default:
-		// Tripwire, mirroring the one in Handle. A kind added to classifyBucketGet without deciding
-		// its permission here must not silently inherit fs:ListObjects: if its handler reads
-		// anything branch-scoped, that is this advisory again. Fail closed instead.
-		return permissions.Node{}, fmt.Errorf("%w: %d", errUnhandledBucketGetKind, kind)
-	}
+	// otherwise, we're listing objects within a branch
 	return permissions.Node{
 		Permission: permissions.Permission{
-			Action:   action,
+			Action:   permissions.ListObjectsAction,
 			Resource: permissions.RepoArn(repoID),
 		},
 	}, nil
@@ -166,7 +103,7 @@ func (controller *ListObjects) serializeBranches(branches []*catalog.Branch) ([]
 	return dirs, lastKey
 }
 
-func (controller *ListObjects) ListV2(w http.ResponseWriter, req *http.Request, o *RepoOperation, prefix path.ResolvedPath) {
+func (controller *ListObjects) ListV2(w http.ResponseWriter, req *http.Request, o *RepoOperation) {
 	req = req.WithContext(logging.AddFields(req.Context(), logging.Fields{
 		logging.ListTypeFieldKey: "v2",
 	}))
@@ -190,6 +127,16 @@ func (controller *ListObjects) ListV2(w http.ResponseWriter, req *http.Request, 
 	var results []*catalog.DBEntry
 	var hasMore bool
 	var ref string
+	// should we list branches?
+	prefix, err := path.ResolvePath(params.Get("prefix"))
+	if err != nil {
+		o.Log(req).
+			WithError(err).
+			WithField("path", params.Get("prefix")).
+			Error("could not resolve path for prefix")
+		_ = o.EncodeError(w, req, err, gatewayerrors.Codes.ToAPIErr(gatewayerrors.ErrBadRequest))
+		return
+	}
 
 	var from path.ResolvedPath
 	if !prefix.WithPath {
@@ -227,7 +174,6 @@ func (controller *ListObjects) ListV2(w http.ResponseWriter, req *http.Request, 
 		return
 	} else {
 		// list objects then.
-		var err error
 		ref = prefix.Ref
 		if len(fromStr) > 0 {
 			from, err = path.ResolvePath(fromStr)
@@ -287,7 +233,7 @@ func (controller *ListObjects) ListV2(w http.ResponseWriter, req *http.Request, 
 	o.EncodeResponse(w, req, resp, http.StatusOK)
 }
 
-func (controller *ListObjects) ListV1(w http.ResponseWriter, req *http.Request, o *RepoOperation, prefix path.ResolvedPath) {
+func (controller *ListObjects) ListV1(w http.ResponseWriter, req *http.Request, o *RepoOperation) {
 	req = req.WithContext(logging.AddFields(req.Context(), logging.Fields{
 		logging.ListTypeFieldKey: "v1",
 	}))
@@ -301,6 +247,17 @@ func (controller *ListObjects) ListV1(w http.ResponseWriter, req *http.Request, 
 	hasMore := false
 
 	var ref string
+	// should we list branches?
+	prefix, err := path.ResolvePath(params.Get("prefix"))
+	if err != nil {
+		o.Log(req).
+			WithError(err).
+			WithField("path", params.Get("prefix")).
+			Error("could not resolve path for prefix")
+		_ = o.EncodeError(w, req, err, gatewayerrors.Codes.ToAPIErr(gatewayerrors.ErrBadRequest))
+		return
+	}
+
 	if !prefix.WithPath {
 		// list branches then.
 		branches, hasMore, err := o.Catalog.ListBranches(req.Context(), o.Repository.Name, prefix.Ref, maxKeys, params.Get("marker"))
@@ -334,7 +291,12 @@ func (controller *ListObjects) ListV1(w http.ResponseWriter, req *http.Request, 
 		o.EncodeResponse(w, req, resp, http.StatusOK)
 		return
 	} else {
-		var err error
+		prefix, err := path.ResolvePath(params.Get("prefix"))
+		if err != nil {
+			o.Log(req).WithError(err).Error("could not list branches")
+			_ = o.EncodeError(w, req, err, gatewayerrors.Codes.ToAPIErr(gatewayerrors.ErrBadRequest))
+			return
+		}
 		ref = prefix.Ref
 		// see if we have a continuation token in the request to pick up from
 		var marker path.ResolvedPath
@@ -403,18 +365,10 @@ func (controller *ListObjects) Handle(w http.ResponseWriter, req *http.Request, 
 		"requestPayment", "logging", "tagging", "versions", "policyStatus") {
 		return
 	}
-	kind, prefix, err := classifyBucketGet(req)
-	if err != nil {
-		o.Log(req).
-			WithError(err).
-			WithField("path", req.URL.Query().Get(QueryParamPrefix)).
-			Error("could not resolve path for prefix")
-		_ = o.EncodeError(w, req, err, gatewayerrors.Codes.ToAPIErr(gatewayerrors.ErrBadRequest))
-		return
-	}
+	query := req.URL.Query()
 
-	switch kind {
-	case bucketGetLocation:
+	// getbucketlocation support
+	if query.Has("location") {
 		o.Incr("get_bucket_location", o.Principal, o.Repository.Name, "")
 		response := serde.LocationResponse{}
 		if o.Region != "" && o.Region != defaultBucketLocation {
@@ -422,20 +376,15 @@ func (controller *ListObjects) Handle(w http.ResponseWriter, req *http.Request, 
 		}
 		o.EncodeResponse(w, req, response, http.StatusOK)
 		return
-	case bucketGetMultipartUploads:
+	}
+	// check if request is list-multipart-uploads
+	if query.Has("uploads") {
 		handleListMultipartUploads(w, req, o)
 		return
-	case bucketGetVersioning:
+	}
+	// getbucketversioing support
+	if query.Has("versioning") {
 		o.EncodeXMLBytes(w, req, []byte(serde.VersioningResponse), http.StatusOK)
-		return
-	case bucketGetBranches, bucketGetObjects:
-		// handled below
-	default:
-		// Tripwire. A kind added to classifyBucketGet but not handled here would fall through to
-		// the listing below and list branches, while RequiredPermissions demanded only
-		// fs:ListObjects -- reintroducing this advisory by omission. Fail instead.
-		o.Log(req).WithField("kind", kind).Error("unhandled bucket GET kind")
-		_ = o.EncodeError(w, req, nil, gatewayerrors.Codes.ToAPIErr(gatewayerrors.ErrInternalError))
 		return
 	}
 	o.Incr("list_objects", o.Principal, o.Repository.Name, "")
@@ -444,12 +393,12 @@ func (controller *ListObjects) Handle(w http.ResponseWriter, req *http.Request, 
 	// GET /example?list-type=2&prefix=main%2F&delimiter=%2F&encoding-type=url HTTP/1.1
 
 	// handle ListObjects versions
-	listType := req.URL.Query().Get("list-type")
+	listType := query.Get("list-type")
 	switch listType {
 	case "", "1":
-		controller.ListV1(w, req, o, prefix)
+		controller.ListV1(w, req, o)
 	case "2":
-		controller.ListV2(w, req, o, prefix)
+		controller.ListV2(w, req, o)
 	default:
 		o.Log(req).WithField("list-type", listType).Error("listObjects version not supported")
 		_ = o.EncodeError(w, req, nil, gatewayerrors.Codes.ToAPIErr(gatewayerrors.ErrBadRequest))
@@ -509,7 +458,7 @@ func handleListMultipartUploads(w http.ResponseWriter, req *http.Request, o *Rep
 			if errors.Is(err, kv.ErrNotFound) {
 				continue
 			}
-			o.Log(req).WithError(err).Errorf("could not read multipart record %s", *upload.UploadId)
+			o.Log(req).WithError(err).Error("could not read multipart record %s", *upload.UploadId)
 			_ = o.EncodeError(w, req, err, gatewayerrors.Codes.ToAPIErr(gatewayerrors.ErrInternalError))
 			return
 		}

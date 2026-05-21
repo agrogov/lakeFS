@@ -3767,12 +3767,13 @@ func TestController_SetupLakeFSHandler(t *testing.T) {
 		{
 			name: "all fields",
 			body: apigen.SetupJSONRequestBody{
-				Username:       "admin",
-				Email:          swag.String("user@acme.co"),
-				FirstName:      swag.String("Test"),
-				LastName:       swag.String("User"),
-				CompanyName:    swag.String("Acme Inc."),
-				FeatureUpdates: swag.Bool(true),
+				Username:        "admin",
+				Email:           swag.String("user@acme.co"),
+				FirstName:       swag.String("Test"),
+				LastName:        swag.String("User"),
+				CompanyName:     swag.String("Acme Inc."),
+				FeatureUpdates:  swag.Bool(true),
+				SecurityUpdates: swag.Bool(true),
 			},
 			expectedStatusCode:     http.StatusOK,
 			expectCommPrefsMissing: false,
@@ -3904,12 +3905,12 @@ func TestController_SetupThenCommPrefs(t *testing.T) {
 
 	// step 2: separate comm prefs call
 	commResp, err := clt.SetupCommPrefsWithResponse(ctx, apigen.SetupCommPrefsJSONRequestBody{
-		Email:          swag.String("test@acme.co"),
-		FirstName:      swag.String("Test"),
-		LastName:       swag.String("User"),
-		CompanyName:    swag.String("Acme Inc."),
-		Country:        swag.String("United States"),
-		FeatureUpdates: true,
+		Email:           swag.String("test@acme.co"),
+		FirstName:       swag.String("Test"),
+		LastName:        swag.String("User"),
+		CompanyName:     swag.String("Acme Inc."),
+		FeatureUpdates:  true,
+		SecurityUpdates: true,
 	})
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, commResp.StatusCode())
@@ -3941,7 +3942,6 @@ func TestController_SetupCommPrefs(t *testing.T) {
 				Email:       &mockEmail,
 				LastName:    swag.String("User"),
 				CompanyName: swag.String("Acme Inc."),
-				Country:     swag.String("United States"),
 			},
 			expectedStatusCode: http.StatusOK,
 		},
@@ -3971,81 +3971,12 @@ func TestController_SetupCommPrefs(t *testing.T) {
 			handler, _ := setupHandler(t)
 			server := setupServer(t, handler)
 			clt := setupClientByEndpoint(t, server.URL, "", "")
-			ctx := t.Context()
 
-			// initialize without comm prefs so the endpoint is in the "missing" state
-			setupResp, err := clt.SetupWithResponse(ctx, apigen.SetupJSONRequestBody{Username: "admin"})
-			testutil.Must(t, err)
-			require.Equal(t, http.StatusOK, setupResp.HTTPResponse.StatusCode)
-
-			resp, err := clt.SetupCommPrefsWithResponse(ctx, c.body)
+			resp, err := clt.SetupCommPrefsWithResponse(t.Context(), c.body)
 			require.NoError(t, err)
 			require.Equal(t, c.expectedStatusCode, resp.StatusCode(), "unexpected status for %s", c.name)
 		})
 	}
-}
-
-// TestController_SetupCommPrefsRejected verifies the setup-state guard: comm prefs
-// cannot be set before setup (412) or overwritten once captured (409).
-func TestController_SetupCommPrefsRejected(t *testing.T) {
-	mockEmail := "test@acme.co"
-	commPrefsBody := apigen.SetupCommPrefsJSONRequestBody{
-		Email:       &mockEmail,
-		FirstName:   swag.String("Test"),
-		LastName:    swag.String("User"),
-		CompanyName: swag.String("Acme Inc."),
-	}
-
-	t.Run("not initialized", func(t *testing.T) {
-		handler, _ := setupHandler(t)
-		server := setupServer(t, handler)
-		clt := setupClientByEndpoint(t, server.URL, "", "")
-
-		resp, err := clt.SetupCommPrefsWithResponse(t.Context(), commPrefsBody)
-		require.NoError(t, err)
-		require.Equal(t, http.StatusPreconditionFailed, resp.StatusCode())
-	})
-
-	t.Run("already set during setup", func(t *testing.T) {
-		handler, _ := setupHandler(t)
-		server := setupServer(t, handler)
-		clt := setupClientByEndpoint(t, server.URL, "", "")
-		ctx := t.Context()
-
-		// setup with an email so comm prefs are captured as part of setup
-		setupResp, err := clt.SetupWithResponse(ctx, apigen.SetupJSONRequestBody{
-			Username: "admin",
-			Email:    &mockEmail,
-		})
-		testutil.Must(t, err)
-		require.Equal(t, http.StatusOK, setupResp.HTTPResponse.StatusCode)
-
-		// an unauthenticated caller must not be able to overwrite the stored prefs
-		resp, err := clt.SetupCommPrefsWithResponse(ctx, commPrefsBody)
-		require.NoError(t, err)
-		require.Equal(t, http.StatusConflict, resp.StatusCode())
-	})
-
-	t.Run("second call after update", func(t *testing.T) {
-		handler, _ := setupHandler(t)
-		server := setupServer(t, handler)
-		clt := setupClientByEndpoint(t, server.URL, "", "")
-		ctx := t.Context()
-
-		// setup without comm prefs, then supply them via setup_comm_prefs
-		setupResp, err := clt.SetupWithResponse(ctx, apigen.SetupJSONRequestBody{Username: "admin"})
-		testutil.Must(t, err)
-		require.Equal(t, http.StatusOK, setupResp.HTTPResponse.StatusCode)
-
-		first, err := clt.SetupCommPrefsWithResponse(ctx, commPrefsBody)
-		require.NoError(t, err)
-		require.Equal(t, http.StatusOK, first.StatusCode())
-
-		// second call is rejected (exercises the commPrefsSet latch fast path)
-		second, err := clt.SetupCommPrefsWithResponse(ctx, commPrefsBody)
-		require.NoError(t, err)
-		require.Equal(t, http.StatusConflict, second.StatusCode())
-	})
 }
 
 func TestLogin(t *testing.T) {

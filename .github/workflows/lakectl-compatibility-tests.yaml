@@ -133,7 +133,7 @@ jobs:
           LAKEFS_BLOCKSTORE_TYPE: s3
           LAKEFS_BLOCKSTORE_S3_CREDENTIALS_ACCESS_KEY_ID: ${{ secrets.ESTI_AWS_ACCESS_KEY_ID }}
           LAKEFS_BLOCKSTORE_S3_CREDENTIALS_SECRET_ACCESS_KEY: ${{ secrets.ESTI_AWS_SECRET_ACCESS_KEY }}
-          SKIP_TESTS: 'TestLakectl(Usage|Help)$|TestLakectlTagList/delete_tag1|TestLakectlLocal_interrupted_commit_yes_flag'
+          SKIP_TESTS: 'TestLakectl(Usage|Help)$|TestLakectlTagList/delete_tag1'
 
   notify-slack:
     name: Notify slack on workflow failures
@@ -142,67 +142,11 @@ jobs:
     if: ${{ always() && contains(needs.*.result, 'failure') && github.ref == 'refs/heads/master' }}
     steps:
       - name: slack-send
-        uses: slackapi/slack-github-action@v4.0.0
+        uses: slackapi/slack-github-action@v3
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
-          errors: true
           payload: |
             {
-              "text": ":x: lakeFS Community - lakectl compatibility tests failed on `${{ github.ref_name }}` (run #${{ github.run_number }})",
-              "blocks": [
-                {
-                  "type": "header",
-                  "text": {
-                    "type": "plain_text",
-                    "text": ":x: lakeFS Community - lakectl compatibility tests failed",
-                    "emoji": true
-                  }
-                },
-                {
-                  "type": "section",
-                  "fields": [
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Repository*\n<${{ github.server_url }}/${{ github.repository }}|${{ github.repository }}>"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Branch*\n`${{ github.ref_name }}`"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Compatibility checks*\n${{ needs.compatibility-checks.result }}"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Trigger*\n`${{ github.event_name }}`"
-                    }
-                  ]
-                },
-                {
-                  "type": "actions",
-                  "elements": [
-                    {
-                      "type": "button",
-                      "style": "danger",
-                      "text": {
-                        "type": "plain_text",
-                        "text": "View failed run",
-                        "emoji": true
-                      },
-                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-                    }
-                  ]
-                },
-                {
-                  "type": "context",
-                  "elements": [
-                    {
-                      "type": "mrkdwn",
-                      "text": "Run #${{ github.run_number }} · commit <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
-                    }
-                  ]
-                }
-              ]
+              "text": "Lakectl compatibility tests failure in master branch: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             }

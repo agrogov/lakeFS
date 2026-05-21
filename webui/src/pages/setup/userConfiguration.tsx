@@ -6,7 +6,6 @@ import Col from 'react-bootstrap/Col';
 import Form from 'react-bootstrap/Form';
 import Row from 'react-bootstrap/Row';
 import { AlertError } from '../../lib/components/controls';
-import { COUNTRIES } from './countries';
 
 interface UserConfigurationProps {
     onSubmit: (
@@ -16,7 +15,6 @@ interface UserConfigurationProps {
         email: string,
         companyName: string,
         checks: boolean,
-        country: string,
     ) => Promise<void>;
     setupError: Error;
     disabled: boolean;
@@ -37,14 +35,13 @@ export const UserConfiguration: FC<UserConfigurationProps> = ({
     const [lastName, setLastName] = useState<string>('');
     const [companyName, setCompanyName] = useState<string>('');
     const [checks, setChecks] = useState<boolean>(false);
-    const [country, setCountry] = useState<string>('');
 
     const submitHandler = useCallback(
         (e: FormEvent) => {
-            onSubmit(adminUser, firstName, lastName, userEmail, companyName, checks, country);
+            onSubmit(adminUser, firstName, lastName, userEmail, companyName, checks);
             e.preventDefault();
         },
-        [onSubmit, adminUser, firstName, lastName, userEmail, companyName, checks, country],
+        [onSubmit, adminUser, firstName, lastName, userEmail, companyName, checks],
     );
 
     const handleEmailChange = useCallback(
@@ -66,13 +63,6 @@ export const UserConfiguration: FC<UserConfigurationProps> = ({
             setChecks(e.target.checked);
         },
         [setChecks],
-    );
-
-    const handleCountryChange = useCallback(
-        (e: ChangeEvent<HTMLSelectElement>) => {
-            setCountry(e.target.value);
-        },
-        [setCountry],
     );
 
     const handleFirstNameChange = useCallback(
@@ -172,30 +162,6 @@ export const UserConfiguration: FC<UserConfigurationProps> = ({
                                     </Row>
 
                                     <Row>
-                                        {/* half width - fits the longest country name without stretching the card */}
-                                        <Col md={6}>
-                                            <Form.Group controlId="user-country" className="mt-4">
-                                                <Form.Label>
-                                                    Country <span className="required-field-label">*</span>
-                                                </Form.Label>
-                                                <Form.Select
-                                                    name="country"
-                                                    value={country}
-                                                    onChange={handleCountryChange}
-                                                    autoComplete="country-name"
-                                                >
-                                                    <option value="">Select a country...</option>
-                                                    {COUNTRIES.map((countryName) => (
-                                                        <option key={countryName} value={countryName}>
-                                                            {countryName}
-                                                        </option>
-                                                    ))}
-                                                </Form.Select>
-                                            </Form.Group>
-                                        </Col>
-                                    </Row>
-
-                                    <Row>
                                         <Col>
                                             <Form.Group controlId="company-name" className="mt-4">
                                                 <Form.Label>Company name</Form.Label>
@@ -218,7 +184,7 @@ export const UserConfiguration: FC<UserConfigurationProps> = ({
                                                     type="checkbox"
                                                     checked={checks}
                                                     onChange={handleChecksChange}
-                                                    label="I'd like to receive product and feature updates"
+                                                    label="I'd like to receive security, product and feature updates"
                                                 />
                                             </Form.Group>
                                         </Col>

@@ -14,11 +14,3 @@ export const ReadOnlyBadge: FC<{ readOnly: boolean; style?: CSS.Properties }> = 
         </Badge>
     ) : null;
 };
-
-export const NewBadge: FC<{ style?: CSS.Properties }> = ({ style = {} }) => {
-    return (
-        <Badge pill className="feature-new-badge" style={style}>
-            NEW
-        </Badge>
-    );
-};

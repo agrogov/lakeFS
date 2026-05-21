@@ -5,7 +5,6 @@ import { WithLoginConfigContext } from '../lib/hooks/conf';
 
 // pages
 import RepositoriesPage from './repositories';
-import DatasetsPage from './datasets';
 import { RepositoryPageLayout } from '../lib/components/repository/layout.jsx';
 import RepositoryObjectsPage from './repositories/repository/objects';
 import RepositoryObjectsViewPage from './repositories/repository/objectViewer';
@@ -98,9 +97,6 @@ export const IndexPage = () => {
                                         </Route>
                                         <Route index element={<Navigate to="objects" />} />
                                     </Route>
-                                </Route>
-                                <Route path="datasets" element={<Layout />}>
-                                    <Route index element={<DatasetsPage />} />
                                 </Route>
                                 <Route path="auth" element={<Layout />}>
                                     <Route index element={<Navigate to="credentials" replace />} />

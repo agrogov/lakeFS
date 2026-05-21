@@ -4,7 +4,6 @@ import { LakeFSCredentials } from "../../types";
 export class SetupPage {
     public emailErrorSelectorText = "Please enter your email address.";
     public usernameErrorSelectorText = "Please enter your admin username.";
-    public countryErrorSelectorText = "Please select your country.";
     public usernameInputLocator: Locator;
     public downloadCredentialsButtonLocator: Locator;
     public goToLoginButtonLocator: Locator;
@@ -28,16 +27,14 @@ export class SetupPage {
         firstName = "",
         lastName = "",
         companyName = "",
-        country = "United States",
     ): Promise<void> {
         await this.usernameInputLocator.fill(username);
         await this.page.getByLabel("First name").fill(firstName);
         await this.page.getByLabel("Last name").fill(lastName);
         await this.page.getByLabel("Email").fill(email);
-        await this.page.getByLabel("Country").selectOption(country);
         await this.page.getByLabel("Company name").fill(companyName);
         if (receiveUpdatesChecked) {
-            await this.page.getByLabel("I'd like to receive product and feature updates").check();
+            await this.page.getByLabel("I'd like to receive security, product and feature updates").check();
         }
         await this.page.getByRole("button", { name: "Setup" }).click();
     }

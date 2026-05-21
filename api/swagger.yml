@@ -1076,15 +1076,11 @@ components:
         companyName:
           description: the provided company name
           type: string
-        country:
-          description: the provided country
-          type: string
         featureUpdates:
           description: user preference to receive feature updates
           type: boolean
         securityUpdates:
-          deprecated: true
-          description: "Deprecated: no longer used"
+          description: user preference to receive security updates
           type: boolean
       required:
         - username
@@ -1104,15 +1100,11 @@ components:
         companyName:
           description: the provided company name
           type: string
-        country:
-          description: the provided country
-          type: string
         featureUpdates:
           description: user preference to receive feature updates
           type: boolean
         securityUpdates:
-          deprecated: true
-          description: "Deprecated: no longer used"
+          description: user preference to receive security updates
           type: boolean
       required:
         - featureUpdates

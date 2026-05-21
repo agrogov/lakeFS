@@ -101,8 +101,8 @@ var localCommitCmd = &cobra.Command{
 		syncFlags := getSyncFlags(cmd, client, remote.Repository)
 
 		if idx.ActiveOperation != "" {
-			confirmationWarning := fmt.Sprintf("Latest 'local %s' operation was interrupted, running 'local commit' operation now might lead to data loss.", idx.ActiveOperation)
-			confirmation, err := Confirm(cmd.Flags(), "Proceed", confirmationWarning)
+			fmt.Printf("Latest 'local %s' operation was interrupted, running 'local commit' operation now might lead to data loss.\n", idx.ActiveOperation)
+			confirmation, err := Confirm(cmd.Flags(), "Proceed")
 			if err != nil || !confirmation {
 				Die("command aborted", 1)
 			}
@@ -233,7 +233,6 @@ var localCommitCmd = &cobra.Command{
 func init() {
 	withForceFlag(localCommitCmd, "Commit changes even if remote branch includes uncommitted changes external to the synced path")
 	withCommitFlags(localCommitCmd, false)
-	AssignAutoConfirmFlag(localCommitCmd.Flags())
 	withSyncFlags(localCommitCmd)
 	localCmd.AddCommand(localCommitCmd)
 }

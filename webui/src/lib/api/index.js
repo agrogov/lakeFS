@@ -1271,7 +1271,7 @@ class Setup {
         }
     }
 
-    async lakeFS({ username, email, firstName, lastName, companyName, featureUpdates, country }) {
+    async lakeFS({ username, email, firstName, lastName, companyName, featureUpdates, securityUpdates }) {
         const response = await apiRequest('/setup_lakefs', {
             method: 'POST',
             body: JSON.stringify({
@@ -1281,8 +1281,7 @@ class Setup {
                 lastName,
                 companyName,
                 featureUpdates,
-                country,
-                securityUpdates: false, // ignored
+                securityUpdates,
             }),
         });
         switch (response.status) {
@@ -1297,19 +1296,10 @@ class Setup {
         }
     }
 
-    async commPrefs({ email, firstName, lastName, companyName, featureUpdates, country }) {
+    async commPrefs({ email, firstName, lastName, companyName, featureUpdates, securityUpdates }) {
         const response = await apiRequest('/setup_comm_prefs', {
             method: 'POST',
-            // securityUpdates is ignored
-            body: JSON.stringify({
-                email,
-                firstName,
-                lastName,
-                companyName,
-                featureUpdates,
-                country,
-                securityUpdates: false,
-            }),
+            body: JSON.stringify({ email, firstName, lastName, companyName, featureUpdates, securityUpdates }),
         });
 
         switch (response.status) {

@@ -87,14 +87,6 @@ public class SetupTest {
     }
 
     /**
-     * Test the property 'country'
-     */
-    @Test
-    public void countryTest() {
-        // TODO: test country
-    }
-
-    /**
      * Test the property 'featureUpdates'
      */
     @Test

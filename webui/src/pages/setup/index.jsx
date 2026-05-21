@@ -29,17 +29,13 @@ const SetupContents = () => {
     const notInitialized = currentStep !== SETUP_STATE_INITIALIZED;
 
     const onSubmitUserConfiguration = useCallback(
-        async (adminUser, firstName, lastName, userEmail, companyName, checked, country) => {
+        async (adminUser, firstName, lastName, userEmail, companyName, checked) => {
             if (notInitialized && !adminUser) {
                 setSetupError('Please enter your admin username.');
                 return;
             }
             if (commPrefsMissing && !userEmail) {
                 setSetupError('Please enter your email address.');
-                return;
-            }
-            if (commPrefsMissing && !country) {
-                setSetupError('Please select your country.');
                 return;
             }
 
@@ -49,7 +45,7 @@ const SetupContents = () => {
                 lastName,
                 companyName,
                 featureUpdates: checked,
-                country,
+                securityUpdates: checked,
             };
 
             setDisabled(true);

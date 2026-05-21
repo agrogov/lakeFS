@@ -29,13 +29,10 @@ pub struct Setup {
     /// the provided company name
     #[serde(rename = "companyName", skip_serializing_if = "Option::is_none")]
     pub company_name: Option<String>,
-    /// the provided country
-    #[serde(rename = "country", skip_serializing_if = "Option::is_none")]
-    pub country: Option<String>,
     /// user preference to receive feature updates
     #[serde(rename = "featureUpdates", skip_serializing_if = "Option::is_none")]
     pub feature_updates: Option<bool>,
-    /// Deprecated: no longer used
+    /// user preference to receive security updates
     #[serde(rename = "securityUpdates", skip_serializing_if = "Option::is_none")]
     pub security_updates: Option<bool>,
 }
@@ -49,7 +46,6 @@ impl Setup {
             last_name: None,
             email: None,
             company_name: None,
-            country: None,
             feature_updates: None,
             security_updates: None,
         }

@@ -20,24 +20,17 @@ const (
 
 	// heartbeatInterval is the interval between 2 heartbeat events.
 	heartbeatInterval = time.Hour
-
-	// EventNameBytesIn and EventNameBytesOut report bytes written to / read from lakeFS.
-	EventNameBytesIn  = "bytes_in"
-	EventNameBytesOut = "bytes_out"
-
-	// EventClassTraffic is the class under which bytes_in/bytes_out are reported
-	EventClassTraffic = "traffic"
 )
 
 type CommPrefs struct {
-	InstallationID string
-	Email          string
-	FirstName      string
-	LastName       string
-	CompanyName    string
-	Country        string
-	FeatureUpdates bool
-	BlockstoreType string
+	InstallationID  string
+	Email           string
+	FirstName       string
+	LastName        string
+	CompanyName     string
+	FeatureUpdates  bool
+	SecurityUpdates bool
+	BlockstoreType  string
 }
 
 type Collector interface {
@@ -96,14 +89,14 @@ type InputEvent struct {
 }
 
 type CommPrefsData struct {
-	InstallationID string `json:"installation_id"`
-	Email          string `json:"email"`
-	FirstName      string `json:"firstName,omitempty"`
-	LastName       string `json:"lastName,omitempty"`
-	CompanyName    string `json:"companyName,omitempty"`
-	Country        string `json:"country,omitempty"`
-	FeatureUpdates bool   `json:"featureUpdates"`
-	BlockstoreType string `json:"blockstoreType"`
+	InstallationID  string `json:"installation_id"`
+	Email           string `json:"email"`
+	FirstName       string `json:"firstName,omitempty"`
+	LastName        string `json:"lastName,omitempty"`
+	CompanyName     string `json:"companyName,omitempty"`
+	FeatureUpdates  bool   `json:"featureUpdates"`
+	SecurityUpdates bool   `json:"securityUpdates"`
+	BlockstoreType  string `json:"blockstoreType"`
 }
 
 type keyIndex map[Event]uint64
