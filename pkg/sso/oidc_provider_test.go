@@ -399,6 +399,32 @@ func TestCLILoginRedirectRejectsNonLoopback(t *testing.T) {
 	}
 }
 
+// TestOauthCallbackMissingCode verifies that a callback with a valid state but no
+// code parameter is rejected with HTTP 400 before reaching the token endpoint.
+func TestOauthCallbackMissingCode(t *testing.T) {
+	mock := newMockOIDCServer(t)
+	defer mock.close()
+
+	svc := buildService(t, mock)
+	store := buildSessionStore()
+
+	state, _, loginCookies := seedFlowSession(t, svc, store)
+
+	// Callback URL has a matching state but deliberately omits the code param.
+	callbackURL := "/api/v1/oidc/callback?state=" + url.QueryEscape(state)
+	req := httptest.NewRequest(http.MethodGet, callbackURL, nil)
+	for _, c := range loginCookies {
+		req.AddCookie(c)
+	}
+	w := httptest.NewRecorder()
+
+	svc.OauthCallback(w, req, store)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing code, got %d; body: %s", w.Code, w.Body.String())
+	}
+}
+
 // ---- helpers ----------------------------------------------------------------
 
 // seedFlowSession calls /oidc/login and returns state, nonce, and the Set-Cookie headers

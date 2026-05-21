@@ -24,6 +24,10 @@ func BuildAuthenticationService(ctx context.Context, cfg config.Config, logger l
 	cachedSvc := builtAuthService
 	builtAuthServiceMu.RUnlock()
 
+	if cachedSvc == nil {
+		logger.Warn("sso: BuildAuthService was not called before BuildAuthenticationService; group sync will be disabled")
+	}
+
 	logoutRedirectURL := ssoCfg.LogoutURL
 	if logoutRedirectURL == "" {
 		logoutRedirectURL = cfg.AuthConfig().GetBaseAuthConfig().LogoutRedirectURL

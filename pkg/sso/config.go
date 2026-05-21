@@ -1,6 +1,10 @@
 package sso
 
-import "github.com/spf13/viper"
+import (
+	"strings"
+
+	"github.com/spf13/viper"
+)
 
 // SSOConfig holds Azure Entra ID OIDC configuration, read from the "sso:" YAML namespace.
 // The upstream config.ConfigImpl absorbs the "sso" key via its SSO field so that
@@ -42,6 +46,24 @@ func LoadSSOConfig() *SSOConfig {
 	}
 	if cfg.GroupsClaim == "" {
 		cfg.GroupsClaim = "roles"
+	}
+	if cfg.Enabled {
+		var missing []string
+		if cfg.ClientID == "" {
+			missing = append(missing, "client_id")
+		}
+		if cfg.ClientSecret == "" {
+			missing = append(missing, "client_secret")
+		}
+		if cfg.IssuerURL == "" {
+			missing = append(missing, "issuer_url")
+		}
+		if cfg.CallbackBaseURL == "" {
+			missing = append(missing, "callback_base_url")
+		}
+		if len(missing) > 0 {
+			panic("sso: missing required config fields: " + strings.Join(missing, ", "))
+		}
 	}
 	return cfg
 }

@@ -31,8 +31,10 @@
 
 # Our binaries
 /lakefs
+/lakefs-sso
 /lakefs-loadtest
 /lakectl
+/lakectl-sso
 /main
 /cmd/lakefs/lakefs
 /cmd/lakefs-loadtest/lakefs-loadtest
