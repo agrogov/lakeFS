@@ -45,7 +45,7 @@ require (
 	github.com/xitongsys/parquet-go v1.6.2
 	github.com/xitongsys/parquet-go-source v0.0.0-20241021075129-b732d2ac9c9b
 	golang.org/x/crypto v0.48.0
-	golang.org/x/oauth2 v0.35.0 // indirect
+	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/term v0.40.0
 	google.golang.org/api v0.269.0
 	google.golang.org/protobuf v1.36.11
@@ -186,6 +186,7 @@ require (
 	github.com/cncf/xds/go v0.0.0-20251210132809-ee656c7534f5 // indirect
 	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
+	github.com/coreos/go-oidc/v3 v3.18.0 // indirect
 	github.com/curioswitch/go-reassign v0.3.0 // indirect
 	github.com/daixiang0/gci v0.13.7 // indirect
 	github.com/dave/dst v0.27.3 // indirect
@@ -206,7 +207,7 @@ require (
 	github.com/getsentry/sentry-go v0.27.0 // indirect
 	github.com/ghostiam/protogetter v0.3.17 // indirect
 	github.com/go-critic/go-critic v0.14.2 // indirect
-	github.com/go-jose/go-jose/v4 v4.1.3 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-toolsmith/astcast v1.1.0 // indirect

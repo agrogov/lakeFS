@@ -24,7 +24,12 @@ type SSOConfig struct {
 
 func LoadSSOConfig() *SSOConfig {
 	cfg := &SSOConfig{}
-	_ = viper.UnmarshalKey("sso", cfg)
+	if err := viper.UnmarshalKey("sso", cfg); err != nil {
+		// A structurally invalid sso: section (wrong field type, etc.) would leave cfg at
+		// zero values, including Enabled=false, causing silent fallback to basic auth.
+		// Panic here so the misconfiguration is never silently hidden.
+		panic("sso: config parse error: " + err.Error())
+	}
 	if len(cfg.Scopes) == 0 {
 		cfg.Scopes = []string{"openid", "profile", "email"}
 	}
