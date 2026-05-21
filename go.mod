@@ -45,7 +45,7 @@ require (
 	github.com/xitongsys/parquet-go v1.6.2
 	github.com/xitongsys/parquet-go-source v0.0.0-20241021075129-b732d2ac9c9b
 	golang.org/x/crypto v0.48.0
-	golang.org/x/oauth2 v0.36.0 // indirect
+	golang.org/x/oauth2 v0.36.0
 	golang.org/x/term v0.40.0
 	google.golang.org/api v0.269.0
 	google.golang.org/protobuf v1.36.11
@@ -81,11 +81,13 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.38.6
 	github.com/aws/smithy-go v1.23.0
 	github.com/benburkert/dns v0.0.0-20190225204957-d356cf78cdfc
+	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/csimplestring/delta-go v0.0.0-20231105162402-9b93ca02cedf
 	github.com/databricks/databricks-sdk-go v0.26.2
 	github.com/dgraph-io/badger/v4 v4.7.0
 	github.com/georgysavva/scany/v2 v2.0.0
 	github.com/go-co-op/gocron v1.35.2
+	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/go-viper/mapstructure/v2 v2.4.0
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/gorilla/securecookie v1.1.2
@@ -96,7 +98,6 @@ require (
 	github.com/matoous/go-nanoid v1.5.0
 	github.com/minio/crc64nvme v1.0.1
 	github.com/puzpuzpuz/xsync v1.5.2
-	github.com/skratchdot/open-golang v0.0.0-20200116055534-eef842397966
 	github.com/tilinna/z85 v1.0.0
 	go.uber.org/ratelimit v0.3.0
 	gocloud.dev v0.34.1-0.20231122211418-53ccd8db26a1
@@ -186,7 +187,6 @@ require (
 	github.com/cncf/xds/go v0.0.0-20251210132809-ee656c7534f5 // indirect
 	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
-	github.com/coreos/go-oidc/v3 v3.18.0 // indirect
 	github.com/curioswitch/go-reassign v0.3.0 // indirect
 	github.com/daixiang0/gci v0.13.7 // indirect
 	github.com/dave/dst v0.27.3 // indirect
@@ -207,7 +207,6 @@ require (
 	github.com/getsentry/sentry-go v0.27.0 // indirect
 	github.com/ghostiam/protogetter v0.3.17 // indirect
 	github.com/go-critic/go-critic v0.14.2 // indirect
-	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-toolsmith/astcast v1.1.0 // indirect

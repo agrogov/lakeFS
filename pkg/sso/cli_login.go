@@ -88,7 +88,7 @@ func BrowserLogin(ctx context.Context, endpoint string, ttlSeconds int) (token s
 
 	endpoint = strings.TrimRight(endpoint, "/")
 
-	normalizedEndpoint, err := apiutil.NormalizeLakeFSEndpoint(endpoint)
+	apiEndpoint, err := apiutil.NormalizeLakeFSEndpoint(endpoint)
 	if err != nil {
 		return "", 0, fmt.Errorf("sso: normalize endpoint: %w", err)
 	}
@@ -113,7 +113,7 @@ func BrowserLogin(ctx context.Context, endpoint string, ttlSeconds int) (token s
 		return "", 0, ctx.Err()
 	}
 
-	client, err := apigen.NewClientWithResponses(normalizedEndpoint)
+	client, err := apigen.NewClientWithResponses(apiEndpoint)
 	if err != nil {
 		return "", 0, fmt.Errorf("sso: create lakeFS client: %w", err)
 	}
