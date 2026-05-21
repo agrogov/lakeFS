@@ -20,6 +20,7 @@ type SSOConfig struct {
 	SyncGroupsOnLogin bool              `mapstructure:"sync_groups_on_login"`
 	ManagedGroupPrefix string           `mapstructure:"managed_group_prefix"`
 	AuthorizeParams   map[string]string `mapstructure:"authorize_params"`
+	LogoutURL         string            `mapstructure:"logout_url"`
 }
 
 func LoadSSOConfig() *SSOConfig {

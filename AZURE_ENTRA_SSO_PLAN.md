@@ -727,11 +727,12 @@ auth:
    - Add groups claim: select "Security groups" or "Groups assigned to the application"
 
 5. **Configure App Roles** (recommended over raw groups):
-   - App roles → Create app role:
-     - Display name: `Admin` / `Developer` / `Viewer`
+   - App roles → Create app role for each ACL tier:
+     - Display name: `Admin` / `Super` / `Writer` / `Reader`
      - Allowed member types: Users/Groups
-     - Value: `Admins` / `Developers` / `Viewers` (must match lakeFS group names)
+     - Value: `Admins` / `Supers` / `Writers` / `Readers` (must match lakeFS ACL group names exactly)
    - Enterprise applications → Your App → Users and groups → Assign Azure groups to roles
+   - Note: these four values correspond to the ACL groups bootstrapped by `acl.SetupACLServer()` in `contrib/auth/acl/setup.go`
 
 6. **API permissions:**
    - Ensure `openid`, `profile`, `email` delegated permissions under Microsoft Graph
