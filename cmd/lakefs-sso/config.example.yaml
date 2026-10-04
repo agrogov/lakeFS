@@ -1,0 +1,72 @@
+# Example lakeFS configuration for Azure Entra ID SSO (lakefs-sso binary).
+# Copy to lakefs.yaml and fill in the placeholders.
+#
+# Prerequisites:
+#   1. Register a web application in Azure Entra ID.
+#   2. Add a redirect URI: https://<your-lakefs-host>/api/v1/oidc/callback
+#   3. Create App Roles (e.g. "Admins", "Writers", "Readers") and assign users.
+#   4. Grant API permissions: openid, profile, email (delegated).
+#   5. Run `lakefs-sso sso-migrate` once on an existing install to move the admin
+#      user from BasicAuthService to the ACL service before enabling SSO.
+
+database:
+  type: postgres
+  postgres:
+    connection_string: "postgres://lakefs:password@localhost/lakefs?sslmode=disable"
+
+auth:
+  # Redirect here after /logout — Azure's end_session_endpoint clears the IdP session.
+  # Replace <tenant-id> and the post_logout_redirect_uri with your actual values.
+  logout_redirect_url: "https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/logout?post_logout_redirect_uri=https://<your-lakefs-host>/auth/login"
+
+  ui_config:
+    # Primary login: go straight to Azure without showing the access-key form.
+    login_url: "/oidc/login"
+
+    # Fallback button on the login page for service accounts that use access keys.
+    fallback_login_url: "/auth/login"
+    fallback_login_label: "Login with Access Key"
+
+    # Cookies whose absence means "not logged in" — the UI uses this list to detect
+    # whether to show the login page.  Must include oidc_auth_session for SSO users.
+    login_cookie_names:
+      - "internal_auth_session"
+      - "oidc_auth_session"
+
+sso:
+  enabled: true
+  client_id: "<Application (client) ID from Azure>"
+  client_secret: "<Client secret value>"
+  issuer_url: "https://login.microsoftonline.com/<tenant-id>/v2.0"
+  callback_base_url: "https://<your-lakefs-host>"
+
+  # Claim that uniquely identifies the user.  Azure Entra ID uses "oid" (object ID).
+  user_id_claim: "oid"
+
+  # Claim shown as the display name in lakeFS.
+  friendly_name_claim: "preferred_username"
+
+  # OpenID Connect scopes to request.
+  scopes:
+    - "openid"
+    - "profile"
+    - "email"
+
+  # --- Group synchronisation (optional) ---
+  # Synchronise ACL group membership on every login based on App Role assignments.
+  # The token claim that carries App Role names (set in the Azure app manifest).
+  groups_claim: "roles"
+
+  # Enable sync on every login.
+  sync_groups_on_login: true
+
+  # Only touch ACL groups whose name starts with this prefix; other group memberships
+  # (e.g. manually assigned) are left intact.  Leave empty to manage all groups.
+  # Example: if prefix is "lakefs-", the token role "lakefs-Admins" maps to the
+  # local ACL group "Admins".
+  managed_group_prefix: ""
+
+  # Extra parameters forwarded to the Azure authorization endpoint.
+  # prompt: select_account forces the account-picker on every login.
+  authorize_params:
+    prompt: "select_account"

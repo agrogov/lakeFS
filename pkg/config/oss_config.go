@@ -6,8 +6,9 @@ import (
 
 type ConfigImpl struct {
 	BaseConfig `mapstructure:",squash"`
-	Auth       Auth `mapstructure:"auth"`
-	UI         UI   `mapstructure:"ui"`
+	Auth       Auth                   `mapstructure:"auth"`
+	UI         UI                     `mapstructure:"ui"`
+	SSO        map[string]interface{} `mapstructure:"sso"` // absorbed so viper.UnmarshalExact accepts the "sso:" YAML key; parsed by pkg/sso
 }
 
 func (c *ConfigImpl) AuthConfig() AuthConfig {
