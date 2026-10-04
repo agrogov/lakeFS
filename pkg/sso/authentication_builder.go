@@ -20,6 +20,9 @@ func BuildAuthenticationService(ctx context.Context, cfg config.Config, logger l
 		return authentication.NewAuthenticationService(ctx, cfg, logger)
 	}
 
+	// Upstream reads the friendly name from auth.oidc.friendly_name_claim_name.
+	ApplyFriendlyNameClaim(cfg.AuthConfig().GetBaseAuthConfig(), ssoCfg)
+
 	builtAuthServiceMu.RLock()
 	cachedSvc := builtAuthService
 	builtAuthServiceMu.RUnlock()

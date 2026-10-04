@@ -42,10 +42,11 @@ func BuildAuthService(ctx context.Context, cfg config.Config, logger logging.Log
 	// acl.SetupACLServer requires the concrete type, not the auth.Service interface.
 	aclService := acl.NewAuthService(kvStore, secretStore, cacheConf)
 
-	// Bootstrap the 4 default ACL groups (Admins/Supers/Writers/Readers) on first run.
+	// Bootstrap the 4 default ACL groups (Admins/Supers/Writers/Readers) when missing,
+	// including on installations set up with basic auth before SSO was enabled.
 	// Idempotent: safe to call on every startup.
-	if err := acl.SetupACLServer(ctx, aclService); err != nil {
-		logger.WithError(err).Warn("acl setup skipped (may already exist)")
+	if err := EnsureACLBaseGroups(ctx, aclService); err != nil {
+		logger.WithError(err).Warn("acl base group bootstrap failed")
 	}
 
 	svc := auth.NewMonitoredAuthService(aclService)

@@ -29,11 +29,17 @@ const (
 
 // NativeOIDCService implements authentication.Service for Azure Entra ID OIDC.
 // It handles the authorization code flow natively without an external auth service.
+// ssoAuthService is the subset of auth.Service the OIDC callback needs.
+type ssoAuthService interface {
+	groupManager
+	userProvisioner
+}
+
 type NativeOIDCService struct {
 	cfg               *SSOConfig
 	provider          *gooidc.Provider
 	oauth2Cfg         oauth2.Config
-	authService       groupManager
+	authService       ssoAuthService
 	logger            logging.Logger
 	logoutRedirectURL string
 }
@@ -298,8 +304,11 @@ func (s *NativeOIDCService) OauthCallback(w http.ResponseWriter, r *http.Request
 				"claim": s.cfg.GroupsClaim,
 			}).Warn("group sync: groups claim absent from token, skipping sync")
 		} else {
-			tokenGroups := ExtractStringSlice(rawGroups)
-			if syncErr := SyncGroups(ctx, s.authService, s.logger, username, tokenGroups, s.cfg); syncErr != nil {
+			// The user is normally created on its first authenticated request, which
+			// is after this callback; create it now so the first login gets its groups.
+			if _, provErr := EnsureUser(ctx, s.authService, username); provErr != nil {
+				s.logger.WithField("user", username).WithError(provErr).Warn("user provisioning failed, skipping group sync")
+			} else if syncErr := SyncGroups(ctx, s.authService, s.logger, username, ExtractStringSlice(rawGroups), s.cfg); syncErr != nil {
 				s.logger.WithField("user", username).WithError(syncErr).Warn("group sync failed")
 			}
 		}

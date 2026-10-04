@@ -28,6 +28,8 @@ type mockOIDCServer struct {
 	server  *httptest.Server
 	privKey *rsa.PrivateKey
 	keyID   string
+	// extraClaims are added to every id_token the server issues (e.g. "roles").
+	extraClaims map[string]any
 }
 
 func newMockOIDCServer(t *testing.T) *mockOIDCServer {
@@ -114,7 +116,7 @@ func (m *mockOIDCServer) serveToken(w http.ResponseWriter, r *http.Request) {
 	}
 	nonce := parts[0]
 	oid := parts[1]
-	idToken, err := m.buildIDToken(clientID, nonce, oid, nil)
+	idToken, err := m.buildIDToken(clientID, nonce, oid, m.extraClaims)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -144,6 +146,12 @@ func buildSessionStore() *sessions.CookieStore {
 // buildService creates a NativeOIDCService pointed at the mock server.
 func buildService(t *testing.T, mock *mockOIDCServer) *sso.NativeOIDCService {
 	t.Helper()
+	return buildServiceWithAuth(t, mock, nil, false)
+}
+
+// buildServiceWithAuth is buildService with an auth service and group sync switched on.
+func buildServiceWithAuth(t *testing.T, mock *mockOIDCServer, authSvc auth.Service, syncGroups bool) *sso.NativeOIDCService {
+	t.Helper()
 	cfg := &sso.SSOConfig{
 		Enabled:           true,
 		ClientID:          "test-client-id",
@@ -154,9 +162,9 @@ func buildService(t *testing.T, mock *mockOIDCServer) *sso.NativeOIDCService {
 		UserIDClaim:       "oid",
 		FriendlyNameClaim: "preferred_username",
 		GroupsClaim:       "roles",
+		SyncGroupsOnLogin: syncGroups,
 	}
-	// Pass nil for authService and a no-op logger — group sync is not exercised here.
-	svc, err := sso.NewNativeOIDCService(context.Background(), cfg, nil, logging.Dummy(), "/auth/login")
+	svc, err := sso.NewNativeOIDCService(context.Background(), cfg, authSvc, logging.Dummy(), "/auth/login")
 	if err != nil {
 		t.Fatalf("NewNativeOIDCService: %v", err)
 	}

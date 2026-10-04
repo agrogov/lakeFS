@@ -74,6 +74,12 @@ func MigrateBasicToACL(ctx context.Context, kvStore kv.Store, secretStore crypt.
 	noCache := authparams.ServiceCache{Enabled: false}
 	aclSvc := acl.NewAuthService(kvStore, secretStore, noCache)
 
+	// --- 3b. Make sure the ACL groups exist. A basic-auth "lakefs setup" leaves a setup
+	// timestamp behind that makes acl.SetupACLServer skip creating them.
+	if err = EnsureACLBaseGroups(ctx, aclSvc); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+
 	// --- 4. Create user in ACL partition (idempotent) ---
 	if _, err = aclSvc.CreateUser(ctx, user); err != nil {
 		if !errors.Is(err, auth.ErrAlreadyExists) {
