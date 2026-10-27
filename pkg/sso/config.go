@@ -16,6 +16,9 @@ type SSOConfig struct {
 	ClientSecret      string            `mapstructure:"client_secret"`
 	IssuerURL         string            `mapstructure:"issuer_url"`
 	CallbackBaseURL   string            `mapstructure:"callback_base_url"`
+	// CallbackURL is the full redirect_uri sent to the IdP, exactly as registered there. When set it
+	// overrides CallbackBaseURL + /api/v1/oidc/callback. Also settable via LAKEFS_SSO_CALLBACK_URL.
+	CallbackURL       string            `mapstructure:"callback_url"`
 	Scopes            []string          `mapstructure:"scopes"`
 	UserIDClaim       string            `mapstructure:"user_id_claim"`
 	FriendlyNameClaim string            `mapstructure:"friendly_name_claim"`
@@ -34,6 +37,10 @@ func LoadSSOConfig() *SSOConfig {
 		// zero values, including Enabled=false, causing silent fallback to basic auth.
 		// Panic here so the misconfiguration is never silently hidden.
 		panic("sso: config parse error: " + err.Error())
+	}
+	// read through viper so that LAKEFS_SSO_CALLBACK_URL works: UnmarshalKey only sees the config file map
+	if v := viper.GetString("sso.callback_url"); v != "" {
+		cfg.CallbackURL = v
 	}
 	if len(cfg.Scopes) == 0 {
 		cfg.Scopes = []string{"openid", "profile", "email"}
@@ -58,8 +65,8 @@ func LoadSSOConfig() *SSOConfig {
 		if cfg.IssuerURL == "" {
 			missing = append(missing, "issuer_url")
 		}
-		if cfg.CallbackBaseURL == "" {
-			missing = append(missing, "callback_base_url")
+		if cfg.CallbackBaseURL == "" && cfg.CallbackURL == "" {
+			missing = append(missing, "callback_base_url (or callback_url)")
 		}
 		if len(missing) > 0 {
 			panic("sso: missing required config fields: " + strings.Join(missing, ", "))

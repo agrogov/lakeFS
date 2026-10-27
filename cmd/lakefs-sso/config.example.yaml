@@ -39,6 +39,9 @@ sso:
   client_secret: "<Client secret value>"
   issuer_url: "https://login.microsoftonline.com/<tenant-id>/v2.0"
   callback_base_url: "https://<your-lakefs-host>"
+  # Optional. Full redirect_uri sent to Entra, exactly as registered in the app. Overrides
+  # callback_base_url + /api/v1/oidc/callback. Env: LAKEFS_SSO_CALLBACK_URL.
+  # callback_url: "https://<your-lakefs-host>/oidc/callback"
 
   # Claim that uniquely identifies the user.  Azure Entra ID uses "oid" (object ID).
   user_id_claim: "oid"
