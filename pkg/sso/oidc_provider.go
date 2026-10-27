@@ -55,7 +55,10 @@ func NewNativeOIDCService(ctx context.Context, cfg *SSOConfig, authService auth.
 		return nil, fmt.Errorf("oidc: discover %s: %w", cfg.IssuerURL, err)
 	}
 
-	callbackURL := strings.TrimRight(cfg.CallbackBaseURL, "/") + "/api/v1/oidc/callback"
+	callbackURL := cfg.CallbackURL
+	if callbackURL == "" {
+		callbackURL = strings.TrimRight(cfg.CallbackBaseURL, "/") + "/api/v1/oidc/callback"
+	}
 
 	oauth2Cfg := oauth2.Config{
 		ClientID:     cfg.ClientID,
