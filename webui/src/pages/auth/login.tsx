@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Navigate, useLocation } from 'react-router-dom';
 import Card from 'react-bootstrap/Card';
 import Form from 'react-bootstrap/Form';
@@ -163,11 +163,32 @@ const LoginForm = ({ loginConfig }: { loginConfig: LoginConfig }) => {
     );
 };
 
+const SSO_AUTO_REDIRECT_KEY = 'lakefs_sso_auto_redirect_at';
+const SSO_AUTO_REDIRECT_COOLDOWN_MS = 30000;
+
+// Go straight to the SSO login (login_url_method=redirect) unless the user asked for the local form
+// (?local=true) or we already did so a moment ago (a failed SSO round-trip must not loop).
+const shouldAutoRedirect = (loginConfig: LoginConfig | undefined, search: string) => {
+    if (loginConfig?.login_url_method !== 'redirect' || !loginConfig.fallback_login_url) return false;
+    if (new URLSearchParams(search).get('local') === 'true') return false;
+    const last = Number(window.sessionStorage.getItem(SSO_AUTO_REDIRECT_KEY) || 0);
+    return Date.now() - last > SSO_AUTO_REDIRECT_COOLDOWN_MS;
+};
+
 const LoginPage = () => {
     const location = useLocation();
     const { response, error, loading } = useAPI(() => setup.getState());
     const setupResponse = response as SetupResponse | null;
     const { redirectedFromQuery, next, cleanUrl } = getLoginIntent(location);
+    const autoRedirect = shouldAutoRedirect(setupResponse?.login_config, location.search);
+
+    useEffect(() => {
+        const cfg = setupResponse?.login_config;
+        if (!autoRedirect || !cfg?.fallback_login_url) return;
+        window.sessionStorage.setItem(SSO_AUTO_REDIRECT_KEY, String(Date.now()));
+        window.sessionStorage.setItem(LAKEFS_POST_LOGIN_NEXT, next);
+        window.location.href = withNext(cfg.fallback_login_url, next);
+    }, [autoRedirect, setupResponse, next]);
 
     // Persist next for post-login redirect
     if (next && next.startsWith('/')) window.sessionStorage.setItem(LAKEFS_POST_LOGIN_NEXT, next);
@@ -184,6 +205,8 @@ const LoginPage = () => {
     if (redirectedFromQuery) return <Navigate to={cleanUrl} replace state={{ next }} />;
 
     const loginConfig = setupResponse?.login_config;
+
+    if (autoRedirect) return <Loading />;
 
     // Default: lakeFS login form
     return <LoginForm loginConfig={loginConfig} />;
