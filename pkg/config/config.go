@@ -716,6 +716,9 @@ type BaseAuth struct {
 type AuthUIConfig struct {
 	RBAC                 string   `mapstructure:"rbac"`
 	LoginURL             string   `mapstructure:"login_url"`
+	// LoginURLMethod: "none" (default) shows the login form; "redirect" makes the UI go straight to
+	// FallbackLoginURL (e.g. /oidc/login) instead of showing the form.
+	LoginURLMethod       string   `mapstructure:"login_url_method"`
 	LoginFailedMessage   string   `mapstructure:"login_failed_message"`
 	FallbackLoginURL     *string  `mapstructure:"fallback_login_url"`
 	FallbackLoginLabel   *string  `mapstructure:"fallback_login_label"`
@@ -766,7 +769,10 @@ func (a *Auth) GetAuthUIConfig() *AuthUIConfig {
 }
 
 func (a *Auth) GetLoginURLMethodConfigParam() string {
-	return "none"
+	if a.LoginURLMethod == "" {
+		return "none"
+	}
+	return a.LoginURLMethod
 }
 
 // UseUILoginPlaceholders returns true if the UI should use placeholders for login
