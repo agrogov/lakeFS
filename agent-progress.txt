@@ -47,6 +47,10 @@ W3: B3 B5                 W4: B6 C2 C3 C4    W5: C5
 - setup.go (auth): A2, C4 (C4 depends on A2)
 
 ## Status
+- F5 landed as 0178c5de0 (manager cherry-pick of worktree commit 747375cbf; §4.10
+  immediate-revoke matrix 7 cases; contrib tests green; card done).
+- F3 afa4f still running. F4 8775e gated on F3. Remaining after F3+F4: board complete.
+--- (previous F-card status) ---
 - F-cards shipping (auto-review commit enabled on all): landed on branch —
   F1 eff5bb6a9 (ListBranches condition-context + deny-aware gate; done, verified:
     TestListBranches + full pkg/api/auth/sso suites green),
