@@ -5181,6 +5181,11 @@ func (c *Controller) GetObject(w http.ResponseWriter, r *http.Request, repositor
 }
 
 func (c *Controller) ListObjects(w http.ResponseWriter, r *http.Request, repository, ref string, params apigen.ListObjectsParams) {
+	// Attach the condition context before authorizing: the presigned-URL pass below re-authorizes
+	// every object, and that nested call must see the same conditions (a conditional deny must
+	// prevent the URL from being issued).
+	ctx, clientIP, fields := c.conditionContext(r, repository)
+	r = r.WithContext(ctx)
 	if !c.authorize(w, r, permissions.Node{
 		Permission: permissions.Permission{
 			Action:   permissions.ListObjectsAction,
@@ -5189,7 +5194,6 @@ func (c *Controller) ListObjects(w http.ResponseWriter, r *http.Request, reposit
 	}) {
 		return
 	}
-	ctx := r.Context()
 	user, _ := auth.GetUser(ctx)
 	c.LogAction(ctx, "list_objects", r, repository, ref, "")
 
@@ -5211,7 +5215,6 @@ func (c *Controller) ListObjects(w http.ResponseWriter, r *http.Request, reposit
 		return
 	}
 
-	var clientIP string
 	objList := make([]apigen.ObjectStats, 0, len(res))
 	for _, entry := range res {
 		qk, err := c.BlockAdapter.ResolveNamespace(repo.StorageID, repo.StorageNamespace, entry.PhysicalAddress, entry.AddressType.ToIdentifierType())
@@ -5243,9 +5246,6 @@ func (c *Controller) ListObjects(w http.ResponseWriter, r *http.Request, reposit
 				objStat.Metadata = &apigen.ObjectUserMetadata{AdditionalProperties: entry.Metadata}
 			}
 			if swag.BoolValue(params.Presign) {
-				if clientIP == "" {
-					clientIP = httputil.ExtractClientIP(r.Header, r.RemoteAddr)
-				}
 				// check if the user has read permissions for this object
 				authResponse, err := c.Auth.Authorize(ctx, &auth.AuthorizationRequest{
 					Username: user.Username,
@@ -5256,6 +5256,7 @@ func (c *Controller) ListObjects(w http.ResponseWriter, r *http.Request, reposit
 						},
 					},
 					ClientIP: clientIP,
+					Fields:   fields,
 				})
 				if c.handleAPIError(ctx, w, r, err) {
 					return
@@ -5295,6 +5296,9 @@ func (c *Controller) ListObjects(w http.ResponseWriter, r *http.Request, reposit
 }
 
 func (c *Controller) StatObject(w http.ResponseWriter, r *http.Request, repository, ref string, params apigen.StatObjectParams) {
+	// Derive the request once so every authorization on this path - including the presign branch -
+	// evaluates policy conditions with the request's condition context.
+	r = c.withConditionContext(r, repository)
 	if !c.authorize(w, r, permissions.Node{
 		Permission: permissions.Permission{
 			Action:   permissions.ReadObjectAction,
