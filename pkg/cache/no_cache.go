@@ -12,3 +12,7 @@ func (m *noCache) GetOrSetWithExpiry(_ any, setFn SetFnWithExpiry) (v any, err e
 	v, _, err = setFn()
 	return v, err
 }
+
+func (m *noCache) Delete(_ any) {}
+
+func (m *noCache) Purge() {}

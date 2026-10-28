@@ -20,6 +20,10 @@ type SetFnWithExpiry func() (v any, expiry time.Duration, err error)
 type Cache interface {
 	GetOrSet(k any, setFn SetFn) (v any, err error)
 	GetOrSetWithExpiry(k any, setFn SetFnWithExpiry) (v any, err error)
+	// Delete removes the entry for k from the cache, if present.
+	Delete(k any)
+	// Purge removes all entries from the cache.
+	Purge()
 }
 
 type GetSetCache struct {
@@ -66,6 +70,14 @@ func (c *GetSetCache) GetOrSetWithExpiry(k any, setFn SetFnWithExpiry) (v any, e
 		c.lru.AddEx(k, v, expiry)
 		return v, nil
 	})
+}
+
+func (c *GetSetCache) Delete(k any) {
+	c.lru.Remove(k)
+}
+
+func (c *GetSetCache) Purge() {
+	c.lru.Purge()
 }
 
 func NewJitterFn(jitter time.Duration) JitterFn {

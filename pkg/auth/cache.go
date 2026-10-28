@@ -15,7 +15,7 @@ type (
 )
 
 type UserKey struct {
-	id         string
+	ID         string
 	Username   string
 	ExternalID string
 	Email      string
@@ -26,6 +26,13 @@ type Cache interface {
 	GetUser(key UserKey, setFn UserSetFn) (*model.User, error)
 	GetUserPolicies(userID string, setFn UserPoliciesSetFn) ([]*model.Policy, error)
 	GetExternalPrincipal(key string, setFn ExternalPrincipalFn) (*model.ExternalPrincipal, error)
+
+	// InvalidateUser removes the cached user entries for the given keys.
+	InvalidateUser(keys ...UserKey)
+	// InvalidateUserPolicies removes the cached policies of a single user.
+	InvalidateUserPolicies(userID string)
+	// PurgePolicies removes all cached user policies.
+	PurgePolicies()
 }
 
 type LRUCache struct {
@@ -77,6 +84,20 @@ func (c *LRUCache) GetExternalPrincipal(key string, setFn ExternalPrincipalFn) (
 	return v.(*model.ExternalPrincipal), nil
 }
 
+func (c *LRUCache) InvalidateUser(keys ...UserKey) {
+	for _, key := range keys {
+		c.userCache.Delete(key)
+	}
+}
+
+func (c *LRUCache) InvalidateUserPolicies(userID string) {
+	c.policyCache.Delete(userID)
+}
+
+func (c *LRUCache) PurgePolicies() {
+	c.policyCache.Purge()
+}
+
 // DummyCache dummy cache that doesn't cache
 type DummyCache struct{}
 
@@ -95,3 +116,9 @@ func (d *DummyCache) GetUserPolicies(_ string, setFn UserPoliciesSetFn) ([]*mode
 func (d *DummyCache) GetExternalPrincipal(_ string, setFn ExternalPrincipalFn) (*model.ExternalPrincipal, error) {
 	return setFn()
 }
+
+func (d *DummyCache) InvalidateUser(_ ...UserKey) {}
+
+func (d *DummyCache) InvalidateUserPolicies(_ string) {}
+
+func (d *DummyCache) PurgePolicies() {}
