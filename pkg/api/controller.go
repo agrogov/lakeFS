@@ -1284,6 +1284,10 @@ func (c *Controller) GetGroupACL(w http.ResponseWriter, r *http.Request, groupID
 }
 
 func (c *Controller) SetGroupACL(w http.ResponseWriter, r *http.Request, body apigen.SetGroupACLJSONRequestBody, groupID string) {
+	if !c.Config.AuthConfig().GetAuthUIConfig().IsAuthUISimplified() {
+		writeError(w, r, http.StatusConflict, "group ACLs are not used in RBAC mode; attach policies instead")
+		return
+	}
 	aclPolicyName := authacl.PolicyName(groupID)
 	if !c.authorize(w, r, permissions.Node{
 		Type: permissions.NodeTypeAnd,
