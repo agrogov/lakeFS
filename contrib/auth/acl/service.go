@@ -118,9 +118,29 @@ func (s *AuthService) CreateUser(ctx context.Context, user *model.User) (string,
 }
 
 func (s *AuthService) DeleteUser(ctx context.Context, username string) error {
-	if _, err := s.GetUser(ctx, username); err != nil {
+	user, err := s.GetUser(ctx, username)
+	if err != nil {
 		return err
 	}
+
+	// Drop every key under which this user can be cached, plus their cached effective
+	// policies. Deleting detaches the user's policies and group memberships, so stale
+	// cache entries would keep the user authorized until the TTL expires, and a new user
+	// created with the same username would inherit the deleted user's grants (the policy
+	// cache is keyed by username). Invalidate even on a partial failure: every cached value
+	// is then stale, and a miss only costs a read.
+	cacheKeys := []auth.UserKey{{Username: username}}
+	if user.Email != nil && *user.Email != "" {
+		cacheKeys = append(cacheKeys, auth.UserKey{Email: *user.Email})
+	}
+	if user.ExternalID != nil && *user.ExternalID != "" {
+		cacheKeys = append(cacheKeys, auth.UserKey{ExternalID: *user.ExternalID})
+	}
+	defer func() {
+		s.cache.InvalidateUser(cacheKeys...)
+		s.cache.InvalidateUserPolicies(username)
+	}()
+
 	userPath := model.UserPath(username)
 
 	// delete policy attached to user
