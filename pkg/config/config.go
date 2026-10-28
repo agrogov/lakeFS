@@ -41,6 +41,10 @@ const (
 	AuthRBACSimplified = "simplified"
 	AuthRBACExternal   = "external"
 	AuthRBACInternal   = "internal"
+
+	// DefaultAuthorizationFailureStatus keeps authorization failures as 401 unless explicitly
+	// configured otherwise; the UI and SDK clients rely on 401 for authorization errors.
+	DefaultAuthorizationFailureStatus = 401
 )
 
 type Logging struct {
@@ -603,6 +607,7 @@ func SetDefaults(cfgType string, c Config) {
 	for _, key := range keys {
 		viper.SetDefault(key, nil)
 	}
+	viper.SetDefault("auth.authorization_failure_status", DefaultAuthorizationFailureStatus)
 	setBaseDefaults(cfgType)
 }
 
@@ -688,7 +693,10 @@ type BaseAuth struct {
 		HealthCheckTimeout time.Duration `mapstructure:"health_check_timeout"`
 		SkipHealthCheck    bool          `mapstructure:"skip_health_check"`
 	} `mapstructure:"api"`
-	AuthenticationAPI struct {
+	// AuthorizationFailureStatus is the HTTP status code for ErrInsufficientPermissions responses.
+	// Zero (the default) means 401. Set it to 403 to opt in to forbidden responses.
+	AuthorizationFailureStatus int `mapstructure:"authorization_failure_status"`
+	AuthenticationAPI          struct {
 		// Endpoint for authentication operations
 		Endpoint string `mapstructure:"endpoint"`
 		// ExternalPrincipalAuth configuration related external principals
@@ -714,8 +722,8 @@ type BaseAuth struct {
 }
 
 type AuthUIConfig struct {
-	RBAC                 string   `mapstructure:"rbac"`
-	LoginURL             string   `mapstructure:"login_url"`
+	RBAC     string `mapstructure:"rbac"`
+	LoginURL string `mapstructure:"login_url"`
 	// LoginURLMethod: "none" (default) shows the login form; "redirect" makes the UI go straight to
 	// FallbackLoginURL (e.g. /oidc/login) instead of showing the form.
 	LoginURLMethod       string   `mapstructure:"login_url_method"`

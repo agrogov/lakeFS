@@ -2221,7 +2221,7 @@ func (c *Controller) ListRepositories(w http.ResponseWriter, r *http.Request, pa
 	}
 	if err == nil {
 		if !auth.HasActionOnAnyResource(policies, permissions.ListRepositoriesAction) {
-			writeError(w, r, http.StatusUnauthorized, auth.ErrInsufficientPermissions)
+			writeError(w, r, c.authorizationFailureStatus(), auth.ErrInsufficientPermissions)
 			return
 		}
 		opts = append(opts, catalog.WithListReposPermissionFilter(user.Username, policies))
@@ -3004,7 +3004,7 @@ func (c *Controller) ListBranches(w http.ResponseWriter, r *http.Request, reposi
 			},
 		}, user.Username, policies, &auth.MissingPermissions{}) == auth.CheckAllow
 		if !repoAllowed && !hasBranchPermission(repository, user.Username, policies, permissions.ListBranchesAction) {
-			writeError(w, r, http.StatusUnauthorized, auth.ErrInsufficientPermissions)
+			writeError(w, r, c.authorizationFailureStatus(), auth.ErrInsufficientPermissions)
 			return
 		}
 	} else if !c.authorize(w, r, permissions.Node{
@@ -6384,14 +6384,34 @@ func (c *Controller) authorizeCallback(w http.ResponseWriter, r *http.Request, p
 		return false
 	}
 	if resp.Error != nil {
-		cb(w, r, http.StatusUnauthorized, resp.Error)
+		status := http.StatusUnauthorized
+		if errors.Is(resp.Error, auth.ErrInsufficientPermissions) {
+			status = c.authorizationFailureStatus()
+		}
+		cb(w, r, status, resp.Error)
 		return false
 	}
 	if !resp.Allowed {
-		cb(w, r, http.StatusInternalServerError, "User does not have the required permissions")
+		cb(w, r, http.StatusUnauthorized, "User does not have the required permissions")
 		return false
 	}
 	return true
+}
+
+// authorizationFailureStatus returns the HTTP status to use for authorization failures. It
+// defaults to 401: the web UI and SDK clients treat a 401 without the authentication message as
+// an authorization error, and the API does not declare 403 on these endpoints. Set
+// auth.authorization_failure_status to 403 to opt in to forbidden responses.
+func (c *Controller) authorizationFailureStatus() int {
+	if c.Config != nil {
+		authCfg := c.Config.AuthConfig()
+		if authCfg != nil {
+			if base := authCfg.GetBaseAuthConfig(); base != nil && base.AuthorizationFailureStatus != 0 {
+				return base.AuthorizationFailureStatus
+			}
+		}
+	}
+	return http.StatusUnauthorized
 }
 
 func (c *Controller) authorize(w http.ResponseWriter, r *http.Request, perms permissions.Node) bool {
