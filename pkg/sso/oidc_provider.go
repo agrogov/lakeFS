@@ -42,6 +42,12 @@ type NativeOIDCService struct {
 	authService       ssoAuthService
 	logger            logging.Logger
 	logoutRedirectURL string
+	// profiles stores email/display name from the ID token on the user; nil disables it.
+	profiles profileUpdater
+}
+
+type profileUpdater interface {
+	UpdateUserProfile(ctx context.Context, username string, p UserProfile) error
 }
 
 // NewNativeOIDCService constructs the service by performing OIDC discovery against
@@ -197,6 +203,40 @@ func (s *NativeOIDCService) cliLoginRedirect(w http.ResponseWriter, r *http.Requ
 	http.Redirect(w, r, cfg.AuthCodeURL(state, opts...), http.StatusFound)
 }
 
+func (s *NativeOIDCService) provisionUser(ctx context.Context, username string, claims oidcencoding.Claims) {
+	syncGroups := s.cfg.SyncGroupsOnLogin && s.cfg.GroupsClaim != ""
+	if !syncGroups && s.profiles == nil {
+		return
+	}
+	// The user is normally created on its first authenticated request, which is after
+	// this callback; create it now so the first login gets its profile and groups.
+	if _, err := EnsureUser(ctx, s.authService, username); err != nil {
+		s.logger.WithField("user", username).WithError(err).Warn("user provisioning failed, skipping profile and group sync")
+		return
+	}
+	if s.profiles != nil {
+		if err := s.profiles.UpdateUserProfile(ctx, username, ProfileFromClaims(claims, s.cfg)); err != nil {
+			s.logger.WithField("user", username).WithError(err).Warn("user profile update failed")
+		}
+	}
+	if !syncGroups {
+		return
+	}
+	rawGroups, claimPresent := claims[s.cfg.GroupsClaim]
+	if !claimPresent {
+		// Absent claim is distinct from an empty list. Skipping sync rather than
+		// silently stripping all managed memberships (e.g. misconfigured manifest).
+		s.logger.WithFields(logging.Fields{
+			"user":  username,
+			"claim": s.cfg.GroupsClaim,
+		}).Warn("group sync: groups claim absent from token, skipping sync")
+		return
+	}
+	if err := SyncGroups(ctx, s.authService, s.logger, username, ExtractStringSlice(rawGroups), s.cfg); err != nil {
+		s.logger.WithField("user", username).WithError(err).Warn("group sync failed")
+	}
+}
+
 // OauthCallback is called by the controller when the Azure callback lands on
 // /api/v1/oidc/callback. It validates state + nonce, exchanges the code for an
 // ID token, normalises the user ID claim (oid→sub), stores claims in the
@@ -295,26 +335,10 @@ func (s *NativeOIDCService) OauthCallback(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Sync group memberships from the token. Errors are non-fatal: the user is
-	// already authenticated at this point, so we log and continue.
-	if s.authService != nil && username != "" && s.cfg.SyncGroupsOnLogin && s.cfg.GroupsClaim != "" {
-		rawGroups, claimPresent := claims[s.cfg.GroupsClaim]
-		if !claimPresent {
-			// Absent claim is distinct from an empty list. Skipping sync rather than
-			// silently stripping all managed memberships (e.g. misconfigured manifest).
-			s.logger.WithFields(logging.Fields{
-				"user":  username,
-				"claim": s.cfg.GroupsClaim,
-			}).Warn("group sync: groups claim absent from token, skipping sync")
-		} else {
-			// The user is normally created on its first authenticated request, which
-			// is after this callback; create it now so the first login gets its groups.
-			if _, provErr := EnsureUser(ctx, s.authService, username); provErr != nil {
-				s.logger.WithField("user", username).WithError(provErr).Warn("user provisioning failed, skipping group sync")
-			} else if syncErr := SyncGroups(ctx, s.authService, s.logger, username, ExtractStringSlice(rawGroups), s.cfg); syncErr != nil {
-				s.logger.WithField("user", username).WithError(syncErr).Warn("group sync failed")
-			}
-		}
+	// Provision the user, refresh its profile and sync group memberships from the token.
+	// Errors are non-fatal: the user is already authenticated, so we log and continue.
+	if s.authService != nil && username != "" {
+		s.provisionUser(ctx, username, claims)
 	}
 
 	if next == "" {
