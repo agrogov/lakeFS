@@ -47,7 +47,21 @@ W3: B3 B5                 W4: B6 C2 C3 C4    W5: C5
 - setup.go (auth): A2, C4 (C4 depends on A2)
 
 ## Status
-- BOARD COMPLETE: 24/24 cards done (A1-A6, B1-B6, C1-C5, R1, F1-F6). Nothing in
+- NEW CARDS (created, NOT started, auto-review commit ON, in backlog):
+  D1=eb226 extract the 24 RBAC commits onto branch feature/rbac-policy-engine (base a25abca09,
+           cherry-pick -x, oldest first; 10 bookkeeping commits excluded; git-only, no code).
+  D2=b27a2 RBAC_DESIGN.md conformance check -> DESIGN_CONFORMANCE.md (review-only).
+           baseRef=feature/rbac-policy-engine. LINKED: D2 waits on D1.
+  Decisions baked into D1 (owner can overrule before start): "move" is implemented as COPY;
+  the source branch is NOT rewritten (unpushed history rewrite is out of scope) and nothing is
+  pushed; safety tag backup/rbac-source-tip-74c19c0fb. Pre-checked: no RBAC commit touches
+  board files, so cherry-picks should be conflict-free; tree(new) == tree(source) except
+  agent-progress.txt.
+  Watch: board may unblock D2 when D1 reaches `review` (seen with B6 earlier); D2 only needs the
+  branch ref, which exists once D1's git steps finish, so start D2 only after D1 reports its 5
+  acceptance checks green. Do not start D2 if D1 stopped on a mismatch/conflict.
+  Note: tasks.json is a stale pre-board mirror and does not list D1/D2.
+- BOARD COMPLETE (before D1/D2): 24/24 cards done (A1-A6, B1-B6, C1-C5, R1, F1-F6). Nothing in
   backlog/in_progress/review.
 - Final two landed by manager cherry-pick after awaiting_review parking (hook stops,
   not losses): F3 5c8bbe755 (condition ctx for nested gateway bulk-delete + presign
