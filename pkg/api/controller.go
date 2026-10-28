@@ -33,7 +33,6 @@ import (
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/model"
 	"github.com/treeverse/lakefs/pkg/auth/setup"
-	"github.com/treeverse/lakefs/pkg/auth/wildcard"
 	"github.com/treeverse/lakefs/pkg/authentication"
 	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/catalog"
@@ -2924,59 +2923,48 @@ func (c *Controller) GetRunHookOutput(w http.ResponseWriter, r *http.Request, re
 	}
 }
 
-// hasBranchPermission reports whether policies grant action on at least one
-// branch resource of the given repository.
-func hasBranchPermission(repositoryID, username string, policies []*model.Policy, action string) bool {
-	const branchResourceSeparator = "/branch/"
-	for _, policy := range policies {
-		for _, stmt := range policy.Statement {
-			if stmt.Effect != model.StatementEffectAllow {
-				continue
-			}
-			actionMatches := false
-			for _, stmtAction := range stmt.Action {
-				if wildcard.Match(stmtAction, action) {
-					actionMatches = true
-					break
-				}
-			}
-			if !actionMatches {
-				continue
-			}
-			resources, err := auth.ParsePolicyResourceAsList(stmt.Resource)
-			if err != nil {
-				continue
-			}
-			for _, resource := range resources {
-				resource = strings.ReplaceAll(resource, "${user}", username)
-				if resource == permissions.All {
-					return true
-				}
-				parsed, err := auth.ParseARN(resource)
-				if err != nil {
-					continue
-				}
-				if idx := strings.Index(parsed.ResourceID, branchResourceSeparator); idx >= 0 {
-					branchPattern := parsed.ResourceID[idx+len(branchResourceSeparator):]
-					// Replace wildcard characters with a literal so the pattern can be
-					// matched against a concrete branch ARN.
-					branchName := strings.NewReplacer("*", "x", "?", "x").Replace(branchPattern)
-					if auth.ArnMatch(resource, permissions.BranchArn(repositoryID, branchName)) {
-						return true
-					}
-					continue
-				}
-				// A broader wildcard (for example repository/repo/*) may cover branches too.
-				if auth.ArnMatch(resource, permissions.BranchArn(repositoryID, "probe")) {
-					return true
-				}
+// checkListBranchesOnBranch evaluates the policy decision for listing a single branch. Every
+// condition in a statement is evaluated against the condition context carried by ctx, so callers
+// must use a context derived through withConditionContext.
+func checkListBranchesOnBranch(ctx context.Context, repository, branch, username string, policies []*model.Policy) auth.CheckResult {
+	return auth.CheckPermissions(ctx, permissions.Node{
+		Permission: permissions.Permission{
+			Action:   permissions.ListBranchesAction,
+			Resource: permissions.BranchArn(repository, branch),
+		},
+	}, username, policies, &auth.MissingPermissions{})
+}
+
+// anyBranchAllowed reports whether policies grant listing branches on at least one branch of
+// repository. It uses the same per-branch evaluation that filters the response, so policy
+// conditions and explicit denies are honoured (unlike a policy-shape scan). Branches are read in
+// pages and the scan stops at the first allowed branch. Hidden branches count: they are listed
+// only on request, but they are still proof that the user holds a branch-scoped grant.
+func (c *Controller) anyBranchAllowed(ctx context.Context, repository, username string, policies []*model.Policy) (bool, error) {
+	after := ""
+	for {
+		branches, hasMore, err := c.Catalog.ListBranches(ctx, repository, "", catalog.ListBranchesLimitMax, after,
+			graveler.WithShowHidden(true))
+		if err != nil {
+			return false, err
+		}
+		for _, branch := range branches {
+			if checkListBranchesOnBranch(ctx, repository, branch.Name, username, policies) == auth.CheckAllow {
+				return true, nil
 			}
 		}
+		if !hasMore || len(branches) == 0 {
+			return false, nil
+		}
+		after = branches[len(branches)-1].Name
 	}
-	return false
 }
 
 func (c *Controller) ListBranches(w http.ResponseWriter, r *http.Request, repository string, params apigen.ListBranchesParams) {
+	// Attach the authorization condition context to the request context before evaluating any
+	// policy: conditions are evaluated against the context, and a missing one makes every
+	// condition - including the deny in an explicit branch deny - evaluate to false.
+	r = c.withConditionContext(r, repository)
 	ctx := r.Context()
 	user, err := auth.GetUser(ctx)
 	if err != nil {
@@ -2997,15 +2985,36 @@ func (c *Controller) ListBranches(w http.ResponseWriter, r *http.Request, reposi
 	filterByPolicy := !errors.Is(err, auth.ErrNotImplemented)
 	repoAllowed := false
 	if filterByPolicy {
-		repoAllowed = auth.CheckPermissions(ctx, permissions.Node{
+		repoResult := auth.CheckPermissions(ctx, permissions.Node{
 			Permission: permissions.Permission{
 				Action:   permissions.ListBranchesAction,
 				Resource: permissions.RepoArn(repository),
 			},
-		}, user.Username, policies, &auth.MissingPermissions{}) == auth.CheckAllow
-		if !repoAllowed && !hasBranchPermission(repository, user.Username, policies, permissions.ListBranchesAction) {
+		}, user.Username, policies, &auth.MissingPermissions{})
+		// Deny first: an explicit (possibly conditional) deny on the repository fails the whole
+		// request, even when some of its branches are allowed.
+		if repoResult == auth.CheckDeny {
 			writeError(w, r, c.authorizationFailureStatus(), auth.ErrInsufficientPermissions)
 			return
+		}
+		repoAllowed = repoResult == auth.CheckAllow
+		if !repoAllowed {
+			// Without a repository-level grant the user may still hold the action on specific
+			// branches; the response is then filtered per branch below.
+			allowed, err := c.anyBranchAllowed(ctx, repository, user.Username, policies)
+			if err != nil {
+				if errors.Is(err, graveler.ErrRepositoryNotFound) {
+					// Do not reveal whether a repository the user cannot access exists.
+					writeError(w, r, c.authorizationFailureStatus(), auth.ErrInsufficientPermissions)
+					return
+				}
+				c.handleAPIError(ctx, w, r, err)
+				return
+			}
+			if !allowed {
+				writeError(w, r, c.authorizationFailureStatus(), auth.ErrInsufficientPermissions)
+				return
+			}
 		}
 	} else if !c.authorize(w, r, permissions.Node{
 		Permission: permissions.Permission{
@@ -3033,12 +3042,7 @@ func (c *Controller) ListBranches(w http.ResponseWriter, r *http.Request, reposi
 		if filterByPolicy {
 			// Explicit branch denies always hide a branch. Neutral results are visible
 			// only when the user has access to the whole repository.
-			result := auth.CheckPermissions(ctx, permissions.Node{
-				Permission: permissions.Permission{
-					Action:   permissions.ListBranchesAction,
-					Resource: permissions.BranchArn(repository, branch.Name),
-				},
-			}, user.Username, policies, &auth.MissingPermissions{})
+			result := checkListBranchesOnBranch(ctx, repository, branch.Name, user.Username, policies)
 			if result == auth.CheckDeny || (result == auth.CheckNeutral && !repoAllowed) {
 				continue
 			}
@@ -6356,6 +6360,33 @@ func paginationFor(hasMore bool, results any, fieldName string) apigen.Paginatio
 	return pagination
 }
 
+// conditionContext builds the authorization condition context of r: the client IP, and the
+// lakefs:RepositoryMetadata/<key> fields of repository (using the "repository" URL parameter when
+// repository is empty). It returns the derived context, carrying the condition context, together
+// with the client IP and the lazy metadata field provider used by AuthorizationRequest.
+func (c *Controller) conditionContext(r *http.Request, repository string) (context.Context, string, func(key string) (string, bool)) {
+	ctx := r.Context()
+	if repository == "" {
+		repository = chi.URLParam(r, "repository")
+	}
+	clientIP := httputil.ExtractClientIP(r.Header, r.RemoteAddr)
+
+	// Repository metadata is exposed to policy conditions as lakefs:RepositoryMetadata/<key>.
+	// The provider is lazy, so the metadata is loaded at most once per request, and only when a
+	// statement actually carries such a condition. Without a repository every repository metadata
+	// condition is missing, and so denies.
+	fields := c.repositoryMetadataFields(ctx, repository)
+	return auth.WithConditionContext(ctx, auth.NewConditionContextWithProvider(clientIP, fields)), clientIP, fields
+}
+
+// withConditionContext returns r carrying the authorization condition context on its context, so
+// that every downstream auth.CheckPermissions call evaluates policy conditions exactly as
+// authorizeCallback does: a conditional deny is enforced, and a conditional allow is not lost.
+func (c *Controller) withConditionContext(r *http.Request, repository string) *http.Request {
+	ctx, _, _ := c.conditionContext(r, repository)
+	return r.WithContext(ctx)
+}
+
 func (c *Controller) authorizeCallback(w http.ResponseWriter, r *http.Request, perms permissions.Node, cb func(w http.ResponseWriter, r *http.Request, code int, v any)) bool {
 	ctx := r.Context()
 	user, err := auth.GetUser(ctx)
@@ -6364,14 +6395,7 @@ func (c *Controller) authorizeCallback(w http.ResponseWriter, r *http.Request, p
 		return false
 	}
 
-	clientIP := httputil.ExtractClientIP(r.Header, r.RemoteAddr)
-
-	// Repository metadata is exposed to policy conditions as lakefs:RepositoryMetadata/<key>.
-	// The provider is lazy, so the metadata is loaded at most once per request, and only when a
-	// statement actually carries such a condition. Without a repository path parameter every
-	// repository metadata condition is missing, and so denies.
-	fields := c.repositoryMetadataFields(ctx, chi.URLParam(r, "repository"))
-	ctx = auth.WithConditionContext(ctx, auth.NewConditionContextWithProvider(clientIP, fields))
+	ctx, clientIP, fields := c.conditionContext(r, "")
 
 	resp, err := c.Auth.Authorize(ctx, &auth.AuthorizationRequest{
 		Username:            user.Username,
