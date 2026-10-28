@@ -20,12 +20,16 @@ auth:
   logout_redirect_url: "https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/logout?post_logout_redirect_uri=https://<your-lakefs-host>/auth/login"
 
   ui_config:
-    # Primary login: go straight to Azure without showing the access-key form.
     login_url: "/oidc/login"
 
-    # Fallback button on the login page for service accounts that use access keys.
-    fallback_login_url: "/auth/login"
-    fallback_login_label: "Login with Access Key"
+    # SSO-first login. "redirect" sends the browser straight to fallback_login_url; the
+    # "Continue with ..." card is shown only after a failed SSO round-trip or on
+    # /auth/login?local=true. "select" always shows the card. Access keys stay
+    # available behind the card's "Sign in with access key" link.
+    login_url_method: "redirect"
+    fallback_login_url: "/oidc/login"
+    # A label mentioning Microsoft/Azure/Entra gets the Microsoft logo on the button.
+    fallback_login_label: "Continue with Microsoft"
 
     # Cookies whose absence means "not logged in" — the UI uses this list to detect
     # whether to show the login page.  Must include oidc_auth_session for SSO users.

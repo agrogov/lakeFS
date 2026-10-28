@@ -55,18 +55,86 @@ export const getLoginIntent = (location: ReturnType<typeof useLocation>) => {
     return { redirected, redirectedFromQuery, next, cleanUrl };
 };
 
-const LoginForm = ({ loginConfig }: { loginConfig: LoginConfig }) => {
-    const location = useLocation();
+const AccessKeyForm = ({ loginConfig, next }: { loginConfig: LoginConfig; next: string }) => {
     const { refreshUser } = useAuth();
     const [loginError, setLoginError] = useState<React.ReactNode>(null);
+
+    const usernamePlaceholder = loginConfig.username_ui_placeholder || 'Access Key ID';
+    const passwordPlaceholder = loginConfig.password_ui_placeholder || 'Secret Access Key';
+
+    return (
+        <Form
+            onSubmit={async (e) => {
+                e.preventDefault();
+                const form = e.target as HTMLFormElement;
+                const formData = new FormData(form);
+                try {
+                    setLoginError(null);
+                    const username = formData.get('username');
+                    const password = formData.get('password');
+                    await auth.login(username, password);
+                    window.sessionStorage.setItem(LAKEFS_POST_LOGIN_NEXT, next);
+                    await refreshUser({ useCache: false });
+                } catch (err) {
+                    if (err instanceof AuthenticationError) {
+                        // Invalid credentials (401)
+                        const message = loginConfig.login_failed_message || "The credentials don't match.";
+                        setLoginError(message);
+                    } else if (err instanceof ServerError) {
+                        // Server errors (5xx)
+                        setLoginError('A server error occurred. Please try again in a few moments.');
+                    } else if (err instanceof ClientError) {
+                        // Other client errors (4xx) - bad request, rate limiting, etc.
+                        setLoginError('Unable to process login request. Please try again.');
+                    } else {
+                        // Network errors, refreshUser errors, or other unexpected errors
+                        const message =
+                            err instanceof Error ? err.message : 'Unable to complete login. Please try again.';
+                        setLoginError(message);
+                    }
+                }
+            }}
+        >
+            <Form.Group controlId="username" className="mb-3">
+                <Form.Control
+                    name="username"
+                    type="text"
+                    placeholder={usernamePlaceholder}
+                    autoFocus
+                    className="bg-light"
+                />
+            </Form.Group>
+
+            <Form.Group controlId="password" className="mb-3">
+                <Form.Control name="password" type="password" placeholder={passwordPlaceholder} className="bg-light" />
+            </Form.Group>
+
+            {!!loginError && <AlertError error={loginError} />}
+
+            <Button variant="primary" type="submit" className="w-100 mt-3 py-2">
+                Login
+            </Button>
+        </Form>
+    );
+};
+
+const goToFallbackLogin = (loginConfig: LoginConfig, next: string) => {
+    window.sessionStorage.setItem(LAKEFS_POST_LOGIN_NEXT, next);
+    loginConfig.login_cookie_names?.forEach((cookie) => {
+        document.cookie = `${cookie}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;`;
+    });
+    if (loginConfig.fallback_login_url) {
+        window.location.href = withNext(loginConfig.fallback_login_url, next);
+    }
+};
+
+const LoginForm = ({ loginConfig }: { loginConfig: LoginConfig }) => {
+    const location = useLocation();
 
     // Resolve "next" for post-login navigation
     const state = (location.state as NavigateState | null) ?? null;
     const qp = new URLSearchParams(location.search);
     const next = normalizeNext(state?.next ?? qp.get('next'));
-
-    const usernamePlaceholder = loginConfig.username_ui_placeholder || 'Access Key ID';
-    const passwordPlaceholder = loginConfig.password_ui_placeholder || 'Secret Access Key';
 
     return (
         <div className="d-flex align-items-center justify-content-center">
@@ -77,79 +145,13 @@ const LoginForm = ({ loginConfig }: { loginConfig: LoginConfig }) => {
                     </div>
                 </Card.Header>
                 <Card.Body className="p-4">
-                    <Form
-                        onSubmit={async (e) => {
-                            e.preventDefault();
-                            const form = e.target as HTMLFormElement;
-                            const formData = new FormData(form);
-                            try {
-                                setLoginError(null);
-                                const username = formData.get('username');
-                                const password = formData.get('password');
-                                await auth.login(username, password);
-                                window.sessionStorage.setItem(LAKEFS_POST_LOGIN_NEXT, next);
-                                await refreshUser({ useCache: false });
-                            } catch (err) {
-                                if (err instanceof AuthenticationError) {
-                                    // Invalid credentials (401)
-                                    const message = loginConfig.login_failed_message || "The credentials don't match.";
-                                    setLoginError(message);
-                                } else if (err instanceof ServerError) {
-                                    // Server errors (5xx)
-                                    setLoginError('A server error occurred. Please try again in a few moments.');
-                                } else if (err instanceof ClientError) {
-                                    // Other client errors (4xx) - bad request, rate limiting, etc.
-                                    setLoginError('Unable to process login request. Please try again.');
-                                } else {
-                                    // Network errors, refreshUser errors, or other unexpected errors
-                                    const message =
-                                        err instanceof Error
-                                            ? err.message
-                                            : 'Unable to complete login. Please try again.';
-                                    setLoginError(message);
-                                }
-                            }
-                        }}
-                    >
-                        <Form.Group controlId="username" className="mb-3">
-                            <Form.Control
-                                name="username"
-                                type="text"
-                                placeholder={usernamePlaceholder}
-                                autoFocus
-                                className="bg-light"
-                            />
-                        </Form.Group>
-
-                        <Form.Group controlId="password" className="mb-3">
-                            <Form.Control
-                                name="password"
-                                type="password"
-                                placeholder={passwordPlaceholder}
-                                className="bg-light"
-                            />
-                        </Form.Group>
-
-                        {!!loginError && <AlertError error={loginError} />}
-
-                        <Button variant="primary" type="submit" className="w-100 mt-3 py-2">
-                            Login
-                        </Button>
-                    </Form>
+                    <AccessKeyForm loginConfig={loginConfig} next={next} />
                     <div className={'mt-2 mb-1'}>
                         {loginConfig.fallback_login_url ? (
                             <Button
                                 variant="link"
                                 className="text-secondary mt-2"
-                                onClick={async () => {
-                                    window.sessionStorage.setItem(LAKEFS_POST_LOGIN_NEXT, next);
-                                    loginConfig.login_cookie_names?.forEach((cookie) => {
-                                        document.cookie = `${cookie}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;`;
-                                    });
-                                    if (loginConfig.fallback_login_url) {
-                                        window.location.href = withNext(loginConfig.fallback_login_url, next);
-                                    }
-                                }}
+                                onClick={() => goToFallbackLogin(loginConfig, next)}
                             >
                                 {loginConfig.fallback_login_label || 'Try another way to login'}
                             </Button>
@@ -162,6 +164,65 @@ const LoginForm = ({ loginConfig }: { loginConfig: LoginConfig }) => {
         </div>
     );
 };
+
+const MicrosoftLogo = () => (
+    <svg width="18" height="18" viewBox="0 0 21 21" aria-hidden="true">
+        <rect x="1" y="1" width="9" height="9" fill="#f25022" />
+        <rect x="11" y="1" width="9" height="9" fill="#7fba00" />
+        <rect x="1" y="11" width="9" height="9" fill="#00a4ef" />
+        <rect x="11" y="11" width="9" height="9" fill="#ffb900" />
+    </svg>
+);
+
+// SSO-first login card: a single "Continue with ..." button, with the access-key form tucked
+// behind a small link for service accounts and break-glass admins.
+const SSOLoginCard = ({ loginConfig, showLocal }: { loginConfig: LoginConfig; showLocal: boolean }) => {
+    const location = useLocation();
+    const [localOpen, setLocalOpen] = useState(showLocal);
+
+    const state = (location.state as NavigateState | null) ?? null;
+    const qp = new URLSearchParams(location.search);
+    const next = normalizeNext(state?.next ?? qp.get('next'));
+
+    const label = loginConfig.fallback_login_label || 'Continue with SSO';
+    const isMicrosoft = /microsoft|azure|entra/i.test(label);
+
+    return (
+        <div className="d-flex align-items-center justify-content-center">
+            <Card className="sso-login-card">
+                <Card.Body className="p-4">
+                    <div className="d-flex align-items-center gap-3 mb-3">
+                        <img src="/logo192.png" alt="" className="sso-login-icon" />
+                        <span className="sso-login-title">lakeFS</span>
+                    </div>
+                    <p className="sso-login-subtitle mb-3">Sign in to continue.</p>
+                    <Button
+                        variant="outline-secondary"
+                        className="sso-login-button w-100 d-flex align-items-center justify-content-center gap-2"
+                        onClick={() => goToFallbackLogin(loginConfig, next)}
+                    >
+                        {isMicrosoft && <MicrosoftLogo />}
+                        <span>{label}</span>
+                    </Button>
+                    {localOpen ? (
+                        <div className="mt-4">
+                            <AccessKeyForm loginConfig={loginConfig} next={next} />
+                        </div>
+                    ) : (
+                        <Button variant="link" className="sso-login-local p-0 mt-3" onClick={() => setLocalOpen(true)}>
+                            Sign in with access key
+                        </Button>
+                    )}
+                </Card.Body>
+            </Card>
+        </div>
+    );
+};
+
+// SSO is the primary login when the UI is told to redirect (or offer a choice) to fallback_login_url.
+const isSSOPrimary = (loginConfig: LoginConfig | undefined) =>
+    !!loginConfig?.fallback_login_url &&
+    (loginConfig.login_url_method === 'redirect' || loginConfig.login_url_method === 'select');
 
 const SSO_AUTO_REDIRECT_KEY = 'lakefs_sso_auto_redirect_at';
 const SSO_AUTO_REDIRECT_COOLDOWN_MS = 30000;
@@ -221,6 +282,11 @@ const LoginPage = () => {
     const loginConfig = setupResponse?.login_config;
 
     if (autoRedirect) return <Loading />;
+
+    if (loginConfig && isSSOPrimary(loginConfig)) {
+        const showLocal = new URLSearchParams(location.search).get('local') === 'true';
+        return <SSOLoginCard loginConfig={loginConfig} showLocal={showLocal} />;
+    }
 
     // Default: lakeFS login form
     return <LoginForm loginConfig={loginConfig} />;
