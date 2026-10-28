@@ -1,8 +1,20 @@
 # agent-progress — RBAC kanban management (RBAC_DESIGN.md)
 
-Role: kanban management only. This agent plans, links, tracks; it does NOT implement.
-Workers pick tasks from tasks.json. Max 5 in_progress. Parallel only when depends_on is
-satisfied AND files_expected are disjoint.
+Role: kanban management only (Local orchestration board, `kanban` CLI, workspace
+/Users/arogov/GitHub/lakeFS, runtime http://127.0.0.1:3484). This agent plans, links,
+tracks; it does NOT implement. tasks.json is the detailed spec mirror; prompts on the
+board carry the worker instructions. Max 5 in_progress; deps enforce serialization
+where files could collide.
+
+## Board task IDs (kanban task ids)
+A1=3380a A2=3fce6 A3=a31c2 A4=31195 A5=cf2b7 A6=02c1c
+B1=debea B2=08e1f B3=c81ce B4=61e32 B5=785b4 B6=cbfb0
+C1=ef71b C2=969ad C3=ec86a C4=42f63 C5=0d286
+
+## Dependency edges (dependent waits on prerequisite) — all created on board
+B1→A3 | B2→A2,A3 | B3→A2,B2,B4 | B4→A1 | B5→A2 | B6→B3,B5
+C2→A5,B1 | C3→A5 | C4→A1,A2 | C5→C3
+Unblocked at creation: A1, A2, A3, A4, A5, A6, C1 (7; board cap 5 → wave 1 = A1–A5).
 
 ## Board layout (17 tasks)
 Phase A (safety fixes, shippable in both simplified and internal modes):
@@ -35,7 +47,8 @@ W3: B3 B5                 W4: B6 C2 C3 C4    W5: C5
 - setup.go (auth): A2, C4 (C4 depends on A2)
 
 ## Status
-- All tasks created; wave-1 tasks A1-A5 marked ready.
-- No implementation done by this agent (earlier trial edits were reverted; HEAD = 95dceafc2).
-- Open design questions from RBAC_DESIGN §9 still unanswered (rbac-migrate merge strategy,
-  break-glass membership, cross-replica TTL) — do not block wave-1 tasks on them.
+- 17 tasks created in `backlog` on the kanban board; 16 dependency links verified.
+- Wave 1 started on board: A1, A2, A3, A4, A5 (in_progress sessions). A6, C1 held in
+  backlog for wave 2 slot (max-5 cap).
+- No implementation done by this agent (earlier trial edits were reverted; base HEAD was 95dceafc2).
+- Open design questions from RBAC_DESIGN §9 unanswered — do not block wave-1 tasks on them.
