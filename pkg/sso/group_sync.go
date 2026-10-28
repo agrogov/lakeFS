@@ -22,9 +22,10 @@ type groupManager interface {
 }
 
 // SyncGroups reconciles the user's ACL group memberships against tokenGroups (raw values
-// of the cfg.GroupsClaim from the ID token). Only groups whose name starts with
-// cfg.ManagedGroupPrefix are touched; groups without the prefix are preserved as manually
-// assigned. When ManagedGroupPrefix is empty, all current memberships are in-scope.
+// of the cfg.GroupsClaim from the ID token). Token values are translated through
+// cfg.GroupMapping when set, and only its target groups are touched. Otherwise only groups
+// whose name starts with cfg.ManagedGroupPrefix are touched (all when it is empty).
+// Groups outside the managed scope are preserved as manually assigned.
 //
 // A nil tokenGroups slice means the token contained the claim but it was empty — all
 // managed memberships are removed. When the claim is absent from the token entirely,
@@ -36,18 +37,7 @@ func SyncGroups(ctx context.Context, svc groupManager, logger logging.Logger, us
 		return nil
 	}
 
-	// Build desired set: token groups that fall within the managed scope.
-	// Empty strings are filtered here rather than relying solely on ExtractStringSlice
-	// so that SyncGroups is safe when called directly with caller-supplied slices.
-	desired := make(map[string]bool, len(tokenGroups))
-	for _, tg := range tokenGroups {
-		if tg == "" {
-			continue
-		}
-		if cfg.ManagedGroupPrefix == "" || strings.HasPrefix(tg, cfg.ManagedGroupPrefix) {
-			desired[tg] = true
-		}
-	}
+	desired, managed := desiredGroups(tokenGroups, cfg)
 
 	// Fetch the user's current groups (one page; lakeFS ACL has 4 built-in groups so
 	// this is sufficient in practice, but log if the result is truncated).
@@ -63,7 +53,7 @@ func SyncGroups(ctx context.Context, svc groupManager, logger logging.Logger, us
 	// Separate current groups into managed (subject to sync) and unmanaged (preserved).
 	currentManaged := make(map[string]bool, len(current))
 	for _, g := range current {
-		if cfg.ManagedGroupPrefix == "" || strings.HasPrefix(g.DisplayName, cfg.ManagedGroupPrefix) {
+		if managed(g.DisplayName) {
 			currentManaged[g.DisplayName] = true
 		}
 	}
@@ -102,6 +92,45 @@ func SyncGroups(ctx context.Context, svc groupManager, logger logging.Logger, us
 	}
 
 	return nil
+}
+
+// desiredGroups returns the lakeFS groups the token grants and a predicate for the groups
+// sync may change.
+//
+// With cfg.GroupMapping set, token values (e.g. Entra group object IDs or app role values)
+// are translated to lakeFS groups, compared case-insensitively since config keys are
+// lowercased; only groups that appear as mapping targets are managed. Otherwise token
+// values are lakeFS group names, scoped by cfg.ManagedGroupPrefix.
+func desiredGroups(tokenGroups []string, cfg *SSOConfig) (map[string]bool, func(string) bool) {
+	desired := make(map[string]bool, len(tokenGroups))
+	if len(cfg.GroupMapping) > 0 {
+		mapping := make(map[string][]string, len(cfg.GroupMapping))
+		targets := make(map[string]bool)
+		for k, groups := range cfg.GroupMapping {
+			mapping[strings.ToLower(k)] = groups
+			for _, g := range groups {
+				targets[g] = true
+			}
+		}
+		for _, tg := range tokenGroups {
+			for _, g := range mapping[strings.ToLower(tg)] {
+				desired[g] = true
+			}
+		}
+		return desired, func(g string) bool { return targets[g] }
+	}
+
+	inScope := func(g string) bool {
+		return cfg.ManagedGroupPrefix == "" || strings.HasPrefix(g, cfg.ManagedGroupPrefix)
+	}
+	// Empty strings are filtered here rather than relying solely on ExtractStringSlice
+	// so that SyncGroups is safe when called directly with caller-supplied slices.
+	for _, tg := range tokenGroups {
+		if tg != "" && inScope(tg) {
+			desired[tg] = true
+		}
+	}
+	return desired, inScope
 }
 
 // ExtractStringSlice coerces a claims value to []string.
