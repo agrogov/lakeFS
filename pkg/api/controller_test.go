@@ -5009,6 +5009,23 @@ func TestController_Policy(t *testing.T) {
 	})
 }
 
+func TestSetGroupACL(t *testing.T) {
+	viper.Set("auth.ui_config.rbac", config.AuthRBACNone)
+	t.Cleanup(func() { viper.Set("auth.ui_config.rbac", config.AuthRBACNone) })
+
+	clt, _ := setupClientWithAdmin(t)
+	ctx := t.Context()
+
+	// The gate runs before authorization and before any lookup, so a group does not need to exist.
+	resp, err := clt.SetGroupACLWithResponse(ctx, "TestSetGroupACLGroup", apigen.SetGroupACLJSONRequestBody{
+		Permission: "Write",
+	})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusConflict, resp.StatusCode())
+	require.NotNil(t, resp.JSONDefault)
+	require.Equal(t, "group ACLs are not used in RBAC mode; attach policies instead", resp.JSONDefault.Message)
+}
+
 func TestController_GetPhysicalAddress(t *testing.T) {
 	clt, deps := setupClientWithAdmin(t)
 	ctx := t.Context()
