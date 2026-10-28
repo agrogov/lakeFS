@@ -47,12 +47,20 @@ W3: B3 B5                 W4: B6 C2 C3 C4    W5: C5
 - setup.go (auth): A2, C4 (C4 depends on A2)
 
 ## Status
-- 17 tasks created in `backlog` on the kanban board; 16 dependency links verified.
-- Wave 1 started on board: A1, A2, A3, A4, A5 (in_progress sessions). A6, C1 held in
-  backlog for wave 2 slot (max-5 cap).
-- UPDATE: auto-review ENABLED (mode=commit) on ALL 17 tasks incl. running wave-1 ones —
-  agents commit their worktree onto the base ref when done; progress cannot be lost to
-  worktree cleanup. Dependency links remain the mechanism that guarantees wave-2
-  worktrees start from a base ref already containing their prerequisites.
+- 17 tasks on board; deps verified. Auto-review (mode=commit) enabled on all cards.
+- Done (10): A1 A2 A3 A4 A5 B1 B5 B6 C2 C4 — 10 commits on feature/azure-entra-sso-apache.
+  NOTE: some commit-message task ids are wrong (7ef078aa7 is B1, 361b59e4e is C4,
+  fed01838c is A5 no-id); board card->commit mapping above is authoritative.
+- Review gate (2026-10-28, manager scope review, marked [reviewed_ok] on board):
+  * B2 08e1f @9a8a4a7c1 — scope exact, pkg/sso tests ok
+  * B4 61e32 @f93229aec — scope exact, contrib/auth/acl tests ok
+  * B3 c81ce @9dc5ccfba — scope exact; does NOT compile on its own base (references
+    EnsureRBACBase from B2). Verified in scratch worktree: B3+B2+B4 merge => build ok,
+    pkg/sso tests ok. SHIP ORDER REQUIRED: B2, B4, then B3.
+  * C3 ec86a @411274f18 — scope exact; -run TestListBranches ok. C2 already merged
+    (controller.go overlap), so ship C3 to current tip; expect board agent to resolve
+    any conflict hunks.
+- In_progress (2): A6 02c1c (webui), C1 ef71b (StringEquals). Backlog: C5 0d286 (waits on C3).
+- User action: click Commit on B2 -> B4 -> B3 -> C3 to land them and unlock C5.
 - No implementation done by this agent (earlier trial edits were reverted; base HEAD was 95dceafc2).
-- Open design questions from RBAC_DESIGN §9 unanswered — do not block wave-1 tasks on them.
+- Open design questions from RBAC_DESIGN §9 unanswered — do not block tasks on them.
