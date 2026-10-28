@@ -68,6 +68,7 @@ const ACLPermission: React.FC<ACLPermissionButtonProps> = ({ initialValue, onSel
 
     return (
         <Dropdown
+            className="acl-permission-dropdown"
             onSelect={(p: PermissionType) => {
                 if (value !== p) {
                     if (onSelect) {
@@ -81,8 +82,7 @@ const ACLPermission: React.FC<ACLPermissionButtonProps> = ({ initialValue, onSel
             <Dropdown.Toggle variant={variant} title={title}>
                 {value}
             </Dropdown.Toggle>
-            {/* fixed positioning: the table cell clips overflow (text-truncate), which hid the menu */}
-            <Dropdown.Menu popperConfig={{ strategy: 'fixed' }}>
+            <Dropdown.Menu>
                 {Object.entries(permissions).map(([key, text]) => (
                     <Dropdown.Item key={key} eventKey={key}>
                         <div>

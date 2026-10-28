@@ -155,6 +155,11 @@ body .auth-page .nav-pills .nav-link:hover {
     color: var(--bs-body-color);
 }
 
+/* DataTable cells clip overflow (text-truncate), which would hide the group permission menu */
+td:has(> .acl-permission-dropdown) {
+    overflow: visible !important;
+}
+
 /* Feature-locked empty state for Enterprise-only auth pages */
 .feature-locked-empty-state .feature-locked-card {
     background-color: var(--bs-tertiary-bg, #f8f9fa);
