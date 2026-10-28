@@ -1652,10 +1652,13 @@ func (s *policyAuthService) Authorize(ctx context.Context, req *auth.Authorizati
 	return &auth.AuthorizationResponse{Allowed: true}, nil
 }
 
-func listBranchesAsUser(t *testing.T, controller *api.Controller, repository, username string) (int, []string) {
+func listBranchesAsUser(t *testing.T, controller *api.Controller, repository, username string, opts ...func(*http.Request)) (int, []string) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/repositories/"+repository+"/branches", nil)
 	req = req.WithContext(auth.WithUser(req.Context(), &model.User{Username: username}))
+	for _, opt := range opts {
+		opt(req)
+	}
 	recorder := httptest.NewRecorder()
 	controller.ListBranches(recorder, req, repository, apigen.ListBranchesParams{
 		Amount: apiutil.Ptr(apigen.PaginationAmount(-1)),
@@ -1671,6 +1674,223 @@ func listBranchesAsUser(t *testing.T, controller *api.Controller, repository, us
 	}
 	sort.Strings(ids)
 	return recorder.Code, ids
+}
+
+// TestListBranchesPolicyConditions verifies that listing branches evaluates policy conditions with
+// the request's condition context: a conditional allow grants the listing, and a conditional deny -
+// on the repository or on a branch - is enforced instead of being bypassed.
+func TestListBranchesPolicyConditions(t *testing.T) {
+	_, deps := setupHandler(t)
+	ctx := t.Context()
+	repo := testUniqueRepoName()
+	_, err := deps.catalog.CreateRepository(ctx, repo, config.SingleBlockstoreID, onBlock(deps, "foo1"), "main", false)
+	testutil.Must(t, err)
+	testutil.Must(t, deps.catalog.UpdateRepositoryMetadata(ctx, repo, graveler.RepositoryMetadata{"team": "data"}))
+	testutil.Must(t, deps.catalog.CreateEntry(ctx, repo, "main", catalog.DBEntry{Path: "file"}))
+	_, err = deps.catalog.Commit(ctx, repo, "main", "initial commit", "tester", nil, nil, nil, false)
+	testutil.Must(t, err)
+	for _, branch := range []string{"feature", "secret", "other"} {
+		_, err := deps.catalog.CreateBranch(ctx, repo, branch, "main")
+		testutil.MustDo(t, "create branch "+branch, err)
+	}
+
+	const (
+		allowedIP = "203.0.113.5"
+		otherIP   = "198.51.100.7"
+	)
+	ipCondition := func(ip string) map[string]map[string][]string {
+		return map[string]map[string][]string{
+			auth.OperatorNameIpAddress: {"SourceIp": {ip + "/32"}},
+		}
+	}
+	repoMetadataCondition := func(value string) map[string]map[string][]string {
+		return map[string]map[string][]string{
+			auth.OperatorNameStringEquals: {auth.RepositoryMetadataConditionKeyPrefix + "team": {value}},
+		}
+	}
+
+	policies := map[string][]*model.Policy{
+		"conditional-repo-allow": {
+			{DisplayName: "conditional-repo-allow-policy", Statement: model.Statements{{
+				Effect:    model.StatementEffectAllow,
+				Action:    []string{permissions.ListBranchesAction},
+				Resource:  permissions.RepoArn(repo),
+				Condition: ipCondition(allowedIP),
+			}}},
+		},
+		"conditional-repo-deny": {
+			{DisplayName: "conditional-repo-deny-policy", Statement: model.Statements{
+				{
+					Effect:   model.StatementEffectAllow,
+					Action:   []string{permissions.ListBranchesAction},
+					Resource: permissions.RepoArn(repo),
+				},
+				{
+					Effect:    model.StatementEffectDeny,
+					Action:    []string{permissions.ListBranchesAction},
+					Resource:  permissions.RepoArn(repo),
+					Condition: ipCondition(allowedIP),
+				},
+			}},
+		},
+		"conditional-repo-metadata-allow": {
+			{DisplayName: "conditional-repo-metadata-allow-policy", Statement: model.Statements{{
+				Effect:    model.StatementEffectAllow,
+				Action:    []string{permissions.ListBranchesAction},
+				Resource:  permissions.RepoArn(repo),
+				Condition: repoMetadataCondition("data"),
+			}}},
+		},
+		"conditional-branch-allow": {
+			{DisplayName: "conditional-branch-allow-policy", Statement: model.Statements{{
+				Effect:    model.StatementEffectAllow,
+				Action:    []string{permissions.ListBranchesAction},
+				Resource:  permissions.BranchArn(repo, "feature"),
+				Condition: ipCondition(allowedIP),
+			}}},
+		},
+		"conditional-branch-deny": {
+			{DisplayName: "conditional-branch-deny-policy", Statement: model.Statements{
+				{
+					Effect:   model.StatementEffectAllow,
+					Action:   []string{permissions.ListBranchesAction},
+					Resource: permissions.BranchArn(repo, "*"),
+				},
+				{
+					Effect:    model.StatementEffectDeny,
+					Action:    []string{permissions.ListBranchesAction},
+					Resource:  permissions.BranchArn(repo, "secret"),
+					Condition: ipCondition(allowedIP),
+				},
+			}},
+		},
+	}
+
+	controller := &api.Controller{
+		Catalog:   deps.catalog,
+		Auth:      &policyAuthService{Service: deps.authService, policies: policies},
+		Logger:    logging.FromContext(ctx),
+		Collector: deps.collector,
+	}
+
+	allBranches := []string{"feature", "main", "other", "secret"}
+	tests := []struct {
+		name         string
+		user         string
+		clientIP     string
+		wantStatus   int
+		wantBranches []string
+	}{
+		{
+			name:         "conditional allow from matching IP is allowed",
+			user:         "conditional-repo-allow",
+			clientIP:     allowedIP,
+			wantStatus:   http.StatusOK,
+			wantBranches: allBranches,
+		},
+		{
+			name:       "conditional allow from other IP is rejected",
+			user:       "conditional-repo-allow",
+			clientIP:   otherIP,
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "conditional repository deny from matching IP is enforced",
+			user:       "conditional-repo-deny",
+			clientIP:   allowedIP,
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:         "conditional repository deny from other IP does not apply",
+			user:         "conditional-repo-deny",
+			clientIP:     otherIP,
+			wantStatus:   http.StatusOK,
+			wantBranches: allBranches,
+		},
+		{
+			name:         "repository metadata conditioned grant with matching metadata is allowed",
+			user:         "conditional-repo-metadata-allow",
+			clientIP:     otherIP,
+			wantStatus:   http.StatusOK,
+			wantBranches: allBranches,
+		},
+		{
+			name:       "conditional branch allow from matching IP is allowed",
+			user:       "conditional-branch-allow",
+			clientIP:   allowedIP,
+			wantStatus: http.StatusOK,
+			wantBranches: []string{
+				"feature",
+			},
+		},
+		{
+			name:       "conditional branch allow from other IP is rejected",
+			user:       "conditional-branch-allow",
+			clientIP:   otherIP,
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:         "conditional branch deny from matching IP hides branch",
+			user:         "conditional-branch-deny",
+			clientIP:     allowedIP,
+			wantStatus:   http.StatusOK,
+			wantBranches: []string{"feature", "main", "other"},
+		},
+		{
+			name:         "conditional branch deny from other IP does not apply",
+			user:         "conditional-branch-deny",
+			clientIP:     otherIP,
+			wantStatus:   http.StatusOK,
+			wantBranches: allBranches,
+		},
+	}
+
+	withClientIP := func(ip string) func(*http.Request) {
+		return func(r *http.Request) {
+			r.RemoteAddr = net.JoinHostPort(ip, "1234")
+		}
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, branches := listBranchesAsUser(t, controller, repo, tt.user, withClientIP(tt.clientIP))
+			require.Equal(t, tt.wantStatus, status)
+			if tt.wantStatus == http.StatusOK {
+				require.Equal(t, tt.wantBranches, branches)
+			}
+		})
+	}
+
+	t.Run("unauthorized user does not learn whether a repository exists", func(t *testing.T) {
+		missingRepo := testUniqueRepoName() + "-missing"
+		status, _ := listBranchesAsUser(t, controller, missingRepo, "conditional-repo-allow", withClientIP(otherIP))
+		require.Equal(t, http.StatusUnauthorized, status)
+	})
+
+	t.Run("repository metadata conditioned grant with other metadata is rejected", func(t *testing.T) {
+		otherRepo := testUniqueRepoName()
+		_, err := deps.catalog.CreateRepository(ctx, otherRepo, config.SingleBlockstoreID, onBlock(deps, "foo2"), "main", false)
+		testutil.Must(t, err)
+		testutil.Must(t, deps.catalog.UpdateRepositoryMetadata(ctx, otherRepo, graveler.RepositoryMetadata{"team": "other"}))
+		otherRepoPolicies := map[string][]*model.Policy{
+			"conditional-repo-metadata-allow": {{
+				DisplayName: "conditional-repo-metadata-allow-policy",
+				Statement: model.Statements{{
+					Effect:    model.StatementEffectAllow,
+					Action:    []string{permissions.ListBranchesAction},
+					Resource:  permissions.RepoArn(otherRepo),
+					Condition: repoMetadataCondition("data"),
+				}},
+			}},
+		}
+		otherController := &api.Controller{
+			Catalog:   deps.catalog,
+			Auth:      &policyAuthService{Service: deps.authService, policies: otherRepoPolicies},
+			Logger:    logging.FromContext(ctx),
+			Collector: deps.collector,
+		}
+		status, _ := listBranchesAsUser(t, otherController, otherRepo, "conditional-repo-metadata-allow", withClientIP(otherIP))
+		require.Equal(t, http.StatusUnauthorized, status)
+	})
 }
 
 func TestListBranchesPolicyFilter(t *testing.T) {
