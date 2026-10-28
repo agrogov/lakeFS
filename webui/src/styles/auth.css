@@ -155,8 +155,10 @@ body .auth-page .nav-pills .nav-link:hover {
     color: var(--bs-body-color);
 }
 
-/* DataTable cells clip overflow (text-truncate), which would hide the group permission menu */
-td:has(> .acl-permission-dropdown) {
+/* DataTable cells (text-truncate) and the table itself (rounded corners) clip overflow,
+   which would hide the group permission menu */
+td:has(> .acl-permission-dropdown),
+.table:has(.acl-permission-dropdown) {
     overflow: visible !important;
 }
 
