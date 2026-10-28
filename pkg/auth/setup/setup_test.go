@@ -15,6 +15,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/kv/kvtest"
 	"github.com/treeverse/lakefs/pkg/logging"
+	"github.com/treeverse/lakefs/pkg/permissions"
 )
 
 func SetupService(t *testing.T, secret string) (*auth.BasicAuthService, kv.Store) {
@@ -75,6 +76,71 @@ func TestEnsureRBACBaseGroups(t *testing.T) {
 		}
 		require.ElementsMatch(t, expectedPolicies, actualPolicies)
 	}
+}
+
+func TestEnsureRBACBaseGroupsDatasetsDisabled(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	authService, _ := authtestutil.SetupService(t, ctx, []byte("secret"))
+
+	require.NoError(t, setup.EnsureRBACBaseGroups(ctx, authService, time.Now()))
+
+	policies, _, err := authService.ListGroupPolicies(ctx, setup.AdminsGroup, &model.PaginationParams{Amount: 100})
+	require.NoError(t, err)
+	for _, policy := range policies {
+		require.NotEqual(t, setup.DatasetsFullAccessPolicy, policy.DisplayName)
+		require.NotEqual(t, setup.DatasetsReadAllPolicy, policy.DisplayName)
+	}
+}
+
+func TestEnsureRBACBaseGroupsDatasetsEnabled(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	authService, _ := authtestutil.SetupService(t, ctx, []byte("secret"))
+	ts := time.Now()
+
+	require.NoError(t, setup.EnsureRBACBaseGroups(ctx, authService, ts, setup.WithDatasetsEnabled(true)))
+
+	// Policies are created with the datasets actions and the ARN service prefix is plural.
+	full, err := authService.GetPolicy(ctx, setup.DatasetsFullAccessPolicy)
+	require.NoError(t, err)
+	require.Equal(t, model.Statements{{
+		Action:    []string{"datasets:*"},
+		Resource:  permissions.All,
+		Effect:    model.StatementEffectAllow,
+		Condition: map[string]map[string][]string{},
+	}}, full.Statement)
+
+	read, err := authService.GetPolicy(ctx, setup.DatasetsReadAllPolicy)
+	require.NoError(t, err)
+	require.Equal(t, model.Statements{{
+		Action:    []string{"datasets:List*", "datasets:Read*"},
+		Resource:  permissions.All,
+		Effect:    model.StatementEffectAllow,
+		Condition: map[string]map[string][]string{},
+	}}, read.Statement)
+
+	expectedAttachments := map[string][]string{
+		setup.AdminsGroup:     {"FSFullAccess", "CatalogReadWriteAll", "AuthFullAccess", "RepoManagementFullAccess", setup.DatasetsFullAccessPolicy},
+		setup.SuperUsersGroup: {"FSFullAccess", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll", setup.DatasetsFullAccessPolicy},
+		setup.DevelopersGroup: {"FSReadWriteAll", "PRReadWriteAll", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll", setup.DatasetsReadAllPolicy},
+		setup.ViewersGroup:    {"FSReadAll", "CatalogReadAll", "AuthManageOwnCredentials", setup.DatasetsReadAllPolicy},
+	}
+	for groupName, expectedPolicies := range expectedAttachments {
+		policies, _, err := authService.ListGroupPolicies(ctx, groupName, &model.PaginationParams{Amount: 100})
+		require.NoError(t, err)
+		actualPolicies := make([]string, 0, len(policies))
+		for _, policy := range policies {
+			actualPolicies = append(actualPolicies, policy.DisplayName)
+		}
+		require.ElementsMatch(t, expectedPolicies, actualPolicies)
+	}
+
+	// A second run is a no-op.
+	require.NoError(t, setup.EnsureRBACBaseGroups(ctx, authService, ts.Add(time.Hour), setup.WithDatasetsEnabled(true)))
+	policies, _, err := authService.ListGroupPolicies(ctx, setup.AdminsGroup, &model.PaginationParams{Amount: 100})
+	require.NoError(t, err)
+	require.Len(t, policies, len(expectedAttachments[setup.AdminsGroup]))
 }
 
 func TestAddAdminUser(t *testing.T) {

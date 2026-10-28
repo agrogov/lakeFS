@@ -20,6 +20,37 @@ const (
 	ViewersGroup    = "Viewers"
 )
 
+// Built-in datasets policies (DATASETS_DESIGN.md §9.5).
+const (
+	DatasetsFullAccessPolicy = "DatasetsFullAccess"
+	DatasetsReadAllPolicy    = "DatasetsReadAll"
+)
+
+// BaseGroupsOption configures optional parts of the RBAC bootstrap.
+type BaseGroupsOption func(*baseGroupsConfig)
+
+type baseGroupsConfig struct {
+	// datasetsEnabled attaches the datasets built-in policies to the base groups.
+	datasetsEnabled bool
+}
+
+// WithDatasetsEnabled makes the RBAC bootstrap attach the datasets policies when the datasets feature is enabled
+// (RBAC_DESIGN.md §5.4). Without it the bootstrap is unchanged, so installations without datasets get no
+// datasets policies attached.
+func WithDatasetsEnabled(enabled bool) BaseGroupsOption {
+	return func(c *baseGroupsConfig) {
+		c.datasetsEnabled = enabled
+	}
+}
+
+func newBaseGroupsConfig(opts ...BaseGroupsOption) *baseGroupsConfig {
+	cfg := &baseGroupsConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	return cfg
+}
+
 func createGroups(ctx context.Context, authService auth.Service, groups []*model.Group) error {
 	for _, group := range groups {
 		_, err := authService.CreateGroup(ctx, group)
@@ -91,6 +122,18 @@ func CreateRBACBasePolicies(ctx context.Context, authService auth.Service, ts ti
 			DisplayName: "CatalogReadWriteAll",
 			Statement:   auth.MakeStatementForPolicyTypeOrDie("CatalogReadWrite", all),
 		},
+		// Datasets control-plane policies (DATASETS_DESIGN.md §9.5). They are attached to the base groups by
+		// EnsureRBACBaseGroups only when the datasets feature is enabled.
+		{
+			CreatedAt:   ts,
+			DisplayName: DatasetsFullAccessPolicy,
+			Statement:   auth.MakeStatementForPolicyTypeOrDie("DatasetsFull", all),
+		},
+		{
+			CreatedAt:   ts,
+			DisplayName: DatasetsReadAllPolicy,
+			Statement:   auth.MakeStatementForPolicyTypeOrDie("DatasetsRead", all),
+		},
 		{
 			CreatedAt:   ts,
 			DisplayName: "RepoManagementReadAll",
@@ -130,7 +173,9 @@ func attachPolicies(ctx context.Context, authService auth.Service, groupID strin
 	return nil
 }
 
-func EnsureRBACBaseGroups(ctx context.Context, authService auth.Service, ts time.Time) error {
+func EnsureRBACBaseGroups(ctx context.Context, authService auth.Service, ts time.Time, opts ...BaseGroupsOption) error {
+	cfg := newBaseGroupsConfig(opts...)
+
 	err := createGroups(ctx, authService, []*model.Group{
 		{CreatedAt: ts, DisplayName: AdminsGroup},
 		{CreatedAt: ts, DisplayName: SuperUsersGroup},
@@ -146,21 +191,29 @@ func EnsureRBACBaseGroups(ctx context.Context, authService auth.Service, ts time
 		return err
 	}
 
-	err = attachPolicies(ctx, authService, "Admins", []string{"FSFullAccess", "CatalogReadWriteAll", "AuthFullAccess", "RepoManagementFullAccess"})
-	if err != nil {
-		return err
+	attachments := []struct {
+		group    string
+		policies []string
+	}{
+		{AdminsGroup, []string{"FSFullAccess", "CatalogReadWriteAll", "AuthFullAccess", "RepoManagementFullAccess"}},
+		{SuperUsersGroup, []string{"FSFullAccess", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll"}},
+		{DevelopersGroup, []string{"FSReadWriteAll", "PRReadWriteAll", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll"}},
+		{ViewersGroup, []string{"FSReadAll", "CatalogReadAll", "AuthManageOwnCredentials"}},
 	}
-	err = attachPolicies(ctx, authService, "SuperUsers", []string{"FSFullAccess", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll"})
-	if err != nil {
-		return err
+
+	if cfg.datasetsEnabled {
+		// Datasets control-plane access: admins manage every dataset, the other base groups may only list and read.
+		// Data-plane (fs:) access to dataset repositories is granted separately by the datasets service.
+		attachments[0].policies = append(attachments[0].policies, DatasetsFullAccessPolicy)
+		attachments[1].policies = append(attachments[1].policies, DatasetsFullAccessPolicy)
+		attachments[2].policies = append(attachments[2].policies, DatasetsReadAllPolicy)
+		attachments[3].policies = append(attachments[3].policies, DatasetsReadAllPolicy)
 	}
-	err = attachPolicies(ctx, authService, "Developers", []string{"FSReadWriteAll", "PRReadWriteAll", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll"})
-	if err != nil {
-		return err
-	}
-	err = attachPolicies(ctx, authService, "Viewers", []string{"FSReadAll", "CatalogReadAll", "AuthManageOwnCredentials"})
-	if err != nil {
-		return err
+
+	for _, attachment := range attachments {
+		if err := attachPolicies(ctx, authService, attachment.group, attachment.policies); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -168,8 +221,8 @@ func EnsureRBACBaseGroups(ctx context.Context, authService auth.Service, ts time
 
 // CreateRBACBaseGroups creates the RBAC base groups, policies and attachments.
 // It is idempotent and keeps existing policies unchanged.
-func CreateRBACBaseGroups(ctx context.Context, authService auth.Service, ts time.Time) error {
-	return EnsureRBACBaseGroups(ctx, authService, ts)
+func CreateRBACBaseGroups(ctx context.Context, authService auth.Service, ts time.Time, opts ...BaseGroupsOption) error {
+	return EnsureRBACBaseGroups(ctx, authService, ts, opts...)
 }
 
 // CreateAdminUser setup base groups, policies and create admin user
@@ -269,9 +322,9 @@ func CreateInitialAdminUserWithKeys(ctx context.Context, authService auth.Servic
 	return cred, err
 }
 
-func CreateBaseGroups(ctx context.Context, authService auth.Service, ts time.Time) error {
+func CreateBaseGroups(ctx context.Context, authService auth.Service, ts time.Time, opts ...BaseGroupsOption) error {
 	if !authService.IsAdvancedAuth() {
 		return nil
 	}
-	return CreateRBACBaseGroups(ctx, authService, ts)
+	return CreateRBACBaseGroups(ctx, authService, ts, opts...)
 }
