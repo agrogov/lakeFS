@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"errors"
 	"testing"
 )
 
@@ -333,7 +334,7 @@ func TestStringMatchOperators_Evaluate(t *testing.T) {
 			ctx := &ConditionContext{Fields: tt.contextMap}
 
 			t.Run("StringLike", func(t *testing.T) {
-				op := &StringMatchOperator{negate: false}
+				op := &StringMatchOperator{negate: false, match: stringLikeMatch}
 				result, err := op.Evaluate(tt.fields, ctx)
 				if err != nil {
 					t.Fatalf("Unexpected error: %v", err)
@@ -344,7 +345,7 @@ func TestStringMatchOperators_Evaluate(t *testing.T) {
 			})
 
 			t.Run("StringNotLike", func(t *testing.T) {
-				op := &StringMatchOperator{negate: true}
+				op := &StringMatchOperator{negate: true, match: stringLikeMatch}
 				result, err := op.Evaluate(tt.fields, ctx)
 				if err != nil {
 					t.Fatalf("Unexpected error: %v", err)
@@ -362,6 +363,253 @@ func TestStringMatchOperator_NilContext(t *testing.T) {
 	_, err := op.Evaluate(map[string][]string{"field": {"value"}}, nil)
 	if err == nil {
 		t.Error("Expected error for nil context")
+	}
+}
+
+func TestStringEqualsOperators_Evaluate(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name                    string
+		fields                  map[string][]string
+		contextMap              map[string]string
+		expectedStringEquals    bool // Expected result for StringEquals (negate=false)
+		expectedStringNotEquals bool // Expected result for StringNotEquals (negate=true)
+	}{
+		{
+			name:                    "exact match",
+			fields:                  map[string][]string{"catalog:TableName": {"analytics-report"}},
+			contextMap:              map[string]string{"catalog:TableName": "analytics-report"},
+			expectedStringEquals:    true,
+			expectedStringNotEquals: false,
+		},
+		{
+			name:                    "exact no match",
+			fields:                  map[string][]string{"catalog:TableName": {"analytics-report"}},
+			contextMap:              map[string]string{"catalog:TableName": "sales-data"},
+			expectedStringEquals:    false,
+			expectedStringNotEquals: true,
+		},
+		{
+			name:                    "comparison is case sensitive",
+			fields:                  map[string][]string{"catalog:TableName": {"Analytics-Report"}},
+			contextMap:              map[string]string{"catalog:TableName": "analytics-report"},
+			expectedStringEquals:    false,
+			expectedStringNotEquals: true,
+		},
+		{
+			name:                    "comparison is whitespace sensitive",
+			fields:                  map[string][]string{"catalog:TableName": {" analytics-report "}},
+			contextMap:              map[string]string{"catalog:TableName": "analytics-report"},
+			expectedStringEquals:    false,
+			expectedStringNotEquals: true,
+		},
+		{
+			name:                    "wildcards are literal - no match",
+			fields:                  map[string][]string{"catalog:TableName": {"analytics-*"}},
+			contextMap:              map[string]string{"catalog:TableName": "analytics-report"},
+			expectedStringEquals:    false,
+			expectedStringNotEquals: true,
+		},
+		{
+			name:                    "wildcards are literal - exact match",
+			fields:                  map[string][]string{"catalog:TableName": {"analytics-*"}},
+			contextMap:              map[string]string{"catalog:TableName": "analytics-*"},
+			expectedStringEquals:    true,
+			expectedStringNotEquals: false,
+		},
+		{
+			name:                    "question mark is literal",
+			fields:                  map[string][]string{"catalog:TableName": {"table-?"}},
+			contextMap:              map[string]string{"catalog:TableName": "table-A"},
+			expectedStringEquals:    false,
+			expectedStringNotEquals: true,
+		},
+		{
+			name:                    "multiple values OR logic - first matches",
+			fields:                  map[string][]string{"catalog:TableName": {"analytics-report", "sales-data"}},
+			contextMap:              map[string]string{"catalog:TableName": "analytics-report"},
+			expectedStringEquals:    true,
+			expectedStringNotEquals: false,
+		},
+		{
+			name:                    "multiple values OR logic - second matches",
+			fields:                  map[string][]string{"catalog:TableName": {"analytics-report", "sales-data"}},
+			contextMap:              map[string]string{"catalog:TableName": "sales-data"},
+			expectedStringEquals:    true,
+			expectedStringNotEquals: false,
+		},
+		{
+			name:                    "multiple values OR logic - none match",
+			fields:                  map[string][]string{"catalog:TableName": {"analytics-report", "sales-data"}},
+			contextMap:              map[string]string{"catalog:TableName": "marketing-data"},
+			expectedStringEquals:    false,
+			expectedStringNotEquals: true,
+		},
+		{
+			name:                    "missing field in context",
+			fields:                  map[string][]string{"catalog:TableName": {"analytics-report"}},
+			contextMap:              map[string]string{"catalog:ViewName": "analytics-report"},
+			expectedStringEquals:    false,
+			expectedStringNotEquals: false,
+		},
+		{
+			name:                    "multiple fields AND logic - both match",
+			fields:                  map[string][]string{"catalog:TableName": {"analytics-report"}, "catalog:repo": {"my-repo"}},
+			contextMap:              map[string]string{"catalog:TableName": "analytics-report", "catalog:repo": "my-repo"},
+			expectedStringEquals:    true,
+			expectedStringNotEquals: false,
+		},
+		{
+			name:                    "multiple fields AND logic - one no match",
+			fields:                  map[string][]string{"catalog:TableName": {"analytics-report"}, "catalog:repo": {"my-repo"}},
+			contextMap:              map[string]string{"catalog:TableName": "analytics-report", "catalog:repo": "other-repo"},
+			expectedStringEquals:    false,
+			expectedStringNotEquals: false,
+		},
+		{
+			name:                    "empty fields - always pass",
+			fields:                  map[string][]string{},
+			contextMap:              map[string]string{"catalog:TableName": "anything"},
+			expectedStringEquals:    true,
+			expectedStringNotEquals: true,
+		},
+		{
+			name:                    "empty values list for field",
+			fields:                  map[string][]string{"catalog:TableName": {}},
+			contextMap:              map[string]string{"catalog:TableName": "anything"},
+			expectedStringEquals:    false,
+			expectedStringNotEquals: true,
+		},
+		{
+			name:                    "empty context value matches empty pattern",
+			fields:                  map[string][]string{"catalog:TableName": {""}},
+			contextMap:              map[string]string{"catalog:TableName": ""},
+			expectedStringEquals:    true,
+			expectedStringNotEquals: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := &ConditionContext{Fields: tt.contextMap}
+
+			t.Run("StringEquals", func(t *testing.T) {
+				op, err := OperatorFactory(OperatorNameStringEquals)
+				if err != nil {
+					t.Fatalf("Unexpected factory error: %v", err)
+				}
+				result, err := op.Evaluate(tt.fields, ctx)
+				if err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+				if result != tt.expectedStringEquals {
+					t.Errorf("Expected %v but got %v", tt.expectedStringEquals, result)
+				}
+			})
+
+			t.Run("StringNotEquals", func(t *testing.T) {
+				op, err := OperatorFactory(OperatorNameStringNotEquals)
+				if err != nil {
+					t.Fatalf("Unexpected factory error: %v", err)
+				}
+				result, err := op.Evaluate(tt.fields, ctx)
+				if err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+				if result != tt.expectedStringNotEquals {
+					t.Errorf("Expected %v but got %v", tt.expectedStringNotEquals, result)
+				}
+			})
+		})
+	}
+}
+
+func TestStringMatchOperator_Validate(t *testing.T) {
+	t.Parallel()
+	operators := []string{
+		OperatorNameStringLike,
+		OperatorNameStringNotLike,
+		OperatorNameStringEquals,
+		OperatorNameStringNotEquals,
+	}
+	for _, name := range operators {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			op, err := OperatorFactory(name)
+			if err != nil {
+				t.Fatalf("Unexpected factory error: %v", err)
+			}
+
+			t.Run("valid fields", func(t *testing.T) {
+				t.Parallel()
+				fields := map[string][]string{"catalog:TableName": {"analytics-report", "analytics-*", ""}}
+				if err := op.Validate(fields); err != nil {
+					t.Errorf("Unexpected validation error: %v", err)
+				}
+			})
+
+			t.Run("empty field name", func(t *testing.T) {
+				t.Parallel()
+				fields := map[string][]string{"": {"analytics-report"}}
+				err := op.Validate(fields)
+				if !errors.Is(err, ErrMissingFieldName) {
+					t.Errorf("Expected %v, got %v", ErrMissingFieldName, err)
+				}
+			})
+
+			t.Run("no fields", func(t *testing.T) {
+				t.Parallel()
+				if err := op.Validate(map[string][]string{}); err != nil {
+					t.Errorf("Unexpected validation error: %v", err)
+				}
+			})
+		})
+	}
+}
+
+func TestOperatorFactory_StringOperators(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name          string
+		operatorName  string
+		pattern       string
+		value         string
+		expectedMatch bool
+	}{
+		{name: "StringLike wildcard", operatorName: OperatorNameStringLike, pattern: "analytics-*", value: "analytics-report", expectedMatch: true},
+		{name: "StringNotLike wildcard", operatorName: OperatorNameStringNotLike, pattern: "analytics-*", value: "analytics-report", expectedMatch: false},
+		{name: "StringEquals exact", operatorName: OperatorNameStringEquals, pattern: "analytics-report", value: "analytics-report", expectedMatch: true},
+		{name: "StringEquals does not wildcard", operatorName: OperatorNameStringEquals, pattern: "analytics-*", value: "analytics-report", expectedMatch: false},
+		{name: "StringNotEquals exact", operatorName: OperatorNameStringNotEquals, pattern: "analytics-report", value: "sales-data", expectedMatch: true},
+		{name: "StringNotEquals does not wildcard", operatorName: OperatorNameStringNotEquals, pattern: "analytics-*", value: "analytics-report", expectedMatch: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			op, err := OperatorFactory(tt.operatorName)
+			if err != nil {
+				t.Fatalf("Unexpected factory error: %v", err)
+			}
+			result, err := op.Evaluate(
+				map[string][]string{"catalog:TableName": {tt.pattern}},
+				&ConditionContext{Fields: map[string]string{"catalog:TableName": tt.value}},
+			)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if result != tt.expectedMatch {
+				t.Errorf("Expected %v but got %v", tt.expectedMatch, result)
+			}
+		})
+	}
+}
+
+func TestOperatorFactory_UnsupportedOperator(t *testing.T) {
+	t.Parallel()
+	_, err := OperatorFactory("NotAnOperator")
+	if !errors.Is(err, ErrUnsupportedConditionOperator) {
+		t.Errorf("Expected %v, got %v", ErrUnsupportedConditionOperator, err)
 	}
 }
 
@@ -462,6 +710,44 @@ func TestEvaluateConditions(t *testing.T) {
 			name:       "StringNotLike condition - no match allows",
 			conditions: map[string]map[string][]string{"StringNotLike": {"catalog:TableName": {"temp-*"}}},
 			contextMap: map[string]string{"catalog:TableName": "analytics-report"},
+			shouldErr:  false,
+			expected:   true,
+		},
+		{
+			name:       "StringNotEquals condition - match filters out",
+			conditions: map[string]map[string][]string{"StringNotEquals": {"catalog:TableName": {"temp-scratch"}}},
+			contextMap: map[string]string{"catalog:TableName": "temp-scratch"},
+			shouldErr:  false,
+			expected:   false,
+		},
+		{
+			name:       "StringNotEquals condition - no match allows",
+			conditions: map[string]map[string][]string{"StringNotEquals": {"catalog:TableName": {"temp-scratch"}}},
+			contextMap: map[string]string{"catalog:TableName": "analytics-report"},
+			shouldErr:  false,
+			expected:   true,
+		},
+		{
+			name:       "StringEquals condition - match",
+			conditions: map[string]map[string][]string{"StringEquals": {"catalog:TableName": {"analytics-report"}}},
+			contextMap: map[string]string{"catalog:TableName": "analytics-report"},
+			shouldErr:  false,
+			expected:   true,
+		},
+		{
+			name:       "StringEquals condition - wildcard is literal",
+			conditions: map[string]map[string][]string{"StringEquals": {"catalog:TableName": {"analytics-*"}}},
+			contextMap: map[string]string{"catalog:TableName": "analytics-report"},
+			shouldErr:  false,
+			expected:   false,
+		},
+		{
+			name: "IpAddress AND StringNotEquals - both pass",
+			conditions: map[string]map[string][]string{
+				"IpAddress":       {"SourceIp": {"10.0.0.0/8"}},
+				"StringNotEquals": {"catalog:TableName": {"temp-scratch"}},
+			},
+			contextMap: map[string]string{"SourceIp": "10.1.2.3", "catalog:TableName": "analytics-report"},
 			shouldErr:  false,
 			expected:   true,
 		},
