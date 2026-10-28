@@ -180,15 +180,29 @@ const LoginPage = () => {
     const { response, error, loading } = useAPI(() => setup.getState());
     const setupResponse = response as SetupResponse | null;
     const { redirectedFromQuery, next, cleanUrl } = getLoginIntent(location);
-    const autoRedirect = shouldAutoRedirect(setupResponse?.login_config, location.search);
+    // Latch the decision: once the redirect starts, the cooldown timestamp makes shouldAutoRedirect()
+    // false, and any re-render before the browser leaves the page would otherwise flash the login form.
+    const [redirecting, setRedirecting] = useState(false);
+    const autoRedirect = redirecting || shouldAutoRedirect(setupResponse?.login_config, location.search);
 
     useEffect(() => {
         const cfg = setupResponse?.login_config;
-        if (!autoRedirect || !cfg?.fallback_login_url) return;
+        if (redirecting || !autoRedirect || !cfg?.fallback_login_url) return;
+        setRedirecting(true);
         window.sessionStorage.setItem(SSO_AUTO_REDIRECT_KEY, String(Date.now()));
         window.sessionStorage.setItem(LAKEFS_POST_LOGIN_NEXT, next);
         window.location.href = withNext(cfg.fallback_login_url, next);
-    }, [autoRedirect, setupResponse, next]);
+    }, [redirecting, autoRedirect, setupResponse, next]);
+
+    // Coming back from the IdP via the back button restores this page from bfcache mid-redirect;
+    // drop the latch so the (cooled-down) SSO card shows instead of a spinner.
+    useEffect(() => {
+        const onPageShow = (e: PageTransitionEvent) => {
+            if (e.persisted) setRedirecting(false);
+        };
+        window.addEventListener('pageshow', onPageShow);
+        return () => window.removeEventListener('pageshow', onPageShow);
+    }, []);
 
     // Persist next for post-login redirect
     if (next && next.startsWith('/')) window.sessionStorage.setItem(LAKEFS_POST_LOGIN_NEXT, next);
