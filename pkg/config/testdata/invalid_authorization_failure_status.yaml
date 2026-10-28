@@ -1,0 +1,22 @@
+---
+logging:
+  format: text
+  level: NONE
+  output: "-"
+
+database:
+  type: postgres
+  postgres:
+    connection_string: test:///dev/null
+
+auth:
+  encrypt:
+    secret_key: "required in config"
+  # Not a valid authorization failure status: a typo such as this would make authorization
+  # failures return a "success" status with an error body.
+  authorization_failure_status: 200
+
+blockstore:
+  type: local
+  local:
+    path: /tmp
