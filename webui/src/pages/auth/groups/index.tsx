@@ -81,7 +81,8 @@ const ACLPermission: React.FC<ACLPermissionButtonProps> = ({ initialValue, onSel
             <Dropdown.Toggle variant={variant} title={title}>
                 {value}
             </Dropdown.Toggle>
-            <Dropdown.Menu>
+            {/* fixed positioning: the table cell clips overflow (text-truncate), which hid the menu */}
+            <Dropdown.Menu popperConfig={{ strategy: 'fixed' }}>
                 {Object.entries(permissions).map(([key, text]) => (
                     <Dropdown.Item key={key} eventKey={key}>
                         <div>
