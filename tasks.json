@@ -1,0 +1,198 @@
+{
+  "project": "lakeFS policy RBAC (RBAC_DESIGN.md)",
+  "design_doc": "RBAC_DESIGN.md",
+  "branch": "feature/azure-entra-sso-apache",
+  "board_rules": [
+    "Max 5 tasks in_progress at once.",
+    "Parallelism only between tasks with disjoint files_expected and satisfied depends_on.",
+    "One commit per implementable task, message format: '<task-id>: <short description>'.",
+    "Definition of done per task: task-scoped tests pass, lint clean, diff limited to files_expected, evidence recorded in the task's 'validation' field.",
+    "License guard (RBAC_DESIGN §2): never copy from upstream commits at/after 358544dd7 (BSL)."
+  ],
+  "statuses": ["backlog", "ready", "in_progress", "in_review", "done"],
+  "work_waves": {
+    "comment": "Suggested scheduling; workers may pick any 'ready' task while respecting the max-5 cap.",
+    "wave1": ["A1", "A2", "A3", "A4", "A5"],
+    "wave2": ["A6", "B1", "B2", "B4", "C1"],
+    "wave3": ["B3", "B5"],
+    "wave4": ["B6", "C2", "C3", "C4"],
+    "wave5": ["C5"]
+  },
+  "tasks": [
+    {
+      "id": "A1",
+      "type": "implement",
+      "title": "ACL/template fixes: catalog:* in AllAccess; PR/Catalog grants in ACL Read/Write/Super",
+      "refs": ["§3.3 #1 #2", "§4.5 #1"],
+      "status": "ready",
+      "depends_on": [],
+      "files_expected": ["pkg/auth/base.go", "contrib/auth/acl/permission.go", "contrib/auth/acl/permission_test.go"],
+      "validation": "go test ./contrib/auth/acl/... ./pkg/auth/..."
+    },
+    {
+      "id": "A2",
+      "type": "implement",
+      "title": "Idempotent RBAC bootstrap in pkg/auth/setup (ErrAlreadyExists=success, EnsureRBACBaseGroups, never overwrite edited built-ins)",
+      "refs": ["§4.3"],
+      "status": "ready",
+      "depends_on": [],
+      "files_expected": ["pkg/auth/setup/setup.go", "pkg/auth/setup/setup_test.go"],
+      "validation": "go test ./pkg/auth/setup/... (run-twice + edited-policy cases)"
+    },
+    {
+      "id": "A3",
+      "type": "implement",
+      "title": "Cache invalidation primitives: pkg/cache Delete/Purge; auth.Cache InvalidateUser/InvalidateUserPolicies/PurgePolicies",
+      "refs": ["§4.7"],
+      "status": "ready",
+      "depends_on": [],
+      "notes": "pkg/cache.Cache has no Delete/Purge today; also fixes mockCache in pkg/graveler/settings/manager_test.go. UserKey.id must be exported for out-of-package invalidation.",
+      "files_expected": ["pkg/cache/cache.go", "pkg/cache/no_cache.go", "pkg/auth/cache.go", "pkg/auth/service.go", "pkg/graveler/settings/manager_test.go", "pkg/auth/cache_test.go"],
+      "validation": "go test ./pkg/cache/... ./pkg/auth/... ./pkg/graveler/settings/..."
+    },
+    {
+      "id": "A4",
+      "type": "implement",
+      "title": "Route lakefs setup and superuser through authServiceBuilder (fixes lakefs-sso setup/superuser failure)",
+      "refs": ["§4.2"],
+      "status": "ready",
+      "depends_on": [],
+      "files_expected": ["cmd/lakefs/cmd/setup.go", "cmd/lakefs/cmd/superuser.go"],
+      "validation": "go test ./cmd/lakefs/cmd/... ; manual: lakefs-sso setup with rbac=internal"
+    },
+    {
+      "id": "A5",
+      "type": "implement",
+      "title": "SetGroupACL returns 409 when RBAC mode is not simplified (protects custom policies)",
+      "refs": ["§3.3 #4", "§4.5 #3"],
+      "status": "ready",
+      "depends_on": [],
+      "files_expected": ["pkg/api/controller.go", "pkg/api/controller_test.go"],
+      "validation": "go test -run TestSetGroupACL ./pkg/api/..."
+    },
+    {
+      "id": "A6",
+      "type": "implement",
+      "title": "webui simplified mode: 'Custom (policies)' read-only badge for multi-policy groups instead of empty dropdown",
+      "refs": ["§3.3 #5", "§4.5 #4"],
+      "status": "backlog",
+      "depends_on": [],
+      "notes": "Needs NoAcl signal from the 404 body of GetGroupACL ('Multiple policies attached').",
+      "files_expected": ["webui/src/pages/auth/groups/index.tsx"],
+      "validation": "cd webui && npm run lint && npm test"
+    },
+    {
+      "id": "B1",
+      "type": "implement",
+      "title": "ACL service profile API (UpdateUserProfile, UpdateUserFriendlyName) + wire cache invalidation into group/policy mutations; SSO uses service API, delete kvProfileStore; EnsureUser GetUser-first",
+      "refs": ["§1.1 #1 #5", "§4.6", "§4.7"],
+      "status": "backlog",
+      "depends_on": ["A3"],
+      "files_expected": ["contrib/auth/acl/service.go", "contrib/auth/acl/service_test.go", "pkg/sso/user.go", "pkg/sso/oidc_provider.go", "pkg/sso/authentication_builder.go"],
+      "validation": "go test ./contrib/auth/acl/... ./pkg/sso/..."
+    },
+    {
+      "id": "B2",
+      "type": "implement",
+      "title": "pkg/sso/rbac_bootstrap.go: EnsureRBACBase + rbac-bootstrap-version key in auth partition",
+      "refs": ["§4.3"],
+      "status": "backlog",
+      "depends_on": ["A2", "A3"],
+      "files_expected": ["pkg/sso/rbac_bootstrap.go", "pkg/sso/rbac_bootstrap_test.go"],
+      "validation": "go test ./pkg/sso/... (bootstrap twice + version bump)"
+    },
+    {
+      "id": "B3",
+      "type": "implement",
+      "title": "auth_builder: resolveAuthMode (none/simplified/internal, reject external w/ SSO), rbacAuthService wrapper, bootstrap order, break-glass into Admins",
+      "refs": ["§4.1", "§4.2"],
+      "status": "backlog",
+      "depends_on": ["A2", "B2", "B4"],
+      "files_expected": ["pkg/sso/auth_builder.go", "pkg/sso/auth_builder_test.go"],
+      "validation": "go test ./pkg/sso/... (resolveAuthMode table)"
+    },
+    {
+      "id": "B4",
+      "type": "implement",
+      "title": "contrib/auth/acl/reconcile.go: ReconcileACLPolicies — recompute stored ACL policy statements from templates, once per template version",
+      "refs": ["§3.3 #3", "§4.5 #2"],
+      "status": "backlog",
+      "depends_on": ["A1"],
+      "notes": "Standalone new file; startup wiring happens in B3 (auth_builder).",
+      "files_expected": ["contrib/auth/acl/reconcile.go", "contrib/auth/acl/reconcile_test.go"],
+      "validation": "go test ./contrib/auth/acl/... (before/after template change)"
+    },
+    {
+      "id": "B5",
+      "type": "implement",
+      "title": "lakefs-sso rbac-migrate command: dry-run default, --yes to apply, --cleanup, idempotent, prints sso.group_mapping rewrites + rollback warning",
+      "refs": ["§4.4"],
+      "status": "backlog",
+      "depends_on": ["A2"],
+      "files_expected": ["pkg/sso/rbac_migrate.go", "pkg/sso/rbac_migrate_test.go", "cmd/lakefs-sso/main.go"],
+      "validation": "go test ./pkg/sso/... (plan/apply/re-run no-op on kv/mem)"
+    },
+    {
+      "id": "B6",
+      "type": "docs",
+      "title": "config.example.yaml rbac: internal + CHANGELOG_SSO.md migration steps (simplified→internal, rollback)",
+      "refs": ["§4.9", "§6"],
+      "status": "backlog",
+      "depends_on": ["B3", "B5"],
+      "files_expected": ["cmd/lakefs-sso/config.example.yaml", "CHANGELOG_SSO.md"],
+      "validation": "manual review; links/commands resolve"
+    },
+    {
+      "id": "C1",
+      "type": "implement",
+      "title": "StringEquals/StringNotEquals condition operators (OperatorFactory + StringMatchOperator reuse)",
+      "refs": ["§5.1"],
+      "status": "backlog",
+      "depends_on": [],
+      "files_expected": ["pkg/auth/condition.go", "pkg/auth/condition_test.go"],
+      "validation": "go test ./pkg/auth/..."
+    },
+    {
+      "id": "C2",
+      "type": "implement",
+      "title": "AuthorizationRequest.Fields lazy provider + lakefs:RepositoryMetadata/<k> conditions (API authorizeCallback + gateway handler), memoised per request",
+      "refs": ["§5.2 phase 1"],
+      "status": "backlog",
+      "depends_on": ["A5", "B1"],
+      "files_expected": ["pkg/auth/service.go", "pkg/auth/authorization_request.gen.go or wrappers", "pkg/api/controller.go", "pkg/gateway/handler.go"],
+      "validation": "go test ./pkg/auth/... ./pkg/api/... ./pkg/gateway/... ; missing key => deny"
+    },
+    {
+      "id": "C3",
+      "type": "implement",
+      "title": "ListBranches filtered by policy (repo-ARN grant => all; else per-branch CheckPermission; else 401)",
+      "refs": ["§5.3"],
+      "status": "backlog",
+      "depends_on": ["A5"],
+      "files_expected": ["pkg/api/controller.go", "pkg/api/controller_test.go"],
+      "validation": "go test -run TestListBranches ./pkg/api/... (explicit deny hides branch)"
+    },
+    {
+      "id": "C4",
+      "type": "implement",
+      "title": "datasets action service in permissions + Datasets* built-in policies; ARN arn:lakefs:datasets:::dataset/<name>",
+      "refs": ["§5.4", "DATASETS_DESIGN §9.6"],
+      "status": "backlog",
+      "depends_on": ["A1", "A2"],
+      "notes": "Blocked on datasets feature landing; agree on ARN prefix earlier via design note.",
+      "files_expected": ["pkg/permissions/actions.go", "pkg/auth/base.go", "pkg/auth/setup/setup.go"],
+      "validation": "go test ./pkg/permissions/... ./pkg/auth/setup/..."
+    },
+    {
+      "id": "C5",
+      "type": "implement",
+      "title": "Authorization failures: fix Allowed=false-without-error 500 => 401; opt-in auth.authorization_failure_status: 403 (default stays 401)",
+      "refs": ["§5.5"],
+      "status": "backlog",
+      "depends_on": ["C3"],
+      "notes": "Default must stay 401: webui/SDKs map 401-without-auth-message to AuthorizationError; swagger has no 403 on these endpoints.",
+      "files_expected": ["pkg/config/config.go", "pkg/api/controller.go", "api/swagger.yml (only if 403 documented)"],
+      "validation": "go test ./pkg/api/... ; make validate-api if swagger touched"
+    }
+  ]
+}

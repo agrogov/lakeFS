@@ -1,0 +1,41 @@
+# agent-progress — RBAC kanban management (RBAC_DESIGN.md)
+
+Role: kanban management only. This agent plans, links, tracks; it does NOT implement.
+Workers pick tasks from tasks.json. Max 5 in_progress. Parallel only when depends_on is
+satisfied AND files_expected are disjoint.
+
+## Board layout (17 tasks)
+Phase A (safety fixes, shippable in both simplified and internal modes):
+  A1 templates | A2 idempotent bootstrap | A3 cache primitives | A4 builder routing | A5 ACL-set gate | A6 webui badge
+Phase B (internal mode):
+  B2 bootstrap -> B3 auth_builder ; B1 profile (needs A3) ; B4 reconcile (needs A1) ; B5 rbac-migrate (needs A2) ; B6 docs (needs B3,B5)
+Option 3 (gap fill, after Option 2):
+  C1 conditions | C2 metadata ABAC | C3 branch filtering | C4 datasets actions | C5 403 opt-in
+
+## Dependency edges (blocking)
+A3 -> B1, B2
+A2 -> B2, B3, B5, C4
+A1 -> B4, C4
+B2,B4 -> B3
+B3,B5 -> B6
+A5,B1 -> C2
+A5 -> C3
+C3 -> C5
+(no deps: A4, A6, C1)
+
+## Wave plan (<=5 concurrent)
+W1: A1 A2 A3 A4 A5        W2: A6 B1 B2 B4 C1
+W3: B3 B5                 W4: B6 C2 C3 C4    W5: C5
+
+## File-collision watch (do not run these together)
+- controller.go: A5, C2, C3, C5 (serialized via deps)
+- pkg/auth/service.go: A3 (UserKey), C2 — C2 already depends on B1/A5; add review note if C2 starts before A3 is merged
+- pkg/sso/*: B1, B2, B3, B5 — B3 edits auth_builder.go only (wires B2/B4); B5 stays in rbac_migrate.go + cmd
+- pkg/auth/base.go: A1, C4 (C4 depends on A1)
+- setup.go (auth): A2, C4 (C4 depends on A2)
+
+## Status
+- All tasks created; wave-1 tasks A1-A5 marked ready.
+- No implementation done by this agent (earlier trial edits were reverted; HEAD = 95dceafc2).
+- Open design questions from RBAC_DESIGN §9 still unanswered (rbac-migrate merge strategy,
+  break-glass membership, cross-replica TTL) — do not block wave-1 tasks on them.
