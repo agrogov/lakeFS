@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -41,6 +42,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/config"
 	"github.com/treeverse/lakefs/pkg/graveler"
 	"github.com/treeverse/lakefs/pkg/httputil"
+	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/permissions"
 	"github.com/treeverse/lakefs/pkg/stats"
 	"github.com/treeverse/lakefs/pkg/testutil"
@@ -1625,6 +1627,177 @@ func TestController_ListBranchesHandler(t *testing.T) {
 			t.Fatal("expected error calling list branches on repo that doesnt exist")
 		}
 	})
+}
+
+// policyAuthService is an auth.Service with policy-based authorization, used by
+// controller policy-filtering tests that do not need a full ACL service.
+type policyAuthService struct {
+	auth.Service
+	policies map[string][]*model.Policy
+}
+
+func (s *policyAuthService) ListEffectivePolicies(_ context.Context, username string, _ *model.PaginationParams) ([]*model.Policy, *model.Paginator, error) {
+	policies := s.policies[username]
+	return policies, &model.Paginator{Amount: len(policies)}, nil
+}
+
+func (s *policyAuthService) Authorize(ctx context.Context, req *auth.AuthorizationRequest) (*auth.AuthorizationResponse, error) {
+	missing := &auth.MissingPermissions{}
+	if auth.CheckPermissions(ctx, req.RequiredPermissions, req.Username, s.policies[req.Username], missing) != auth.CheckAllow {
+		return &auth.AuthorizationResponse{
+			Allowed: false,
+			Error:   fmt.Errorf("%w: %s", auth.ErrInsufficientPermissions, missing.String()),
+		}, nil
+	}
+	return &auth.AuthorizationResponse{Allowed: true}, nil
+}
+
+func listBranchesAsUser(t *testing.T, controller *api.Controller, repository, username string) (int, []string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/repositories/"+repository+"/branches", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &model.User{Username: username}))
+	recorder := httptest.NewRecorder()
+	controller.ListBranches(recorder, req, repository, apigen.ListBranchesParams{
+		Amount: apiutil.Ptr(apigen.PaginationAmount(-1)),
+	})
+	if recorder.Code != http.StatusOK {
+		return recorder.Code, nil
+	}
+	var result apigen.RefList
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &result))
+	ids := make([]string, 0, len(result.Results))
+	for _, ref := range result.Results {
+		ids = append(ids, ref.Id)
+	}
+	sort.Strings(ids)
+	return recorder.Code, ids
+}
+
+func TestListBranchesPolicyFilter(t *testing.T) {
+	_, deps := setupHandler(t)
+	ctx := t.Context()
+	repo := testUniqueRepoName()
+	_, err := deps.catalog.CreateRepository(ctx, repo, config.SingleBlockstoreID, onBlock(deps, "foo1"), "main", false)
+	testutil.Must(t, err)
+	testutil.Must(t, deps.catalog.CreateEntry(ctx, repo, "main", catalog.DBEntry{Path: "file"}))
+	_, err = deps.catalog.Commit(ctx, repo, "main", "initial commit", "tester", nil, nil, nil, false)
+	testutil.Must(t, err)
+	for _, branch := range []string{"feature", "secret", "other"} {
+		_, err := deps.catalog.CreateBranch(ctx, repo, branch, "main")
+		testutil.MustDo(t, "create branch "+branch, err)
+	}
+
+	policies := map[string][]*model.Policy{
+		"repo-reader": {
+			{DisplayName: "repo-reader-policy", Statement: model.Statements{{
+				Effect:   model.StatementEffectAllow,
+				Action:   []string{permissions.ListBranchesAction},
+				Resource: permissions.RepoArn(repo),
+			}}},
+		},
+		"branch-reader": {
+			{DisplayName: "branch-reader-policy", Statement: model.Statements{{
+				Effect:   model.StatementEffectAllow,
+				Action:   []string{permissions.ListBranchesAction},
+				Resource: permissions.BranchArn(repo, "feature"),
+			}}},
+		},
+		"branch-wildcard": {
+			{DisplayName: "branch-wildcard-policy", Statement: model.Statements{
+				{
+					Effect:   model.StatementEffectAllow,
+					Action:   []string{permissions.ListBranchesAction},
+					Resource: permissions.BranchArn(repo, "*"),
+				},
+				{
+					Effect:   model.StatementEffectDeny,
+					Action:   []string{permissions.ListBranchesAction},
+					Resource: permissions.BranchArn(repo, "secret"),
+				},
+			}},
+		},
+		"repo-reader-with-branch-deny": {
+			{DisplayName: "repo-reader-branch-deny-policy", Statement: model.Statements{
+				{
+					Effect:   model.StatementEffectAllow,
+					Action:   []string{permissions.ListBranchesAction},
+					Resource: permissions.RepoArn(repo),
+				},
+				{
+					Effect:   model.StatementEffectDeny,
+					Action:   []string{permissions.ListBranchesAction},
+					Resource: permissions.BranchArn(repo, "secret"),
+				},
+			}},
+		},
+		"other-repo-branch-reader": {
+			{DisplayName: "other-repo-branch-reader-policy", Statement: model.Statements{{
+				Effect:   model.StatementEffectAllow,
+				Action:   []string{permissions.ListBranchesAction},
+				Resource: permissions.BranchArn("other-repo", "main"),
+			}}},
+		},
+	}
+
+	controller := &api.Controller{
+		Catalog:   deps.catalog,
+		Auth:      &policyAuthService{Service: deps.authService, policies: policies},
+		Logger:    logging.FromContext(ctx),
+		Collector: deps.collector,
+	}
+
+	allBranches := []string{"feature", "main", "other", "secret"}
+	tests := []struct {
+		name         string
+		user         string
+		wantStatus   int
+		wantBranches []string
+	}{
+		{
+			name:         "repo scoped user sees all branches",
+			user:         "repo-reader",
+			wantStatus:   http.StatusOK,
+			wantBranches: allBranches,
+		},
+		{
+			name:         "branch scoped user sees only granted branches",
+			user:         "branch-reader",
+			wantStatus:   http.StatusOK,
+			wantBranches: []string{"feature"},
+		},
+		{
+			name:         "explicit branch deny hides branch",
+			user:         "branch-wildcard",
+			wantStatus:   http.StatusOK,
+			wantBranches: []string{"feature", "main", "other"},
+		},
+		{
+			name:         "explicit branch deny hides branch from repo scoped user",
+			user:         "repo-reader-with-branch-deny",
+			wantStatus:   http.StatusOK,
+			wantBranches: []string{"feature", "main", "other"},
+		},
+		{
+			name:       "branch grant on another repository gets unauthorized",
+			user:       "other-repo-branch-reader",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "user without list permission gets unauthorized",
+			user:       "no-permission",
+			wantStatus: http.StatusUnauthorized,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, branches := listBranchesAsUser(t, controller, repo, tt.user)
+			require.Equal(t, tt.wantStatus, status)
+			if tt.wantStatus == http.StatusOK {
+				require.Equal(t, tt.wantBranches, branches)
+			}
+		})
+	}
 }
 
 func TestController_ListTagsHandler(t *testing.T) {
