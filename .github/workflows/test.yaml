@@ -5,6 +5,26 @@ on:
       - master
   pull_request:
 jobs:
+  license-base:
+    name: Check licence base
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check-out code
+        uses: actions/checkout@v6
+        with:
+          # The guard compares HEAD against the upstream BSL 1.1 relicense commit,
+          # which only exists in the treeverse history, not in this fork's origin.
+          # A full clone keeps the ancestry check conclusive (see the guard script).
+          fetch-depth: 0
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/treeverse/lakeFS.git ||
+            git remote set-url upstream https://github.com/treeverse/lakeFS.git
+      - name: Self-test the guard
+        run: bash scripts/check-license-base.sh --self-test
+      - name: Check that no BSL 1.1 upstream commit is an ancestor
+        run: bash scripts/check-license-base.sh
+
   validator:
     name: Run Linters and Checkers
     runs-on: ubuntu-24.04-8-cores
