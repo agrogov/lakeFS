@@ -6,6 +6,26 @@ the upstream `CHANGELOG.md` so upstream merges stay conflict-free.
 
 ## Unreleased
 
+:new: What's new — policy RBAC (`auth.ui_config.rbac: internal`):
+
+- **Opt-in internal mode.** `lakefs-sso` can now run on policy-based RBAC instead of ACL mode. Set `auth.ui_config.rbac: internal` to get the full Users / Groups / Policies UI and policy scoping by repository, branch, path and source IP, including `${user}` self-service and audit request logging. The backend is the same ACL KV service, only the capability flag differs, so no data migration of users or credentials is needed. The default stays `simplified`; an unset value and `none` also resolve to `simplified`, and `external` is rejected with a warning because SSO has no remote auth service.
+- **Idempotent bootstrap.** At startup in `internal` mode the RBAC base groups (`Admins`, `SuperUsers`, `Developers`, `Viewers`), their policies and attachments are created only when missing. Existing policies are never overwritten, so edited built-ins survive restarts. The break-glass admin is added to `Admins`.
+- **`lakefs-sso rbac-migrate`.** New command that moves a `simplified` installation to `internal`. It is a dry run by default, needs `--yes` to apply, accepts `--cleanup`, and is idempotent (re-runs are no-ops).
+
+Migrating `simplified` → `internal`:
+
+1. Run `lakefs-sso rbac-migrate` on the running (still `simplified`) installation and review the printed plan. It attaches `FSFullAccess`, `CatalogReadWriteAll`, `AuthFullAccess`, `RepoManagementFullAccess` and `PRReadWriteAll` to `Admins` and detaches the old `ACL(_-_)Admins` policy; copies members `Supers` → `SuperUsers`, `Writers` → `Developers`, `Readers` → `Viewers`; leaves custom groups untouched (their `ACL(_-_)<group>` policies are kept and remain valid, editable policies).
+2. Run `lakefs-sso rbac-migrate --yes` to apply.
+3. Update `sso.group_mapping` in the config with the rewrites the command prints (e.g. `Writers` → `Developers`, `Readers` → `Viewers`, `Supers` → `SuperUsers`). This step is required: without it the next login's group sync re-adds users to the legacy groups and the migration is undone.
+4. Set `auth.ui_config.rbac: internal` and restart `lakefs-sso`.
+5. Verify that the Policies pages are visible and that an SSO login lands the user in the expected RBAC group.
+
+Rollback and notes:
+
+- Rollback is `auth.ui_config.rbac: simplified` plus a restart. It is lossless as long as the migration was applied **without** `--cleanup`: the legacy groups and ACL policies are then still present. `--cleanup` deletes the emptied `Supers` / `Writers` / `Readers` groups and their `ACL(_-_)<group>` policies, after which a rollback needs the members re-added (for example through `sso.group_mapping`).
+- After a rollback, a group that holds more than one policy shows no ACL in the simplified UI (RBAC_DESIGN.md §3.3 #5). `rbac-migrate` prints the same warning.
+- The authorization cache is per process (`auth.cache.ttl`, default 20s plus jitter). Policy revocations apply immediately on the replica that handled the request, but other replicas converge only within the TTL. For multi-replica deployments use `auth.cache.ttl: 5s` (RBAC_DESIGN.md §4.7); see `cmd/lakefs-sso/config.example.yaml`.
+
 :bug: Bugs fixed:
 
 - First SSO login now receives its groups. The user is provisioned in the OIDC callback before group sync runs; previously sync failed with "not found" and the user had no permissions until logging in a second time.
