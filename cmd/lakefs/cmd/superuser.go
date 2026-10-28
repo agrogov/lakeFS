@@ -70,7 +70,7 @@ If the wrong user or credentials were chosen it is possible to delete the user a
 		addToAdmins := !authUIConfig.IsAuthBasic()
 		authMetadataManager := auth.NewKVMetadataManager(version.Version, baseConfig.Installation.FixedID, baseConfig.Database.Type, kvStore)
 		metadata := initStatsMetadata(ctx, logger, authMetadataManager, cfg)
-		authService := auth.NewAuthService(ctx, cfg, logger, kvStore, authMetadataManager)
+		authService := authServiceBuilder(ctx, cfg, logger, kvStore, authMetadataManager)
 
 		credentials, err := setup.AddAdminUser(ctx, authService, &model.SuperuserConfiguration{
 			User: model.User{
