@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+	authtestutil "github.com/treeverse/lakefs/contrib/auth/acl/testutil"
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/crypt"
 	"github.com/treeverse/lakefs/pkg/auth/model"
@@ -21,6 +23,58 @@ func SetupService(t *testing.T, secret string) (*auth.BasicAuthService, kv.Store
 	return auth.NewBasicAuthService(kvStore, crypt.NewSecretStore([]byte(secret)), authparams.ServiceCache{
 		Enabled: false,
 	}, logging.ContextUnavailable()), kvStore
+}
+
+func TestEnsureRBACBaseGroups(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	authService, _ := authtestutil.SetupService(t, ctx, []byte("secret"))
+	ts := time.Now()
+
+	require.NoError(t, setup.EnsureRBACBaseGroups(ctx, authService, ts))
+
+	// Edit a built-in policy to make sure a repeated bootstrap keeps admin changes.
+	editedFSReadAll := &model.Policy{
+		CreatedAt:   ts.Add(time.Minute),
+		DisplayName: "FSReadAll",
+		Statement: model.Statements{
+			{
+				Action:    []string{"fs:ReadObject"},
+				Resource:  "arn:lakefs:fs:::repository/edited",
+				Effect:    model.StatementEffectAllow,
+				Condition: map[string]map[string][]string{},
+			},
+		},
+	}
+	require.NoError(t, authService.WritePolicy(ctx, editedFSReadAll, true))
+
+	// Running the bootstrap again must not change existing policies or fail.
+	require.NoError(t, setup.EnsureRBACBaseGroups(ctx, authService, ts.Add(time.Hour)))
+
+	gotFSReadAll, err := authService.GetPolicy(ctx, "FSReadAll")
+	require.NoError(t, err)
+	require.Equal(t, editedFSReadAll.DisplayName, gotFSReadAll.DisplayName)
+	require.True(t, editedFSReadAll.CreatedAt.Equal(gotFSReadAll.CreatedAt))
+	require.Equal(t, editedFSReadAll.Statement, gotFSReadAll.Statement)
+
+	expectedAttachments := map[string][]string{
+		setup.AdminsGroup:     {"FSFullAccess", "CatalogReadWriteAll", "AuthFullAccess", "RepoManagementFullAccess"},
+		setup.SuperUsersGroup: {"FSFullAccess", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll"},
+		setup.DevelopersGroup: {"FSReadWriteAll", "PRReadWriteAll", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll"},
+		setup.ViewersGroup:    {"FSReadAll", "CatalogReadAll", "AuthManageOwnCredentials"},
+	}
+	for groupName, expectedPolicies := range expectedAttachments {
+		_, err := authService.GetGroup(ctx, groupName)
+		require.NoError(t, err)
+
+		policies, _, err := authService.ListGroupPolicies(ctx, groupName, &model.PaginationParams{Amount: 100})
+		require.NoError(t, err)
+		actualPolicies := make([]string, 0, len(policies))
+		for _, policy := range policies {
+			actualPolicies = append(actualPolicies, policy.DisplayName)
+		}
+		require.ElementsMatch(t, expectedPolicies, actualPolicies)
+	}
 }
 
 func TestAddAdminUser(t *testing.T) {

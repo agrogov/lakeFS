@@ -2,6 +2,7 @@ package setup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -22,7 +23,7 @@ const (
 func createGroups(ctx context.Context, authService auth.Service, groups []*model.Group) error {
 	for _, group := range groups {
 		_, err := authService.CreateGroup(ctx, group)
-		if err != nil {
+		if err != nil && !errors.Is(err, auth.ErrAlreadyExists) {
 			return err
 		}
 	}
@@ -32,7 +33,7 @@ func createGroups(ctx context.Context, authService auth.Service, groups []*model
 func createPolicies(ctx context.Context, authService auth.Service, policies []*model.Policy) error {
 	for _, policy := range policies {
 		err := authService.WritePolicy(ctx, policy, false)
-		if err != nil {
+		if err != nil && !errors.Is(err, auth.ErrAlreadyExists) {
 			return err
 		}
 	}
@@ -122,14 +123,14 @@ func CreateRBACBasePolicies(ctx context.Context, authService auth.Service, ts ti
 func attachPolicies(ctx context.Context, authService auth.Service, groupID string, policyIDs []string) error {
 	for _, policyID := range policyIDs {
 		err := authService.AttachPolicyToGroup(ctx, policyID, groupID)
-		if err != nil {
+		if err != nil && !errors.Is(err, auth.ErrAlreadyExists) {
 			return err
 		}
 	}
 	return nil
 }
 
-func CreateRBACBaseGroups(ctx context.Context, authService auth.Service, ts time.Time) error {
+func EnsureRBACBaseGroups(ctx context.Context, authService auth.Service, ts time.Time) error {
 	err := createGroups(ctx, authService, []*model.Group{
 		{CreatedAt: ts, DisplayName: AdminsGroup},
 		{CreatedAt: ts, DisplayName: SuperUsersGroup},
@@ -163,6 +164,12 @@ func CreateRBACBaseGroups(ctx context.Context, authService auth.Service, ts time
 	}
 
 	return nil
+}
+
+// CreateRBACBaseGroups creates the RBAC base groups, policies and attachments.
+// It is idempotent and keeps existing policies unchanged.
+func CreateRBACBaseGroups(ctx context.Context, authService auth.Service, ts time.Time) error {
+	return EnsureRBACBaseGroups(ctx, authService, ts)
 }
 
 // CreateAdminUser setup base groups, policies and create admin user
