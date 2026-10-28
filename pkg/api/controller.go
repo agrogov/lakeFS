@@ -23,6 +23,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/davecgh/go-spew/spew"
+	"github.com/go-chi/chi/v5"
 	"github.com/go-openapi/swag"
 	"github.com/gorilla/sessions"
 	authacl "github.com/treeverse/lakefs/contrib/auth/acl"
@@ -6269,10 +6270,18 @@ func (c *Controller) authorizeCallback(w http.ResponseWriter, r *http.Request, p
 
 	clientIP := httputil.ExtractClientIP(r.Header, r.RemoteAddr)
 
+	// Repository metadata is exposed to policy conditions as lakefs:RepositoryMetadata/<key>.
+	// The provider is lazy, so the metadata is loaded at most once per request, and only when a
+	// statement actually carries such a condition. Without a repository path parameter every
+	// repository metadata condition is missing, and so denies.
+	fields := c.repositoryMetadataFields(ctx, chi.URLParam(r, "repository"))
+	ctx = auth.WithConditionContext(ctx, auth.NewConditionContextWithProvider(clientIP, fields))
+
 	resp, err := c.Auth.Authorize(ctx, &auth.AuthorizationRequest{
 		Username:            user.Username,
 		RequiredPermissions: perms,
 		ClientIP:            clientIP,
+		Fields:              fields,
 	})
 	if err != nil {
 		cb(w, r, http.StatusInternalServerError, err)
@@ -6291,6 +6300,25 @@ func (c *Controller) authorizeCallback(w http.ResponseWriter, r *http.Request, p
 
 func (c *Controller) authorize(w http.ResponseWriter, r *http.Request, perms permissions.Node) bool {
 	return c.authorizeCallback(w, r, perms, writeError)
+}
+
+// repositoryMetadataFields returns a lazy, request-memoised provider of the
+// lakefs:RepositoryMetadata/<key> condition fields of repository. It returns nil when the request
+// does not name a repository, or when the repository metadata cannot be loaded - in both cases a
+// statement requiring such a field does not match, and so does not grant permission.
+func (c *Controller) repositoryMetadataFields(ctx context.Context, repository string) func(key string) (string, bool) {
+	if repository == "" || c.Catalog == nil {
+		return nil
+	}
+	return auth.NewRepositoryMetadataFields(func() (map[string]string, error) {
+		metadata, err := c.Catalog.GetRepositoryMetadata(ctx, repository)
+		if err != nil {
+			logging.FromContext(ctx).WithError(err).WithField("repository", repository).
+				Debug("repository metadata unavailable for authorization conditions")
+			return nil, err
+		}
+		return metadata, nil
+	})
 }
 
 func (c *Controller) isNameValid(name, nameType string) (bool, string) {

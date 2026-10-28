@@ -28,6 +28,27 @@ var (
 // Fields is a map of field names to their string values (e.g., {"SourceIp": "203.0.113.5", "VpcId": "vpc-123"})
 type ConditionContext struct {
 	Fields map[string]string
+	// FieldsProvider is an optional lazy source for field names that are not present in Fields
+	// (e.g. lakefs:RepositoryMetadata/<key>, which is only loaded when a statement asks for it).
+	// A field the provider reports as missing evaluates to false, so the statement it appears in
+	// does not match.
+	FieldsProvider func(key string) (string, bool)
+}
+
+// Lookup returns the value of a condition field along with whether it is known.
+// Fields is consulted first, then the lazy FieldsProvider. A nil context, or one that knows
+// nothing about key, reports the field as missing.
+func (c *ConditionContext) Lookup(key string) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	if value, ok := c.Fields[key]; ok {
+		return value, true
+	}
+	if c.FieldsProvider == nil {
+		return "", false
+	}
+	return c.FieldsProvider(key)
 }
 
 // ConditionOperator defines the interface for different condition operators
@@ -81,7 +102,7 @@ func (op *IpAddressOperator) Evaluate(fields map[string][]string, conditionCtx *
 	// Check each field in the condition against context values (AND logic between fields)
 	for fieldName, conditionValues := range fields {
 		// No field or empty value for the field - condition fails
-		contextValue, hasField := conditionCtx.Fields[fieldName]
+		contextValue, hasField := conditionCtx.Lookup(fieldName)
 		if !hasField {
 			return false, nil
 		}
@@ -161,7 +182,7 @@ func (op *StringMatchOperator) Evaluate(fields map[string][]string, conditionCtx
 	}
 
 	for fieldName, patterns := range fields {
-		contextValue, hasField := conditionCtx.Fields[fieldName]
+		contextValue, hasField := conditionCtx.Lookup(fieldName)
 		if !hasField {
 			return false, nil
 		}
@@ -240,10 +261,18 @@ func EvaluateConditions(conditions map[string]map[string][]string, conditionCtx 
 // NewConditionContext creates a ConditionContext with the client IP in the SourceIp field
 // This is the standard way to enrich context with client IP for IpAddress conditions
 func NewConditionContext(clientIP string) *ConditionContext {
+	return NewConditionContextWithProvider(clientIP, nil)
+}
+
+// NewConditionContextWithProvider creates a ConditionContext with the client IP in the SourceIp
+// field, and provider as the lazy source of every other condition field. A nil provider means
+// that fields not present in Fields are missing.
+func NewConditionContextWithProvider(clientIP string, provider func(key string) (string, bool)) *ConditionContext {
 	return &ConditionContext{
 		Fields: map[string]string{
 			"SourceIp": clientIP,
 		},
+		FieldsProvider: provider,
 	}
 }
 
