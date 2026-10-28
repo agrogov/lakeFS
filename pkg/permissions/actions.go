@@ -99,6 +99,9 @@ var serviceSet = map[string]struct{}{
 	"branches":  {},
 	"pr":        {},
 	"catalog":   {},
+	// Datasets control-plane actions (pkg/datasets/authz.go). The service name is plural on purpose: resources
+	// are arn:lakefs:datasets:::dataset/<name> (see DATASETS_DESIGN.md §9.1, RBAC_DESIGN.md §5.4).
+	"datasets": {},
 }
 
 func IsValidAction(name string) error {
