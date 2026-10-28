@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -116,6 +117,34 @@ func TestConfig_EnvironmentVariables(t *testing.T) {
 	if kvParams.Postgres.ConnectionString != dbString {
 		t.Errorf("got DB connection string %s, expected to override to %s", kvParams.Postgres.ConnectionString, dbString)
 	}
+}
+
+func TestConfig_AuthorizationFailureStatus(t *testing.T) {
+	t.Run("accepted values", func(t *testing.T) {
+		for _, status := range []int{0, http.StatusUnauthorized, http.StatusForbidden} {
+			cfg := &config.ConfigImpl{}
+			cfg.Auth.AuthorizationFailureStatus = status
+			require.NoError(t, cfg.Auth.ValidateAuthorizationFailureStatus(), "status %d should be accepted", status)
+		}
+	})
+
+	t.Run("rejected values", func(t *testing.T) {
+		// Any status other than 401/403 is rejected: a typo such as 200 would make an
+		// authorization failure look like a success to the UI and SDK clients.
+		for _, status := range []int{http.StatusOK, http.StatusNotFound, http.StatusInternalServerError, -1} {
+			cfg := &config.ConfigImpl{}
+			cfg.Auth.AuthorizationFailureStatus = status
+			err := cfg.Auth.ValidateAuthorizationFailureStatus()
+			require.ErrorIs(t, err, config.ErrInvalidAuthorizationFailureStatus, "status %d should be rejected", status)
+			require.Contains(t, err.Error(), "auth.authorization_failure_status", "error should name the setting")
+		}
+	})
+
+	t.Run("startup validation", func(t *testing.T) {
+		_, err := newConfigFromFile("testdata/invalid_authorization_failure_status.yaml")
+		require.ErrorIs(t, err, config.ErrInvalidAuthorizationFailureStatus)
+		require.Contains(t, err.Error(), "got 200")
+	})
 }
 
 func TestConfig_DomainNamePrefix(t *testing.T) {

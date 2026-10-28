@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"reflect"
 	"sort"
 	"strings"
@@ -25,6 +26,10 @@ var (
 	ErrGCPEncryptKeyConflict = errors.New("setting both kms and customer supplied encryption will result failure when reading/writing object")
 	ErrNoStorageConfig       = errors.New("no storage config")
 )
+
+// ErrInvalidAuthorizationFailureStatus is returned when auth.authorization_failure_status is not a
+// status code lakeFS can return for an authorization failure.
+var ErrInvalidAuthorizationFailureStatus = fmt.Errorf("%w: auth.authorization_failure_status must be 401 (unauthorized) or 403 (forbidden)", ErrBadConfiguration)
 
 // UseLocalConfiguration set to true will add defaults that enable a lakeFS run
 // without any other configuration like DB or blockstore.
@@ -659,6 +664,17 @@ func (c *BaseConfig) GetBaseConfig() *BaseConfig {
 	return c
 }
 
+// ValidateAuthorizationFailureStatus validates auth.authorization_failure_status. Zero (unset)
+// is allowed and means the default of 401; otherwise the value must be 401 or 403.
+func (c *BaseAuth) ValidateAuthorizationFailureStatus() error {
+	switch c.AuthorizationFailureStatus {
+	case 0, http.StatusUnauthorized, http.StatusForbidden:
+		return nil
+	default:
+		return fmt.Errorf("%w, got %d", ErrInvalidAuthorizationFailureStatus, c.AuthorizationFailureStatus)
+	}
+}
+
 func (c *BaseConfig) StorageConfig() StorageConfig {
 	return &c.Blockstore
 }
@@ -694,7 +710,9 @@ type BaseAuth struct {
 		SkipHealthCheck    bool          `mapstructure:"skip_health_check"`
 	} `mapstructure:"api"`
 	// AuthorizationFailureStatus is the HTTP status code for ErrInsufficientPermissions responses.
-	// Zero (the default) means 401. Set it to 403 to opt in to forbidden responses.
+	// Zero (unset) means DefaultAuthorizationFailureStatus (401). Only 401 and 403 are allowed:
+	// any other value would turn an authorization failure into a response the UI and SDK
+	// clients read as success (e.g. 200) or into a misleading status code.
 	AuthorizationFailureStatus int `mapstructure:"authorization_failure_status"`
 	AuthenticationAPI          struct {
 		// Endpoint for authentication operations

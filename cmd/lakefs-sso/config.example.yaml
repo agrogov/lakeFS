@@ -27,6 +27,16 @@ auth:
   # cache:
   #   ttl: 5s
 
+  # HTTP status returned for authorization failures (insufficient permissions).
+  #   401 — default. The web UI and the SDK clients treat a 401 without the authentication
+  #         message as an authorization error, and the API does not declare 403 on these
+  #         endpoints.
+  #   403 — opt in to "forbidden" responses, for example when a proxy or client in front of
+  #         lakeFS distinguishes "not authenticated" (401) from "not allowed" (403).
+  # Only 401 and 403 are accepted; any other value (for example a typo such as 200, which
+  # would make a denial look like a success) fails startup with a clear error.
+  # authorization_failure_status: 401
+
   ui_config:
     # RBAC mode. lakefs-sso defaults to "simplified" whenever sso.enabled is true.
     #   simplified — ACL mode: one permission dropdown per group (Admins / Supers /
