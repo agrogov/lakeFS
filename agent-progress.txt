@@ -47,6 +47,17 @@ W3: B3 B5                 W4: B6 C2 C3 C4    W5: C5
 - setup.go (auth): A2, C4 (C4 depends on A2)
 
 ## Status
+- F-cards shipping (auto-review commit enabled on all): landed on branch —
+  F1 eff5bb6a9 (ListBranches condition-context + deny-aware gate; done, verified:
+    TestListBranches + full pkg/api/auth/sso suites green),
+  F2 d9f31e62f (DeleteUser cache invalidation + tests; done, contrib tests green),
+  F6 8fb584042 (scripts/check-license-base.sh + CI wiring; done, guard runs clean,
+    --self-test 3/3 PASS).
+- Now running: F3 afa4f (started after F1 done), F5 50cd4 (board auto-started when F2
+  done). Backlog: F4 8775e (waits F3).
+- Release gate (F1 blocker) is now resolved; rbac: internal unblocked once F3-F5 land
+  or are explicitly deferred (F4/F5 are minor).
+--- previous status (superseded) ---
 - R1 executed by review agent; report committed as REVIEW_R1.md (repo commit 38e6435d5).
   Verdict: changes requested — 1 blocker, 2 majors, minors. R1 card moved to done.
 - FOLLOW-UP CARDS on board (from REVIEW_R1.md §5):
