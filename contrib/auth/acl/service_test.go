@@ -450,6 +450,188 @@ func TestAuthService_DeleteUserInvalidatesCache(t *testing.T) {
 	require.ErrorIs(t, resp.Error, auth.ErrInsufficientPermissions)
 }
 
+// writeAllowReadPolicy writes a policy allowing fs:ReadObject on every
+// repository.
+func writeAllowReadPolicy(t *testing.T, ctx context.Context, s *authacl.AuthService, policyName string) {
+	t.Helper()
+	err := s.WritePolicy(ctx, &model.Policy{
+		DisplayName: policyName,
+		Statement: model.Statements{
+			{Action: []string{permissions.ReadObjectAction}, Resource: "*", Effect: model.StatementEffectAllow},
+		},
+	}, false)
+	require.NoError(t, err)
+}
+
+// authorizeReadObject authorizes reading a single object as username.
+func authorizeReadObject(ctx context.Context, s *authacl.AuthService, username string) (*auth.AuthorizationResponse, error) {
+	return s.Authorize(ctx, &auth.AuthorizationRequest{
+		Username: username,
+		RequiredPermissions: permissions.Node{
+			Permission: permissions.Permission{
+				Action:   permissions.ReadObjectAction,
+				Resource: permissions.ObjectArn("revoke-repo", "object"),
+			},
+		},
+	})
+}
+
+// TestAuthService_RevocationIsImmediate asserts design §4.10: every revocation
+// performed through the service API denies the very next Authorize call, while
+// the affected entries are still cached.
+//
+// The service runs with the LRU cache enabled and a TTL far longer than the
+// test, so a deny after the revoke cannot be explained by expiry - only by
+// explicit cache invalidation. Each case warms the user and policy cache with
+// a successful Authorize before revoking.
+func TestAuthService_RevocationIsImmediate(t *testing.T) {
+	t.Parallel()
+
+	type fixture struct {
+		username   string
+		groupName  string
+		policyName string
+	}
+
+	// grantUserPolicy attaches the allow policy directly to the user.
+	grantUserPolicy := func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture) {
+		t.Helper()
+		writeAllowReadPolicy(t, ctx, s, f.policyName)
+		require.NoError(t, s.AttachPolicyToUser(ctx, f.policyName, f.username))
+	}
+
+	// grantGroupPolicy puts the user in a group that carries the allow policy.
+	grantGroupPolicy := func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture) {
+		t.Helper()
+		_, err := s.CreateGroup(ctx, &model.Group{DisplayName: f.groupName})
+		require.NoError(t, err)
+		writeAllowReadPolicy(t, ctx, s, f.policyName)
+		require.NoError(t, s.AttachPolicyToGroup(ctx, f.policyName, f.groupName))
+		require.NoError(t, s.AddUserToGroup(ctx, f.username, f.groupName))
+	}
+
+	tests := []struct {
+		name string
+		// grant establishes the grant that the case revokes; the user must be
+		// allowed to read objects once it returns.
+		grant func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture)
+		// revoke applies the mutation under test.
+		revoke func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture)
+		// wantAuthorizeErr, when true, expects Authorize to return an error
+		// because the user itself is gone (nothing is left to authorize).
+		wantAuthorizeErr bool
+	}{
+		{
+			name:  "detach_user_policy",
+			grant: grantUserPolicy,
+			revoke: func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture) {
+				t.Helper()
+				require.NoError(t, s.DetachPolicyFromUser(ctx, f.policyName, f.username))
+			},
+		},
+		{
+			name:  "remove_user_from_group",
+			grant: grantGroupPolicy,
+			revoke: func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture) {
+				t.Helper()
+				require.NoError(t, s.RemoveUserFromGroup(ctx, f.username, f.groupName))
+			},
+		},
+		{
+			name:  "detach_group_policy",
+			grant: grantGroupPolicy,
+			revoke: func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture) {
+				t.Helper()
+				require.NoError(t, s.DetachPolicyFromGroup(ctx, f.policyName, f.groupName))
+			},
+		},
+		{
+			name:  "delete_group",
+			grant: grantGroupPolicy,
+			revoke: func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture) {
+				t.Helper()
+				require.NoError(t, s.DeleteGroup(ctx, f.groupName))
+			},
+		},
+		{
+			name:  "delete_policy",
+			grant: grantUserPolicy,
+			revoke: func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture) {
+				t.Helper()
+				require.NoError(t, s.DeletePolicy(ctx, f.policyName))
+			},
+		},
+		{
+			name:  "delete_user",
+			grant: grantUserPolicy,
+			revoke: func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture) {
+				t.Helper()
+				require.NoError(t, s.DeleteUser(ctx, f.username))
+			},
+			wantAuthorizeErr: true,
+		},
+		{
+			// A deleted username must not resurrect the deleted user's grants when
+			// it is re-created (the policy cache is keyed by username). Unlike the
+			// plain delete_user case, a cached-and-stale user entry would be found
+			// again here, so this case fails unless DeleteUser invalidated the
+			// user cache as well as the policy cache.
+			name:  "delete_user_then_recreate",
+			grant: grantUserPolicy,
+			revoke: func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture) {
+				t.Helper()
+				require.NoError(t, s.DeleteUser(ctx, f.username))
+				_, err := s.CreateUser(ctx, &model.User{Username: f.username})
+				require.NoError(t, err)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			kvStore := kvtest.GetStore(ctx, t)
+			s := authacl.NewAuthService(kvStore, crypt.NewSecretStore(someSecret), authparams.ServiceCache{
+				Enabled: true,
+				Size:    1024,
+				TTL:     time.Hour, // far beyond the test: only invalidation can deny
+				Jitter:  0,
+			})
+			// The property under test is cache invalidation, so make sure the
+			// service is not falling back to the no-op DummyCache.
+			require.IsType(t, &auth.LRUCache{}, s.Cache())
+
+			f := fixture{username: "revoke-user", groupName: "revoke-group", policyName: "revoke-policy"}
+			_, err := s.CreateUser(ctx, &model.User{Username: f.username})
+			require.NoError(t, err)
+			tt.grant(t, ctx, s, f)
+
+			// Warm the user and effective-policy cache entries that the mutation
+			// must invalidate, and check the grant is live before revoking.
+			for range 2 { // twice: the second call is served from the cache
+				resp, err := authorizeReadObject(ctx, s, f.username)
+				require.NoError(t, err)
+				require.True(t, resp.Allowed, "grant should be allowed before revocation")
+			}
+
+			tt.revoke(t, ctx, s, f)
+
+			// Well inside the TTL: a deny now proves the cache was invalidated.
+			resp, err := authorizeReadObject(ctx, s, f.username)
+			if tt.wantAuthorizeErr {
+				require.ErrorIs(t, err, auth.ErrNotFound)
+				require.Nil(t, resp)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+			require.False(t, resp.Allowed, "grant survived revocation in the cache")
+			require.ErrorIs(t, resp.Error, auth.ErrInsufficientPermissions)
+		})
+	}
+}
+
 func TestAuthService_DeleteGroupWithRelations(t *testing.T) {
 	t.Parallel()
 	userNames := []string{"first", "second", "third"}
