@@ -19,9 +19,25 @@ auth:
   # Replace <tenant-id> and the post_logout_redirect_uri with your actual values.
   logout_redirect_url: "https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/logout?post_logout_redirect_uri=https://<your-lakefs-host>/auth/login"
 
+  # Authorization cache. Effective policies are cached per user and per process. Attaching
+  # or detaching a policy, and group sync at login, take effect immediately on the replica
+  # that handled the request; other replicas converge only within the TTL plus jitter.
+  # For multi-replica deployments set a short TTL so revocation propagates quickly
+  # (RBAC_DESIGN.md §4.7):
+  # cache:
+  #   ttl: 5s
+
   ui_config:
-    # Set automatically to "simplified" when sso.enabled is true (the ACL auth service's mode),
-    # which enables the Users / Groups / Permissions pages in the UI.
+    # RBAC mode. lakefs-sso defaults to "simplified" whenever sso.enabled is true.
+    #   simplified — ACL mode: one permission dropdown per group (Admins / Supers /
+    #                Writers / Readers). Also the fallback for an unset value, "none",
+    #                and "external" (SSO has no remote auth service; "external" is
+    #                rejected with a warning).
+    #   internal   — policy-based RBAC: full Users / Groups / Policies UI, plus
+    #                repository-, branch-, path- and IP-scoped policies, ${user}
+    #                self-service and audit request logging. Opt-in (RBAC_DESIGN.md §4).
+    # Both modes run on the same ACL KV backend, so switching is a config change plus the
+    # `lakefs-sso rbac-migrate` step described in CHANGELOG_SSO.md.
     rbac: "simplified"
     login_url: "/oidc/login"
 
