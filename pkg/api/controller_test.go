@@ -1893,6 +1893,83 @@ func TestListBranchesPolicyConditions(t *testing.T) {
 	})
 }
 
+func TestPresignPolicyConditions(t *testing.T) {
+	_, deps := setupHandler(t)
+	ctx := t.Context()
+	repo := testUniqueRepoName()
+	_, err := deps.catalog.CreateRepository(ctx, repo, config.SingleBlockstoreID, onBlock(deps, "presign"), "main", false)
+	testutil.Must(t, err)
+	testutil.Must(t, deps.catalog.CreateEntry(ctx, repo, "main", catalog.DBEntry{
+		Path:            "file",
+		PhysicalAddress: "file-address",
+		CreationDate:    time.Now(),
+		Size:            1,
+		Checksum:        "checksum",
+	}))
+
+	const allowedIP = "203.0.113.5"
+	ipCondition := map[string]map[string][]string{
+		auth.OperatorNameIpAddress: {"SourceIp": {allowedIP + "/32"}},
+	}
+	policies := map[string][]*model.Policy{
+		"conditional-presign-deny": {
+			{DisplayName: "presign-policy", Statement: model.Statements{
+				{
+					Effect:   model.StatementEffectAllow,
+					Action:   []string{permissions.ListObjectsAction},
+					Resource: permissions.RepoArn(repo),
+				},
+				{
+					Effect:   model.StatementEffectAllow,
+					Action:   []string{permissions.ReadObjectAction},
+					Resource: permissions.ObjectArn(repo, "*"),
+				},
+				{
+					Effect:    model.StatementEffectDeny,
+					Action:    []string{permissions.ReadObjectAction},
+					Resource:  permissions.ObjectArn(repo, "*"),
+					Condition: ipCondition,
+				},
+			}},
+		},
+	}
+	controller := &api.Controller{
+		Catalog:      deps.catalog,
+		BlockAdapter: deps.catalog.BlockAdapter,
+		Auth:         &policyAuthService{Service: deps.authService, policies: policies},
+		Logger:       logging.FromContext(ctx),
+		Collector:    deps.collector,
+	}
+	newRequest := func(target string) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req.RemoteAddr = net.JoinHostPort(allowedIP, "1234")
+		return req.WithContext(auth.WithUser(req.Context(), &model.User{Username: "conditional-presign-deny"}))
+	}
+
+	t.Run("stat object presign conditioned deny blocks URL issuance", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		controller.StatObject(recorder, newRequest("/repositories/"+repo+"/refs/main/objects"), repo, "main", apigen.StatObjectParams{
+			Path:    "file",
+			Presign: swag.Bool(true),
+		})
+		require.Equal(t, http.StatusUnauthorized, recorder.Code)
+	})
+
+	t.Run("list objects presign conditioned deny does not issue a URL", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		controller.ListObjects(recorder, newRequest("/repositories/"+repo+"/refs/main/objects"), repo, "main", apigen.ListObjectsParams{
+			Presign: swag.Bool(true),
+		})
+		// The per-object re-authorization must see the deny; otherwise the mem block adapter rejects
+		// the presign request and the whole listing fails instead of returning plain stats.
+		require.Equal(t, http.StatusOK, recorder.Code)
+		var resp apigen.ObjectStatsList
+		require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &resp))
+		require.Len(t, resp.Results, 1)
+		require.Nil(t, resp.Results[0].PhysicalAddressExpiry, "a denied presign must not issue a URL")
+	})
+}
+
 func TestListBranchesPolicyFilter(t *testing.T) {
 	_, deps := setupHandler(t)
 	ctx := t.Context()

@@ -268,6 +268,12 @@ func authorize(w http.ResponseWriter, req *http.Request, authService auth.Gatewa
 		accessKeyID = authContext.GetAccessKeyID()
 	}
 
+	// Attach the condition context before the empty-permissions early return: operations such as
+	// DeleteObjects require no permission themselves but authorize every object they touch.
+	bucket, _ := ctx.Value(ContextKeyRepositoryID).(string)
+	req, clientIP, fields := conditionContext(req, o.Catalog, bucket)
+	ctx = req.Context()
+
 	if len(perms.Nodes) == 0 && len(perms.Permission.Action) == 0 {
 		// has not provided required permissions
 		return &operations.AuthorizedOperation{
@@ -275,16 +281,6 @@ func authorize(w http.ResponseWriter, req *http.Request, authService auth.Gatewa
 			Principal: username,
 		}
 	}
-
-	clientIP := httputil.ExtractClientIP(req.Header, req.RemoteAddr)
-
-	// Repository (bucket) metadata is exposed to policy conditions as
-	// lakefs:RepositoryMetadata/<key>. The provider is lazy, so the metadata is loaded at most once
-	// per request, and only when a statement actually carries such a condition. Without a bucket
-	// every repository metadata condition is missing, and so denies.
-	bucket, _ := ctx.Value(ContextKeyRepositoryID).(string)
-	fields := repositoryMetadataFields(ctx, o.Catalog, bucket)
-	ctx = auth.WithConditionContext(ctx, auth.NewConditionContextWithProvider(clientIP, fields))
 
 	authResp, err := authService.Authorize(ctx, &auth.AuthorizationRequest{
 		Username:            username,
@@ -310,6 +306,25 @@ func authorize(w http.ResponseWriter, req *http.Request, authService auth.Gatewa
 		Operation: o,
 		Principal: username,
 	}
+}
+
+// conditionContext builds the authorization condition context of req: the client IP and the
+// lakefs:RepositoryMetadata/<key> fields of bucket. It returns the derived request, the client IP,
+// and the lazy metadata field provider used by AuthorizationRequest. Attaching the context to the
+// request lets every nested Authorize call in an operation handler inherit it, so a conditional
+// deny cannot be bypassed by a per-object re-authorization.
+func conditionContext(req *http.Request, cat *catalog.Catalog, bucket string) (*http.Request, string, func(key string) (string, bool)) {
+	ctx := req.Context()
+	clientIP := httputil.ExtractClientIP(req.Header, req.RemoteAddr)
+	fields := repositoryMetadataFields(ctx, cat, bucket)
+	ctx = auth.WithConditionContext(ctx, auth.NewConditionContextWithProvider(clientIP, fields))
+	return req.WithContext(ctx), clientIP, fields
+}
+
+// withConditionContext returns req carrying the authorization condition context on its context.
+func withConditionContext(req *http.Request, cat *catalog.Catalog, bucket string) *http.Request {
+	req, _, _ = conditionContext(req, cat, bucket)
+	return req
 }
 
 // repositoryMetadataFields returns a lazy, request-memoised provider of the

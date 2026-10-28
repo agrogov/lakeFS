@@ -193,6 +193,11 @@ func EnrichWithRepositoryOrFallback(c *catalog.Catalog, authService auth.Gateway
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		ctx := req.Context()
 		repoID := ctx.Value(ContextKeyRepositoryID).(string)
+		// Attach the authorization condition context once the bucket is known. Every authorization
+		// from here on - including per-object re-authorization inside an operation handler - then
+		// evaluates policy conditions against the request.
+		req = withConditionContext(req, c, repoID)
+		ctx = req.Context()
 		user, _ := auth.GetUser(ctx)
 		username := user.Username
 		o := ctx.Value(ContextKeyOperation).(*operations.Operation)
