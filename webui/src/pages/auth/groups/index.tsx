@@ -3,7 +3,7 @@ import Button from 'react-bootstrap/Button';
 import Dropdown from 'react-bootstrap/Dropdown';
 
 import { useAPIWithPagination } from '../../../lib/hooks/api';
-import { auth } from '../../../lib/api';
+import { auth, NoAclError } from '../../../lib/api';
 import { ConfirmationButton } from '../../../lib/components/modals';
 import { Paginator } from '../../../lib/components/pagination';
 import {
@@ -101,7 +101,16 @@ const getACLMaybe = async (groupId: string) => {
     try {
         return await auth.getACL(groupId);
     } catch (e) {
-        if (e.message.toLowerCase().includes('no acl')) {
+        const message = typeof e?.message === 'string' ? e.message.toLowerCase() : '';
+        if (
+            e instanceof NoAclError ||
+            e?.noAcl === true ||
+            e?.no_acl === true ||
+            message.includes('multiple policies')
+        ) {
+            return { customPolicies: true };
+        }
+        if (message.includes('no acl')) {
             return null;
         }
         throw e;
@@ -236,15 +245,19 @@ const GroupsContainer = () => {
                     simplified &&
                         elements.push(
                             group.acl ? (
-                                <ACLPermission
-                                    initialValue={group.acl.permission}
-                                    onSelect={(permission) =>
-                                        auth.putACL(group.id, { ...group.acl, permission }).then(
-                                            () => setPutACLError(null),
-                                            (e) => setPutACLError(e),
-                                        )
-                                    }
-                                />
+                                group.acl.customPolicies ? (
+                                    <span className="text-muted">Custom (policies)</span>
+                                ) : (
+                                    <ACLPermission
+                                        initialValue={group.acl.permission}
+                                        onSelect={(permission) =>
+                                            auth.putACL(group.id, { ...group.acl, permission }).then(
+                                                () => setPutACLError(null),
+                                                (e) => setPutACLError(e),
+                                            )
+                                        }
+                                    />
+                                )
                             ) : (
                                 <></>
                             ),

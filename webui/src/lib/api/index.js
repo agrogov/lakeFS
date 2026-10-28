@@ -101,6 +101,15 @@ export class NotFoundError extends Error {
     }
 }
 
+export class NoAclError extends NotFoundError {
+    constructor(message) {
+        super(message);
+        this.name = this.constructor.name;
+        this.noAcl = true;
+        this.no_acl = true;
+    }
+}
+
 export class BadRequestError extends Error {
     constructor(message) {
         super(message);
@@ -265,6 +274,18 @@ class Auth {
 
     async getACL(groupId) {
         const response = await apiRequest(`/auth/groups/${groupId}/acl`);
+        if (response.status === 404) {
+            let body;
+            try {
+                body = await response.json();
+            } catch {
+                throw new NotFoundError(`could not find ACL for group ${groupId}`);
+            }
+            if (body?.no_acl) {
+                throw new NoAclError(body.message ?? `group ${groupId} has no ACL`);
+            }
+            throw new NotFoundError(body?.message ?? `could not find ACL for group ${groupId}`);
+        }
         if (response.status !== 200) {
             throw new Error(`could not get ACL for group ${groupId}: ${await extractError(response)}`);
         }
