@@ -47,20 +47,20 @@ W3: B3 B5                 W4: B6 C2 C3 C4    W5: C5
 - setup.go (auth): A2, C4 (C4 depends on A2)
 
 ## Status
-- 17 tasks on board; deps verified. Auto-review (mode=commit) enabled on all cards.
-- Done (10): A1 A2 A3 A4 A5 B1 B5 B6 C2 C4 — 10 commits on feature/azure-entra-sso-apache.
-  NOTE: some commit-message task ids are wrong (7ef078aa7 is B1, 361b59e4e is C4,
-  fed01838c is A5 no-id); board card->commit mapping above is authoritative.
-- Review gate (2026-10-28, manager scope review, marked [reviewed_ok] on board):
-  * B2 08e1f @9a8a4a7c1 — scope exact, pkg/sso tests ok
-  * B4 61e32 @f93229aec — scope exact, contrib/auth/acl tests ok
-  * B3 c81ce @9dc5ccfba — scope exact; does NOT compile on its own base (references
-    EnsureRBACBase from B2). Verified in scratch worktree: B3+B2+B4 merge => build ok,
-    pkg/sso tests ok. SHIP ORDER REQUIRED: B2, B4, then B3.
-  * C3 ec86a @411274f18 — scope exact; -run TestListBranches ok. C2 already merged
-    (controller.go overlap), so ship C3 to current tip; expect board agent to resolve
-    any conflict hunks.
-- In_progress (2): A6 02c1c (webui), C1 ef71b (StringEquals). Backlog: C5 0d286 (waits on C3).
-- User action: click Commit on B2 -> B4 -> B3 -> C3 to land them and unlock C5.
+- BOARD: 16/17 done, C5 (0d286) in_progress (started after C3 landed). Board effectively complete once C5 ships.
+- Ship sequence executed 2026-10-28 (manager cherry-picks, order enforced):
+  B2 e99510278 -> B4 50ac672ea -> B3 7babc8e13 (auth_builder.go conflict resolved:
+    kept B1's authServiceWithProfiles/profileUpdater + B3's resolveAuthMode/
+    rbacAuthService/EnsureRBACBase/reconcile wiring) -> C3 9efa2c279 (auto-merge).
+  Validation on merged branch: go build ./... ok; go test pkg/sso, contrib/auth/acl,
+  pkg/auth/setup, pkg/cache, pkg/api -run TestListBranches, pkg/auth, pkg/permissions: ok.
+- A6 8d5c7c65c and C1 6cdc5d902 auto-shipped via board auto-review (note: C1's commit
+  message is mislabeled "C3:"). B2/B4/B3/C3 cards moved to done; worktrees cleaned.
+- Commit-message task-ids are unreliable overall: 7ef078aa7=B1, 361b59e4e=C4,
+  6cdc5d902=C1, fed01838c=A5 (no id). Board card->commit mapping here is authoritative:
+  A1 9eacd521d | A2 7bfbe8b17 | A3 6f18e72bc | A4 728493845 | A5 fed01838c
+  A6 8d5c7c65c | B1 7ef078aa7 | B2 e99510278 | B3 7babc8e13 | B4 50ac672ea
+  B5 135d1710f | B6 06c258da6 | C1 6cdc5d902 | C2 0009401de | C3 9efa2c279 | C4 361b59e4e
+- Branch is ahead of origin by ~20 commits — NOT pushed (push is operator's call).
 - No implementation done by this agent (earlier trial edits were reverted; base HEAD was 95dceafc2).
 - Open design questions from RBAC_DESIGN §9 unanswered — do not block tasks on them.
