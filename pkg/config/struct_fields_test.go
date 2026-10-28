@@ -145,3 +145,18 @@ func TestMapLoggingFields(t *testing.T) {
 		}
 	}
 }
+
+func TestMapLoggingFieldsMasksSecretSection(t *testing.T) {
+	t.Parallel()
+	value := struct {
+		SSO   config.SecretSection `mapstructure:"sso"`
+		Empty config.SecretSection `mapstructure:"empty"`
+	}{SSO: config.SecretSection{"client_secret": "s3cret"}}
+	fields := config.MapLoggingFields(value)
+	if got := fields["sso"]; got != config.FieldMaskedValue {
+		t.Errorf("sso = %v, want %q", got, config.FieldMaskedValue)
+	}
+	if got := fields["empty"]; got != config.FieldMaskedNoValue {
+		t.Errorf("empty = %v, want %q", got, config.FieldMaskedNoValue)
+	}
+}

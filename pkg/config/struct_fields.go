@@ -64,7 +64,7 @@ func structFieldsFunc(value reflect.Value, tag, squashValue string, prefix []str
 		fieldValue := value.Field(i)
 
 		switch fieldValue.Interface().(type) {
-		case SecureString:
+		case SecureString, SecretSection:
 			// don't pass value of SecureString
 			key := strings.Join(prefix, sep)
 			val := FieldMaskedValue
