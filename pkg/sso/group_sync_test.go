@@ -229,3 +229,30 @@ func equalSlices(a, b []string) bool {
 	}
 	return true
 }
+
+func TestSyncGroups_GroupMapping(t *testing.T) {
+	svc := newFakeGroupManager(map[string][]string{
+		"Admins":  {"dave"},
+		"Writers": {},
+		"Readers": {},
+		"Custom":  {"dave"}, // not a mapping target: preserved
+	})
+	cfg := baseCfg()
+	cfg.ManagedGroupPrefix = "ignored-"
+	cfg.GroupMapping = map[string][]string{
+		"lakefs_admins": {"Admins"},
+		"lakefs_users":  {"Writers", "Readers"},
+	}
+
+	// Token carries Entra values in a different case; dave lost LakeFS_Admins.
+	err := sso.SyncGroups(context.Background(), svc, logging.Dummy(), "dave", []string{"LakeFS_Users", "Unmapped"}, cfg)
+	if err != nil {
+		t.Fatalf("SyncGroups: %v", err)
+	}
+
+	got := svc.groupsOf("dave")
+	want := []string{"Custom", "Readers", "Writers"}
+	if !equalSlices(got, want) {
+		t.Errorf("groups after sync: got %v, want %v", got, want)
+	}
+}
