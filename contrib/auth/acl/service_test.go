@@ -362,6 +362,94 @@ func TestAuthService_DeleteUserWithRelations(t *testing.T) {
 	}
 }
 
+func TestAuthService_DeleteUserInvalidatesCache(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	kvStore := kvtest.GetStore(ctx, t)
+	s := authacl.NewAuthService(kvStore, crypt.NewSecretStore(someSecret), authparams.ServiceCache{
+		Enabled: true,
+		Size:    1024,
+		TTL:     time.Hour, // long TTL: only explicit invalidation can make the deletion visible
+		Jitter:  0,
+	})
+
+	const (
+		username   = "cache-user"
+		userEmail  = "cache-user@example.com"
+		externalID = "cache-user-external"
+	)
+	email, extID := userEmail, externalID
+	_, err := s.CreateUser(ctx, &model.User{Username: username, Email: &email, ExternalID: &extID})
+	require.NoError(t, err)
+
+	// A policy that allows reading objects: this is the grant that must not outlive the user.
+	policy := &model.Policy{
+		DisplayName: model.CreateID(),
+		Statement: model.Statements{
+			{Action: []string{permissions.ReadObjectAction}, Resource: "*", Effect: model.StatementEffectAllow},
+		},
+	}
+	require.NoError(t, s.WritePolicy(ctx, policy, false))
+	require.NoError(t, s.AttachPolicyToUser(ctx, policy.DisplayName, username))
+
+	readObject := &auth.AuthorizationRequest{
+		Username: username,
+		RequiredPermissions: permissions.Node{
+			Permission: permissions.Permission{
+				Action:   permissions.ReadObjectAction,
+				Resource: permissions.ObjectArn("repo", "object"),
+			},
+		},
+	}
+
+	// Warm every cache entry DeleteUser must invalidate.
+	user, err := s.GetUser(ctx, username)
+	require.NoError(t, err)
+	require.Equal(t, username, user.Username)
+	user, err = s.GetUserByEmail(ctx, userEmail)
+	require.NoError(t, err)
+	require.Equal(t, username, user.Username)
+	user, err = s.GetUserByExternalID(ctx, externalID)
+	require.NoError(t, err)
+	require.Equal(t, username, user.Username)
+	policies, _, err := s.ListEffectivePolicies(ctx, username, &model.PaginationParams{Amount: -1})
+	require.NoError(t, err)
+	require.Len(t, policies, 1)
+	resp, err := s.Authorize(ctx, readObject)
+	require.NoError(t, err)
+	require.True(t, resp.Allowed)
+
+	require.NoError(t, s.DeleteUser(ctx, username))
+
+	t.Run("deleted_user_is_gone_immediately", func(t *testing.T) {
+		user, err := s.GetUser(ctx, username)
+		require.ErrorIs(t, err, auth.ErrNotFound)
+		require.Nil(t, user)
+		_, err = s.GetUserByEmail(ctx, userEmail)
+		require.ErrorIs(t, err, auth.ErrNotFound)
+		_, err = s.GetUserByExternalID(ctx, externalID)
+		require.ErrorIs(t, err, auth.ErrNotFound)
+		_, _, err = s.ListEffectivePolicies(ctx, username, &model.PaginationParams{Amount: -1})
+		require.Error(t, err)
+		// A deleted user can no longer be authorized.
+		resp, err := s.Authorize(ctx, readObject)
+		require.Error(t, err)
+		require.False(t, resp != nil && resp.Allowed)
+	})
+
+	// Re-creating the username must not resurrect the deleted user's grants.
+	_, err = s.CreateUser(ctx, &model.User{Username: username})
+	require.NoError(t, err)
+
+	policies, _, err = s.ListEffectivePolicies(ctx, username, &model.PaginationParams{Amount: -1})
+	require.NoError(t, err)
+	require.Empty(t, policies)
+	resp, err = s.Authorize(ctx, readObject)
+	require.NoError(t, err)
+	require.False(t, resp.Allowed)
+	require.ErrorIs(t, resp.Error, auth.ErrInsufficientPermissions)
+}
+
 func TestAuthService_DeleteGroupWithRelations(t *testing.T) {
 	t.Parallel()
 	userNames := []string{"first", "second", "third"}
