@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -38,10 +39,57 @@ const (
 	contextKeyConditionContext contextKey = "condition_context"
 )
 
+// RepositoryMetadataConditionKeyPrefix is the prefix of the condition key exposing repository
+// metadata to policy statements, e.g. lakefs:RepositoryMetadata/team for the "team" metadata key.
+const RepositoryMetadataConditionKeyPrefix = "lakefs:RepositoryMetadata/"
+
+// WithConditionContext returns a context carrying cc as the condition context used by
+// CheckPermissions. Services that evaluate policies from the context rather than from an
+// AuthorizationRequest.Fields provider pick up the condition fields from here.
+func WithConditionContext(ctx context.Context, cc *ConditionContext) context.Context {
+	if cc == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, contextKeyConditionContext, cc)
+}
+
+// NewRepositoryMetadataFields returns a lazy, request-memoised provider of
+// lakefs:RepositoryMetadata/<key> condition fields, to be used as AuthorizationRequest.Fields.
+// load is called at most once, and only when a condition actually references a repository
+// metadata key. A load error, or a key that does not exist, reports the field as missing, which
+// makes the condition (and so the statement) fail.
+func NewRepositoryMetadataFields(load func() (map[string]string, error)) func(key string) (string, bool) {
+	var (
+		once     sync.Once
+		metadata map[string]string
+	)
+	return func(key string) (string, bool) {
+		metadataKey, ok := strings.CutPrefix(key, RepositoryMetadataConditionKeyPrefix)
+		if !ok {
+			return "", false
+		}
+		once.Do(func() {
+			loaded, err := load()
+			if err != nil {
+				// Leave metadata nil: every repository metadata condition is missing, and so denies.
+				return
+			}
+			metadata = loaded
+		})
+		value, ok := metadata[metadataKey]
+		return value, ok
+	}
+}
+
 type AuthorizationRequest struct {
 	Username            string
 	RequiredPermissions permissions.Node
 	ClientIP            string // IP address of the client making the request
+	// Fields is an optional lazy provider of additional condition fields, consulted by policy
+	// statements for keys that are not built into the request (e.g. lakefs:RepositoryMetadata/team).
+	// It is only called when a statement carries such a condition, and a key it reports as
+	// missing evaluates to false - so a statement requiring it is skipped (a missing key denies).
+	Fields func(key string) (string, bool)
 }
 
 type AuthorizationResponse struct {
@@ -976,8 +1024,8 @@ func (a *APIAuthService) Authorize(ctx context.Context, req *AuthorizationReques
 	ctx = httputil.SetClientTrace(ctx, "api_auth")
 
 	// Build condition context from request
-	conditionCtx := NewConditionContext(req.ClientIP)
-	ctx = context.WithValue(ctx, contextKeyConditionContext, conditionCtx)
+	conditionCtx := NewConditionContextWithProvider(req.ClientIP, req.Fields)
+	ctx = WithConditionContext(ctx, conditionCtx)
 
 	policies, _, err := a.ListEffectivePolicies(ctx, req.Username, &model.PaginationParams{
 		After:  "", // all

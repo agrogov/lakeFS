@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	gohttputil "net/http/httputil"
@@ -277,10 +278,19 @@ func authorize(w http.ResponseWriter, req *http.Request, authService auth.Gatewa
 
 	clientIP := httputil.ExtractClientIP(req.Header, req.RemoteAddr)
 
-	authResp, err := authService.Authorize(req.Context(), &auth.AuthorizationRequest{
+	// Repository (bucket) metadata is exposed to policy conditions as
+	// lakefs:RepositoryMetadata/<key>. The provider is lazy, so the metadata is loaded at most once
+	// per request, and only when a statement actually carries such a condition. Without a bucket
+	// every repository metadata condition is missing, and so denies.
+	bucket, _ := ctx.Value(ContextKeyRepositoryID).(string)
+	fields := repositoryMetadataFields(ctx, o.Catalog, bucket)
+	ctx = auth.WithConditionContext(ctx, auth.NewConditionContextWithProvider(clientIP, fields))
+
+	authResp, err := authService.Authorize(ctx, &auth.AuthorizationRequest{
 		Username:            username,
 		RequiredPermissions: perms,
 		ClientIP:            clientIP,
+		Fields:              fields,
 	})
 	if err != nil {
 		o.Log(req).WithError(err).Error("failed to authorize")
@@ -300,6 +310,25 @@ func authorize(w http.ResponseWriter, req *http.Request, authService auth.Gatewa
 		Operation: o,
 		Principal: username,
 	}
+}
+
+// repositoryMetadataFields returns a lazy, request-memoised provider of the
+// lakefs:RepositoryMetadata/<key> condition fields of the bucket's repository. It returns nil when
+// the request has no bucket, or when the metadata cannot be loaded - in both cases a statement
+// requiring such a field does not match, and so does not grant permission.
+func repositoryMetadataFields(ctx context.Context, cat *catalog.Catalog, bucket string) func(key string) (string, bool) {
+	if bucket == "" || cat == nil {
+		return nil
+	}
+	return auth.NewRepositoryMetadataFields(func() (map[string]string, error) {
+		metadata, err := cat.GetRepositoryMetadata(ctx, bucket)
+		if err != nil {
+			logging.FromContext(ctx).WithError(err).WithField("repository", bucket).
+				Debug("repository metadata unavailable for authorization conditions")
+			return nil, err
+		}
+		return metadata, nil
+	})
 }
 
 func selectContentType(acceptable []string) *string {
