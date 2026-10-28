@@ -20,6 +20,9 @@ auth:
   logout_redirect_url: "https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/logout?post_logout_redirect_uri=https://<your-lakefs-host>/auth/login"
 
   ui_config:
+    # Set automatically to "simplified" when sso.enabled is true (the ACL auth service's mode),
+    # which enables the Users / Groups / Permissions pages in the UI.
+    rbac: "simplified"
     login_url: "/oidc/login"
 
     # SSO-first login. "redirect" sends the browser straight to fallback_login_url; the

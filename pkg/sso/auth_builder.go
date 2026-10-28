@@ -34,6 +34,8 @@ func BuildAuthService(ctx context.Context, cfg config.Config, logger logging.Log
 		return auth.NewAuthService(ctx, cfg, logger, kvStore, mm)
 	}
 
+	ensureSimplifiedRBAC(cfg.AuthConfig().GetAuthUIConfig(), logger)
+
 	baseAuthCfg := cfg.AuthConfig().GetBaseAuthConfig()
 	secretStore := crypt.NewSecretStore([]byte(baseAuthCfg.Encrypt.SecretKey))
 	cacheConf := authparams.ServiceCache(baseAuthCfg.Cache)
@@ -59,4 +61,18 @@ func BuildAuthService(ctx context.Context, cfg config.Config, logger logging.Log
 	builtAuthService = svc
 	builtAuthServiceMu.Unlock()
 	return svc
+}
+
+// ensureSimplifiedRBAC forces auth.ui_config.rbac to "simplified", the only mode acl.AuthService
+// supports. The default ("none") makes the UI hide users/groups behind "Unlock Access Control", and
+// "external"/"internal" expect a policy-capable remote auth service. The config is shared by pointer,
+// so setup and the API controller (/setup_lakefs login_config) see the corrected value.
+func ensureSimplifiedRBAC(uiCfg *config.AuthUIConfig, logger logging.Logger) {
+	if uiCfg.RBAC == config.AuthRBACSimplified {
+		return
+	}
+	if uiCfg.RBAC != config.AuthRBACNone && uiCfg.RBAC != "" {
+		logger.WithField("rbac", uiCfg.RBAC).Warn("sso: auth.ui_config.rbac is not supported with the ACL auth service, using \"simplified\"")
+	}
+	uiCfg.RBAC = config.AuthRBACSimplified
 }
