@@ -47,6 +47,28 @@ W3: B3 B5                 W4: B6 C2 C3 C4    W5: C5
 - setup.go (auth): A2, C4 (C4 depends on A2)
 
 ## Status
+- BOARD COMPLETE: 24/24 cards done (A1-A6, B1-B6, C1-C5, R1, F1-F6). Nothing in
+  backlog/in_progress/review.
+- Final two landed by manager cherry-pick after awaiting_review parking (hook stops,
+  not losses): F3 5c8bbe755 (condition ctx for nested gateway bulk-delete + presign
+  stat; controller/gateway/middleware + 2 new test files) and F4 8ba043d4e
+  (authorization_failure_status validated to {401,403} at startup, opt-in test
+  TestAuthorizeCallback_AuthorizationFailureStatus, docs). Zero conflicts; early-F4
+  risk did not materialize.
+- Final validation on merged branch: go build ./... ok; go test ok for pkg/auth,...,
+  pkg/sso, pkg/config, contrib/auth/acl, pkg/gateway (+subpkgs), pkg/cache,
+  pkg/permissions, pkg/graveler/settings, pkg/api targeted (ListBranches,
+  AuthorizationFailureStatus, Condition, Presign); license guard OK (358544dd7 not
+  ancestor).
+- ALL R1 findings resolved: B1(F1), M1(F2), M2(F3), m2(F4), m1(F5), m6(F6). Left
+  unaddressed by choice (minors/nits in REVIEW_R1.md): m3 dual version keys, m4 A6 webui
+  test gap, m5 datasets half-wiring, and nit list — candidates for a follow-up polish
+  card if desired.
+- rbac: internal release gate: CLEAR.
+- Branch NOT pushed (~29 commits ahead of origin) — operator's call.
+- Outstanding non-board items: RBAC_DESIGN §9 open questions (rbac-migrate merge
+  strategy, break-glass in SuperUsers?, cross-replica TTL stance) need product owner.
+--- superseded history below ---
 - F5 landed as 0178c5de0 (manager cherry-pick of worktree commit 747375cbf; §4.10
   immediate-revoke matrix 7 cases; contrib tests green; card done).
 - F3 afa4f still running. F4 8775e gated on F3. Remaining after F3+F4: board complete.
