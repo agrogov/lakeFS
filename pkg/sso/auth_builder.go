@@ -49,6 +49,11 @@ func BuildAuthService(ctx context.Context, cfg config.Config, logger logging.Log
 		logger.WithError(err).Warn("acl base group bootstrap failed")
 	}
 
+	// Seed the optional break-glass local admin (after the groups it joins exist).
+	if _, err := EnsureBreakGlassAdmin(ctx, aclService, logger); err != nil {
+		logger.WithError(err).Error("break-glass admin bootstrap failed")
+	}
+
 	svc := auth.NewMonitoredAuthService(aclService)
 	builtAuthServiceMu.Lock()
 	builtAuthService = svc
