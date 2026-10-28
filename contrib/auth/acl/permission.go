@@ -2,6 +2,7 @@ package acl
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/model"
@@ -52,7 +53,13 @@ func ACLToStatement(acl model.ACL) (model.Statements, error) {
 		if err != nil {
 			return nil, err
 		}
-		statements = append(append(statements, readConfigStatement...), ownCredentialsStatement...)
+
+		catalogReadStatement, err := auth.MakeStatementForPolicyType("CatalogRead", all)
+		if err != nil {
+			return nil, fmt.Errorf("%s: get CatalogRead: %w", acl.Permission, ErrBadACLPermission)
+		}
+
+		statements = append(statements, slices.Concat(readConfigStatement, ownCredentialsStatement, catalogReadStatement)...)
 	case WritePermission:
 		statements, err = auth.MakeStatementForPolicyType("FSReadWrite", all)
 		if err != nil {
@@ -69,7 +76,17 @@ func ACLToStatement(acl model.ACL) (model.Statements, error) {
 			return nil, fmt.Errorf("%s: get RepoManagementRead: %w", acl.Permission, ErrBadACLPermission)
 		}
 
-		statements = append(statements, append(ownCredentialsStatement, ciStatement...)...)
+		prStatement, err := auth.MakeStatementForPolicyType("PRReadWrite", all)
+		if err != nil {
+			return nil, fmt.Errorf("%s: get PRReadWrite: %w", acl.Permission, ErrBadACLPermission)
+		}
+
+		catalogReadWriteStatement, err := auth.MakeStatementForPolicyType("CatalogReadWrite", all)
+		if err != nil {
+			return nil, fmt.Errorf("%s: get CatalogReadWrite: %w", acl.Permission, ErrBadACLPermission)
+		}
+
+		statements = append(statements, slices.Concat(ownCredentialsStatement, ciStatement, prStatement, catalogReadWriteStatement)...)
 	case SuperPermission:
 		statements, err = auth.MakeStatementForPolicyType("FSFullAccess", all)
 		if err != nil {
@@ -86,7 +103,17 @@ func ACLToStatement(acl model.ACL) (model.Statements, error) {
 			return nil, fmt.Errorf("%s: get RepoManagementRead: %w", acl.Permission, ErrBadACLPermission)
 		}
 
-		statements = append(statements, append(ownCredentialsStatement, ciStatement...)...)
+		prStatement, err := auth.MakeStatementForPolicyType("PRReadWrite", all)
+		if err != nil {
+			return nil, fmt.Errorf("%s: get PRReadWrite: %w", acl.Permission, ErrBadACLPermission)
+		}
+
+		catalogReadWriteStatement, err := auth.MakeStatementForPolicyType("CatalogReadWrite", all)
+		if err != nil {
+			return nil, fmt.Errorf("%s: get CatalogReadWrite: %w", acl.Permission, ErrBadACLPermission)
+		}
+
+		statements = append(statements, slices.Concat(ownCredentialsStatement, ciStatement, prStatement, catalogReadWriteStatement)...)
 	case AdminPermission:
 		statements, err = auth.MakeStatementForPolicyType("AllAccess", []string{permissions.All})
 		if err != nil {
