@@ -22,6 +22,9 @@ import (
 var (
 	builtAuthServiceMu sync.RWMutex
 	builtAuthService   auth.Service
+	// builtKVStore backs the SSO user-profile writes (email/display name), which the ACL
+	// auth service has no API for.
+	builtKVStore kv.Store
 )
 
 // BuildAuthService is the AuthServiceBuilder for the lakefs-sso binary.
@@ -59,6 +62,7 @@ func BuildAuthService(ctx context.Context, cfg config.Config, logger logging.Log
 	svc := auth.NewMonitoredAuthService(aclService)
 	builtAuthServiceMu.Lock()
 	builtAuthService = svc
+	builtKVStore = kvStore
 	builtAuthServiceMu.Unlock()
 	return svc
 }
