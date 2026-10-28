@@ -285,7 +285,7 @@ func (a *APIAuthService) GetUserByID(ctx context.Context, userID string) (*model
 	if err != nil {
 		return nil, fmt.Errorf("userID as int64: %w", err)
 	}
-	return a.getFirstUser(ctx, UserKey{id: userID}, &ListUsersParams{Id: &intID})
+	return a.getFirstUser(ctx, UserKey{ID: userID}, &ListUsersParams{Id: &intID})
 }
 
 func (a *APIAuthService) GetUser(ctx context.Context, username string) (*model.User, error) {

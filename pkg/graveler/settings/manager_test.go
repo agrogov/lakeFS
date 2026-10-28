@@ -45,6 +45,14 @@ func (m *mockCache) GetOrSetWithExpiry(k any, setFn cache.SetFnWithExpiry) (v an
 	panic("Not implemented.")
 }
 
+func (m *mockCache) Delete(k any) {
+	delete(m.c, k)
+}
+
+func (m *mockCache) Purge() {
+	m.c = make(map[any]any)
+}
+
 func TestNonExistent(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
