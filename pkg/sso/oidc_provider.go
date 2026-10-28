@@ -47,7 +47,7 @@ type NativeOIDCService struct {
 }
 
 type profileUpdater interface {
-	UpdateUserProfile(ctx context.Context, username string, p UserProfile) error
+	UpdateUserProfile(ctx context.Context, username, email, friendlyName string) error
 }
 
 // NewNativeOIDCService constructs the service by performing OIDC discovery against
@@ -74,14 +74,20 @@ func NewNativeOIDCService(ctx context.Context, cfg *SSOConfig, authService auth.
 		Scopes:       cfg.Scopes,
 	}
 
-	return &NativeOIDCService{
+	svc := &NativeOIDCService{
 		cfg:               cfg,
 		provider:          provider,
 		oauth2Cfg:         oauth2Cfg,
 		authService:       authService,
 		logger:            logger,
 		logoutRedirectURL: logoutRedirectURL,
-	}, nil
+	}
+	// The ACL auth service exposes the profile update alongside auth.Service; use it
+	// directly instead of writing user records behind the service's back.
+	if profiles, ok := authService.(profileUpdater); ok {
+		svc.profiles = profiles
+	}
+	return svc, nil
 }
 
 func (s *NativeOIDCService) IsExternalPrincipalsEnabled() bool {
@@ -215,7 +221,8 @@ func (s *NativeOIDCService) provisionUser(ctx context.Context, username string, 
 		return
 	}
 	if s.profiles != nil {
-		if err := s.profiles.UpdateUserProfile(ctx, username, ProfileFromClaims(claims, s.cfg)); err != nil {
+		profile := ProfileFromClaims(claims, s.cfg)
+		if err := s.profiles.UpdateUserProfile(ctx, username, profile.Email, profile.FriendlyName); err != nil {
 			s.logger.WithField("user", username).WithError(err).Warn("user profile update failed")
 		}
 	}

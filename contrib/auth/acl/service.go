@@ -236,8 +236,49 @@ func (s *AuthService) ListUsers(ctx context.Context, params *model.PaginationPar
 	return model.ConvertUsersDataList(msgs), paginator, err
 }
 
-func (s *AuthService) UpdateUserFriendlyName(_ context.Context, _ string, _ string) error {
-	return auth.ErrNotImplemented
+func (s *AuthService) UpdateUserFriendlyName(ctx context.Context, username, friendlyName string) error {
+	return s.UpdateUserProfile(ctx, username, "", friendlyName)
+}
+
+// UpdateUserProfile updates the non-empty profile fields that differ from the stored user.
+// A concurrent profile update with the same values is not an error.
+func (s *AuthService) UpdateUserProfile(ctx context.Context, username, email, friendlyName string) error {
+	userKey := model.UserPath(username)
+	data := model.UserData{}
+	pred, err := kv.GetMsg(ctx, s.store, model.PartitionKey, userKey, &data)
+	if err != nil {
+		if errors.Is(err, kv.ErrNotFound) {
+			err = auth.ErrNotFound
+		}
+		return fmt.Errorf("%s: %w", username, err)
+	}
+
+	// Drop every key under which this user can be cached, including the old and new
+	// email lookup keys. Profile changes must be visible before the cache TTL expires.
+	cacheKeys := []auth.UserKey{
+		{Username: username},
+		{Email: data.Email},
+		{Email: email},
+		{ExternalID: data.ExternalId},
+	}
+	defer s.cache.InvalidateUser(cacheKeys...)
+
+	changed := false
+	if email != "" && data.Email != email {
+		data.Email, changed = email, true
+	}
+	if friendlyName != "" && data.FriendlyName != friendlyName {
+		data.FriendlyName, changed = friendlyName, true
+	}
+	if !changed {
+		return nil
+	}
+
+	// A concurrent login writes the same values, so losing the race is fine.
+	if err = kv.SetMsgIf(ctx, s.store, model.PartitionKey, userKey, &data, pred); err != nil && !errors.Is(err, kv.ErrPredicateFailed) {
+		return fmt.Errorf("update user %q: %w", username, err)
+	}
+	return nil
 }
 
 func (s *AuthService) ListUserCredentials(ctx context.Context, username string, params *model.PaginationParams) ([]*model.Credential, *model.Paginator, error) {
@@ -272,6 +313,7 @@ func (s *AuthService) AttachPolicyToUser(ctx context.Context, policyDisplayName 
 		}
 		return fmt.Errorf("policy attachment to user: (key %s): %w", pu, err)
 	}
+	s.cache.InvalidateUserPolicies(username)
 	return nil
 }
 
@@ -291,7 +333,11 @@ func (s *AuthService) DetachPolicyFromUser(ctx context.Context, policyDisplayNam
 	if _, err := s.GetPolicy(ctx, policyDisplayName); err != nil {
 		return err
 	}
-	return s.DetachPolicyFromUserNoValidation(ctx, policyDisplayName, username)
+	if err := s.DetachPolicyFromUserNoValidation(ctx, policyDisplayName, username); err != nil {
+		return err
+	}
+	s.cache.InvalidateUserPolicies(username)
+	return nil
 }
 
 func (s *AuthService) ListUserPolicies(ctx context.Context, username string, params *model.PaginationParams) ([]*model.Policy, *model.Paginator, error) {
@@ -491,6 +537,7 @@ func (s *AuthService) DeleteGroup(ctx context.Context, groupID string) error {
 	if err != nil {
 		return fmt.Errorf("delete user (auth.UserKey %s): %w", groupPath, err)
 	}
+	s.cache.PurgePolicies()
 	return nil
 }
 
@@ -535,6 +582,7 @@ func (s *AuthService) AddUserToGroup(ctx context.Context, username, groupDisplay
 		}
 		return fmt.Errorf("add user to group: (key %s): %w", gu, err)
 	}
+	s.cache.InvalidateUserPolicies(username)
 	return nil
 }
 
@@ -554,7 +602,11 @@ func (s *AuthService) RemoveUserFromGroup(ctx context.Context, username, groupID
 	if _, err := s.GetGroup(ctx, groupID); err != nil {
 		return err
 	}
-	return s.removeUserFromGroupNoValidation(ctx, username, groupID)
+	if err := s.removeUserFromGroupNoValidation(ctx, username, groupID); err != nil {
+		return err
+	}
+	s.cache.InvalidateUserPolicies(username)
+	return nil
 }
 
 func (s *AuthService) ListUserGroups(ctx context.Context, username string, params *model.PaginationParams) ([]*model.Group, *model.Paginator, error) {
@@ -651,6 +703,7 @@ func (s *AuthService) WritePolicy(ctx context.Context, policy *model.Policy, upd
 			}
 			return err
 		}
+		s.cache.PurgePolicies()
 		return nil
 	}
 
@@ -719,6 +772,7 @@ func (s *AuthService) DeletePolicy(ctx context.Context, policyDisplayName string
 	if err != nil {
 		return fmt.Errorf("delete policy (policyKey %s): %w", policyPath, err)
 	}
+	s.cache.PurgePolicies()
 	return nil
 }
 
@@ -816,6 +870,7 @@ func (s *AuthService) AttachPolicyToGroup(ctx context.Context, policyDisplayName
 		}
 		return fmt.Errorf("policy attachment to group: (key %s): %w", pg, err)
 	}
+	s.cache.PurgePolicies()
 	return nil
 }
 
@@ -835,7 +890,11 @@ func (s *AuthService) DetachPolicyFromGroup(ctx context.Context, policyDisplayNa
 	if _, err := s.GetPolicy(ctx, policyDisplayName); err != nil {
 		return err
 	}
-	return s.DetachPolicyFromGroupNoValidation(ctx, policyDisplayName, groupDisplayName)
+	if err := s.DetachPolicyFromGroupNoValidation(ctx, policyDisplayName, groupDisplayName); err != nil {
+		return err
+	}
+	s.cache.PurgePolicies()
+	return nil
 }
 
 func (s *AuthService) GetCredentialsForUser(ctx context.Context, username, accessKeyID string) (*model.Credential, error) {

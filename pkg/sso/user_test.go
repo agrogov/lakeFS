@@ -29,9 +29,20 @@ func newFakeUserStore(groups map[string][]string) *fakeUserStore {
 	return &fakeUserStore{fakeGroupManager: newFakeGroupManager(groups), users: map[string]*model.User{}}
 }
 
+func (f *fakeUserStore) GetUser(_ context.Context, username string) (*model.User, error) {
+	for _, u := range f.users {
+		if u.Username == username {
+			return u, nil
+		}
+	}
+	return nil, auth.ErrNotFound
+}
+
 func (f *fakeUserStore) GetUserByExternalID(_ context.Context, id string) (*model.User, error) {
-	if u, ok := f.users[id]; ok {
-		return u, nil
+	for _, u := range f.users {
+		if u.ExternalID != nil && *u.ExternalID == id {
+			return u, nil
+		}
 	}
 	return nil, auth.ErrNotFound
 }
@@ -74,6 +85,16 @@ func TestEnsureUser_ExistingUserUntouched(t *testing.T) {
 	store := newFakeUserStore(nil)
 	store.users["oid-1"] = &model.User{Username: "oid-1"}
 	created, err := sso.EnsureUser(context.Background(), store, "oid-1")
+	if err != nil || created || store.creates != 0 {
+		t.Fatalf("EnsureUser = (%v, %v), creates=%d; want (false, nil), 0", created, err, store.creates)
+	}
+}
+
+func TestEnsureUser_FallsBackToExternalIDLookup(t *testing.T) {
+	store := newFakeUserStore(nil)
+	externalID := "oid-1"
+	store.users[externalID] = &model.User{Username: "legacy-user", ExternalID: &externalID}
+	created, err := sso.EnsureUser(context.Background(), store, externalID)
 	if err != nil || created || store.creates != 0 {
 		t.Fatalf("EnsureUser = (%v, %v), creates=%d; want (false, nil), 0", created, err, store.creates)
 	}
