@@ -16,7 +16,7 @@ var (
 // without the required ARN.
 var statementByName = map[string]model.Statement{
 	"AllAccess": {
-		Action: []string{"fs:*", "auth:*", "ci:*", "retention:*", "branches:*", "pr:*"},
+		Action: []string{"fs:*", "auth:*", "ci:*", "retention:*", "branches:*", "pr:*", "catalog:*"},
 		Effect: model.StatementEffectAllow,
 	},
 	"FSFullAccess": {
