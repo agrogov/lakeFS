@@ -47,7 +47,20 @@ W3: B3 B5                 W4: B6 C2 C3 C4    W5: C5
 - setup.go (auth): A2, C4 (C4 depends on A2)
 
 ## Status
+- R1 executed by review agent; report committed as REVIEW_R1.md (repo commit 38e6435d5).
+  Verdict: changes requested — 1 blocker, 2 majors, minors. R1 card moved to done.
+- FOLLOW-UP CARDS on board (from REVIEW_R1.md §5):
+  F1=29def BLOCKER ListBranches condition-context bypass  [in_progress]
+  F2=09281 MAJOR DeleteUser cache invalidation            [in_progress]
+  F6=26452 minor license-guard script + CI                [in_progress]
+  F3=afa4f MAJOR nested-Authorize condition ctx  [waits F1]
+  F4=8775e minor failure_status validation      [waits F3]
+  F5=50cd4 minor revoke test suite              [waits F2]
+  File-collision chain: F1 -> F3 -> F4 (controller.go/authorize paths); F2 -> F5 (acl tests).
+- Release gate: rbac: internal must NOT ship until F1 is done (blocker per R1).
+--- previous status (superseded) ---
 - BOARD: 16/17 done, C5 (0d286) in_progress (started after C3 landed). Board effectively complete once C5 ships.
+- (C5 has since shipped as b2086304d; all original 17 cards done.)
 - NEW CARD: R1 0a0e4 "full code review of policy-RBAC delivery" — in backlog, linked to
   wait on C5 (0d286). Review-only (auto-review intentionally OFF). Scope: diff
   a25abca09424d660bc659d0b35340329877a6390..HEAD; focus: authz correctness, cache
