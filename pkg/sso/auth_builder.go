@@ -22,10 +22,14 @@ import (
 var (
 	builtAuthServiceMu sync.RWMutex
 	builtAuthService   auth.Service
-	// builtKVStore backs the SSO user-profile writes (email/display name), which the ACL
-	// auth service has no API for.
-	builtKVStore kv.Store
 )
+
+// authServiceWithProfiles is the built auth.Service together with the ACL profile-update
+// API. The generated monitored-service wrapper only forwards auth.Service methods.
+type authServiceWithProfiles struct {
+	auth.Service
+	profileUpdater
+}
 
 // BuildAuthService is the AuthServiceBuilder for the lakefs-sso binary.
 // When SSO is enabled it instantiates acl.AuthService in-process (RBAC "simplified" mode),
@@ -59,10 +63,12 @@ func BuildAuthService(ctx context.Context, cfg config.Config, logger logging.Log
 		logger.WithError(err).Error("break-glass admin bootstrap failed")
 	}
 
-	svc := auth.NewMonitoredAuthService(aclService)
+	svc := authServiceWithProfiles{
+		Service:        auth.NewMonitoredAuthService(aclService),
+		profileUpdater: aclService,
+	}
 	builtAuthServiceMu.Lock()
 	builtAuthService = svc
-	builtKVStore = kvStore
 	builtAuthServiceMu.Unlock()
 	return svc
 }

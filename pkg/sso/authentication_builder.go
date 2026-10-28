@@ -25,7 +25,6 @@ func BuildAuthenticationService(ctx context.Context, cfg config.Config, logger l
 
 	builtAuthServiceMu.RLock()
 	cachedSvc := builtAuthService
-	kvStore := builtKVStore
 	builtAuthServiceMu.RUnlock()
 
 	if cachedSvc == nil {
@@ -39,9 +38,6 @@ func BuildAuthenticationService(ctx context.Context, cfg config.Config, logger l
 	svc, err := NewNativeOIDCService(ctx, ssoCfg, cachedSvc, logger, logoutRedirectURL)
 	if err != nil {
 		return nil, err
-	}
-	if kvStore != nil {
-		svc.profiles = &kvProfileStore{store: kvStore}
 	}
 	logger.WithField("issuer", ssoCfg.IssuerURL).Info("native OIDC service initialized")
 	return svc, nil
