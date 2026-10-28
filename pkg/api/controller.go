@@ -33,6 +33,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/model"
 	"github.com/treeverse/lakefs/pkg/auth/setup"
+	"github.com/treeverse/lakefs/pkg/auth/wildcard"
 	"github.com/treeverse/lakefs/pkg/authentication"
 	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/catalog"
@@ -2923,8 +2924,90 @@ func (c *Controller) GetRunHookOutput(w http.ResponseWriter, r *http.Request, re
 	}
 }
 
+// hasBranchPermission reports whether policies grant action on at least one
+// branch resource of the given repository.
+func hasBranchPermission(repositoryID, username string, policies []*model.Policy, action string) bool {
+	const branchResourceSeparator = "/branch/"
+	for _, policy := range policies {
+		for _, stmt := range policy.Statement {
+			if stmt.Effect != model.StatementEffectAllow {
+				continue
+			}
+			actionMatches := false
+			for _, stmtAction := range stmt.Action {
+				if wildcard.Match(stmtAction, action) {
+					actionMatches = true
+					break
+				}
+			}
+			if !actionMatches {
+				continue
+			}
+			resources, err := auth.ParsePolicyResourceAsList(stmt.Resource)
+			if err != nil {
+				continue
+			}
+			for _, resource := range resources {
+				resource = strings.ReplaceAll(resource, "${user}", username)
+				if resource == permissions.All {
+					return true
+				}
+				parsed, err := auth.ParseARN(resource)
+				if err != nil {
+					continue
+				}
+				if idx := strings.Index(parsed.ResourceID, branchResourceSeparator); idx >= 0 {
+					branchPattern := parsed.ResourceID[idx+len(branchResourceSeparator):]
+					// Replace wildcard characters with a literal so the pattern can be
+					// matched against a concrete branch ARN.
+					branchName := strings.NewReplacer("*", "x", "?", "x").Replace(branchPattern)
+					if auth.ArnMatch(resource, permissions.BranchArn(repositoryID, branchName)) {
+						return true
+					}
+					continue
+				}
+				// A broader wildcard (for example repository/repo/*) may cover branches too.
+				if auth.ArnMatch(resource, permissions.BranchArn(repositoryID, "probe")) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (c *Controller) ListBranches(w http.ResponseWriter, r *http.Request, repository string, params apigen.ListBranchesParams) {
-	if !c.authorize(w, r, permissions.Node{
+	ctx := r.Context()
+	user, err := auth.GetUser(ctx)
+	if err != nil {
+		writeError(w, r, http.StatusUnauthorized, ErrAuthenticatingRequest)
+		return
+	}
+
+	// Fetch effective policies so branches can be filtered by policy. Legacy auth
+	// services (e.g. BasicAuthService) do not implement this and keep the original
+	// repository-level authorization behaviour.
+	policies, _, err := c.Auth.ListEffectivePolicies(ctx, user.Username, &model.PaginationParams{Amount: -1})
+	if err != nil && !errors.Is(err, auth.ErrNotImplemented) {
+		c.Logger.WithContext(ctx).WithError(err).Error("failed to list effective policies")
+		writeError(w, r, http.StatusInternalServerError, err)
+		return
+	}
+
+	filterByPolicy := !errors.Is(err, auth.ErrNotImplemented)
+	repoAllowed := false
+	if filterByPolicy {
+		repoAllowed = auth.CheckPermissions(ctx, permissions.Node{
+			Permission: permissions.Permission{
+				Action:   permissions.ListBranchesAction,
+				Resource: permissions.RepoArn(repository),
+			},
+		}, user.Username, policies, &auth.MissingPermissions{}) == auth.CheckAllow
+		if !repoAllowed && !hasBranchPermission(repository, user.Username, policies, permissions.ListBranchesAction) {
+			writeError(w, r, http.StatusUnauthorized, auth.ErrInsufficientPermissions)
+			return
+		}
+	} else if !c.authorize(w, r, permissions.Node{
 		Permission: permissions.Permission{
 			Action:   permissions.ListBranchesAction,
 			Resource: permissions.RepoArn(repository),
@@ -2932,7 +3015,7 @@ func (c *Controller) ListBranches(w http.ResponseWriter, r *http.Request, reposi
 	}) {
 		return
 	}
-	ctx := r.Context()
+
 	c.LogAction(ctx, "list_branches", r, repository, "", "")
 	res, hasMore, err := c.Catalog.ListBranches(
 		ctx,
@@ -2947,6 +3030,19 @@ func (c *Controller) ListBranches(w http.ResponseWriter, r *http.Request, reposi
 
 	refs := make([]apigen.Ref, 0, len(res))
 	for _, branch := range res {
+		if filterByPolicy {
+			// Explicit branch denies always hide a branch. Neutral results are visible
+			// only when the user has access to the whole repository.
+			result := auth.CheckPermissions(ctx, permissions.Node{
+				Permission: permissions.Permission{
+					Action:   permissions.ListBranchesAction,
+					Resource: permissions.BranchArn(repository, branch.Name),
+				},
+			}, user.Username, policies, &auth.MissingPermissions{})
+			if result == auth.CheckDeny || (result == auth.CheckNeutral && !repoAllowed) {
+				continue
+			}
+		}
 		refs = append(refs, apigen.Ref{
 			CommitId: branch.Reference,
 			Id:       branch.Name,
