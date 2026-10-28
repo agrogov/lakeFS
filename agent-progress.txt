@@ -50,5 +50,9 @@ W3: B3 B5                 W4: B6 C2 C3 C4    W5: C5
 - 17 tasks created in `backlog` on the kanban board; 16 dependency links verified.
 - Wave 1 started on board: A1, A2, A3, A4, A5 (in_progress sessions). A6, C1 held in
   backlog for wave 2 slot (max-5 cap).
+- UPDATE: auto-review ENABLED (mode=commit) on ALL 17 tasks incl. running wave-1 ones —
+  agents commit their worktree onto the base ref when done; progress cannot be lost to
+  worktree cleanup. Dependency links remain the mechanism that guarantees wave-2
+  worktrees start from a base ref already containing their prerequisites.
 - No implementation done by this agent (earlier trial edits were reverted; base HEAD was 95dceafc2).
 - Open design questions from RBAC_DESIGN §9 unanswered — do not block wave-1 tasks on them.
