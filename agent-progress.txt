@@ -47,7 +47,20 @@ W3: B3 B5                 W4: B6 C2 C3 C4    W5: C5
 - setup.go (auth): A2, C4 (C4 depends on A2)
 
 ## Status
-- U1=2d585 STARTED (auto-review commit ON, baseRef feature/azure-entra-sso-apache): can pi use
+- U1=2d585 SUPERSEDED by U2=eda44 (owner directives arrived ~2 min after start: Playwright is
+  mandatory; react-bootstrap must go, replace with modern UI on a modern framework). The board has no
+  stop/message command for a running card, so U1 was moved to done (it had made 0 changes, 0 home-dir
+  side effects; /tmp/xias-work scratch removed) and U2 created+started with the full new scope.
+- U2=eda44 STARTED (auto-review commit ON, base feature/azure-entra-sso-apache). Scope: (1) make XIAS
+  skills usable from pi via ~/.agents/ux-ui-kit + ~/.agents/skills/<name> (ported absolute paths);
+  (2) install Playwright+chromium INSIDE the kit dir and prove >=3 browser gates run; (3) STACK DECISION
+  for replacing react-bootstrap/bootstrap(/MUI): evaluate Tailwind+shadcn/Radix (XIAS react-tailwind
+  adapter), MUI-only, Mantine/Chakra, CSS-modules+Radix against hard constraints (static SPA into
+  webui/dist go:embed, 20k LOC / 118 files, 18 react-bootstrap files, ~70 bootstrap-class files, 25 e2e
+  specs with ~10 class-coupled locators, incremental coexistence, dark mode, Apache-2.0); (4) deliverable
+  UX_SKILLS_PI.md only, with a proposed rewrite card list. STACK CHOICE IS A PROPOSAL: owner confirms
+  before any rewrite card is created/started. webui/ is read-only for U2.
+- (superseded) U1=2d585 STARTED (auto-review commit ON, baseRef feature/azure-entra-sso-apache): can pi use
   plugin87/ux-ui-agent-skills (MIT, 26 skills, pinned def84a70f v3.0.0) -> if yes, install for pi
   OUTSIDE the repo (~/.agents/ux-ui-kit + ~/.agents/skills/<name>), deliverable UX_SKILLS_PI.md only.
   Pre-probe findings baked into the card: pi does NOT expand ${CLAUDE_SKILL_DIR} (kit ships
