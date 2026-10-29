@@ -47,6 +47,41 @@ W3: B3 B5                 W4: B6 C2 C3 C4    W5: C5
 - setup.go (auth): A2, C4 (C4 depends on A2)
 
 ## Status
+- BRANCH SPLIT DONE (owner-approved history rewrite, unpushed): feature/azure-entra-sso-apache was
+  rewritten to a25abca09 + 12 board-bookkeeping commits ONLY (zero code files differ from a25abca09;
+  agent-progress.txt content identical to pre-rewrite tip). All 24 RBAC commits now live ONLY on
+  feature/rbac-policy-engine (tip ba109abe7). Old SHAs quoted anywhere below this line that are
+  RBAC commits (and every bookkeeping SHA, which were re-created by cherry-pick) are NO LONGER ON
+  the source branch; they stay reachable via backup tags:
+    backup/source-pre-drop-396c630b7  (source branch before rewrite, includes everything)
+    backup/rbac-source-tip-74c19c0fb  (older tip)
+  OLD -> NEW SHA map for the 24 RBAC commits (old = card->commit table / card list below):
+  7bfbe8b17 -> 7d05c21be
+  728493845 -> 40698e6ff
+  9eacd521d -> adbec67e6
+  6f18e72bc -> d2cb4521a
+  fed01838c -> f22e0595c
+  135d1710f -> 36f68c8a3
+  361b59e4e -> fa5203bfc
+  7ef078aa7 -> 1f8fdd760
+  06c258da6 -> 50bc2bba9
+  0009401de -> 29a345cd3
+  6cdc5d902 -> 3c3052442
+  8d5c7c65c -> 67ea964b3
+  9a8a4a7c1 -> da75fd5f2
+  f93229aec -> 20881d6c4
+  9dc5ccfba -> 7d5871840
+  411274f18 -> 79347b45f
+  b2086304d -> 91ef0eea0
+  38e6435d5 -> 31f841a79
+  8fb584042 -> eb3267624
+  d9f31e62f -> 940900d44
+  eff5bb6a9 -> bd150c6b6
+  747375cbf -> f565427a9
+  51cfc14b8 -> d4dca3108
+  0163f944c -> ba109abe7
+  To restore the old combined branch: git branch -f feature/azure-entra-sso-apache backup/source-pre-drop-396c630b7
+- D2 (b27a2) still running on feature/rbac-policy-engine; unaffected (its worktree is on that branch).
 - D1 DONE: branch feature/rbac-policy-engine tip ba109abe7 (24 cherry-picks, -x, base a25abca09);
   backup tag backup/rbac-source-tip-74c19c0fb. Manager re-verified all 5 acceptance checks: count=24,
   tree diff vs source = agent-progress.txt only, 0 bookkeeping commits, go build ok + 17 pkgs ok/0 FAIL +
