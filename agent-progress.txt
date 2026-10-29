@@ -47,6 +47,22 @@ W3: B3 B5                 W4: B6 C2 C3 C4    W5: C5
 - setup.go (auth): A2, C4 (C4 depends on A2)
 
 ## Status
+- D2 DONE (b27a2): DESIGN_CONFORMANCE.md landed on feature/rbac-policy-engine as 54beb4c62 (tip, 25 commits
+  over a25abca09; ONLY that file added; NOT on the source branch). Manager review: scope clean; spot-verified
+  3 claims independently - (a) GAP-01 mechanism (setup.go:82 builder -> EnsureACLBaseGroups ->
+  SetupACLServer writes auth/setup_timestamp, the same key setupLakeFS's IsInitialized reads at :124 ->
+  'Setup is already complete'); (b) GAP-09 mutant (restore 500 for !Allowed) passes all of ./pkg/api; (c)
+  GAP-13 stale comment at rbac_bootstrap.go:28 and GAP-14 (no 'committer' in CHANGELOG_SSO.md).
+  VERDICT: 107 rows = 84 IMPLEMENTED, 15 PARTIAL, 4 DEVIATION-JUSTIFIED, 2 MISSING, 2 OUT-OF-SCOPE;
+  20 gaps = 0 BLOCKER, 2 MAJOR (GAP-01 `lakefs-sso setup` fails on fresh KV with SSO unless --no-check;
+  GAP-02 wiring in BuildAuthService/setup.go untested, 6/6 mutants survive), 14 MINOR, 4 NIT. F1-F6 verified
+  closing B1/M1/M2/m1/m2/m6 via mutation testing; R1 m3/m4/m5 still open. Proposed follow-up cards are in
+  DESIGN_CONFORMANCE.md section 7. NOT created yet (owner to choose). rbac: internal release gate: GAP-01 +
+  GAP-02 should be fixed first (setup is the first thing an operator runs).
+  D2 SIDE EFFECT FIXED: the agent ran `git fetch https://github.com/treeverse/lakeFS.git master`, which
+  re-imported the BSL objects into the shared .git. Re-pruned (reflog expire + gc --prune=now): BSL commit and
+  the 4 design-section2 commits are gone again, fsck clean, .git back to 188M. Lesson for future cards: never
+  allow fetching from the treeverse URL (add to prompts). Probes kept at ~/.agents/d2-probes (72K).
 - U1=2d585 SUPERSEDED by U2=eda44 (owner directives arrived ~2 min after start: Playwright is
   mandatory; react-bootstrap must go, replace with modern UI on a modern framework). The board has no
   stop/message command for a running card, so U1 was moved to done (it had made 0 changes, 0 home-dir
