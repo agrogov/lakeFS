@@ -47,6 +47,16 @@ W3: B3 B5                 W4: B6 C2 C3 C4    W5: C5
 - setup.go (auth): A2, C4 (C4 depends on A2)
 
 ## Status
+- U1=2d585 STARTED (auto-review commit ON, baseRef feature/azure-entra-sso-apache): can pi use
+  plugin87/ux-ui-agent-skills (MIT, 26 skills, pinned def84a70f v3.0.0) -> if yes, install for pi
+  OUTSIDE the repo (~/.agents/ux-ui-kit + ~/.agents/skills/<name>), deliverable UX_SKILLS_PI.md only.
+  Pre-probe findings baked into the card: pi does NOT expand ${CLAUDE_SKILL_DIR} (kit ships
+  bin/port-skills.js for that); 3 Claude-only skills (critique, observe, scaffold-project); hooks
+  + 34 browser gates not available under pi without Playwright; adapters exist for nextjs,
+  react-tailwind, swiftui only -> lakeFS stack (react-bootstrap + MUI v5 + sass) fit is an open question;
+  must NOT run `ux-ui-skills init` in the repo (collides with scripts/ docs/). webui/ is read-only for U1.
+  Ship plan: review UX_SKILLS_PI.md + verify the install from another cwd, then cherry-pick the doc.
+  Runs in parallel with D2 (disjoint: D2 = review of rbac branch, U1 = tooling + one doc).
 - LICENCE HYGIENE (owner decision: repo = upstream Apache-2.0 code + our changes only):
   * `upstream` remote removed (887 remote-tracking branches gone); only `origin` (agrogov/lakeFS) remains.
   * Deleted local tags v1.87.0 and v1.88.0 (the only refs containing BSL relicense commit 358544dd7)
