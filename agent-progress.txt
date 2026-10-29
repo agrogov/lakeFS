@@ -47,7 +47,13 @@ W3: B3 B5                 W4: B6 C2 C3 C4    W5: C5
 - setup.go (auth): A2, C4 (C4 depends on A2)
 
 ## Status
-- NEW CARDS (created, NOT started, auto-review commit ON, in backlog):
+- D1 DONE: branch feature/rbac-policy-engine tip ba109abe7 (24 cherry-picks, -x, base a25abca09);
+  backup tag backup/rbac-source-tip-74c19c0fb. Manager re-verified all 5 acceptance checks: count=24,
+  tree diff vs source = agent-progress.txt only, 0 bookkeeping commits, go build ok + 17 pkgs ok/0 FAIL +
+  license guard OK on the new branch (in a throwaway worktree, removed), source branch untouched.
+  Source branch NOT rewritten, nothing pushed. D1 board card done.
+- D2 STARTED (b27a2), worktree based at ba109abe7. Output expected: DESIGN_CONFORMANCE.md (review-only).
+- (older) NEW CARDS (created, NOT started, auto-review commit ON, in backlog):
   D1=eb226 extract the 24 RBAC commits onto branch feature/rbac-policy-engine (base a25abca09,
            cherry-pick -x, oldest first; 10 bookkeeping commits excluded; git-only, no code).
   D2=b27a2 RBAC_DESIGN.md conformance check -> DESIGN_CONFORMANCE.md (review-only).
