@@ -47,6 +47,20 @@ W3: B3 B5                 W4: B6 C2 C3 C4    W5: C5
 - setup.go (auth): A2, C4 (C4 depends on A2)
 
 ## Status
+- LICENCE HYGIENE (owner decision: repo = upstream Apache-2.0 code + our changes only):
+  * `upstream` remote removed (887 remote-tracking branches gone); only `origin` (agrogov/lakeFS) remains.
+  * Deleted local tags v1.87.0 and v1.88.0 (the only refs containing BSL relicense commit 358544dd7)
+    and ran `git reflog expire` + `git gc --prune=now`: the BSL commit object and all post-BSL upstream
+    history are physically gone (.git 383M -> 188M). `git fsck` clean, all 9 branches intact.
+  * PROOF of Apache-only lineage: BSL commit object is absent AND fsck reports no missing objects, so no
+    reachable commit can have it as an ancestor. Also: every commit dated on/after the BSL date reachable
+    from any ref is authored by the owner or `kanban-checkpoint` (0 upstream-authored).
+  * CONSEQUENCE for scripts/check-license-base.sh (on feature/rbac-policy-engine): locally it now takes the
+    documented SKIP path (exit 0 + 'inconclusive' warning) because the commit is unavailable. It stays
+    conclusive in CI (workflow adds the upstream remote and fetches full history). Local `skipped` is
+    EXPECTED, not a regression; do not re-add the upstream remote or re-fetch tags to 'fix' it.
+    Never `git fetch upstream` into this clone again: it re-imports BSL objects.
+  * Left alone: 272 Apache-era upstream release tags (v1.0 ... v1.86.x), some not reachable from master.
 - BRANCH SPLIT DONE (owner-approved history rewrite, unpushed): feature/azure-entra-sso-apache was
   rewritten to a25abca09 + 12 board-bookkeeping commits ONLY (zero code files differ from a25abca09;
   agent-progress.txt content identical to pre-rewrite tip). All 24 RBAC commits now live ONLY on
