@@ -1893,6 +1893,101 @@ func TestListBranchesPolicyConditions(t *testing.T) {
 	})
 }
 
+// TestListBranchesIPConditionTrustedProxy verifies that an IpAddress-conditioned allow cannot be
+// satisfied by a spoofed X-Forwarded-For header unless the request's peer is a configured trusted
+// proxy. It also covers the standard right-to-left walk that ignores a client-supplied leftmost
+// entry.
+func TestListBranchesIPConditionTrustedProxy(t *testing.T) {
+	_, deps := setupHandler(t)
+	ctx := t.Context()
+	repo := testUniqueRepoName()
+	_, err := deps.catalog.CreateRepository(ctx, repo, config.SingleBlockstoreID, onBlock(deps, "trusted-proxy"), "main", false)
+	testutil.Must(t, err)
+
+	const (
+		allowedIP    = "203.0.113.5"
+		proxyIP      = "10.0.0.1"
+		realClientIP = "198.51.100.7"
+		user         = "ip-condition-user"
+	)
+	policies := map[string][]*model.Policy{
+		user: {{
+			DisplayName: "ip-condition-allow-policy",
+			Statement: model.Statements{{
+				Effect:   model.StatementEffectAllow,
+				Action:   []string{permissions.ListBranchesAction},
+				Resource: permissions.RepoArn(repo),
+				Condition: map[string]map[string][]string{
+					auth.OperatorNameIpAddress: {"SourceIp": {allowedIP + "/32"}},
+				},
+			}},
+		}},
+	}
+
+	newController := func(trustedProxies []string) *api.Controller {
+		cfg := &config.ConfigImpl{}
+		cfg.Security.TrustedProxies = trustedProxies
+		return &api.Controller{
+			Catalog:   deps.catalog,
+			Config:    cfg,
+			Auth:      &policyAuthService{Service: deps.authService, policies: policies},
+			Logger:    logging.FromContext(ctx),
+			Collector: deps.collector,
+		}
+	}
+	withForwarded := func(remoteAddr, xForwardedFor string) func(*http.Request) {
+		return func(r *http.Request) {
+			r.RemoteAddr = net.JoinHostPort(remoteAddr, "1234")
+			if xForwardedFor != "" {
+				r.Header.Set("X-Forwarded-For", xForwardedFor)
+			}
+		}
+	}
+
+	t.Run("default config ignores a spoofed X-Forwarded-For", func(t *testing.T) {
+		controller := newController(nil)
+		status, _ := listBranchesAsUser(t, controller, repo, user, withForwarded(realClientIP, allowedIP))
+		require.Equal(t, http.StatusUnauthorized, status,
+			"an X-Forwarded-For entry must not satisfy an IpAddress allow when no proxy is trusted")
+	})
+
+	t.Run("controller without config ignores a spoofed X-Forwarded-For", func(t *testing.T) {
+		controller := &api.Controller{
+			Catalog:   deps.catalog,
+			Auth:      &policyAuthService{Service: deps.authService, policies: policies},
+			Logger:    logging.FromContext(ctx),
+			Collector: deps.collector,
+		}
+		status, _ := listBranchesAsUser(t, controller, repo, user, withForwarded(realClientIP, allowedIP))
+		require.Equal(t, http.StatusUnauthorized, status)
+	})
+
+	t.Run("default config uses the peer address", func(t *testing.T) {
+		controller := newController(nil)
+		status, _ := listBranchesAsUser(t, controller, repo, user, withForwarded(allowedIP, ""))
+		require.Equal(t, http.StatusOK, status)
+	})
+
+	t.Run("trusted proxy honours X-Forwarded-For", func(t *testing.T) {
+		controller := newController([]string{proxyIP + "/32"})
+		status, _ := listBranchesAsUser(t, controller, repo, user, withForwarded(proxyIP, allowedIP))
+		require.Equal(t, http.StatusOK, status)
+	})
+
+	t.Run("trusted proxy ignores a spoofed leftmost entry", func(t *testing.T) {
+		controller := newController([]string{proxyIP + "/32"})
+		status, _ := listBranchesAsUser(t, controller, repo, user, withForwarded(proxyIP, allowedIP+", "+realClientIP))
+		require.Equal(t, http.StatusUnauthorized, status,
+			"the rightmost untrusted hop is the real client and must not match the allowed IP")
+	})
+
+	t.Run("trusted proxy rejects a real client that is not allowed", func(t *testing.T) {
+		controller := newController([]string{proxyIP + "/32"})
+		status, _ := listBranchesAsUser(t, controller, repo, user, withForwarded(proxyIP, realClientIP))
+		require.Equal(t, http.StatusUnauthorized, status)
+	})
+}
+
 // TestListRepositoriesPolicyConditions verifies that listing repositories evaluates policy conditions
 // with the request's condition context, per repository: a conditional allow grants the repository, a
 // conditional deny hides it (deny-first), and a lakefs:RepositoryMetadata/<key> condition sees that

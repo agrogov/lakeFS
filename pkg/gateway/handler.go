@@ -63,9 +63,15 @@ type ServerContext struct {
 	stats             stats.Collector
 	pathProvider      upload.PathProvider
 	verifyUnsupported bool
+	clientIPResolver  *httputil.ClientIPResolver
 }
 
-func NewHandler(region string, catalog *catalog.Catalog, multipartTracker multipart.Tracker, blockStore block.Adapter, authService auth.GatewayService, bareDomains []string, stats stats.Collector, pathProvider upload.PathProvider, fallbackURL *url.URL, auditLogLevel string, traceRequestHeaders bool, verifyUnsupported bool, isAdvancedAuth bool) http.Handler {
+func NewHandler(region string, catalog *catalog.Catalog, multipartTracker multipart.Tracker, blockStore block.Adapter, authService auth.GatewayService, bareDomains []string, stats stats.Collector, pathProvider upload.PathProvider, fallbackURL *url.URL, auditLogLevel string, traceRequestHeaders bool, verifyUnsupported bool, isAdvancedAuth bool, trustedProxies []string) http.Handler {
+	clientIPResolver, err := httputil.NewClientIPResolver(trustedProxies)
+	if err != nil {
+		logging.ContextUnavailable().WithError(err).Warn("invalid security.trusted_proxies; ignoring client-supplied forwarding headers")
+		clientIPResolver = nil
+	}
 	var fallbackHandler http.Handler
 	if fallbackURL != nil {
 		fallbackProxy := gohttputil.NewSingleHostReverseProxy(fallbackURL)
@@ -90,6 +96,7 @@ func NewHandler(region string, catalog *catalog.Catalog, multipartTracker multip
 		stats:             stats,
 		pathProvider:      pathProvider,
 		verifyUnsupported: verifyUnsupported,
+		clientIPResolver:  clientIPResolver,
 	}
 
 	// setup routes
@@ -123,7 +130,7 @@ func NewHandler(region string, catalog *catalog.Catalog, multipartTracker multip
 	h = EnrichWithOperation(sc,
 		MetricsMiddleware(
 			AuthenticationHandler(authService, EnrichWithParts(bareDomains,
-				EnrichWithRepositoryOrFallback(catalog, authService, fallbackHandler, h)))))
+				EnrichWithRepositoryOrFallback(catalog, authService, fallbackHandler, clientIPResolver, h)))))
 
 	logging.ContextUnavailable().WithFields(logging.Fields{
 		"s3_bare_domain": bareDomains,
@@ -271,7 +278,7 @@ func authorize(w http.ResponseWriter, req *http.Request, authService auth.Gatewa
 	// Attach the condition context before the empty-permissions early return: operations such as
 	// DeleteObjects require no permission themselves but authorize every object they touch.
 	bucket, _ := ctx.Value(ContextKeyRepositoryID).(string)
-	req, clientIP, fields := conditionContext(req, o.Catalog, bucket)
+	req, clientIP, fields := conditionContext(req, o.Catalog, bucket, o.ClientIPResolver)
 	ctx = req.Context()
 
 	if len(perms.Nodes) == 0 && len(perms.Permission.Action) == 0 {
@@ -313,17 +320,17 @@ func authorize(w http.ResponseWriter, req *http.Request, authService auth.Gatewa
 // and the lazy metadata field provider used by AuthorizationRequest. Attaching the context to the
 // request lets every nested Authorize call in an operation handler inherit it, so a conditional
 // deny cannot be bypassed by a per-object re-authorization.
-func conditionContext(req *http.Request, cat *catalog.Catalog, bucket string) (*http.Request, string, func(key string) (string, bool)) {
+func conditionContext(req *http.Request, cat *catalog.Catalog, bucket string, clientIPResolver *httputil.ClientIPResolver) (*http.Request, string, func(key string) (string, bool)) {
 	ctx := req.Context()
-	clientIP := httputil.ExtractClientIP(req.Header, req.RemoteAddr)
+	clientIP := clientIPResolver.Extract(req.Header, req.RemoteAddr)
 	fields := repositoryMetadataFields(ctx, cat, bucket)
 	ctx = auth.WithConditionContext(ctx, auth.NewConditionContextWithProvider(clientIP, fields))
 	return req.WithContext(ctx), clientIP, fields
 }
 
 // withConditionContext returns req carrying the authorization condition context on its context.
-func withConditionContext(req *http.Request, cat *catalog.Catalog, bucket string) *http.Request {
-	req, _, _ = conditionContext(req, cat, bucket)
+func withConditionContext(req *http.Request, cat *catalog.Catalog, bucket string, clientIPResolver *httputil.ClientIPResolver) *http.Request {
+	req, _, _ = conditionContext(req, cat, bucket, clientIPResolver)
 	return req
 }
 

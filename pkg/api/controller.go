@@ -130,6 +130,10 @@ type Controller struct {
 	PathProvider    upload.PathProvider
 	usageReporter   stats.UsageReporterOperations
 
+	// clientIPResolver resolves the request client IP for auth policy conditions. It is built
+	// from security.trusted_proxies; nil falls back to the safe no-trusted-proxy behaviour.
+	clientIPResolver *httputil.ClientIPResolver
+
 	// One-way latches for the unauthenticated setup endpoints. Once we observe
 	// that setup / comm prefs are complete, further POSTs are rejected without a
 	// KV read. They only ever flip false -> true, so they never serve stale state.
@@ -156,22 +160,32 @@ func NewController(
 	pathProvider upload.PathProvider,
 	usageReporter stats.UsageReporterOperations,
 ) *Controller {
+	clientIPResolver, err := httputil.NewClientIPResolver(cfg.GetBaseConfig().Security.TrustedProxies)
+	if err != nil {
+		if logger != nil {
+			logger.WithError(err).Warn("invalid security.trusted_proxies; ignoring client-supplied forwarding headers")
+		} else {
+			logging.ContextUnavailable().WithError(err).Warn("invalid security.trusted_proxies; ignoring client-supplied forwarding headers")
+		}
+		clientIPResolver = nil
+	}
 	return &Controller{
-		Config:          cfg,
-		Catalog:         catalog,
-		Authenticator:   authenticator,
-		Auth:            authService,
-		Authentication:  authenticationService,
-		BlockAdapter:    blockAdapter,
-		MetadataManager: metadataManager,
-		Migrator:        migrator,
-		Collector:       collector,
-		Actions:         actions,
-		AuditChecker:    auditChecker,
-		Logger:          logger,
-		sessionStore:    sessionStore,
-		PathProvider:    pathProvider,
-		usageReporter:   usageReporter,
+		Config:           cfg,
+		Catalog:          catalog,
+		Authenticator:    authenticator,
+		Auth:             authService,
+		Authentication:   authenticationService,
+		BlockAdapter:     blockAdapter,
+		MetadataManager:  metadataManager,
+		Migrator:         migrator,
+		Collector:        collector,
+		Actions:          actions,
+		AuditChecker:     auditChecker,
+		Logger:           logger,
+		sessionStore:     sessionStore,
+		PathProvider:     pathProvider,
+		usageReporter:    usageReporter,
+		clientIPResolver: clientIPResolver,
 	}
 }
 
@@ -6373,6 +6387,23 @@ func paginationFor(hasMore bool, results any, fieldName string) apigen.Paginatio
 	return pagination
 }
 
+// clientIP returns the request client IP for auth policy conditions, honouring forwarding headers
+// only from security.trusted_proxies. A Controller built outside NewController (for example in
+// tests) has no cached resolver, so build one from its Config here; without a Config the safe
+// default of trusting no proxy applies.
+func (c *Controller) clientIP(r *http.Request) string {
+	if c.clientIPResolver != nil {
+		return c.clientIPResolver.Extract(r.Header, r.RemoteAddr)
+	}
+	if c.Config != nil {
+		resolver, err := httputil.NewClientIPResolver(c.Config.GetBaseConfig().Security.TrustedProxies)
+		if err == nil {
+			return resolver.Extract(r.Header, r.RemoteAddr)
+		}
+	}
+	return httputil.ExtractClientIP(r.Header, r.RemoteAddr)
+}
+
 // conditionContext builds the authorization condition context of r: the client IP, and the
 // lakefs:RepositoryMetadata/<key> fields of repository (using the "repository" URL parameter when
 // repository is empty). It returns the derived context, carrying the condition context, together
@@ -6382,7 +6413,7 @@ func (c *Controller) conditionContext(r *http.Request, repository string) (conte
 	if repository == "" {
 		repository = chi.URLParam(r, "repository")
 	}
-	clientIP := httputil.ExtractClientIP(r.Header, r.RemoteAddr)
+	clientIP := c.clientIP(r)
 
 	// Repository metadata is exposed to policy conditions as lakefs:RepositoryMetadata/<key>.
 	// The provider is lazy, so the metadata is loaded at most once per condition context - that is,
