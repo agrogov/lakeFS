@@ -16,7 +16,8 @@
 // server stubs (api/datasets.yml, apigen, http.go, handlers.go), materialisation
 // (resolve.go, materialize.go), the GC pins with degraded detection of §8.2 (pins.go), the
 // service that owns the dataset lifecycle including publish/versions and the validate dry
-// run (service.go), the version diff of §10.3 (diff.go), and the design-phase spike evidence
-// (S2 and S4) as executable tests. Proposals, metadata-key CRUD, the reconciler, the CLI and
-// the remaining UI pages land in later phases.
+// run (service.go), the version diff of §10.3 (diff.go), the proposals of §5.6 with their
+// preview branches (proposals.go), and the design-phase spike evidence (S2 and S4) as
+// executable tests. Metadata-key CRUD, the reconciler, the CLI and the remaining UI pages
+// land in later phases.
 package datasets

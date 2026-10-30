@@ -7,11 +7,13 @@ package datasets
 //
 //	400  validation / source problems, with one entry per problem in the errors array
 //	403  a permission denial, naming the data item when it was a source check (§9.3)
-//	404  unknown dataset, version record or grant
-//	409  name taken by a repository or a dataset, or a lost publish race (§5.4)
+//	404  unknown dataset, version record, task, proposal or grant
+//	409  name taken by a repository or a dataset, a lost publish race (§5.4), a proposal that
+//	     is no longer open, or a stale proposal base (§5.6, with latest_version in the body)
 //	422  a source repository on a different storage ID (§5.2 rule 4)
 //	500  a failure to decide (never a denial) or an internal error
 //	501  datasets disabled, a reserved item type, or an operation of a later phase
+//	     (metadata-key CRUD, GET /datasets/config)
 //
 // Authentication itself is enforced in front of these handlers by api.GenericAuthMiddleware
 // plus requireUser (see http.go), so every handler can rely on auth.GetUser.
@@ -41,9 +43,11 @@ const MetadataFilterPrefix = "metadata."
 
 // server implements apigen.ServerInterface.
 //
-// The in-scope operations of this phase (create, get, list, delete, validate and the access
-// grants, §10.1) delegate to Service. The remaining operations still answer 501 with
-// ErrNotImplemented, so a client gets a precise answer instead of a routing error.
+// The in-scope operations delegate to Service: create, get, list, delete, validate, the
+// access grants (§10.1), publish and the version reads, the version diff of §10.3 and the
+// proposals of §5.6. The remaining operations - metadata-key CRUD and GET /datasets/config -
+// still answer 501 with ErrNotImplemented, so a client gets a precise answer instead of a
+// routing error.
 type server struct {
 	svc      *Service
 	clientIP *httputil.ClientIPResolver
@@ -109,14 +113,14 @@ func writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
 		})
 	case errors.Is(err, ErrUnsupported):
 		httputil.WriteAPIError(w, r, http.StatusNotImplemented, err.Error())
-	// The 404 union spans both implemented cards: ErrDatasetNotFound, ErrVersionNotFound and
+	// The 404 union spans the implemented cards: ErrDatasetNotFound, ErrVersionNotFound and
 	// ErrTaskNotFound came in with the publish/versions card (§10.1 version and task reads),
-	// ErrRefNotFound came in with the diff card (§10.3 bad left/right ref), and isNotFound
-	// covers the store/catalog path. Every one of them must map to 404: dropping any sends a
-	// client-fixable case to 500.
-	case errors.Is(err, ErrDatasetNotFound), errors.Is(err, ErrVersionNotFound), errors.Is(err, ErrTaskNotFound), errors.Is(err, ErrRefNotFound), isNotFound(err):
+	// ErrRefNotFound came in with the diff card (§10.3 bad left/right ref), ErrProposalNotFound
+	// came in with the proposals card (§5.6, §10.1), and isNotFound covers the store/catalog
+	// path. Every one of them must map to 404: dropping any sends a client-fixable case to 500.
+	case errors.Is(err, ErrDatasetNotFound), errors.Is(err, ErrVersionNotFound), errors.Is(err, ErrTaskNotFound), errors.Is(err, ErrRefNotFound), errors.Is(err, ErrProposalNotFound), isNotFound(err):
 		httputil.WriteAPIError(w, r, http.StatusNotFound, err.Error())
-	case errors.Is(err, ErrNameTaken), errors.Is(err, ErrDatasetConflict), errors.Is(err, ErrPublishInProgress), errors.Is(err, kv.ErrPredicateFailed):
+	case errors.Is(err, ErrNameTaken), errors.Is(err, ErrDatasetConflict), errors.Is(err, ErrPublishInProgress), errors.Is(err, ErrProposalNotOpen), errors.Is(err, kv.ErrPredicateFailed):
 		httputil.WriteAPIError(w, r, http.StatusConflict, err.Error())
 	default:
 		httputil.WriteAPIError(w, r, http.StatusInternalServerError, err.Error())
@@ -438,24 +442,111 @@ func (s *server) DiffRefs(w http.ResponseWriter, r *http.Request, dataset apigen
 	httputil.WriteAPIResponse(w, r, http.StatusOK, definitionDiffToAPI(result.Definition))
 }
 
-func (s *server) ListProposals(w http.ResponseWriter, r *http.Request, _ apigen.DatasetName, _ apigen.ListProposalsParams) {
-	notImplemented(w, r, "ListProposals")
+func (s *server) ListProposals(w http.ResponseWriter, r *http.Request, dataset apigen.DatasetName, params apigen.ListProposalsParams) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	result, err := s.svc.ListProposals(r.Context(), caller, string(dataset),
+		valueOrZero(params.Status), string(valueOrZero(params.After)), int(valueOrZero(params.Amount)))
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	body := apigen.ProposalList{
+		Results: make([]apigen.Proposal, 0, len(result.Proposals)),
+		Pagination: apigen.Pagination{
+			HasMore:    result.HasMore,
+			NextOffset: result.NextOffset,
+			Results:    len(result.Proposals),
+			MaxPerPage: result.MaxPerPage,
+		},
+	}
+	for _, proposal := range result.Proposals {
+		// The list endpoint returns the records without diffs: §10.1 puts the diff summary
+		// on the detail read, and a data diff per row would be a diff per row of the page.
+		body.Results = append(body.Results, proposalToAPI(&ProposalView{Record: proposal}))
+	}
+	httputil.WriteAPIResponse(w, r, http.StatusOK, body)
 }
 
-func (s *server) CreateProposal(w http.ResponseWriter, r *http.Request, _ apigen.CreateProposalJSONRequestBody, _ apigen.DatasetName) {
-	notImplemented(w, r, "CreateProposal")
+func (s *server) CreateProposal(w http.ResponseWriter, r *http.Request, body apigen.CreateProposalJSONRequestBody, dataset apigen.DatasetName) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	req := CreateProposalRequest{
+		Definition: definitionFromAPI(body.Definition),
+		Title:      body.Title,
+	}
+	if body.Description != nil {
+		req.Description = *body.Description
+	}
+	view, err := s.svc.CreateProposal(r.Context(), caller, string(dataset), req)
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	httputil.WriteAPIResponse(w, r, http.StatusCreated, proposalToAPI(view))
 }
 
-func (s *server) GetProposal(w http.ResponseWriter, r *http.Request, _ apigen.DatasetName, _ apigen.ProposalID) {
-	notImplemented(w, r, "GetProposal")
+func (s *server) GetProposal(w http.ResponseWriter, r *http.Request, dataset apigen.DatasetName, id apigen.ProposalID) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	view, err := s.svc.GetProposal(r.Context(), caller, string(dataset), string(id))
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	httputil.WriteAPIResponse(w, r, http.StatusOK, proposalToAPI(view))
 }
 
-func (s *server) UpdateProposal(w http.ResponseWriter, r *http.Request, _ apigen.UpdateProposalJSONRequestBody, _ apigen.DatasetName, _ apigen.ProposalID) {
-	notImplemented(w, r, "UpdateProposal")
+func (s *server) UpdateProposal(w http.ResponseWriter, r *http.Request, body apigen.UpdateProposalJSONRequestBody, dataset apigen.DatasetName, id apigen.ProposalID) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	req := UpdateProposalRequest{Title: body.Title, Description: body.Description}
+	if body.Definition != nil {
+		definition := definitionFromAPI(*body.Definition)
+		req.Definition = &definition
+	}
+	if body.Status != nil {
+		req.Status = *body.Status
+	}
+	view, err := s.svc.UpdateProposal(r.Context(), caller, string(dataset), string(id), req)
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	httputil.WriteAPIResponse(w, r, http.StatusOK, proposalToAPI(view))
 }
 
-func (s *server) MergeProposal(w http.ResponseWriter, r *http.Request, _ apigen.MergeProposalJSONRequestBody, _ apigen.DatasetName, _ apigen.ProposalID) {
-	notImplemented(w, r, "MergeProposal")
+func (s *server) MergeProposal(w http.ResponseWriter, r *http.Request, body apigen.MergeProposalJSONRequestBody, dataset apigen.DatasetName, id apigen.ProposalID) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	version, err := s.svc.MergeProposal(r.Context(), caller, string(dataset), string(id), MergeProposalRequest{
+		Message: valueOrZero(body.Message),
+	})
+	if err != nil {
+		// §5.6: a stale proposal base is the 409 whose body carries latest_version, the same
+		// shape as a lost expected_version check (§5.4).
+		if writeVersionConflict(w, r, err) {
+			return
+		}
+		writeServiceError(w, r, err)
+		return
+	}
+	httputil.WriteAPIResponse(w, r, http.StatusCreated, versionToAPI(version))
 }
 
 // --- API type conversions (§10.2) ---
@@ -678,23 +769,31 @@ func taskToAPI(rec *TaskRecord) apigen.Task {
 	return out
 }
 
-// versionConflictBody is the 409 body of §5.4: the core Error shape plus the current
-// latest_version, so a client whose expected_version lost can retry with the right value
-// instead of re-reading the dataset.
+// versionConflictBody is the 409 body of §5.4 and §5.6: the core Error shape plus the current
+// latest_version, so a client whose expected_version lost - or whose proposal base went
+// stale - can retry with the right value instead of re-reading the dataset.
 type versionConflictBody struct {
 	Message       string `json:"message"`
 	LatestVersion int    `json:"latest_version"`
 }
 
-// writeVersionConflict writes the expected_version 409 and reports whether it did.
+// staleVersionError is a 409 that carries the current latest_version in its body: the
+// expected_version mismatch of §5.4 (VersionConflictError) and the base version of a
+// proposal that must be rebased first (§5.6, RebaseRequiredError).
+type staleVersionError interface {
+	error
+	latestVersion() int
+}
+
+// writeVersionConflict writes the stale-version 409 and reports whether it did.
 func writeVersionConflict(w http.ResponseWriter, r *http.Request, err error) bool {
-	var conflict *VersionConflictError
+	var conflict staleVersionError
 	if !errors.As(err, &conflict) {
 		return false
 	}
 	httputil.WriteAPIResponse(w, r, http.StatusConflict, versionConflictBody{
-		Message:       conflict.Error(),
-		LatestVersion: conflict.LatestVersion,
+		Message:       err.Error(),
+		LatestVersion: conflict.latestVersion(),
 	})
 	return true
 }
@@ -709,6 +808,48 @@ func grantToAPI(grant *GrantRecord) apigen.AccessGrant {
 		GrantedBy:     &grantedBy,
 		GrantedAt:     &grantedAt,
 	}
+}
+
+// proposalToAPI renders a proposal view as the §10.2 Proposal schema. The diffs of the
+// detail read are optional: a list row has none, and a diff the service could not compute
+// is left out rather than failing the read (see Service.proposalView).
+func proposalToAPI(view *ProposalView) apigen.Proposal {
+	rec := view.Record
+	out := apigen.Proposal{
+		Id:            rec.ID,
+		Dataset:       rec.Dataset,
+		BaseVersion:   rec.BaseVersion,
+		Title:         rec.Title,
+		Author:        rec.Author,
+		Status:        rec.Status,
+		CreatedAt:     rec.CreatedAt.UnixMilli(),
+		PreviewBranch: rec.PreviewBranch,
+	}
+	if rec.Description != "" {
+		description := rec.Description
+		out.Description = &description
+	}
+	if rec.ClosedAt != nil {
+		closedAt := rec.ClosedAt.UnixMilli()
+		out.ClosedAt = &closedAt
+	}
+	if rec.MergedVersion > 0 {
+		mergedVersion := rec.MergedVersion
+		out.MergedVersion = &mergedVersion
+	}
+	if !definitionIsZero(rec.Definition) {
+		definition := definitionToAPI(rec.Definition)
+		out.Definition = &definition
+	}
+	if view.Diff != nil {
+		diff := definitionDiffToAPI(view.Diff)
+		out.Diff = &diff
+	}
+	if view.DataDiff != nil {
+		dataDiff := dataDiffToAPI(view.DataDiff)
+		out.DataDiff = &dataDiff
+	}
+	return out
 }
 
 // metadataFilters extracts the dynamic metadata.<key>=<value> query parameters of §10.1.

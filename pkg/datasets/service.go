@@ -103,6 +103,11 @@ func (e *VersionConflictError) Error() string {
 // writeServiceError applies.
 func (e *VersionConflictError) Unwrap() error { return ErrDatasetConflict }
 
+// latestVersion reports the version the 409 body of §5.4 carries; writeVersionConflict in
+// handlers.go reads it through the staleVersionError interface, which RebaseRequiredError
+// (proposals.go) implements too.
+func (e *VersionConflictError) latestVersion() int { return e.LatestVersion }
+
 // Service is the datasets control plane. One instance serves every request of a process; it
 // holds no per-request state.
 //
@@ -606,6 +611,13 @@ type PublishVersionRequest struct {
 	// ProposalID is set when the version is published by merging a proposal (§5.6); the
 	// empty string is a direct publish.
 	ProposalID string
+
+	// Sync keeps the publish in the request even when the definition is above
+	// datasets.sync_publish_max_objects (§6.5). A proposal merge sets it: its response body
+	// is the new version (§10.1 POST /datasets/{ds}/proposals/{id}/merge answers 201), and
+	// the proposal record is closed in the same request that publishes it, which a 202
+	// accepted into a background task could not guarantee.
+	Sync bool
 }
 
 // PublishOutcome is the result of Service.PublishVersion: either a completed version (the
@@ -678,7 +690,7 @@ func (s *Service) PublishVersion(ctx context.Context, caller Caller, name string
 		return nil, err
 	}
 
-	if s.publishIsAsync(estimate) {
+	if !req.Sync && s.publishIsAsync(estimate) {
 		return s.startAsyncPublish(ctx, publishing, *resolved, req, caller.Username)
 	}
 	version, err := s.runPublish(ctx, publishing, *resolved, req, caller.Username)

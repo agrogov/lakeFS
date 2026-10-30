@@ -190,8 +190,13 @@ func (r VersionRecord) HasInlineDefinition() bool {
 }
 
 // ProposalRecord is a dataset pull request, stored at proposals/<name>/<id> (§5.6).
-// Proposals are not graveler pull requests: publishing a proposal's definition is
-// what advances a version.
+//
+// Proposals are not graveler pull requests, and must not be turned into them: merging one
+// publishes the proposal's definition as a version, and a dataset version is a single-parent
+// commit on `latest` (§6.2 step 9), which a graveler merge commit would break. A graveler pull
+// request would also have to merge through the caller's own write permission, and nobody -
+// least of all a reviewer - holds one on a read-only, immutability-guarded dataset repository
+// (§9.4). The rationale is spelled out in proposals.go.
 type ProposalRecord struct {
 	ID            string     `json:"id"`           // ULID
 	Dataset       string     `json:"dataset"`      //
