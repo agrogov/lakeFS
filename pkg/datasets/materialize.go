@@ -134,6 +134,14 @@ type PublishRequest struct {
 	// Branch is the dataset repository branch to commit on. Empty means DefaultBranch.
 	Branch string
 
+	// DefinitionScope, when set, places the synthetic definition object of §6.4 in a
+	// namespace of its own inside the dataset storage namespace:
+	// _lakefs_dataset/<scope>/v<N>/definition.json. A proposal preview sets it to its
+	// preview branch, so materialising a preview can neither overwrite nor be
+	// overwritten by the definition object of the version it would produce. Empty means
+	// the version namespace of §6.4.
+	DefinitionScope string
+
 	// Version is the version number this publish creates, N+1 in §5.4.
 	Version int
 
@@ -248,9 +256,14 @@ func VersionTag(version int) string {
 // dataset namespace (§6.4). It is version-scoped on purpose: entries store *relative*
 // addresses into that shared namespace, so a fixed path would make every older
 // version's definition.json point at the newest document, and a version would stop
-// being self-describing for disaster recovery (§5.4, §12.3).
-func definitionObjectKey(version int) string {
-	return fmt.Sprintf("%s/v%d/definition.json", definitionObjectPrefix, version)
+// being self-describing for disaster recovery (§5.4, §12.3). scope adds one level for a
+// caller outside the version namespace (a proposal preview, see
+// PublishRequest.DefinitionScope); an empty scope is the version namespace itself.
+func definitionObjectKey(scope string, version int) string {
+	if scope == "" {
+		return fmt.Sprintf("%s/v%d/definition.json", definitionObjectPrefix, version)
+	}
+	return fmt.Sprintf("%s/%s/v%d/definition.json", definitionObjectPrefix, scope, version)
 }
 
 // definitionDocument is the self-describing payload of the synthetic
@@ -286,12 +299,48 @@ type definitionDocument struct {
 // different commit for the same version is a conflict: deciding whether an interrupted
 // publish is resumed or rolled back belongs to the reconciler (§12.3), not here.
 func (m *Materializer) Publish(ctx context.Context, req PublishRequest) (*PublishResult, error) {
-	if req.Version <= 0 {
-		return nil, fmt.Errorf("%w: version must be positive, got %d", ErrInvalidPublishRequest, req.Version)
-	}
 	branch := req.Branch
 	if branch == "" {
 		branch = DefaultBranch
+	}
+	result, err := m.materialize(ctx, req, branch)
+	if err != nil {
+		return nil, err
+	}
+
+	// §6.2 step 10: the tag is what turns the commit into a version ref (§7.1). Only a
+	// version is tagged; MaterializePreview is the untagged form used by a proposal.
+	tag := VersionTag(req.Version)
+	if err := m.tag(ctx, req.Dataset, tag, result.CommitID); err != nil {
+		return nil, err
+	}
+	result.Tag = tag
+	return result, nil
+}
+
+// MaterializePreview materialises req on branch without creating a version tag (§5.6): a
+// proposal preview is a branch a reviewer can browse (`lakefs://<ds>/_proposal-<id>/...`),
+// not a version. Everything else is the publish path of §6.2 steps 1-9, so a preview can
+// never show data a merge would not produce, and there is no second materialisation code
+// path to keep in step with this one.
+//
+// The metarange is a complete snapshot of the definition, so committing it on a branch
+// whose head predates the current `latest` still serves exactly the definition's data: only
+// the commit's ancestry differs, and nothing diffs ancestry. The caller creates the branch
+// first, hidden and forced (a dataset repository is read-only, §6.1).
+func (m *Materializer) MaterializePreview(ctx context.Context, req PublishRequest, branch string) (*PublishResult, error) {
+	if branch == "" {
+		return nil, fmt.Errorf("%w: preview branch must not be empty", ErrInvalidPublishRequest)
+	}
+	return m.materialize(ctx, req, branch)
+}
+
+// materialize performs §6.2 steps 1-9 on branch: validate, write the definition object and
+// the data metarange, and commit it. It is the shared body of Publish, which then tags the
+// commit as a version, and of MaterializePreview, which leaves it as a branch head.
+func (m *Materializer) materialize(ctx context.Context, req PublishRequest, branch string) (*PublishResult, error) {
+	if req.Version <= 0 {
+		return nil, fmt.Errorf("%w: version must be positive, got %d", ErrInvalidPublishRequest, req.Version)
 	}
 
 	// §6.2 step 1, the half that does not need the catalog: normalise and validate the
@@ -366,15 +415,8 @@ func (m *Materializer) Publish(ctx context.Context, req PublishRequest) (*Publis
 		return nil, err
 	}
 
-	// §6.2 step 10.
-	tag := VersionTag(req.Version)
-	if err := m.tag(ctx, req.Dataset, tag, commitID); err != nil {
-		return nil, err
-	}
-
 	result := &PublishResult{
 		Version:     req.Version,
-		Tag:         tag,
 		CommitID:    commitID,
 		MetaRangeID: *metaRangeID,
 		Definition:  req.Definition,
@@ -449,7 +491,7 @@ func (m *Materializer) putDefinition(ctx context.Context, dsRepo *graveler.Repos
 		return nil, fmt.Errorf("datasets: marshal definition of %s version %d: %w", req.Dataset, req.Version, err)
 	}
 
-	objectKey := definitionObjectKey(req.Version)
+	objectKey := definitionObjectKey(req.DefinitionScope, req.Version)
 	pointer := block.ObjectPointer{
 		StorageID:        dsRepo.StorageID.String(),
 		StorageNamespace: dsRepo.StorageNamespace.String(),
