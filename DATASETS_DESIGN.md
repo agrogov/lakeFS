@@ -627,10 +627,14 @@ _lakefs_ds_pin_<commit-id>
 
 Risks:
 
-- Source repo admins can delete pin branches. Mitigation: deny policy `datasets-pins-protect` with `fs:DeleteBranch` on
+- Source repo admins can delete pin branches, and anyone with `fs:CreateBranch` can squat on a pin branch name, which
+  makes every publish that pins the commit fail. Mitigation: deny policy `datasets-pins-protect` with
+  `fs:{DeleteBranch,CreateBranch,CreateCommit,RevertBranch}` on
   `arn:lakefs:fs:::repository/*/branch/_lakefs_ds_pin_*` attached to all non-service principals (needs ARN wildcard
   support in the middle of the resource; `auth.ArnMatch` uses wildcard matching on the resource part, **verify in S2**).
-  The reconciler recreates missing pins and reports them.
+  The bootstrap that creates and attaches it runs on every `lakefs-sso` start (`datasets.RoutesBuilder`), and the
+  reconciler re-creates the policy and re-attaches it, so a deleted policy does not stay deleted. The reconciler also
+  recreates missing pins and reports them.
 - Deleting a source repository deletes its pins. Dataset reads keep working until the source storage namespace's data is
   removed by someone. The reconciler marks such versions `degraded` and the UI shows a warning.
 
@@ -716,28 +720,37 @@ Any failure → `403` naming the item. When a proposal is merged, the check runs
 
 ### 9.4 Immutability guard
 
-`ReadOnly` + `force=true` is the only bypass. Per dataset, the service writes `dataset-<name>-immutable`:
-
+`ReadOnly` + `force=true` is the only bypass. Immutability is enforced in the **authorizer**, not only through
+policies (SEC-2 of `DATASETS_REVIEW.md`): the `lakefs-sso` auth-service builder wraps the `auth.Service` it hands to
+the REST API and the S3 gateway (`datasets.WrapAuthService`, `pkg/datasets/immutability_guard.go`), and that wrapper
+answers every authorization request for a write action on a resource of a **dataset repository** with a denial. The
+set of dataset repositories is a cached name set read from the datasets KV partition, refreshed on a TTL and updated
+by the service on create/delete. The service itself doesn't go through `Authorize` for its own writes (`force`), so
+it isn't affected.
 ```json
 { "statement": [ { "effect": "deny",
   "action": ["fs:WriteObject", "fs:DeleteObject", "fs:CreateCommit", "fs:CreateBranch", "fs:DeleteBranch",
              "fs:RevertBranch", "fs:CreateTag", "fs:DeleteTag", "fs:UpdateRepository", "fs:DeleteRepository",
-             "fs:ImportFromStorage", "fs:AttachStorageNamespace", "branches:SetBranchProtectionRules",
-             "retention:SetGarbageCollectionRules", "ci:WriteAction"],
+             "fs:ImportFromStorage", "fs:ImportCancel", "fs:AttachStorageNamespace",
+             "branches:SetBranchProtectionRules", "retention:SetGarbageCollectionRules", "pr:WritePullRequest",
+             "catalog:Create*", "catalog:Update*", "catalog:Delete*", "ci:WriteAction"],
   "resource": "arn:lakefs:fs:::repository/customer-360" },
   { "effect": "deny", "action": ["...same list..."],
   "resource": "arn:lakefs:fs:::repository/customer-360/*" } ] }
 ```
 
-and attaches it to the base groups `Admins`, `Supers`, `Writers`, `Readers` plus every group in
-`datasets.immutable_guard_groups`. The service doesn't go through `Authorize` for its own writes, so it isn't affected.
+As defence in depth, the service also writes the per-dataset deny policy `dataset-<name>-immutable` with the same
+statements and attaches it to the base groups `Admins`, `Supers`, `Writers`, `Readers` plus every group in
+`datasets.immutable_guard_groups`. That policy protects an installation whose authorizer is not wrapped (a stock
+`lakefs` binary), and it denies through the ordinary policy engine.
 
 Limits (documented, accepted):
 
 - An admin can detach the deny policy, and then use `force`. That's equivalent to an admin deleting any repo today.
-  The reconciler re-attaches it and logs a warning.
-- Users who aren't members of a guarded group aren't covered. With SSO group sync every interactive user is in a base
-  group; service accounts must be added to a guarded group.
+  The reconciler re-attaches it and logs a warning. The authorizer guard is independent of the attachment.
+- Before the authorizer guard, users who weren't members of a guarded group were not covered. With SSO group sync
+  every interactive user is in a base group, but custom groups, `sso.groups_claim` groups and policies attached
+  directly to a user were not, so the guard no longer relies on group membership.
 - The guard uses two exact resources (`repository/<name>` and `repository/<name>/*`) rather than `repository/<name>*`,
   which would also match an unrelated repository `<name>-something`.
 
