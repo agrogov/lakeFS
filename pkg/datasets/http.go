@@ -56,8 +56,17 @@ func RoutesBuilder(_ context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) error 
 		MountDisabled(r)
 		return nil
 	}
-	if deps.Config == nil || deps.AuthService == nil || deps.Authenticator == nil || deps.Logger == nil {
+	if deps.Config == nil || deps.AuthService == nil || deps.Authenticator == nil || deps.Logger == nil || deps.Catalog == nil || deps.KVStore == nil {
 		return ErrMissingDeps
+	}
+
+	// The service is the only writer of dataset repositories and their control-plane
+	// records. It is built once per process and shared by every request; it authorizes each
+	// caller itself and writes with graveler.WithForce(true) without going through the
+	// caller's permissions (DATASETS_DESIGN.md §4.6, and the Service doc comment).
+	svc, err := NewService(cfg, deps.KVStore, deps.Catalog, deps.AuthService)
+	if err != nil {
+		return err
 	}
 
 	// The core AuthMiddleware is bound to the swagger routes, so the datasets router wraps
@@ -71,12 +80,26 @@ func RoutesBuilder(_ context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) error 
 		return fmt.Errorf("datasets: build auth middleware: %w", err)
 	}
 
-	datasetsRouter, err := NewRouter(authMiddleware, newStubServer())
+	datasetsRouter, err := NewRouter(authMiddleware, newServer(svc, newClientIPResolver(deps)))
 	if err != nil {
 		return err
 	}
 	r.Mount(APIBasePath, datasetsRouter)
 	return nil
+}
+
+// newClientIPResolver builds the client-IP resolver used by authorization conditions from the
+// server's security.trusted_proxies setting, exactly as the core API does
+// (pkg/api/controller.go clientIP). An invalid setting must not silently weaken a condition,
+// so the fallback is the strict "trust no proxy" default of httputil.ExtractClientIP (a nil
+// resolver here means the caller is resolved from RemoteAddr alone).
+func newClientIPResolver(deps cmdpkg.ServerDeps) *httputil.ClientIPResolver {
+	resolver, err := httputil.NewClientIPResolver(deps.Config.GetBaseConfig().Security.TrustedProxies)
+	if err != nil {
+		deps.Logger.WithError(err).Warn("datasets: invalid security.trusted_proxies; authorization conditions use the peer address")
+		return nil
+	}
+	return resolver
 }
 
 // NewRouter builds the datasets sub-router. It is mounted at APIBasePath by RoutesBuilder, so
@@ -89,7 +112,8 @@ func RoutesBuilder(_ context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) error 
 //
 // authMiddleware is a parameter (rather than built here) so the router can be exercised without
 // a full auth service - without one nothing can authenticate, so every route answers 401.
-// server is a parameter so later cards can supply the real implementation.
+// server is a parameter so the service can be replaced in tests and so later phases can add
+// operations without touching the routing.
 func NewRouter(authMiddleware func(http.Handler) http.Handler, server apigen.ServerInterface) (http.Handler, error) {
 	swagger, err := apigen.GetSwagger()
 	if err != nil {

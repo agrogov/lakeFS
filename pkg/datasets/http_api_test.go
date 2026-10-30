@@ -10,6 +10,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/require"
+	cmdpkg "github.com/treeverse/lakefs/cmd/lakefs/cmd"
+	"github.com/treeverse/lakefs/contrib/auth/acl"
 	"github.com/treeverse/lakefs/pkg/api"
 	"github.com/treeverse/lakefs/pkg/auth/model"
 	"github.com/treeverse/lakefs/pkg/datasets/apigen"
@@ -61,8 +63,17 @@ const validMetadataKeyBody = `{"name": "classification", "type": "enum", "allowe
 
 // newControlPlane builds the datasets control plane exactly as RoutesBuilder does (validator,
 // api.GenericAuthMiddleware, authenticated-user requirement, generated server) on top of the
-// core catch-all, and creates a user that can authenticate with basic auth.
+// core catch-all, and creates a user that can authenticate with basic auth and holds the
+// built-in datasets permissions of §9.5 plus the ACL base read/write grants.
 func newControlPlane(t *testing.T) (*chi.Mux, string, string) {
+	t.Helper()
+	mux, _, accessKey, secret := newControlPlaneWithDeps(t)
+	return mux, accessKey, secret
+}
+
+// newControlPlaneWithDeps is newControlPlane plus the server dependencies, for tests that also
+// inspect the KV store or the auth service.
+func newControlPlaneWithDeps(t *testing.T) (*chi.Mux, cmdpkg.ServerDeps, string, string) {
 	t.Helper()
 	useConfig(t, "datasets:\n  enabled: true\n  storage_namespace_prefix: \"mem://datasets\"\n")
 
@@ -72,10 +83,14 @@ func newControlPlane(t *testing.T) (*chi.Mux, string, string) {
 	require.NoError(t, err)
 	cred, err := deps.AuthService.AddCredentials(ctx, testUsername, testAccessKeyID, testSecretAccessKey)
 	require.NoError(t, err)
+	// Admins carries the ACL base grants (fs:* etc.), so the user may read sources;
+	// DatasetAdmins carries DatasetsFullAccess (§9.5), so the user may use the control plane.
+	require.NoError(t, deps.AuthService.AddUserToGroup(ctx, testUsername, acl.AdminsGroup))
+	require.NoError(t, deps.AuthService.AddUserToGroup(ctx, testUsername, DatasetAdminsGroup))
 
 	mux := coreRouter()
 	require.NoError(t, RoutesBuilder(ctx, deps, mux))
-	return mux, cred.AccessKeyID, cred.SecretAccessKey
+	return mux, deps, cred.AccessKeyID, cred.SecretAccessKey
 }
 
 // doRequest issues a request against the control plane. accessKey/secret are optional: an empty
@@ -359,8 +374,10 @@ func TestDatasetsBadRequest400(t *testing.T) {
 	}
 }
 
-// TestDatasetsNotImplemented501 is the 501 mapping: every generated handler is a stub and says
-// so, and the answer is reached only after authentication and validation succeed.
+// TestDatasetsNotImplemented501 is the 501 mapping for the operations of later phases: they
+// are still stubs and say so, and the answer is reached only after authentication and request
+// validation succeed. The create/get/list/delete/validate and access-grant operations of this
+// phase are covered by the CRUD tests instead.
 func TestDatasetsNotImplemented501(t *testing.T) {
 	handler, accessKey, secret := newControlPlane(t)
 
@@ -370,17 +387,12 @@ func TestDatasetsNotImplemented501(t *testing.T) {
 		path      string
 		body      string
 	}{
-		{"ListDatasets", http.MethodGet, "", ""},
-		{"CreateDataset", http.MethodPost, "", validCreateBody},
 		{"GetDatasetsConfig", http.MethodGet, "/config", ""},
 		{"ListMetadataKeys", http.MethodGet, "/metadata-keys", ""},
 		{"CreateMetadataKey", http.MethodPost, "/metadata-keys", validMetadataKeyBody},
 		{"GetMetadataKey", http.MethodGet, "/metadata-keys/classification", ""},
 		{"UpdateMetadataKey", http.MethodPut, "/metadata-keys/classification", `{"required": true}`},
 		{"DeleteMetadataKey", http.MethodDelete, "/metadata-keys/classification", ""},
-		{"GetDataset", http.MethodGet, "/customer-360", ""},
-		{"DeleteDataset", http.MethodDelete, "/customer-360", ""},
-		{"ValidateDataset", http.MethodPost, "/customer-360/validate", `{"definition": ` + enterpriseDefinition + `}`},
 		{"ListVersions", http.MethodGet, "/customer-360/versions", ""},
 		{"PublishVersion", http.MethodPost, "/customer-360/versions", validPublishBody},
 		{"GetVersion", http.MethodGet, "/customer-360/versions/latest", ""},
@@ -391,9 +403,6 @@ func TestDatasetsNotImplemented501(t *testing.T) {
 		{"GetProposal", http.MethodGet, "/customer-360/proposals/01J8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8", ""},
 		{"UpdateProposal", http.MethodPatch, "/customer-360/proposals/01J8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8", `{"status": "closed"}`},
 		{"MergeProposal", http.MethodPost, "/customer-360/proposals/01J8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8/merge", ""},
-		{"ListAccess", http.MethodGet, "/customer-360/access", ""},
-		{"GrantAccess", http.MethodPost, "/customer-360/access", `{"principal_type": "user", "principal_id": "alice"}`},
-		{"RevokeAccess", http.MethodDelete, "/customer-360/access/user/alice", ""},
 		{"GetTask", http.MethodGet, "/customer-360/tasks/01J8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8", ""},
 	}
 	for _, tc := range cases {
@@ -432,7 +441,8 @@ func validCreateBodyWithItemType(itemType string) string {
 // without an auth middleware the router still validates and serves, and every route answers 401
 // because no principal can be authenticated.
 func TestNewRouterWithoutAuthMiddleware(t *testing.T) {
-	handler, err := NewRouter(nil, newStubServer())
+	// A server with no service is enough: requireUser answers 401 before any handler runs.
+	handler, err := NewRouter(nil, newServer(nil, nil))
 	require.NoError(t, err)
 
 	// NewRouter returns the sub-router; the validator resolves paths through the spec server

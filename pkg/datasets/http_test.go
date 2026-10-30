@@ -4,17 +4,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/require"
 	cmdpkg "github.com/treeverse/lakefs/cmd/lakefs/cmd"
+	"github.com/treeverse/lakefs/contrib/auth/acl"
 	"github.com/treeverse/lakefs/pkg/api"
 	"github.com/treeverse/lakefs/pkg/api/apiutil"
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/crypt"
 	authparams "github.com/treeverse/lakefs/pkg/auth/params"
 	"github.com/treeverse/lakefs/pkg/config"
-	"github.com/treeverse/lakefs/pkg/kv/kvtest"
 	"github.com/treeverse/lakefs/pkg/logging"
 )
 
@@ -34,21 +35,29 @@ func doGet(t *testing.T, handler http.Handler, path string) *httptest.ResponseRe
 	return rec
 }
 
+// testDeps builds the server dependencies the datasets control plane needs: a real catalog on
+// the in-memory block adapter and KV store (§15.1) and the ACL auth service, which is what both
+// the handler tests and a lakefs-sso deployment use. Base groups and the built-in datasets
+// policies (§9.5) are created so a test user can be put in a group and behave like a real
+// principal.
 func testDeps(t *testing.T) cmdpkg.ServerDeps {
 	t.Helper()
 	ctx := t.Context()
-	store := kvtest.GetStore(ctx, t)
-	authService := auth.NewBasicAuthService(
-		store,
+	f := newSpikeFixture(t)
+	authService := acl.NewAuthService(
+		f.kvStore,
 		crypt.NewSecretStore([]byte("datasets-test-secret")),
 		authparams.ServiceCache{Enabled: false},
-		logging.ContextUnavailable(),
 	)
+	ts := time.Now()
+	require.NoError(t, acl.CreateACLBaseGroups(ctx, authService, ts))
+	require.NoError(t, Bootstrap(ctx, authService, ts))
 	return cmdpkg.ServerDeps{
 		Config:        &config.ConfigImpl{},
+		Catalog:       f.cat,
 		AuthService:   authService,
 		Authenticator: auth.NewBuiltinAuthenticator(authService),
-		KVStore:       store,
+		KVStore:       f.kvStore,
 		Logger:        logging.ContextUnavailable(),
 	}
 }

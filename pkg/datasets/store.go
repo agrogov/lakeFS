@@ -468,6 +468,29 @@ func (s *Store) GetDataset(ctx context.Context, name string) (*DatasetRecord, er
 	return rec, nil
 }
 
+// ListDatasets returns every dataset record in name order. It is the read behind GET
+// /datasets (§10.1), which filters the result in memory: the record set is small
+// (datasets are curated, not created per object) and the filters combine a name
+// prefix, a free-text search and metadata of the latest version, which a key range
+// cannot express.
+func (s *Store) ListDatasets(ctx context.Context) ([]*DatasetRecord, error) {
+	prefix := []byte(datasetKeyPrefix + kv.PathDelimiter)
+	records := make([]*DatasetRecord, 0)
+	err := s.scanPrefix(ctx, prefix, func(key, value []byte) error {
+		rec, err := decodeRecord[DatasetRecord]("dataset record", key, value)
+		if err != nil {
+			return err
+		}
+		records = append(records, rec)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(records, func(i, j int) bool { return records[i].Name < records[j].Name })
+	return records, nil
+}
+
 // PutDatasetIf writes rec only if the stored record still equals previous, which is
 // the §5.4 step 3 CAS of the publish state machine: read the record, derive the next
 // state from it, write it back conditioned on the record that was read.
@@ -647,6 +670,18 @@ func (s *Store) GetVersion(ctx context.Context, dataset string, version int) (*V
 			ErrRecordMismatch, key, rec.Dataset, rec.Version)
 	}
 	return rec, nil
+}
+
+// DeleteVersion removes the record of one version. Deleting a missing version is not
+// an error, which is what makes the delete sequence of §6.6 tolerant and re-runnable.
+// Version records are immutable while they exist; this is only called when the dataset
+// itself is deleted.
+func (s *Store) DeleteVersion(ctx context.Context, dataset string, version int) error {
+	key, err := versionKey(dataset, version)
+	if err != nil {
+		return err
+	}
+	return s.delete(ctx, key)
 }
 
 // ListVersions returns every version record of dataset, newest first (§10.1
