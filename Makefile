@@ -38,6 +38,7 @@ GOFMT=$(GOCMD)fmt
 GOTEST_FLAGS=-count=1 -race -failfast
 LAKEFS_BINARY_NAME=lakefs
 LAKECTL_BINARY_NAME=lakectl
+LAKECTL_DATASETS_BINARY_NAME=lakectl-datasets
 
 UI_DIR=webui
 UI_BUILD_DIR=$(UI_DIR)/dist
@@ -60,6 +61,7 @@ all: build
 clean:
 	@rm -rf \
 		$(LAKECTL_BINARY_NAME) \
+		$(LAKECTL_DATASETS_BINARY_NAME) \
 		$(LAKEFS_BINARY_NAME) \
 		$(UI_BUILD_DIR) \
 		$(UI_DIR)/node_modules
@@ -165,6 +167,7 @@ build: gen build-binaries ## Download dependencies and build the default binary
 build-binaries:
 	$(GOBUILD) -o $(LAKEFS_BINARY_NAME) -ldflags $(LD_FLAGS) -v ./cmd/$(LAKEFS_BINARY_NAME)
 	$(GOBUILD) -o $(LAKECTL_BINARY_NAME) -ldflags $(LD_FLAGS) -v ./cmd/$(LAKECTL_BINARY_NAME)
+	$(GOBUILD) -o $(LAKECTL_DATASETS_BINARY_NAME) -ldflags $(LD_FLAGS) -v ./cmd/$(LAKECTL_DATASETS_BINARY_NAME)
 
 lint: ## Lint code
 	$(GOCMD) tool golangci-lint run ./... $(GOLANGCI_LINT_FLAGS)

@@ -35,6 +35,7 @@
 /lakefs-loadtest
 /lakectl
 /lakectl-sso
+/lakectl-datasets
 /main
 /cmd/lakefs/lakefs
 /cmd/lakefs-loadtest/lakefs-loadtest
