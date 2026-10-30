@@ -54,9 +54,9 @@ func testDeps(t *testing.T) cmdpkg.ServerDeps {
 }
 
 // TestRoutesBuilderEnabledWinsOverCoreCatchAll is Spike S1 (DATASETS_DESIGN.md §4.5, §18):
-// after api.Serve() mounts /api/v1, mounting /api/v1/datasets on the same chi router must route
-// a datasets request to the datasets router, not to InvalidAPIEndpointHandler. The fallback
-// prefix (/api/v1/x/datasets) is therefore not needed.
+// after api.Serve() mounts /api/v1, mounting the datasets router on the same chi router must
+// route a datasets request to the datasets router, not to InvalidAPIEndpointHandler. The
+// fallback prefix (/api/v1/x/datasets) is therefore not needed.
 func TestRoutesBuilderEnabledWinsOverCoreCatchAll(t *testing.T) {
 	useConfig(t, "datasets:\n  enabled: true\n  storage_namespace_prefix: \"mem://datasets\"\n")
 
@@ -65,12 +65,20 @@ func TestRoutesBuilderEnabledWinsOverCoreCatchAll(t *testing.T) {
 
 	t.Run("datasets path reaches the datasets router", func(t *testing.T) {
 		rec := doGet(t, mux, APIBasePath+"/anything")
-		// The datasets router is empty until the control-plane handlers land, so chi answers
-		// 404 from inside the mounted sub-router. That is a plain-text 404, not the core JSON
-		// {"message":"invalid API endpoint"} - i.e. the catch-all was not selected.
-		require.Equal(t, http.StatusNotFound, rec.Code)
+		// "anything" matches the /{dataset} route of the generated control plane, so the
+		// request is answered inside the datasets router: 401 with the datasets error shape,
+		// never the core {"message":"invalid API endpoint"} catch-all.
+		require.Equal(t, http.StatusUnauthorized, rec.Code)
 		require.NotContains(t, rec.Body.String(), api.ErrInvalidAPIEndpoint.Error())
-		require.Contains(t, rec.Body.String(), "404 page not found")
+		require.NotContains(t, rec.Body.String(), "404 page not found")
+		require.JSONEq(t, `{"message":"`+ErrAuthenticationRequired.Error()+`"}`, rec.Body.String())
+	})
+
+	t.Run("collection root reaches the datasets router", func(t *testing.T) {
+		// The mount point itself is served by the generated "GET /" operation.
+		rec := doGet(t, mux, APIBasePath)
+		require.Equal(t, http.StatusUnauthorized, rec.Code)
+		require.NotContains(t, rec.Body.String(), api.ErrInvalidAPIEndpoint.Error())
 	})
 
 	t.Run("unrelated path still reaches the core handler", func(t *testing.T) {
