@@ -323,7 +323,8 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 		StorageNS:   ns,
 		UpdatedAt:   now,
 	}
-	if err := s.store.CreateDataset(ctx, rec); err != nil {
+	recordPredicate, err := s.store.CreateDataset(ctx, rec)
+	if err != nil {
 		if errors.Is(err, kv.ErrPredicateFailed) {
 			return nil, fmt.Errorf("%w: dataset %q already exists", ErrNameTaken, req.Name)
 		}
@@ -332,7 +333,7 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 
 	// §6.1: the dataset repository is read-only and defaults to the "latest" branch.
 	if _, err := s.catalog.CreateRepository(ctx, req.Name, s.cfg.StorageID, ns, DefaultBranch, true); err != nil {
-		_ = s.store.DeleteDataset(ctx, req.Name, rec)
+		_ = s.store.DeleteDataset(ctx, req.Name, recordPredicate)
 		if errors.Is(err, graveler.ErrNotUnique) || errors.Is(err, kv.ErrPredicateFailed) {
 			return nil, fmt.Errorf("%w: repository %q already exists", ErrNameTaken, req.Name)
 		}
@@ -355,22 +356,21 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 		return nil, err
 	}
 
-	current := rec
 	var version *VersionRecord
 	if req.Publish {
-		version, err = s.publish(ctx, caller, current, *resolved, req.Message, "")
+		version, err = s.publish(ctx, caller, rec, *resolved, req.Message, "")
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	active := *current
+	active := *rec
 	active.State = DatasetStateActive
 	active.UpdatedAt = s.now()
 	if version != nil {
 		active.LatestVersion = version.Version
 	}
-	if err := s.store.PutDatasetIf(ctx, &active, current); err != nil {
+	if _, err := s.store.PutDatasetIf(ctx, &active, recordPredicate); err != nil {
 		if errors.Is(err, kv.ErrPredicateFailed) {
 			return nil, fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, req.Name)
 		}
@@ -391,7 +391,7 @@ func (s *Service) Get(ctx context.Context, caller Caller, name string) (*Dataset
 	if err := s.authorizer.CheckDataset(ctx, caller, ActionReadDataset, name); err != nil {
 		return nil, err
 	}
-	rec, err := s.store.GetDataset(ctx, name)
+	rec, _, err := s.store.GetDataset(ctx, name)
 	if errors.Is(err, kv.ErrNotFound) {
 		return nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, name)
 	}
@@ -518,7 +518,7 @@ func (s *Service) Delete(ctx context.Context, caller Caller, name string) error 
 	if err := s.authorizer.CheckDataset(ctx, caller, ActionDeleteDataset, name); err != nil {
 		return err
 	}
-	rec, err := s.store.GetDataset(ctx, name)
+	rec, predicate, err := s.store.GetDataset(ctx, name)
 	if errors.Is(err, kv.ErrNotFound) {
 		return fmt.Errorf("%w: %q", ErrDatasetNotFound, name)
 	}
@@ -535,13 +535,13 @@ func (s *Service) Delete(ctx context.Context, caller Caller, name string) error 
 	deleting := *rec
 	deleting.State = DatasetStateDeleting
 	deleting.UpdatedAt = s.now()
-	if err := s.store.PutDatasetIf(ctx, &deleting, rec); err != nil {
+	deletingPredicate, err := s.store.PutDatasetIf(ctx, &deleting, predicate)
+	if err != nil {
 		if errors.Is(err, kv.ErrPredicateFailed) {
 			return fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, name)
 		}
 		return err
 	}
-	current := &deleting
 
 	// §6.6 step 2: delete the dataset repository. Object data is not touched; only the
 	// service's own _lakefs_dataset/ objects remain in the (now unused) namespace.
@@ -575,7 +575,7 @@ func (s *Service) Delete(ctx context.Context, caller Caller, name string) error 
 			errs = append(errs, err)
 		}
 	}
-	if err := s.store.DeleteDataset(ctx, name, current); err != nil && !isNotFound(err) {
+	if err := s.store.DeleteDataset(ctx, name, deletingPredicate); err != nil && !isNotFound(err) {
 		if errors.Is(err, kv.ErrPredicateFailed) {
 			errs = append(errs, fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, name))
 		} else {
@@ -718,16 +718,18 @@ func (s *Service) PublishVersion(ctx context.Context, caller Caller, name string
 	}
 
 	// §5.4 steps 1-3: read the record, check expected_version and the current state, and
-	// win or lose the CAS to "publishing".
-	publishing, err := s.beginPublish(ctx, name, req.ExpectedVersion)
+	// win or lose the CAS to "publishing". The predicate of that write travels with the
+	// record through the rest of the publish, so its later CASes condition on the value
+	// they actually wrote (§5.4).
+	publishing, publishingPredicate, err := s.beginPublish(ctx, name, req.ExpectedVersion)
 	if err != nil {
 		return nil, err
 	}
 
 	if !req.Sync && s.publishIsAsync(estimate) {
-		return s.startAsyncPublish(ctx, publishing, *resolved, req, caller)
+		return s.startAsyncPublish(ctx, publishing, publishingPredicate, *resolved, req, caller)
 	}
-	version, err := s.runPublish(ctx, publishing, *resolved, req, caller)
+	version, err := s.runPublish(ctx, publishing, publishingPredicate, *resolved, req, caller)
 	if err != nil {
 		return nil, err
 	}
@@ -736,24 +738,25 @@ func (s *Service) PublishVersion(ctx context.Context, caller Caller, name string
 
 // beginPublish applies §5.4 steps 1-3: it reads the dataset record, enforces
 // expected_version and the state machine, and compare-and-swaps the record to
-// State="publishing" with PendingVersion=N+1.
+// State="publishing" with PendingVersion=N+1. It returns the record it wrote together with
+// the predicate of that write, which the rest of the publish CASes on.
 //
 // A record may be in "publishing" already when the previous attempt crashed; §5.4 allows
 // taking that state over once the record has not moved for datasets.publish_timeout, which
 // is what keeps a single crashed publish from blocking a dataset until the reconciler runs
 // (§12.3). A non-stale publish in flight is a 409 (ErrPublishInProgress).
-func (s *Service) beginPublish(ctx context.Context, name string, expected *int) (*DatasetRecord, error) {
-	rec, err := s.store.GetDataset(ctx, name)
+func (s *Service) beginPublish(ctx context.Context, name string, expected *int) (*DatasetRecord, kv.Predicate, error) {
+	rec, predicate, err := s.store.GetDataset(ctx, name)
 	if errors.Is(err, kv.ErrNotFound) {
-		return nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, name)
+		return nil, nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, name)
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// §5.4: expected_version behaves like an ETag on the dataset head.
 	if expected != nil && *expected != rec.LatestVersion {
-		return nil, &VersionConflictError{Dataset: name, Expected: *expected, LatestVersion: rec.LatestVersion}
+		return nil, nil, &VersionConflictError{Dataset: name, Expected: *expected, LatestVersion: rec.LatestVersion}
 	}
 
 	switch rec.State {
@@ -762,7 +765,7 @@ func (s *Service) beginPublish(ctx context.Context, name string, expected *int) 
 		// replace the sources that disappeared, and repairing is better than blocking.
 	case DatasetStatePublishing:
 		if !s.pendingIsStale(rec) {
-			return nil, fmt.Errorf("%w: dataset %q version %d started at %s", ErrPublishInProgress,
+			return nil, nil, fmt.Errorf("%w: dataset %q version %d started at %s", ErrPublishInProgress,
 				name, rec.PendingVersion, rec.UpdatedAt.UTC().Format(time.RFC3339))
 		}
 		logging.FromContext(ctx).WithFields(logging.Fields{
@@ -771,7 +774,7 @@ func (s *Service) beginPublish(ctx context.Context, name string, expected *int) 
 			"updated_at":      rec.UpdatedAt.UTC().Format(time.RFC3339),
 		}).Warn("datasets: taking over a stale publishing state")
 	default:
-		return nil, fmt.Errorf("%w: dataset %q is %s", ErrDatasetConflict, name, rec.State)
+		return nil, nil, fmt.Errorf("%w: dataset %q is %s", ErrDatasetConflict, name, rec.State)
 	}
 
 	version := rec.LatestVersion + 1
@@ -779,13 +782,14 @@ func (s *Service) beginPublish(ctx context.Context, name string, expected *int) 
 	next.State = DatasetStatePublishing
 	next.PendingVersion = version
 	next.UpdatedAt = s.now()
-	if err := s.store.PutDatasetIf(ctx, &next, rec); err != nil {
+	publishingPredicate, err := s.store.PutDatasetIf(ctx, &next, predicate)
+	if err != nil {
 		if errors.Is(err, kv.ErrPredicateFailed) {
-			return nil, fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, name)
+			return nil, nil, fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, name)
 		}
-		return nil, err
+		return nil, nil, err
 	}
-	return &next, nil
+	return &next, publishingPredicate, nil
 }
 
 // pendingIsStale reports whether a record in "publishing" has been left alone for longer
@@ -809,12 +813,16 @@ func (s *Service) publishIsAsync(estimate ItemStats) bool {
 // runPublish performs §6.2 steps 4-11 for a record that is already CASed to "publishing":
 // materialise (which takes the pins first), write the VersionRecord, and advance the
 // dataset record. Any failure is rolled back to "active" on a best-effort basis.
-func (s *Service) runPublish(ctx context.Context, publishing *DatasetRecord, def Definition, req PublishVersionRequest, caller Caller) (*VersionRecord, error) {
+//
+// predicate is the predicate of the "publishing" write, the value every CAS below replaces
+// (BUG-1). caller is the publisher, whose identity authorizes every source object the
+// materialisation reads (SEC-3).
+func (s *Service) runPublish(ctx context.Context, publishing *DatasetRecord, predicate kv.Predicate, def Definition, req PublishVersionRequest, caller Caller) (*VersionRecord, error) {
 	started := time.Now()
 	publisher := caller.Username
 	version, err := s.publish(ctx, caller, publishing, def, req.Message, req.ProposalID)
 	if err != nil {
-		err = s.rollbackPublish(ctx, publishing, err)
+		err = s.rollbackPublish(ctx, publishing, predicate, err)
 		// §12.4: every attempt is observed, with the same classification the HTTP layer uses.
 		dsMetrics.observePublish(publishResultOf(err), time.Since(started).Seconds(), 0)
 		return nil, err
@@ -822,7 +830,7 @@ func (s *Service) runPublish(ctx context.Context, publishing *DatasetRecord, def
 	// §5.4 step 4: the version is durable; advance the head. This CAS losing is not a
 	// rollback case - the version exists - so it is reported as a conflict and left to
 	// the reconciler (§5.4, §12.3).
-	if err := s.activateDataset(ctx, publishing, version.Version); err != nil {
+	if err := s.activateDataset(ctx, publishing, predicate, version.Version); err != nil {
 		dsMetrics.observePublish(publishResultOf(err), time.Since(started).Seconds(), 0)
 		return nil, err
 	}
@@ -840,13 +848,13 @@ func (s *Service) runPublish(ctx context.Context, publishing *DatasetRecord, def
 
 // activateDataset advances the head record to the version that was just published
 // (§6.2 step 11).
-func (s *Service) activateDataset(ctx context.Context, publishing *DatasetRecord, version int) error {
+func (s *Service) activateDataset(ctx context.Context, publishing *DatasetRecord, predicate kv.Predicate, version int) error {
 	next := *publishing
 	next.State = DatasetStateActive
 	next.PendingVersion = 0
 	next.LatestVersion = version
 	next.UpdatedAt = s.now()
-	if err := s.store.PutDatasetIf(ctx, &next, publishing); err != nil {
+	if _, err := s.store.PutDatasetIf(ctx, &next, predicate); err != nil {
 		if errors.Is(err, kv.ErrPredicateFailed) {
 			return fmt.Errorf("%w: dataset %q changed while publishing version %d; the reconciler will repair it",
 				ErrDatasetConflict, publishing.Name, version)
@@ -859,12 +867,12 @@ func (s *Service) activateDataset(ctx context.Context, publishing *DatasetRecord
 // rollbackPublish is the best-effort CAS back to "active" of §5.4 step 5. It never masks
 // cause: a rollback that itself fails is logged and the reconciler (§12.3 item 1) finishes
 // the job from the record left in "publishing".
-func (s *Service) rollbackPublish(ctx context.Context, publishing *DatasetRecord, cause error) error {
+func (s *Service) rollbackPublish(ctx context.Context, publishing *DatasetRecord, predicate kv.Predicate, cause error) error {
 	next := *publishing
 	next.State = DatasetStateActive
 	next.PendingVersion = 0
 	next.UpdatedAt = s.now()
-	if err := s.store.PutDatasetIf(ctx, &next, publishing); err != nil {
+	if _, err := s.store.PutDatasetIf(ctx, &next, predicate); err != nil {
 		logging.FromContext(ctx).WithError(err).WithFields(logging.Fields{
 			"dataset":         publishing.Name,
 			"pending_version": publishing.PendingVersion,
@@ -880,12 +888,14 @@ func (s *Service) rollbackPublish(ctx context.Context, publishing *DatasetRecord
 //
 // The goroutine carries the caller, because the source guard it builds authorizes every object
 // it materialises for that principal (SEC-3). Only the principal name and the client IP travel
-// with it - both immutable strings - so nothing request-scoped outlives the request.
-func (s *Service) startAsyncPublish(ctx context.Context, publishing *DatasetRecord, def Definition, req PublishVersionRequest, caller Caller) (*PublishOutcome, error) {
+// with it - both immutable strings - so nothing request-scoped outlives the request. It also
+// carries the predicate of the "publishing" write, so the asynchronous CASes condition on the
+// value this attempt wrote (BUG-1).
+func (s *Service) startAsyncPublish(ctx context.Context, publishing *DatasetRecord, predicate kv.Predicate, def Definition, req PublishVersionRequest, caller Caller) (*PublishOutcome, error) {
 	now := s.now()
 	id, err := s.newULID(now)
 	if err != nil {
-		return nil, s.rollbackPublish(ctx, publishing, fmt.Errorf("datasets: generate task id: %w", err))
+		return nil, s.rollbackPublish(ctx, publishing, predicate, fmt.Errorf("datasets: generate task id: %w", err))
 	}
 	task := &TaskRecord{
 		ID:        id,
@@ -896,14 +906,14 @@ func (s *Service) startAsyncPublish(ctx context.Context, publishing *DatasetReco
 		UpdatedAt: now,
 	}
 	if err := s.store.PutTask(ctx, task); err != nil {
-		return nil, s.rollbackPublish(ctx, publishing, err)
+		return nil, s.rollbackPublish(ctx, publishing, predicate, err)
 	}
 	s.notifyTask(*task)
 
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.runAsyncPublish(publishing, def, req, caller, id)
+		s.runAsyncPublish(publishing, predicate, def, req, caller, id)
 	}()
 	return &PublishOutcome{Task: task}, nil
 }
@@ -911,7 +921,7 @@ func (s *Service) startAsyncPublish(ctx context.Context, publishing *DatasetReco
 // runAsyncPublish is the body of the goroutine started by startAsyncPublish. It runs on
 // the service background context, never on the request's, so a client that disconnects
 // does not abort a publish the server already accepted (202).
-func (s *Service) runAsyncPublish(publishing *DatasetRecord, def Definition, req PublishVersionRequest, caller Caller, taskID string) {
+func (s *Service) runAsyncPublish(publishing *DatasetRecord, predicate kv.Predicate, def Definition, req PublishVersionRequest, caller Caller, taskID string) {
 	ctx := s.bgCtx
 	if ctx == nil {
 		ctx = context.Background()
@@ -919,7 +929,7 @@ func (s *Service) runAsyncPublish(publishing *DatasetRecord, def Definition, req
 	s.updateTask(ctx, publishing.Name, taskID, func(task *TaskRecord) {
 		task.Status = TaskStatusRunning
 	})
-	version, err := s.runPublish(ctx, publishing, def, req, caller)
+	version, err := s.runPublish(ctx, publishing, predicate, def, req, caller)
 	if err != nil {
 		s.updateTask(ctx, publishing.Name, taskID, func(task *TaskRecord) {
 			task.Status = TaskStatusFailed
@@ -1053,7 +1063,7 @@ func (s *Service) GetVersion(ctx context.Context, caller Caller, name, ref strin
 	if err := s.authorizer.CheckDataset(ctx, caller, ActionReadDataset, name); err != nil {
 		return nil, err
 	}
-	rec, err := s.store.GetDataset(ctx, name)
+	rec, _, err := s.store.GetDataset(ctx, name)
 	if errors.Is(err, kv.ErrNotFound) {
 		return nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, name)
 	}
@@ -1183,7 +1193,7 @@ func (s *Service) ListAccess(ctx context.Context, caller Caller, dataset string)
 	if err := s.authorizer.CheckDataset(ctx, caller, ActionManageAccess, dataset); err != nil {
 		return nil, err
 	}
-	if _, err := s.store.GetDataset(ctx, dataset); err != nil {
+	if _, _, err := s.store.GetDataset(ctx, dataset); err != nil {
 		if errors.Is(err, kv.ErrNotFound) {
 			return nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, dataset)
 		}
@@ -1322,7 +1332,7 @@ func (s *Service) storageNamespace(name string, now time.Time) (string, error) {
 
 // checkNameAvailable rejects a name used by a dataset or by any repository (§10.4 409).
 func (s *Service) checkNameAvailable(ctx context.Context, name string) error {
-	if _, err := s.store.GetDataset(ctx, name); err == nil {
+	if _, _, err := s.store.GetDataset(ctx, name); err == nil {
 		return fmt.Errorf("%w: dataset %q already exists", ErrNameTaken, name)
 	} else if !errors.Is(err, kv.ErrNotFound) {
 		return err
@@ -1630,7 +1640,7 @@ func (s *Service) ensureConsumerPolicy(ctx context.Context, dataset string) erro
 
 // requireDataset returns 404 (ErrDatasetNotFound) for an unknown dataset.
 func (s *Service) requireDataset(ctx context.Context, dataset string) error {
-	if _, err := s.store.GetDataset(ctx, dataset); err != nil {
+	if _, _, err := s.store.GetDataset(ctx, dataset); err != nil {
 		if errors.Is(err, kv.ErrNotFound) {
 			return fmt.Errorf("%w: %q", ErrDatasetNotFound, dataset)
 		}

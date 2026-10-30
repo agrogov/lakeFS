@@ -37,6 +37,16 @@ type serviceFixture struct {
 
 func newServiceFixture(t *testing.T) *serviceFixture {
 	t.Helper()
+	return newServiceFixtureOnStore(t, nil)
+}
+
+// newServiceFixtureOnStore builds the fixture with the datasets control-plane records on
+// controlPlane, or on the fixture's mem store when it is nil. The catalog, the auth service
+// and the block adapter always use the mem store: in production the datasets partition is a
+// KV store of its own, separate from the auth and graveler data, so putting it on a different
+// backend is the realistic arrangement.
+func newServiceFixtureOnStore(t *testing.T, controlPlane kv.Store) *serviceFixture {
+	t.Helper()
 	f := newDatasetFixture(t)
 	ctx := t.Context()
 
@@ -54,7 +64,10 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 		StorageNamespacePrefix: "mem://datasets",
 	}
 	cfg.setDefaults()
-	svc, err := NewService(cfg, f.kvStore, f.cat, authService)
+	if controlPlane == nil {
+		controlPlane = f.kvStore
+	}
+	svc, err := NewService(cfg, controlPlane, f.cat, authService)
 	require.NoError(t, err)
 
 	fixture := &serviceFixture{datasetFixture: f, svc: svc, cfg: cfg, authService: authService, ts: ts}
@@ -237,7 +250,7 @@ func TestServiceCreateWithPublish(t *testing.T) {
 	require.NoError(t, err, "pin branch exists in the source repository")
 	require.True(t, pinBranch.Hidden)
 	require.Equal(t, commit, pinBranch.CommitID)
-	pin, err := f.svc.store.GetPin(f.ctx, "src", commit.String())
+	pin, _, err := f.svc.store.GetPin(f.ctx, "src", commit.String())
 	require.NoError(t, err)
 	require.Equal(t, []string{PinReference("customer-360", 1)}, pin.References)
 }
@@ -423,7 +436,7 @@ func TestServiceDeleteReleasesPinsAndPolicies(t *testing.T) {
 	require.NoError(t, err)
 
 	// Preconditions: the pin, the repository, the policies and the version exist.
-	_, err = f.svc.store.GetPin(f.ctx, "src", commit.String())
+	_, _, err = f.svc.store.GetPin(f.ctx, "src", commit.String())
 	require.NoError(t, err)
 	_, err = f.cat.GetRepository(f.ctx, "gone-set")
 	require.NoError(t, err)
@@ -438,7 +451,7 @@ func TestServiceDeleteReleasesPinsAndPolicies(t *testing.T) {
 	require.NoError(t, f.svc.Delete(f.ctx, f.caller(), "gone-set"))
 
 	t.Run("pins released", func(t *testing.T) {
-		_, err := f.svc.store.GetPin(f.ctx, "src", commit.String())
+		_, _, err := f.svc.store.GetPin(f.ctx, "src", commit.String())
 		require.ErrorIs(t, err, kv.ErrNotFound)
 		_, err = f.refMgr.GetBranch(f.ctx, f.repositoryRecord(t, "src"), graveler.BranchID(PinBranch(commit.String())))
 		require.Error(t, err, "the hidden pin branch is gone")
@@ -462,7 +475,7 @@ func TestServiceDeleteReleasesPinsAndPolicies(t *testing.T) {
 	})
 
 	t.Run("records deleted", func(t *testing.T) {
-		_, err := f.svc.store.GetDataset(f.ctx, "gone-set")
+		_, _, err := f.svc.store.GetDataset(f.ctx, "gone-set")
 		require.ErrorIs(t, err, kv.ErrNotFound)
 		versions, err := f.svc.store.ListVersions(f.ctx, "gone-set")
 		require.NoError(t, err)

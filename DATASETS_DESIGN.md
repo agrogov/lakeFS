@@ -381,7 +381,10 @@ record keeps only a `definition_ref` (dataset repo commit + path) instead of the
 
 - Versions are dense integers starting at 1. `latest` = `LatestVersion`.
 - Publish uses optimistic concurrency on `datasets/<name>`:
-  1. Read the `DatasetRecord` (`predicate = returned value`).
+  1. Read the `DatasetRecord` **together with the `kv.Predicate` that `Get` returned** and carry that predicate to
+     the next `SetIf`. The predicate is opaque: CosmosDB uses the document's ETag, the other backends the stored
+     value, and it changes on every write. A predicate re-derived from the record (re-encoding it, or comparing the
+     stored bytes with it) therefore works on Postgres/DynamoDB/local/mem and fails every write on CosmosDB.
   2. Require `State == "active"` or the `pending` state to be stale (> `publish_timeout`, default 30m).
   3. `SetIf` to `State="publishing", PendingVersion=N+1`. On `kv.ErrPredicateFailed` → `409 Conflict`.
   4. Materialise (§6). On success, write `VersionRecord` then `SetIf` `LatestVersion=N+1, State="active"`.

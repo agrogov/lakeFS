@@ -359,7 +359,7 @@ func (p *Pins) ClearDatasetDegraded(ctx context.Context, dataset string) (bool, 
 		return false, err
 	}
 	for attempt := 0; attempt < pinCASRetries; attempt++ {
-		rec, err := p.store.GetDataset(ctx, dataset)
+		rec, predicate, err := p.store.GetDataset(ctx, dataset)
 		if errors.Is(err, kv.ErrNotFound) {
 			return false, nil
 		}
@@ -372,7 +372,7 @@ func (p *Pins) ClearDatasetDegraded(ctx context.Context, dataset string) (bool, 
 		next := *rec
 		next.State = DatasetStateActive
 		next.UpdatedAt = time.Now().UTC()
-		err = p.store.PutDatasetIf(ctx, &next, rec)
+		_, err = p.store.PutDatasetIf(ctx, &next, predicate)
 		if errors.Is(err, kv.ErrPredicateFailed) {
 			continue // the record changed under us; re-read and retry
 		}
@@ -516,7 +516,7 @@ func (p *Pins) CheckDatasetDegraded(ctx context.Context, dataset string) (missin
 // reconcile interval.
 func (p *Pins) markDegraded(ctx context.Context, dataset string) (bool, error) {
 	for attempt := 0; attempt < pinCASRetries; attempt++ {
-		rec, err := p.store.GetDataset(ctx, dataset)
+		rec, predicate, err := p.store.GetDataset(ctx, dataset)
 		if errors.Is(err, kv.ErrNotFound) {
 			return false, nil
 		}
@@ -532,7 +532,7 @@ func (p *Pins) markDegraded(ctx context.Context, dataset string) (bool, error) {
 		next := *rec
 		next.State = DatasetStateDegraded
 		next.UpdatedAt = time.Now().UTC()
-		err = p.store.PutDatasetIf(ctx, &next, rec)
+		_, err = p.store.PutDatasetIf(ctx, &next, predicate)
 		if errors.Is(err, kv.ErrPredicateFailed) {
 			continue // the record changed under us; re-read and retry
 		}
@@ -554,7 +554,7 @@ func (p *Pins) pin(ctx context.Context, src PinnedSource, ref string) (bool, err
 	if _, err := p.ensureBranch(ctx, src); err != nil {
 		return false, err
 	}
-	current, err := p.store.GetPin(ctx, src.Repository, src.CommitID)
+	current, _, err := p.store.GetPin(ctx, src.Repository, src.CommitID)
 	switch {
 	case err == nil && containsReference(current.References, ref):
 		return false, nil // already protected by an earlier (possibly interrupted) attempt

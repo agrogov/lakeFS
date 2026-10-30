@@ -63,9 +63,18 @@ func (f *serviceFixture) commitTo(t *testing.T, repo, branch string, objects map
 // datasetRecord reads the current head record of a dataset.
 func (f *serviceFixture) datasetRecord(t *testing.T, name string) *DatasetRecord {
 	t.Helper()
-	rec, err := f.svc.store.GetDataset(f.ctx, name)
+	rec, _, err := f.svc.store.GetDataset(f.ctx, name)
 	require.NoError(t, err, "get dataset record %s", name)
 	return rec
+}
+
+// datasetRecordAndPredicate reads the current head record of a dataset together with the
+// kv.Predicate its next compare-and-swap must present (§5.4).
+func (f *serviceFixture) datasetRecordAndPredicate(t *testing.T, name string) (*DatasetRecord, kv.Predicate) {
+	t.Helper()
+	rec, predicate, err := f.svc.store.GetDataset(f.ctx, name)
+	require.NoError(t, err, "get dataset record %s", name)
+	return rec, predicate
 }
 
 // latestHead returns the commit the dataset repository's "latest" branch points at.
@@ -321,12 +330,13 @@ func TestPublishVersion_TakesOverStalePublishingState(t *testing.T) {
 	// Simulate a publish that crashed right after the CAS to "publishing".
 	leavePublishing := func(age time.Duration) {
 		t.Helper()
-		current := f.datasetRecord(t, dataset)
+		current, predicate := f.datasetRecordAndPredicate(t, dataset)
 		crashed := *current
 		crashed.State = DatasetStatePublishing
 		crashed.PendingVersion = 2
 		crashed.UpdatedAt = f.svc.now().Add(-age)
-		require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &crashed, current))
+		_, err := f.svc.store.PutDatasetIf(f.ctx, &crashed, predicate)
+		require.NoError(t, err)
 	}
 
 	// A recent "publishing" record is not stale: the publish is refused.

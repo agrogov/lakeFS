@@ -377,7 +377,8 @@ func TestDatasetRepoIndexReadsTheStore(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
 	store := NewStore(kvtest.GetStore(ctx, t))
-	require.NoError(t, store.CreateDataset(ctx, &DatasetRecord{Name: guardDataset, State: DatasetStateActive, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+	_, err := store.CreateDataset(ctx, &DatasetRecord{Name: guardDataset, State: DatasetStateActive, CreatedAt: time.Now(), UpdatedAt: time.Now()})
+	require.NoError(t, err)
 
 	index := NewDatasetRepoIndex(store, logging.ContextUnavailable())
 	require.True(t, index.IsDatasetRepo(ctx, guardDataset))

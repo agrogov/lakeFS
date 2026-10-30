@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -447,16 +448,90 @@ func (s *Store) put(ctx context.Context, key, value []byte) error {
 
 // get reads key, returning kv.ErrNotFound unchanged.
 func (s *Store) get(ctx context.Context, key []byte) ([]byte, error) {
+	value, _, err := s.getWithPredicate(ctx, key)
+	return value, err
+}
+
+// getWithPredicate reads key and returns the stored value together with the predicate a
+// conditional write of that key must present.
+//
+// The predicate is opaque (§5.4): postgres, DynamoDB, local and mem return the stored
+// value, CosmosDB returns the document's ETag, and it changes on every write. It is
+// therefore never derived from a decoded record - re-encoding a record reproduces its
+// bytes but never a CosmosDB ETag - so every reader that feeds a compare-and-swap hands
+// the predicate back to its caller (GetDataset, GetPin, getLease).
+func (s *Store) getWithPredicate(ctx context.Context, key []byte) ([]byte, kv.Predicate, error) {
 	res, err := s.store.Get(ctx, []byte(PartitionKey), key)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return res.Value, nil
+	return res.Value, res.Predicate, nil
 }
 
 // delete removes key; deleting a missing key is not an error.
 func (s *Store) delete(ctx context.Context, key []byte) error {
 	return s.store.Delete(ctx, []byte(PartitionKey), key)
+}
+
+// deleteIf removes key only if the stored value still matches predicate, and returns
+// kv.ErrPredicateFailed when it does not.
+//
+// kv.Store has no conditional delete, so the condition is a read followed by a delete. The
+// window between the two is as small as this layer can make it, and the comparison is the
+// predicate the store reported - not a value this package re-encoded - so a backend whose
+// predicate is not the value (CosmosDB) compares the right thing. A delete that loses the
+// race leaves the record alone and returns kv.ErrPredicateFailed; the caller retries or the
+// reconciler finishes the job (§6.6, §12.3).
+func (s *Store) deleteIf(ctx context.Context, key []byte, predicate kv.Predicate) error {
+	if predicate == nil {
+		return s.delete(ctx, key)
+	}
+	_, stored, err := s.getWithPredicate(ctx, key)
+	switch {
+	case errors.Is(err, kv.ErrNotFound):
+		return nil // already gone: this delete lost the race to another one, which is the outcome it wanted
+	case err != nil:
+		return err
+	}
+	if !predicatesEqual(stored, predicate) {
+		return kv.ErrPredicateFailed
+	}
+	return s.delete(ctx, key)
+}
+
+// predicatesEqual reports whether two predicates refer to the same stored value.
+//
+// Every kv.Store implementation returns its predicate as []byte - the stored value on
+// postgres, DynamoDB, local and mem, the ETag on CosmosDB - so the comparison is byte-wise.
+// The fallback keeps a backend with a different predicate type working.
+func predicatesEqual(a, b kv.Predicate) bool {
+	if aBytes, ok := a.([]byte); ok {
+		bBytes, ok := b.([]byte)
+		return ok && bytes.Equal(aBytes, bBytes)
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+// predicateAfterWrite returns the predicate of the value this caller just wrote at key.
+//
+// kv.Store reports only success or failure from SetIf, and the predicate of a written value
+// is backend-specific - CosmosDB mints a new ETag on every write - so it is read back
+// instead of being derived from the record that was written. The read doubles as an
+// ownership check: if a concurrent writer has replaced the value in the meantime, this
+// caller no longer owns the record and gets kv.ErrPredicateFailed, which is the same answer
+// a lost compare-and-swap gives.
+func (s *Store) predicateAfterWrite(ctx context.Context, key, value []byte) (kv.Predicate, error) {
+	stored, predicate, err := s.getWithPredicate(ctx, key)
+	switch {
+	case errors.Is(err, kv.ErrNotFound):
+		return nil, kv.ErrPredicateFailed // deleted by another writer while we were writing it
+	case err != nil:
+		return nil, err
+	}
+	if !bytes.Equal(stored, value) {
+		return nil, kv.ErrPredicateFailed // replaced by another writer
+	}
+	return predicate, nil
 }
 
 // decode unmarshals a stored JSON record, naming the record kind and key in the
@@ -498,23 +573,28 @@ func (s *Store) scanPrefix(ctx context.Context, prefix []byte, fn func(key, valu
 
 // GetDataset reads the record of name, returning kv.ErrNotFound unchanged when the
 // dataset does not exist.
-func (s *Store) GetDataset(ctx context.Context, name string) (*DatasetRecord, error) {
+//
+// It also returns the kv.Predicate of the stored record, which is what PutDatasetIf and
+// DeleteDataset need to bound their write or delete: the predicate is opaque (a CosmosDB
+// ETag, the stored bytes elsewhere) and cannot be reconstructed from the record, so it
+// travels with it. A caller that only reads can drop it.
+func (s *Store) GetDataset(ctx context.Context, name string) (*DatasetRecord, kv.Predicate, error) {
 	key, err := datasetKey(name)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	value, err := s.get(ctx, key)
+	value, predicate, err := s.getWithPredicate(ctx, key)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	rec, err := decodeRecord[DatasetRecord]("dataset record", key, value)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if rec.Name != name {
-		return nil, fmt.Errorf("%w: dataset key %q holds record of %q", ErrRecordMismatch, key, rec.Name)
+		return nil, nil, fmt.Errorf("%w: dataset key %q holds record of %q", ErrRecordMismatch, key, rec.Name)
 	}
-	return rec, nil
+	return rec, predicate, nil
 }
 
 // ListDatasets returns every dataset record in name order. It is the read behind GET
@@ -546,87 +626,62 @@ func (s *Store) ListDatasets(ctx context.Context) ([]*DatasetRecord, error) {
 	return records, nil
 }
 
-// PutDatasetIf writes rec only if the stored record still equals previous, which is
-// the §5.4 step 3 CAS of the publish state machine: read the record, derive the next
-// state from it, write it back conditioned on the record that was read.
+// PutDatasetIf writes rec only if the stored record still matches predicate, which is the
+// §5.4 step 3 CAS of the publish state machine: read the record, derive the next state
+// from it, write it back conditioned on the record that was read.
 //
-// previous must be the record as this caller last read (GetDataset) or last wrote
-// (the value passed to the previous PutDatasetIf). A nil previous means "the record
-// must not exist yet", which is how CreateDataset is expressed.
+// predicate must be the predicate the store returned for the record this caller last read
+// (GetDataset) or last wrote (the predicate PutDatasetIf returned). It is opaque - on
+// CosmosDB it is the document's ETag - so it is never rebuilt from a DatasetRecord. A nil
+// predicate means "the record must not exist yet", which is how CreateDataset is expressed.
 //
-// kv.ErrPredicateFailed is returned unchanged: the caller lost the race and the HTTP
-// layer maps it to 409 Conflict (§5.4, §14 "two concurrent publishes"). The stored
-// record is left untouched.
-func (s *Store) PutDatasetIf(ctx context.Context, rec, previous *DatasetRecord) error {
+// The returned predicate is the one of the value now stored, so a caller that CASes the
+// same record twice in a row - create then publish, publishing then active (§5.4) - can
+// carry it forward without re-reading the record.
+//
+// kv.ErrPredicateFailed is returned unchanged: the caller lost the race and the HTTP layer
+// maps it to 409 Conflict (§5.4, §14 "two concurrent publishes"). The stored record is left
+// untouched.
+func (s *Store) PutDatasetIf(ctx context.Context, rec *DatasetRecord, predicate kv.Predicate) (kv.Predicate, error) {
 	if rec == nil {
-		return fmt.Errorf("datasets: %w", ErrNilRecord)
+		return nil, fmt.Errorf("datasets: %w", ErrNilRecord)
 	}
 	key, err := datasetKey(rec.Name)
 	if err != nil {
-		return err
-	}
-	var predicate kv.Predicate
-	if previous != nil {
-		if previous.Name != rec.Name {
-			return fmt.Errorf("%w: previous record is dataset %q, new record is %q",
-				ErrRecordMismatch, previous.Name, rec.Name)
-		}
-		// The predicate is compared byte for byte with the stored value, and
-		// DatasetRecord has neither map nor float fields, so re-encoding the record
-		// that was read reproduces the stored value exactly.
-		previousValue, err := datasetValue(previous)
-		if err != nil {
-			return err
-		}
-		predicate = previousValue
+		return nil, err
 	}
 	value, err := datasetValue(rec)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return s.store.SetIf(ctx, []byte(PartitionKey), key, value, predicate)
+	if err := s.store.SetIf(ctx, []byte(PartitionKey), key, value, predicate); err != nil {
+		return nil, err
+	}
+	return s.predicateAfterWrite(ctx, key, value)
 }
 
-// CreateDataset writes a new dataset record. It fails with kv.ErrPredicateFailed if a
-// record with that name already exists, so two concurrent creates cannot both win.
-func (s *Store) CreateDataset(ctx context.Context, rec *DatasetRecord) error {
+// CreateDataset writes a new dataset record and returns the predicate of the stored value.
+// It fails with kv.ErrPredicateFailed if a record with that name already exists, so two
+// concurrent creates cannot both win.
+func (s *Store) CreateDataset(ctx context.Context, rec *DatasetRecord) (kv.Predicate, error) {
 	return s.PutDatasetIf(ctx, rec, nil)
 }
 
 // DeleteDataset removes the record of name.
 //
-// previous bounds the delete the way PutDatasetIf bounds a write: pass the record as
-// last read or written, or nil to delete unconditionally. kv.Store has no
-// conditional delete, so the comparison is a read followed by a delete; on conflict
-// the record is left untouched and kv.ErrPredicateFailed is returned. A delete that
-// loses that race is finished by the reconciler (§6.6, §12.3).
-func (s *Store) DeleteDataset(ctx context.Context, name string, previous *DatasetRecord) error {
+// predicate bounds the delete the way PutDatasetIf bounds a write: pass the predicate the
+// store returned for the record as last read or written, or nil to delete unconditionally.
+// On conflict the record is left untouched and kv.ErrPredicateFailed is returned; a delete
+// that loses that race is finished by the reconciler (§6.6, §12.3).
+func (s *Store) DeleteDataset(ctx context.Context, name string, predicate kv.Predicate) error {
 	key, err := datasetKey(name)
 	if err != nil {
 		return err
 	}
-	if previous != nil {
-		if previous.Name != name {
-			return fmt.Errorf("%w: previous record is dataset %q, delete is for %q",
-				ErrRecordMismatch, previous.Name, name)
-		}
-		want, err := datasetValue(previous)
-		if err != nil {
-			return err
-		}
-		current, err := s.get(ctx, key)
-		if err != nil {
-			return err
-		}
-		if !bytes.Equal(current, want) {
-			return kv.ErrPredicateFailed
-		}
-	}
-	return s.delete(ctx, key)
+	return s.deleteIf(ctx, key, predicate)
 }
 
-// datasetValue encodes a dataset record as stored, which is also the CAS predicate
-// of that record.
+// datasetValue encodes a dataset record as stored.
 func datasetValue(rec *DatasetRecord) ([]byte, error) {
 	value, err := json.Marshal(rec)
 	if err != nil {
@@ -908,16 +963,25 @@ func (s *Store) ListMetadataKeys(ctx context.Context) ([]MetadataKey, error) {
 
 // GetPin reads the pin of one (repository, commit), returning kv.ErrNotFound
 // unchanged when it does not exist.
-func (s *Store) GetPin(ctx context.Context, repository, commitID string) (*PinRecord, error) {
+//
+// Like GetDataset it hands back the kv.Predicate of the stored record, so a caller that
+// wants to change or delete the pin conditions on the value it read instead of on bytes it
+// re-encoded (§8.2). The pin reference helpers below read through readPin and retry on
+// kv.ErrPredicateFailed.
+func (s *Store) GetPin(ctx context.Context, repository, commitID string) (*PinRecord, kv.Predicate, error) {
 	key, err := pinKey(repository, commitID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	value, err := s.get(ctx, key)
+	value, predicate, err := s.getWithPredicate(ctx, key)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return decodeRecord[PinRecord]("pin record", key, value)
+	rec, err := decodeRecord[PinRecord]("pin record", key, value)
+	if err != nil {
+		return nil, nil, err
+	}
+	return rec, predicate, nil
 }
 
 // PutPin writes a pin record, normalising References to a sorted, duplicate-free
@@ -1079,18 +1143,18 @@ func (s *Store) ListPins(ctx context.Context, repository string) ([]*PinRecord, 
 // readPin reads a pin record together with the predicate that a conditional write
 // needs. A missing pin yields (nil, nil): the caller is about to create it.
 func (s *Store) readPin(ctx context.Context, key []byte) (*PinRecord, kv.Predicate, error) {
-	res, err := s.store.Get(ctx, []byte(PartitionKey), key)
+	value, predicate, err := s.getWithPredicate(ctx, key)
 	if errors.Is(err, kv.ErrNotFound) {
 		return nil, nil, nil
 	}
 	if err != nil {
 		return nil, nil, err
 	}
-	rec, err := decodeRecord[PinRecord]("pin record", key, res.Value)
+	rec, err := decodeRecord[PinRecord]("pin record", key, value)
 	if err != nil {
 		return nil, nil, err
 	}
-	return rec, res.Predicate, nil
+	return rec, predicate, nil
 }
 
 // containsReference reports whether refs contains ref.

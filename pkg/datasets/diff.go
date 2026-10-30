@@ -554,7 +554,7 @@ func (s *Service) resolveRef(ctx context.Context, name, field, ref string) (*dif
 	if err != nil {
 		return nil, err
 	}
-	rec, err := s.store.GetDataset(ctx, name)
+	rec, _, err := s.store.GetDataset(ctx, name)
 	if errors.Is(err, kv.ErrNotFound) {
 		return nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, name)
 	}

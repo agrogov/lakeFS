@@ -65,6 +65,25 @@ type leaseRecord struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
+// getLease reads the reconcile lease together with the predicate a conditional write or
+// delete of the lease key must present.
+//
+// kv.ErrNotFound is returned unchanged when no node ever took the lease. A record that
+// cannot be decoded is returned as a nil record together with the key's predicate: the lease
+// is unusable, but whether that means "overwrite it" or "leave it to expire" is the caller's
+// decision, and the predicate still lets the caller condition its write on the value it saw.
+func (s *Store) getLease(ctx context.Context) (*leaseRecord, kv.Predicate, error) {
+	value, predicate, err := s.getWithPredicate(ctx, []byte(ReconcileLeaseKey))
+	if err != nil {
+		return nil, nil, err
+	}
+	var current leaseRecord
+	if err := json.Unmarshal(value, &current); err != nil {
+		return nil, predicate, nil
+	}
+	return &current, predicate, nil
+}
+
 // AcquireLease tries to take the reconcile lease for owner for ttl. It reports whether this
 // caller now holds it.
 //
@@ -82,7 +101,7 @@ func (s *Store) AcquireLease(ctx context.Context, owner string, ttl time.Duratio
 	for attempt := 0; attempt < pinCASRetries; attempt++ {
 		now := time.Now().UTC()
 		var predicate kv.Predicate
-		res, err := s.store.Get(ctx, []byte(PartitionKey), key)
+		current, stored, err := s.getLease(ctx)
 		switch {
 		case errors.Is(err, kv.ErrNotFound):
 			// No lease record yet: SetIf with a nil predicate creates it only if it is
@@ -90,12 +109,15 @@ func (s *Store) AcquireLease(ctx context.Context, owner string, ttl time.Duratio
 		case err != nil:
 			return false, err
 		default:
-			var current leaseRecord
-			if decodeErr := json.Unmarshal(res.Value, &current); decodeErr == nil &&
-				current.ExpiresAt.After(now) && current.Owner != owner {
+			// An undecodable lease is treated as expired: it protects nothing, so taking
+			// it over is safe (§12.3).
+			if current != nil && current.ExpiresAt.After(now) && current.Owner != owner {
 				return false, nil // a live lease owned by somebody else
 			}
-			predicate = res.Predicate
+			// The predicate is the store's, never a re-encoding of the lease record: on
+			// CosmosDB it is the document's ETag, and a synthesized value would fail
+			// every acquisition there.
+			predicate = stored
 		}
 		value, err := json.Marshal(leaseRecord{Owner: owner, ExpiresAt: now.Add(ttl)})
 		if err != nil {
@@ -117,17 +139,18 @@ func (s *Store) AcquireLease(ctx context.Context, owner string, ttl time.Duratio
 // immediately instead of waiting for the expiry. It is a no-op when the lease is already gone
 // or owned by someone else (a crashed node's lease expired and was taken over): releasing
 // another owner's lease would let two nodes run concurrently.
+//
+// The delete is conditioned on the predicate of the lease record that was read, so a lease
+// another node has since taken over is left alone (§12.3).
 func (s *Store) ReleaseLease(ctx context.Context, owner string) error {
-	key := []byte(ReconcileLeaseKey)
-	res, err := s.store.Get(ctx, []byte(PartitionKey), key)
+	current, predicate, err := s.getLease(ctx)
 	switch {
 	case errors.Is(err, kv.ErrNotFound):
 		return nil
 	case err != nil:
 		return err
 	}
-	var current leaseRecord
-	if err := json.Unmarshal(res.Value, &current); err != nil {
+	if current == nil {
 		// A corrupted lease is left to expire rather than deleted: it may belong to an
 		// owner this node cannot identify.
 		return nil
@@ -135,7 +158,7 @@ func (s *Store) ReleaseLease(ctx context.Context, owner string) error {
 	if current.Owner != owner {
 		return nil
 	}
-	return s.store.Delete(ctx, []byte(PartitionKey), key)
+	return s.deleteIf(ctx, []byte(ReconcileLeaseKey), predicate)
 }
 
 // Reconciler runs the §12.3 repair pass. One instance per process; it holds no per-pass
@@ -363,19 +386,31 @@ func (r *Reconciler) repair(ctx context.Context) *ReconcileReport {
 func (r *Reconciler) repairDataset(ctx context.Context, rec *DatasetRecord, report *ReconcileReport) error {
 	switch rec.State {
 	case DatasetStateCreating, DatasetStatePublishing, DatasetStateDeleting:
+		// rec came from the partition scan that opened the pass, and a scan carries no
+		// kv.Predicate, so it is re-read: the CAS that repair performs needs the predicate of
+		// the value it replaces, and the fresh record is also what staleness must be judged
+		// on (§5.4 step 2).
+		fresh, predicate, err := r.store.GetDataset(ctx, rec.Name)
+		if errors.Is(err, kv.ErrNotFound) {
+			return nil // deleted since the scan
+		}
+		if err != nil {
+			return err
+		}
+		rec = fresh
 		if !r.stale(rec) {
 			// An operation is genuinely in flight; its own writer owns the record and the
 			// reconciler must not race it (§5.4).
 			return nil
 		}
 		if rec.State == DatasetStateDeleting {
-			return r.finishDelete(ctx, rec, report)
+			return r.finishDelete(ctx, rec, predicate, report)
 		}
-		if err := r.repairInterrupted(ctx, rec, report); err != nil {
+		if err := r.repairInterrupted(ctx, rec, predicate, report); err != nil {
 			return err
 		}
 		// Re-read: the repair advanced the record to active (or removed it).
-		repaired, err := r.store.GetDataset(ctx, rec.Name)
+		repaired, _, err := r.store.GetDataset(ctx, rec.Name)
 		if errors.Is(err, kv.ErrNotFound) {
 			return nil
 		}
@@ -430,8 +465,9 @@ func (r *Reconciler) stale(rec *DatasetRecord) bool {
 // repairInterrupted finishes or rolls back an interrupted create/publish (§12.3 item 1).
 //
 // The order is the one §5.4 makes authoritative: the tag vN first, then the latest HEAD
-// commit carrying dataset.version=N, and only then the rollback.
-func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, report *ReconcileReport) error {
+// commit carrying dataset.version=N, and only then the rollback. predicate is the predicate
+// of rec as it was read, which every write on the record is conditioned on.
+func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, predicate kv.Predicate, report *ReconcileReport) error {
 	dataset := rec.Name
 	version := rec.PendingVersion
 	if version <= 0 {
@@ -443,7 +479,7 @@ func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, 
 	tagCommit, err := r.catalog.GetTag(ctx, dataset, tag)
 	switch {
 	case err == nil:
-		return r.completeVersion(ctx, rec, version, tagCommit, report)
+		return r.completeVersion(ctx, rec, predicate, version, tagCommit, report)
 	case !isNotFound(err):
 		return fmt.Errorf("datasets: read tag %s of %q: %w", tag, dataset, err)
 	}
@@ -466,7 +502,7 @@ func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, 
 				"version": version,
 				"commit":  headCommit,
 			}).Warn("datasets: created the missing tag of an interrupted publish")
-			return r.completeVersion(ctx, rec, version, headCommit, report)
+			return r.completeVersion(ctx, rec, predicate, version, headCommit, report)
 		}
 	case !isNotFound(err):
 		return fmt.Errorf("datasets: read %s/%s: %w", dataset, DefaultBranch, err)
@@ -477,7 +513,7 @@ func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, 
 	// removed instead of being promoted to a dataset with no repository.
 	if rec.State == DatasetStateCreating {
 		if _, err := r.catalog.GetRepository(ctx, dataset); isNotFound(err) {
-			if err := r.store.DeleteDataset(ctx, dataset, rec); err != nil && !errors.Is(err, kv.ErrPredicateFailed) {
+			if err := r.store.DeleteDataset(ctx, dataset, predicate); err != nil && !errors.Is(err, kv.ErrPredicateFailed) {
 				return err
 			}
 			report.StatesRepaired++
@@ -492,7 +528,7 @@ func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, 
 	next.State = DatasetStateActive
 	next.PendingVersion = 0
 	next.UpdatedAt = r.now()
-	if err := r.store.PutDatasetIf(ctx, &next, rec); err != nil {
+	if _, err := r.store.PutDatasetIf(ctx, &next, predicate); err != nil {
 		return fmt.Errorf("datasets: roll %q back to active: %w", dataset, err)
 	}
 	report.StatesRepaired++
@@ -506,7 +542,7 @@ func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, 
 // completeVersion rebuilds the missing VersionRecord of a committed version from the
 // version's _dataset/definition.json and marks the dataset active (§5.4: the tag and the
 // definition object are authoritative, the KV record is derived).
-func (r *Reconciler) completeVersion(ctx context.Context, rec *DatasetRecord, version int, commitID string, report *ReconcileReport) error {
+func (r *Reconciler) completeVersion(ctx context.Context, rec *DatasetRecord, predicate kv.Predicate, version int, commitID string, report *ReconcileReport) error {
 	dataset := rec.Name
 	_, err := r.store.GetVersion(ctx, dataset, version)
 	switch {
@@ -557,7 +593,7 @@ func (r *Reconciler) completeVersion(ctx context.Context, rec *DatasetRecord, ve
 		next.LatestVersion = version
 	}
 	next.UpdatedAt = r.now()
-	if err := r.store.PutDatasetIf(ctx, &next, rec); err != nil {
+	if _, err := r.store.PutDatasetIf(ctx, &next, predicate); err != nil {
 		if errors.Is(err, kv.ErrPredicateFailed) {
 			// Somebody else moved the record; the next pass converges on the new value.
 			return nil
@@ -571,7 +607,7 @@ func (r *Reconciler) completeVersion(ctx context.Context, rec *DatasetRecord, ve
 // finishDelete completes a delete that was interrupted after the record was CASed to
 // "deleting" (§6.6, §12.3 item 1). Every step tolerates not found, so it converges whether
 // the repository, the pins or the records were already removed.
-func (r *Reconciler) finishDelete(ctx context.Context, rec *DatasetRecord, report *ReconcileReport) error {
+func (r *Reconciler) finishDelete(ctx context.Context, rec *DatasetRecord, predicate kv.Predicate, report *ReconcileReport) error {
 	dataset := rec.Name
 	versions, err := r.store.ListVersions(ctx, dataset)
 	if err != nil && !errors.Is(err, kv.ErrNotFound) {
@@ -594,7 +630,7 @@ func (r *Reconciler) finishDelete(ctx context.Context, rec *DatasetRecord, repor
 	// §6.6 step 4: policies and grants, then the control-plane records.
 	errs = append(errs, r.svc.dropAccessGrants(ctx, dataset)...)
 	errs = append(errs, r.svc.dropImmutabilityGuard(ctx, dataset)...)
-	if err := r.store.DeleteDataset(ctx, dataset, rec); err != nil && !isNotFound(err) {
+	if err := r.store.DeleteDataset(ctx, dataset, predicate); err != nil && !isNotFound(err) {
 		errs = append(errs, fmt.Errorf("datasets: delete record of %q: %w", dataset, err))
 	}
 	for _, version := range versions {

@@ -474,7 +474,7 @@ func (s *Service) MergeProposal(ctx context.Context, caller Caller, dataset, id 
 // loadDataset reads the head record of a dataset, mapping a missing record to the 404 of
 // §10.4.
 func (s *Service) loadDataset(ctx context.Context, dataset string) (*DatasetRecord, error) {
-	rec, err := s.store.GetDataset(ctx, dataset)
+	rec, _, err := s.store.GetDataset(ctx, dataset)
 	if errors.Is(err, kv.ErrNotFound) {
 		return nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, dataset)
 	}
