@@ -185,7 +185,7 @@ lint: ## Lint code
 esti: ## run esti (system testing)
 	$(GOTEST) -tags $(ESTI_TAGS) -v ./esti --args --system-tests
 
-esti-datasets: ## run only the datasets system tests (starts its own lakefs-sso; needs Go and optionally Postgres)
+esti-datasets: ## run only the datasets system tests (local blockstore by default; set LAKEFS_BLOCKSTORE_TYPE + ESTI_STORAGE_NAMESPACE to run on a configured blockstore)
 	ESTI_SETUP_LAKEFS=false $(GOTEST) -count=1 -tags $(ESTI_TAGS) -run TestDatasets -v ./esti --args --system-tests
 
 test: test-go test-hadoopfs  ## Run tests for the project

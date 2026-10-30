@@ -337,6 +337,66 @@ jobs:
         continue-on-error: true
         run: docker logs lakefs --tail=1000 2>&1 || echo "Failed to get lakeFS logs"
 
+  datasets-system-tests:
+    name: Test datasets (${{ matrix.blockstore.type }})
+    needs: [check-secrets]
+    if: needs.check-secrets.outputs.secretsavailable == 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        blockstore:
+          - type: s3
+            namespace: s3://esti-system-testing
+          - type: gs
+            namespace: gs://esti-system-testing
+          - type: azure
+            namespace: https://esti.blob.core.windows.net/esti-system-testing
+    steps:
+      - name: Check-out code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Generate uniquifying value
+        id: unique
+        run: echo "value=$RANDOM" >> $GITHUB_OUTPUT
+
+      # Runs the datasets suite only (-run TestDatasets). The suite starts its own lakefs-sso
+      # server, so LAKEFS_BLOCKSTORE_TYPE tells it to use this matrix backend and it allocates
+      # (and removes) its own prefix under ESTI_STORAGE_NAMESPACE.
+      - name: Datasets system tests (${{ matrix.blockstore.type }})
+        env:
+          LAKEFS_BLOCKSTORE_TYPE: ${{ matrix.blockstore.type }}
+          LAKEFS_BLOCKSTORE_S3_CREDENTIALS_ACCESS_KEY_ID: ${{ secrets.ESTI_AWS_ACCESS_KEY_ID }}
+          LAKEFS_BLOCKSTORE_S3_CREDENTIALS_SECRET_ACCESS_KEY: ${{ secrets.ESTI_AWS_SECRET_ACCESS_KEY }}
+          LAKEFS_BLOCKSTORE_GS_CREDENTIALS_JSON: ${{ secrets.LAKEFS_BLOCKSTORE_GS_CREDENTIALS_JSON }}
+          LAKEFS_BLOCKSTORE_AZURE_STORAGE_ACCOUNT: esti
+          LAKEFS_BLOCKSTORE_AZURE_STORAGE_ACCESS_KEY: ${{ secrets.LAKEFS_BLOCKSTORE_AZURE_STORAGE_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.ESTI_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.ESTI_AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: us-east-1
+          ESTI_BLOCKSTORE_TYPE: ${{ matrix.blockstore.type }}
+          ESTI_STORAGE_NAMESPACE: ${{ matrix.blockstore.namespace }}/${{ github.run_number }}/datasets/${{ steps.unique.outputs.value }}
+          ESTI_SETUP_LAKEFS: "false"
+        run: |
+          set -euo pipefail
+          case "$LAKEFS_BLOCKSTORE_TYPE" in
+            s3) backend_secret_name=AWS_ACCESS_KEY_ID; backend_secret_value="${AWS_ACCESS_KEY_ID:-}" ;;
+            gs) backend_secret_name=LAKEFS_BLOCKSTORE_GS_CREDENTIALS_JSON; backend_secret_value="${LAKEFS_BLOCKSTORE_GS_CREDENTIALS_JSON:-}" ;;
+            azure) backend_secret_name=LAKEFS_BLOCKSTORE_AZURE_STORAGE_ACCESS_KEY; backend_secret_value="${LAKEFS_BLOCKSTORE_AZURE_STORAGE_ACCESS_KEY:-}" ;;
+          esac
+          if [ -z "$backend_secret_value" ]; then
+            echo "::notice::$backend_secret_name is not configured for $LAKEFS_BLOCKSTORE_TYPE; skipping the datasets system tests"
+            exit 0
+          fi
+          go test -count=1 -timeout 30m -tags datasets -v ./esti \
+            -system-tests -run TestDatasets
+
   deploy-rclone-export-image:
     name: Build and push rclone export Docker image
     needs: [check-secrets, login-to-amazon-ecr]
