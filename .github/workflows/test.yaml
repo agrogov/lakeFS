@@ -12,18 +12,17 @@ jobs:
       - name: Check-out code
         uses: actions/checkout@v6
         with:
-          # The guard compares HEAD against the upstream BSL 1.1 relicense commit,
-          # which only exists in the treeverse history, not in this fork's origin.
-          # A full clone keeps the ancestry check conclusive (see the guard script).
+          # The guard fails closed on a shallow clone, so it needs complete history.
           fetch-depth: 0
-      - name: Add upstream remote
+      - name: Fetch upstream history
         run: |
-          git remote add upstream https://github.com/treeverse/lakeFS.git ||
-            git remote set-url upstream https://github.com/treeverse/lakeFS.git
-      - name: Self-test the guard
-        run: bash scripts/check-license-base.sh --self-test
-      - name: Check that no BSL 1.1 upstream commit is an ancestor
-        run: bash scripts/check-license-base.sh
+          # 358544dd7 (the BSL 1.1 relicense) only exists in the treeverse history,
+          # not in this fork's origin. A plain, non-shallow fetch of upstream master
+          # keeps the clone unshallow and lets the guard compute the ancestry for
+          # real instead of concluding it from an absent object.
+          git fetch --no-tags https://github.com/treeverse/lakeFS.git master
+      - name: Check licence base (self-test + guard)
+        run: make check-license-base
 
   validator:
     name: Run Linters and Checkers
@@ -31,6 +30,10 @@ jobs:
     steps:
       - name: Check-out code
         uses: actions/checkout@v6
+        with:
+          # make checks-validator runs scripts/check-license-base.sh, which fails
+          # closed unless it can see complete history.
+          fetch-depth: 0
       - name: Setup Go
         uses: actions/setup-go@v6
         with:

@@ -48,7 +48,7 @@ Evidence conventions: `file:line` are at HEAD `ba109abe7`. "probe" means a scrat
 | R08 | §2.2 | Nothing is copied from the BSL commits | IMPLEMENTED | Content comparison: 1,846 unique added lines of ≥30 chars. Overlap with `a6d4f1345` 3 lines, `245cb66af` 2, `ffaa219b4` 0, `24bfa9031` 0. All 5 shared lines are boilerplate already present in the Apache base (an import, `t.Run(tt.name, …)`, `secret_key: "required in config"`). The `Validate()` hook in `config.go` has different content from `a6d4f1345`'s. Keyword grep (ssrf, sigv4, tenant, audit) on added lines: 0 hits. | — |
 | R09 | §2.1, §2.3 | No Enterprise/"Fluffy" code or doc prose copied | IMPLEMENTED | Not provable by execution. Only signal: the word "enterprise" appears in 2 added comments (singular `dataset:` ARN note). No contrary evidence. | — |
 | R10 | §2.4 | `LICENSE`, `NOTICE`, `THIRD_PARTY_LICENSES` unchanged; no new header convention | IMPLEMENTED | `git diff --name-only a25abca09..HEAD` shows none of them. No header added to new files. | — |
-| R11 | §2.5 | CI guard fails when BSL becomes an ancestor | IMPLEMENTED | `scripts/check-license-base.sh` exits 0/1/2. `--self-test` passes 3 cases: clean passes, BSL ancestor exits 1, unavailable commit skips with exit 0. `.github/workflows/test.yaml` (+20 lines): `fetch-depth: 0`, adds `upstream`, runs self-test then the check. **Fail-open locally** when the BSL objects are absent and no `upstream` remote exists: "WARNING: skipping … inconclusive; not failing.", rc 0. No Makefile target. | NIT (GAP-18) |
+| R11 | §2.5 | CI guard fails when BSL becomes an ancestor | IMPLEMENTED | `scripts/check-license-base.sh` (bash 3.2-safe, `set -euo pipefail`, cwd-independent via `git -C`), target `make check-license-base` = `--self-test` + guard, wired into `checks-validator`. `--self-test` passes 6 cases: clean passes, clean passes from a subdirectory, BSL ancestor exits 1, absent commit in a complete clone passes (conclusive), shallow clone **fails closed** (exit 1), shallow clone honours the documented opt-out. **Fails closed** wherever the ancestry cannot be decided (shallow clone, unborn HEAD, no repository) with the remedy printed; the only escape hatch is `LICENSE_GUARD_SKIP_IF_INCONCLUSIVE=1`, which CI never sets. `.github/workflows/test.yaml`: `license-base` job (fetch-depth 0 + upstream master fetch) runs `make check-license-base`; the `validator` job now checks out with `fetch-depth: 0` because `checks-validator` runs the guard. Failure path proven with `BSL_COMMIT=$(git rev-parse 4bb11638e)`. | — |
 
 ### §3.3 Defects in the ACL model
 
@@ -221,7 +221,7 @@ Each fix was reverted in turn (§4.6) to prove that a test notices.
 | M2: two call sites bypass the condition-context plumbing | `d4dca3108` F3 | **Closed** (gateway, ListObjects presign). `StatObject` site is redundant. | Gateway mutant fails `TestDeleteObjectsPolicyConditions/…blocks_the_delete`. ListObjects mutant (nested per-object `Authorize` loses ctx) fails `TestPresignPolicyConditions/list_objects_presign_conditioned_deny_does_not_issue_a_URL`. Three more mutants survive: removing only `r = r.WithContext(ctx)` in ListObjects, emptying `ClientIP` in the nested `Authorize` call, and dropping `StatObject`'s `withConditionContext` (`controller.go:5301`). They are equivalent or redundant. `acl.AuthService.Authorize` reads the conditions from the context, and only `APIAuthService` uses `req.ClientIP`/`req.Fields` (`pkg/auth/service.go:1027`). In `StatObject`, `authorizeCallback` derives its own context and the presign branch does not re-authorize (GAP-17). |
 | m1: no revoke-immediate test | `f565427a9` F5 | **Closed** | `TestAuthService_RevocationIsImmediate`, 7 cases; 5 revoke-path mutants caught (R57-R62). Grant-side is not in m1's scope (GAP-11). |
 | m2: `authorization_failure_status` unvalidated and undocumented | `ba109abe7` F4 | **Closed** | Validation mutant caught; `CHANGELOG_SSO.md:14`; `config.example.yaml:38`. |
-| m6: licence guard | `eb3267624` (message says "R1-F7") | **Closed in CI**, fail-open locally | R11. Label mismatch is a nit (GAP-18). |
+| m6: licence guard | `eb3267624` (labelled "R1-F7") + the `R1-F6` follow-up | **Closed** (fails closed) | R11. |
 | m3: two version keys | none | **Open** | R50 / R105 |
 | m4: A6 untested; C5 500 → 401 untested | none | **Open** | R95 / R107 |
 | m5: datasets half-wired | none | **Open** | R94 / R106 |
@@ -358,7 +358,7 @@ Each mutant was applied, the package tests were run (`go test -count=1 -run <rx>
 | GAP-15 | MINOR | Audit-style logs are invisible at default log levels, and this is undocumented (§7 calls them "enough for log shipping") | R31 | new |
 | GAP-16 | MINOR | Design §4.8 example (deny `fs:WriteObject` on a branch ARN) does not do what it says | R66 | design |
 | GAP-17 | NIT | `StatObject`'s `withConditionContext` is redundant, and the presign tests do not discriminate it | (R1 M2) | R1 M2 |
-| GAP-18 | NIT | Licence guard is fail-open locally; no Makefile target; F6 commit is labelled "R1-F7" | R11 | R1 m6 |
+| GAP-18 | NIT | Licence guard was fail-open locally with no Makefile target (fixed by the `R1-F6` follow-up) | R11 | R1 m6 |
 | GAP-19 | NIT | §8 clean-room fixes are not tracked in the ledger | R101 | design |
 | GAP-20 | NIT | The §4.9 file list is incomplete | R74 | design |
 
@@ -449,8 +449,8 @@ Not counted as a gap: R04 (`#EXT#`, a listed follow-up). R71, R72 and R84 are ma
 - **Validation:** the mutant either no longer exists or fails a test.
 
 ### GAP-18 — Harden the licence guard locally (NIT)
-- **Files:** `scripts/check-license-base.sh`, `Makefile`, git history (commit `eb3267624` label "R1-F7" vs R1-F6).
-- **Validation:** a `make check-license-base` target runs the self-test and the check; the local skip message points to the `upstream` remote setup.
+- **Files:** `scripts/check-license-base.sh`, `Makefile`, `.github/workflows/test.yaml`.
+- **Validation:** `make check-license-base` runs the self-test and then the check; the guard fails closed on a shallow clone with the remedy (`git fetch --unshallow`) in the message, and `LICENSE_GUARD_SKIP_IF_INCONCLUSIVE=1` is the documented local-only opt-out that CI never sets. `.github/workflows/test.yaml`: the `validator` job checks out with `fetch-depth: 0` (it runs `checks-validator`, which includes the guard).
 
 ### GAP-19 — Track the §8 clean-room fixes (NIT)
 - **Files:** `tasks.json` (owner decision; not touched by this review).
