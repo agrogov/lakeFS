@@ -1136,6 +1136,10 @@ components:
           description: |
             Source path inside the repository. For `prefix` items a missing trailing `/` is
             added, and an empty path means the whole repository (§5.2).
+
+            The path is a literal key: the wildcard characters `*` and `?` are rejected, so an
+            item can only ever attach the objects it names (§9.3). An object item names one
+            object; a prefix item names one directory and everything under it.
           example: "data/customers/"
 
     TableSource:

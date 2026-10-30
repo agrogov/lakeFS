@@ -298,7 +298,7 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 		// its commit, or an empty prefix item, must fail the create instead of leaving
 		// a half-created dataset behind. The same walk estimates the version's
 		// footprint, which is what the publish of §6.5 is sized against.
-		if _, err := s.sourceStats(ctx, resolved); err != nil {
+		if _, err := s.sourceStats(ctx, caller, resolved); err != nil {
 			return nil, err
 		}
 	}
@@ -358,7 +358,7 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 	current := rec
 	var version *VersionRecord
 	if req.Publish {
-		version, err = s.publish(ctx, current, *resolved, req.Message, caller.Username, "")
+		version, err = s.publish(ctx, caller, current, *resolved, req.Message, "")
 		if err != nil {
 			return nil, err
 		}
@@ -617,7 +617,7 @@ func (s *Service) Validate(ctx context.Context, caller Caller, name string, def 
 	if err := s.authorizer.CheckSources(ctx, caller, resolved.Data); err != nil {
 		return nil, err
 	}
-	stats, err := s.sourceStats(ctx, resolved)
+	stats, err := s.sourceStats(ctx, caller, resolved)
 	if err != nil {
 		return nil, err
 	}
@@ -712,7 +712,7 @@ func (s *Service) PublishVersion(ctx context.Context, caller Caller, name string
 	// §5.2 rule 5 (every source is there) and the §6.5 size estimate come from the same walk,
 	// capped at the sync threshold: above it the publish is accepted and runs as a task, and
 	// the walk stops counting instead of listing a huge prefix in full.
-	estimate, err := s.estimateSourceObjects(ctx, resolved, int64(s.cfg.SyncPublishMaxObjects))
+	estimate, err := s.estimateSourceObjects(ctx, caller, resolved, int64(s.cfg.SyncPublishMaxObjects))
 	if err != nil {
 		return nil, err
 	}
@@ -725,9 +725,9 @@ func (s *Service) PublishVersion(ctx context.Context, caller Caller, name string
 	}
 
 	if !req.Sync && s.publishIsAsync(estimate) {
-		return s.startAsyncPublish(ctx, publishing, *resolved, req, caller.Username)
+		return s.startAsyncPublish(ctx, publishing, *resolved, req, caller)
 	}
-	version, err := s.runPublish(ctx, publishing, *resolved, req, caller.Username)
+	version, err := s.runPublish(ctx, publishing, *resolved, req, caller)
 	if err != nil {
 		return nil, err
 	}
@@ -809,9 +809,10 @@ func (s *Service) publishIsAsync(estimate ItemStats) bool {
 // runPublish performs §6.2 steps 4-11 for a record that is already CASed to "publishing":
 // materialise (which takes the pins first), write the VersionRecord, and advance the
 // dataset record. Any failure is rolled back to "active" on a best-effort basis.
-func (s *Service) runPublish(ctx context.Context, publishing *DatasetRecord, def Definition, req PublishVersionRequest, publisher string) (*VersionRecord, error) {
+func (s *Service) runPublish(ctx context.Context, publishing *DatasetRecord, def Definition, req PublishVersionRequest, caller Caller) (*VersionRecord, error) {
 	started := time.Now()
-	version, err := s.publish(ctx, publishing, def, req.Message, publisher, req.ProposalID)
+	publisher := caller.Username
+	version, err := s.publish(ctx, caller, publishing, def, req.Message, req.ProposalID)
 	if err != nil {
 		err = s.rollbackPublish(ctx, publishing, err)
 		// §12.4: every attempt is observed, with the same classification the HTTP layer uses.
@@ -876,7 +877,11 @@ func (s *Service) rollbackPublish(ctx context.Context, publishing *DatasetRecord
 // (§6.5). The record is already CASed to "publishing", so a second publish is a 409 from
 // the moment the 202 is returned, and a node that dies before the goroutine runs leaves
 // the task pending and the dataset publishing for the reconciler (§12.3).
-func (s *Service) startAsyncPublish(ctx context.Context, publishing *DatasetRecord, def Definition, req PublishVersionRequest, publisher string) (*PublishOutcome, error) {
+//
+// The goroutine carries the caller, because the source guard it builds authorizes every object
+// it materialises for that principal (SEC-3). Only the principal name and the client IP travel
+// with it - both immutable strings - so nothing request-scoped outlives the request.
+func (s *Service) startAsyncPublish(ctx context.Context, publishing *DatasetRecord, def Definition, req PublishVersionRequest, caller Caller) (*PublishOutcome, error) {
 	now := s.now()
 	id, err := s.newULID(now)
 	if err != nil {
@@ -898,7 +903,7 @@ func (s *Service) startAsyncPublish(ctx context.Context, publishing *DatasetReco
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.runAsyncPublish(publishing, def, req, publisher, id)
+		s.runAsyncPublish(publishing, def, req, caller, id)
 	}()
 	return &PublishOutcome{Task: task}, nil
 }
@@ -906,7 +911,7 @@ func (s *Service) startAsyncPublish(ctx context.Context, publishing *DatasetReco
 // runAsyncPublish is the body of the goroutine started by startAsyncPublish. It runs on
 // the service background context, never on the request's, so a client that disconnects
 // does not abort a publish the server already accepted (202).
-func (s *Service) runAsyncPublish(publishing *DatasetRecord, def Definition, req PublishVersionRequest, publisher, taskID string) {
+func (s *Service) runAsyncPublish(publishing *DatasetRecord, def Definition, req PublishVersionRequest, caller Caller, taskID string) {
 	ctx := s.bgCtx
 	if ctx == nil {
 		ctx = context.Background()
@@ -914,7 +919,7 @@ func (s *Service) runAsyncPublish(publishing *DatasetRecord, def Definition, req
 	s.updateTask(ctx, publishing.Name, taskID, func(task *TaskRecord) {
 		task.Status = TaskStatusRunning
 	})
-	version, err := s.runPublish(ctx, publishing, def, req, publisher)
+	version, err := s.runPublish(ctx, publishing, def, req, caller)
 	if err != nil {
 		s.updateTask(ctx, publishing.Name, taskID, func(task *TaskRecord) {
 			task.Status = TaskStatusFailed
@@ -1337,7 +1342,9 @@ func (s *Service) checkNameAvailable(ctx context.Context, name string) error {
 // Pins are taken before any data is written (§6.2 step 5, pins.go): a crash can then only
 // over-retain source data, never under-retain it (§14). A failed materialisation releases the
 // reference this attempt took.
-func (s *Service) publish(ctx context.Context, rec *DatasetRecord, def Definition, message, publisher, proposalID string) (*VersionRecord, error) {
+func (s *Service) publish(ctx context.Context, caller Caller, rec *DatasetRecord, def Definition, message, proposalID string) (*VersionRecord, error) {
+	publisher := caller.Username
+
 	version := rec.PendingVersion
 	if version <= 0 {
 		version = rec.LatestVersion + 1
@@ -1367,8 +1374,9 @@ func (s *Service) publish(ctx context.Context, rec *DatasetRecord, def Definitio
 	}
 
 	// §5.2 rule 6 is enforced on every publish, not only on create, so the materialiser
-	// is built with the metadata key rules that are in force right now (§5.5).
-	materializer, err := s.materializerFor(ctx)
+	// is built with the metadata key rules that are in force right now (§5.5). The source
+	// guard carries the caller, so every object materialised is authorized for them (SEC-3).
+	materializer, err := s.materializerFor(ctx, caller)
 	if err != nil {
 		return nil, errors.Join(err, s.pins.Release(ctx, def, ref))
 	}
@@ -1412,17 +1420,31 @@ func (s *Service) previousVersion(ctx context.Context, rec *DatasetRecord) (Prev
 	return PreviousVersionFromRecord(previous), nil
 }
 
-// materializerFor returns the publish primitive with the current metadata key rules (§5.5).
-// The service owns one Materializer, but its ValidateOptions depend on KV state, so each
-// publish derives a copy instead of caching options that a metadata key change would stale.
-func (s *Service) materializerFor(ctx context.Context) (*Materializer, error) {
+// materializerFor returns the publish primitive with the current metadata key rules (§5.5) and
+// the source guard of caller (SEC-3).
+// The service owns one Materializer, but its ValidateOptions and its source guard depend on
+// per-request state, so each publish derives a copy instead of caching options that a metadata
+// key change would stale.
+func (s *Service) materializerFor(ctx context.Context, caller Caller) (*Materializer, error) {
 	keys, err := s.store.ListMetadataKeys(ctx)
 	if err != nil {
 		return nil, err
 	}
 	materializer := *s.materializer
 	materializer.ValidateOptions = s.cfg.ValidateOptions(keys)
+	materializer.SourceGuard = s.sourceGuard(caller)
 	return &materializer, nil
+}
+
+// sourceGuard builds the per-object source read check of SEC-3 for caller, or nil when the call
+// has no principal to check (caller.Username == ""). Only the service's own internal paths have
+// no caller - the reconciler rebuilds records from a commit, it never attaches new data - so a
+// request always gets a guard and a materialisation never runs unchecked on behalf of a user.
+func (s *Service) sourceGuard(caller Caller) *SourceReadGuard {
+	if caller.Username == "" {
+		return nil
+	}
+	return NewSourceReadGuard(s.authorizer, caller)
 }
 
 // sourceStats counts the objects and bytes every item contributes, in metarange order
@@ -1431,8 +1453,8 @@ func (s *Service) materializerFor(ctx context.Context) (*Materializer, error) {
 // The returned stats feed the validate response. Counting is also the rule-5 existence
 // check: an object item must exist at its pinned commit, and a prefix item must match at
 // least one object unless datasets.allow_empty_items is set.
-func (s *Service) sourceStats(ctx context.Context, def *Definition) (ItemStats, error) {
-	return s.countSources(ctx, def, 0, true)
+func (s *Service) sourceStats(ctx context.Context, caller Caller, def *Definition) (ItemStats, error) {
+	return s.countSources(ctx, caller, def, 0, true)
 }
 
 // estimateSourceObjects is the size estimate of §6.5, which decides whether a publish runs in
@@ -1442,19 +1464,25 @@ func (s *Service) sourceStats(ctx context.Context, def *Definition) (ItemStats, 
 // answer 202, while §5.2 rule 5 is still checked for every item.
 //
 // limit <= 0 means "count everything", which is what Validate wants.
-func (s *Service) estimateSourceObjects(ctx context.Context, def *Definition, limit int64) (ItemStats, error) {
-	return s.countSources(ctx, def, limit, false)
+func (s *Service) estimateSourceObjects(ctx context.Context, caller Caller, def *Definition, limit int64) (ItemStats, error) {
+	return s.countSources(ctx, caller, def, limit, false)
 }
 
 // countSources is the shared body of sourceStats and estimateSourceObjects. When full is false
 // and limit is positive it stops counting after the running total passes limit; object and
 // emptiness checks (rule 5) always run for every item.
-func (s *Service) countSources(ctx context.Context, def *Definition, limit int64, full bool) (ItemStats, error) {
+func (s *Service) countSources(ctx context.Context, caller Caller, def *Definition, limit int64, full bool) (ItemStats, error) {
+	// The walk opens the same iterators materialisation opens, so it authorizes the caller's
+	// read right on every object it touches (SEC-3): a source the caller is denied inside an
+	// attached prefix fails the create/validate/publish here, before anything is written,
+	// instead of half-way through the merge.
+	materializer := *s.materializer
+	materializer.SourceGuard = s.sourceGuard(caller)
 	stats := ItemStats{Items: make([]ItemStat, 0, len(def.Data))}
 	var total int64
 	for i := range def.Data {
 		item := &def.Data[i]
-		it, err := s.materializer.openItem(ctx, i, item)
+		it, err := materializer.openItem(ctx, i, item)
 		if err != nil {
 			var sourceErr *SourceError
 			if errors.As(err, &sourceErr) && errors.Is(sourceErr.Err, ErrSourceKeyNotFound) {

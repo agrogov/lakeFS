@@ -4,12 +4,15 @@ package datasets
 // the address conversion, and the k-way merge that WriteMetaRangeByIterator requires.
 
 import (
+	"net/http"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/treeverse/lakefs/pkg/auth/model"
 	"github.com/treeverse/lakefs/pkg/block/mem"
 	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/graveler"
+	"github.com/treeverse/lakefs/pkg/permissions"
 )
 
 // mergedItems opens the item streams of def the way Publish does and returns the merged
@@ -312,4 +315,65 @@ func TestConvertEntryAddress(t *testing.T) {
 			require.Equal(t, "etag", entry.ETag, "conversion must not touch the other entry fields")
 		})
 	}
+}
+
+// TestItemIteratorSourceGuard is the SEC-3 check at the iterator the materialiser merges: a Deny
+// on a sub-path of a prefix item stops the iteration with a *SourceError naming the first denied
+// path, and no key at or past it reaches the metarange.
+func TestItemIteratorSourceGuard(t *testing.T) {
+	t.Parallel()
+	const (
+		reader = "guarded-reader"
+		src    = "src-guard"
+	)
+	f := newServiceFixture(t)
+	ctx := f.ctx
+	commit := f.sourceRepo(t, src, map[string]string{
+		"data/private.csv":   "private",
+		"data/public/a.csv":  "a",
+		"data/secret/x.csv":  "x",
+		"data/secret/y.csv":  "y",
+		"data/unrelated.csv": "unrelated",
+	})
+	f.addUser(t, reader)
+	f.grant(t, reader, "guarded-reader-grants", model.Statements{
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{"fs:*"},
+			Resource: permissions.All,
+		},
+		{
+			Effect:   model.StatementEffectDeny,
+			Action:   []string{permissions.ReadObjectAction},
+			Resource: permissions.ObjectArn(src, "data/secret/*"),
+		},
+	})
+
+	item := prefixDefinition(src, commit.String(), "", "data/").Data[0]
+
+	t.Run("without a guard nothing is checked", func(t *testing.T) {
+		it, err := (&Materializer{Catalog: f.cat}).openItem(ctx, 0, &item)
+		require.NoError(t, err)
+		keys, err := drainKeys(t, it)
+		require.NoError(t, err)
+		require.Len(t, keys, 5, "the materialiser alone copies every object under the prefix")
+	})
+
+	t.Run("the guard stops at the first denied path", func(t *testing.T) {
+		m := &Materializer{Catalog: f.cat, SourceGuard: NewSourceReadGuard(f.svc.authorizer, f.callerFor(reader))}
+		it, err := m.openItem(ctx, 0, &item)
+		require.NoError(t, err)
+		keys, err := drainKeys(t, it)
+		require.Error(t, err)
+		require.Equal(t, []string{"private.csv", "public/a.csv"}, keys,
+			"iteration stops where the deny starts; the denied entries are never merged")
+
+		var sourceErr *SourceError
+		require.ErrorAs(t, err, &sourceErr)
+		require.Equal(t, 0, sourceErr.Item)
+		require.Equal(t, "data/secret/x.csv", sourceErr.Path, "the error names the first denied path")
+		require.ErrorIs(t, err, ErrPermissionDenied)
+		require.Equal(t, http.StatusForbidden, sourceErr.HTTPStatusCode())
+		require.Contains(t, err.Error(), "data/secret/x.csv")
+	})
 }

@@ -237,7 +237,7 @@ func (s *Service) CreateProposal(ctx context.Context, caller Caller, dataset str
 	// §5.2 rule 5, before anything is written: an object item whose key is not at its
 	// commit, or an empty prefix item, must fail the proposal instead of materialising a
 	// preview that silently lacks data.
-	if _, err := s.sourceStats(ctx, resolved); err != nil {
+	if _, err := s.sourceStats(ctx, caller, resolved); err != nil {
 		return nil, err
 	}
 
@@ -259,7 +259,7 @@ func (s *Service) CreateProposal(ctx context.Context, caller Caller, dataset str
 		PreviewBranch: ProposalPreviewBranch(id),
 	}
 
-	if err := s.materializePreview(ctx, rec, proposal, caller.Username); err != nil {
+	if err := s.materializePreview(ctx, rec, proposal, caller); err != nil {
 		return nil, err
 	}
 	if err := s.store.PutProposal(ctx, proposal); err != nil {
@@ -366,7 +366,7 @@ func (s *Service) UpdateProposal(ctx context.Context, caller Caller, dataset, id
 	if err := s.authorizer.CheckSources(ctx, caller, resolved.Data); err != nil {
 		return nil, err
 	}
-	if _, err := s.sourceStats(ctx, resolved); err != nil {
+	if _, err := s.sourceStats(ctx, caller, resolved); err != nil {
 		return nil, err
 	}
 
@@ -374,7 +374,7 @@ func (s *Service) UpdateProposal(ctx context.Context, caller Caller, dataset, id
 	// §5.6: this is the rebase. The preview is materialised against the same version, so a
 	// merge right after an update never has to rebase (and never silently picks newer data).
 	updated.BaseVersion = rec.LatestVersion
-	if err := s.materializePreview(ctx, rec, &updated, caller.Username); err != nil {
+	if err := s.materializePreview(ctx, rec, &updated, caller); err != nil {
 		return nil, err
 	}
 	if err := s.store.PutProposal(ctx, &updated); err != nil {
@@ -545,12 +545,12 @@ func (s *Service) ensurePreviewBranch(ctx context.Context, dataset, branch strin
 // is not one. If GC collects a source while a proposal is open, both the preview and the merge
 // fail on the missing key (§5.2 rule 5) - the merge cannot publish a version that silently
 // lacks data, and the reviewer sees exactly the loss the author would.
-func (s *Service) materializePreview(ctx context.Context, rec *DatasetRecord, proposal *ProposalRecord, actor string) error {
+func (s *Service) materializePreview(ctx context.Context, rec *DatasetRecord, proposal *ProposalRecord, caller Caller) error {
 	branch := previewBranchOf(proposal)
 	if err := s.ensurePreviewBranch(ctx, rec.Name, branch); err != nil {
 		return err
 	}
-	materializer, err := s.materializerFor(ctx)
+	materializer, err := s.materializerFor(ctx, caller)
 	if err != nil {
 		return err
 	}
@@ -561,7 +561,7 @@ func (s *Service) materializePreview(ctx context.Context, rec *DatasetRecord, pr
 		Version:         rec.LatestVersion + 1,
 		Definition:      proposal.Definition,
 		Message:         previewMessage(proposal),
-		Publisher:       actor,
+		Publisher:       caller.Username,
 	}, branch)
 	return err
 }

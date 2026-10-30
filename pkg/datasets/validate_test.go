@@ -345,6 +345,18 @@ func TestValidateItemStructure(t *testing.T) {
 			wantPaths: []string{"data[0].object.path"},
 		},
 		{
+			// SEC-3: a wildcard in a source path would make the single ARN the item-level
+			// check authorizes cover objects the item never promised.
+			name:      "object path must not be a glob",
+			item:      DataItem{Target: "t", Repository: "r", Ref: SourceRef{Type: RefTypeCommit, ID: "c"}, Type: ItemTypeObject, Object: &PathSource{Path: "geo/*.csv"}},
+			wantPaths: []string{"data[0].object.path"},
+		},
+		{
+			name:      "prefix path must not be a glob",
+			item:      DataItem{Target: "t", Repository: "r", Ref: SourceRef{Type: RefTypeCommit, ID: "c"}, Type: ItemTypePrefix, Prefix: &PathSource{Path: "data/?/"}},
+			wantPaths: []string{"data[0].prefix.path"},
+		},
+		{
 			name:      "object item needs its source descriptor",
 			item:      DataItem{Target: "t", Repository: "r", Ref: SourceRef{Type: RefTypeCommit, ID: "c"}, Type: ItemTypeObject},
 			wantPaths: []string{"data[0].object"},

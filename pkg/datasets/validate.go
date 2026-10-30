@@ -216,9 +216,15 @@ func validateItems(d *Definition) []Problem {
 			if item.Object != nil && item.Object.Path == "" {
 				problems = append(problems, Problem{Path: itemPath(i, "object.path"), Message: "required"})
 			}
+			if item.Object != nil {
+				problems = append(problems, wildcardPathProblems(i, "object.path", item.Object.Path)...)
+			}
 		case ItemTypePrefix:
 			// Both the target and the prefix source path may be empty here:
 			// they mean "repository root" and "whole source repository".
+			if item.Prefix != nil {
+				problems = append(problems, wildcardPathProblems(i, "prefix.path", item.Prefix.Path)...)
+			}
 		case ItemTypeTable, ItemTypeNamespace:
 			problems = append(problems, Problem{
 				Path:    itemPath(i, "type"),
@@ -234,6 +240,24 @@ func validateItems(d *Definition) []Problem {
 		problems = append(problems, targetProblems(i, d, first)...)
 	}
 	return problems
+}
+
+// wildcardPathProblems reports the wildcard characters of a source path (SEC-3).
+//
+// A source path is a literal repository key: an "object" item names one object and a "prefix"
+// item names one directory. Both are turned into a single ARN - ObjectArn(repo, path) and
+// ObjectArn(repo, path+"*") - and authorized once, per item. A "*" or "?" in the path would make
+// the path itself a glob, so the ARN the check authorizes could cover objects the item does not
+// list, and the item-level check would no longer describe what materialisation copies. There is
+// no use case for it either: a caller who wants many objects uses a prefix item.
+func wildcardPathProblems(i int, field, path string) []Problem {
+	if !strings.ContainsAny(path, "*?") {
+		return nil
+	}
+	return []Problem{{
+		Path:    itemPath(i, field),
+		Message: `must not contain the wildcard characters "*" or "?"`,
+	}}
 }
 
 // validateSourceDescriptors enforces that exactly one source descriptor is set and

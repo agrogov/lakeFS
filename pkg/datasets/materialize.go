@@ -122,6 +122,21 @@ type Materializer struct {
 	// definition that lacks a required metadata key fails the publish with a
 	// *ValidationError instead of becoming a version.
 	ValidateOptions ValidateOptions
+
+	// SourceGuard, when set, authorizes the caller's fs:ReadObject right on the exact
+	// object ARN of every source path the iterators below yield (SEC-3).
+	//
+	// It is the authoritative answer to "may this caller attach this data": the item
+	// level check of Authorizer.CheckSources authorizes one ARN per item, and for a
+	// prefix item that ARN carries a glob, which a Deny on a sub-path of the prefix
+	// does not match. A denial fails the publish with a *SourceError naming the item
+	// and the first denied path, before that entry is merged.
+	//
+	// A nil guard skips the check. Every publish that has a caller to check for sets
+	// one (Service.publish and Service.countSources build it); it stays nil only for a
+	// caller that has no principal to authorize, which is the service's own repair
+	// path (§12.3) and never a request.
+	SourceGuard *SourceReadGuard
 }
 
 // PublishRequest is everything one publish needs. The definition must already be
@@ -556,7 +571,8 @@ func (m *Materializer) openItems(ctx context.Context, def Definition) ([]*itemIt
 	return items, nil
 }
 
-// openItem builds the iterator of a single data item.
+// openItem builds the iterator of a single data item. Its entries are vetted by m.SourceGuard
+// when one is set (SEC-3).
 func (m *Materializer) openItem(ctx context.Context, index int, item *DataItem) (*itemIterator, error) {
 	stream := &itemStream{
 		index:  index,
@@ -595,7 +611,19 @@ func (m *Materializer) openItem(ctx context.Context, index int, item *DataItem) 
 	if err != nil {
 		return nil, err
 	}
-	return &itemIterator{stream: stream, src: src, adapter: m.Catalog.BlockAdapter}, nil
+	// The per-object source read check of SEC-3: every entry this item yields is authorized
+	// for the caller before it is merged, so a Deny on a sub-path of a prefix item cannot be
+	// bypassed. The closure captures ctx, because a graveler.ValueIterator has no request
+	// context of its own.
+	var authorizeSourcePath func(path string) error
+	if m.SourceGuard != nil {
+		guard := m.SourceGuard
+		itemIndex, dataItem := index, item
+		authorizeSourcePath = func(path string) error {
+			return guard.CheckObject(ctx, itemIndex, dataItem, path)
+		}
+	}
+	return &itemIterator{stream: stream, src: src, adapter: m.Catalog.BlockAdapter, authorizeSourcePath: authorizeSourcePath}, nil
 }
 
 // openSource opens the source-key-space iterator of one item: a single-key get for an
@@ -700,6 +728,11 @@ type itemIterator struct {
 	src     graveler.ValueIterator
 	adapter block.Adapter
 
+	// authorizeSourcePath, when set, vets one source key with the caller's fs:ReadObject
+	// right before it is merged into the dataset (SEC-3). It is nil when the
+	// materialisation runs without a caller to check.
+	authorizeSourcePath func(path string) error
+
 	current *graveler.ValueRecord
 	err     error
 
@@ -725,6 +758,15 @@ func (it *itemIterator) Next() bool {
 			ErrInvalidSourceEntry, itemPath(it.stream.index, ""))
 		return false
 	}
+	// SEC-3: the caller's read right on this exact object, before anything is decoded,
+	// converted or merged, so a denied entry never reaches the dataset.
+	if it.authorizeSourcePath != nil {
+		if err := it.authorizeSourcePath(string(record.Key)); err != nil {
+			it.err = err
+			return false
+		}
+	}
+
 	entry, err := catalog.ValueToEntry(record.Value)
 	if err != nil {
 		it.err = fmt.Errorf("datasets: %s: decode source entry %q: %w", itemPath(it.stream.index, ""), record.Key, err)

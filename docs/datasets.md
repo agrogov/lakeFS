@@ -66,7 +66,7 @@ Fields:
 | `data[].repository` | Source repository. It must exist, must not be a dataset, and must live on the same storage as the dataset. |
 | `data[].ref` | `{"type": "commit", "id": "<commit>"}`. On input, `branch` and `tag` are accepted and resolved to a commit; stored definitions only contain commits. |
 | `data[].type` | `object` or `prefix`. |
-| `data[].object.path` / `data[].prefix.path` | The source path. Prefix paths always end with `/`; an empty prefix is the whole repository. |
+| `data[].object.path` / `data[].prefix.path` | The source path. Prefix paths always end with `/`; an empty prefix is the whole repository. Literal keys only: `*` and `?` are rejected. |
 | `publish` | Optional on create: publish the definition as `v1` in the same request. `message` is the version message. |
 
 Target semantics:
@@ -205,10 +205,22 @@ Control-plane actions are authorised on `arn:lakefs:datasets:::dataset/<name>`:
 `datasets:ListDatasets`, `datasets:CreateDataset`, `datasets:ReadDataset`,
 `datasets:PublishVersion`, `datasets:CreateProposal`, `datasets:DeleteDataset`,
 `datasets:ManageAccess` and `datasets:ManageMetadataKeys`. Whoever creates or publishes a
-dataset must be able to read every source it attaches (`fs:ReadCommit`, `fs:ReadObject`,
-`fs:ListObjects` on the source repository); a failure names the item that could not be read.
-On a merge the source check runs for the merging principal, because the merge publishes the
-data under their authority.
+dataset must be able to read every source it attaches:
+
+- `fs:ListObjects` on `arn:lakefs:fs:::repository/<source>` — the ARN the core API authorises
+  listing against, so a grant written from the RBAC documentation works;
+- `fs:ReadObject` on the source path of the item;
+- `fs:ReadObject` on the object ARN of **every object** the item materialises.
+
+The last one is what makes a `Deny` on a sub-path effective: a policy that denies
+`fs:ReadObject` on `arn:lakefs:fs:::repository/hr/object/salaries/*` stops a caller from
+attaching a prefix that covers it, even a whole-repository prefix. A failure is a 403 naming
+the item, and for a per-object denial also the first denied path. The check runs before anything
+is created or written, and it is deliberately conservative: a prefix that merely starts like a
+denied path (`sec` against `secret/*`) is refused rather than risk copying denied data.
+
+`fs:ReadCommit` is not required, matching the documented check. On a merge the source check runs
+for the merging principal, because the merge publishes the data under their authority.
 
 ### Access model note
 

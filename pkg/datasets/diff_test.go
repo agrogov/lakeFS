@@ -361,10 +361,10 @@ func (f *serviceFixture) publishNextVersion(t *testing.T, name string, def Defin
 	resolved, err := f.svc.resolver.Resolve(ctx, &def)
 	require.NoError(t, err)
 	require.NoError(t, f.svc.authorizer.CheckSources(ctx, f.caller(), resolved.Data))
-	_, err = f.svc.sourceStats(ctx, resolved)
+	_, err = f.svc.sourceStats(ctx, f.caller(), resolved)
 	require.NoError(t, err)
 
-	version, err := f.svc.publish(ctx, previous, *resolved, message, testServiceUser, "")
+	version, err := f.svc.publish(ctx, f.caller(), previous, *resolved, message, "")
 	require.NoError(t, err)
 
 	next := *previous
