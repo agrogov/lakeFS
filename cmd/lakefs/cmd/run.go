@@ -300,6 +300,13 @@ var runCmd = &cobra.Command{
 
 		actionsService.SetEndpoint(server)
 
+		// mount extra routes registered by wrapper binaries (lakefs-sso: datasets)
+		for _, b := range extraRoutesBuilders {
+			if err := b(ctx, ServerDeps{cfg, c, authService, middlewareAuthenticator, blockStore, kvStore, logger}, apiHandler); err != nil {
+				logger.WithError(err).Fatal("extra routes")
+			}
+		}
+
 		// register placeholder routes for services not available in OSS
 		api.MountNotImplementedServices(apiHandler)
 

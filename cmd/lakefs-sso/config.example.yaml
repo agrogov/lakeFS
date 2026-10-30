@@ -142,3 +142,27 @@ sso:
   # prompt: select_account forces the account-picker on every login.
   authorize_params:
     prompt: "select_account"
+
+# Datasets control plane (DATASETS_DESIGN.md §13). Disabled by default.
+# Every key can also be set through the environment: LAKEFS_DATASETS_ENABLED,
+# LAKEFS_DATASETS_STORAGE_NAMESPACE_PREFIX, LAKEFS_DATASETS_STORAGE_ID, ...
+# A dataset is materialised as a read-only repository, so its storage must be the same
+# blockstore as its sources.
+# datasets:
+#   enabled: false
+#   # Blockstore that holds dataset repositories. "" is the default single blockstore; it must
+#   # equal the storage ID of every source repository.
+#   storage_id: ""
+#   # Namespace prefix for dataset repositories (<prefix>/<name>-<ulid>). Required when enabled,
+#   # and it must be a namespace the configured blockstore can parse (e.g. s3://bucket/prefix).
+#   storage_namespace_prefix: "s3://my-bucket/lakefs-datasets"
+#   max_items: 1000
+#   allow_empty_items: false
+#   sync_publish_max_objects: 100000   # larger publishes run async (202 + task)
+#   merge_fan_in: 64
+#   publish_timeout: 30m
+#   reconcile_interval: 10m
+#   access_model: open                 # open | strict (strict is not implemented yet)
+#   immutable_guard_groups: []         # extra groups that get the immutability deny policy
+#   metadata:
+#     strict: false                    # reject metadata keys that are not defined

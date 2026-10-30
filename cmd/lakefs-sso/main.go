@@ -23,6 +23,7 @@ import (
 	"github.com/treeverse/lakefs/contrib/auth/acl"
 	"github.com/treeverse/lakefs/pkg/auth/crypt"
 	authparams "github.com/treeverse/lakefs/pkg/auth/params"
+	"github.com/treeverse/lakefs/pkg/datasets"
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/kv/kvparams"
 	logging "github.com/treeverse/lakefs/pkg/logging"
@@ -37,6 +38,10 @@ func main() {
 	// Register the sso-migrate and rbac-migrate subcommands.
 	lakefsCmd.GetRoot().AddCommand(newSSOmigrateCmd())
 	lakefsCmd.GetRoot().AddCommand(newRBACMigrateCmd())
+
+	// Mount the datasets control plane on /api/v1/datasets (DATASETS_DESIGN.md §4.4). The
+	// builder mounts a 501 handler when datasets.enabled is false.
+	lakefsCmd.AddExtraRoutesBuilder(datasets.RoutesBuilder)
 
 	lakefsCmd.Execute()
 }
