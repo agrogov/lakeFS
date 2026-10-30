@@ -113,3 +113,34 @@ func TestMigrateBasicToACL_AfterBasicAuthSetup(t *testing.T) {
 		t.Fatalf("admin groups = %v, want [Admins]", groups)
 	}
 }
+
+// TestEnsureACLBaseGroups_DoesNotMarkInitialized is the regression test for GAP-01. The ACL
+// bootstrap must create the groups without writing the setup timestamp: that timestamp is the
+// installation's "initialized" marker, and both auth.KVMetadataManager.IsInitialized and
+// acl.IsInitialized read it. The auth-service builder runs before setupLakeFS decides whether
+// the KV is initialized, so writing it there made `lakefs-sso setup` (without --no-check) on a
+// fresh KV report "Setup is already complete".
+func TestEnsureACLBaseGroups_DoesNotMarkInitialized(t *testing.T) {
+	ctx, store, _, svc := newACLService(t)
+	if err := sso.EnsureACLBaseGroups(ctx, svc); err != nil {
+		t.Fatal(err)
+	}
+	requireBaseGroups(t, ctx, svc)
+
+	initialized, err := acl.IsInitialized(ctx, svc)
+	if err != nil {
+		t.Fatalf("acl.IsInitialized: %v", err)
+	}
+	if initialized {
+		t.Fatal("EnsureACLBaseGroups wrote the setup timestamp: a fresh KV now looks initialized")
+	}
+
+	mm := auth.NewKVMetadataManager("test", "install-id", "mem", store)
+	initialized, err = mm.IsInitialized(ctx)
+	if err != nil {
+		t.Fatalf("metadata manager IsInitialized: %v", err)
+	}
+	if initialized {
+		t.Fatal("metadata manager sees the installation as initialized after only the ACL bootstrap")
+	}
+}

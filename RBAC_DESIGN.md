@@ -156,7 +156,7 @@ These matter in both modes:
 | `none` (default, SSO off) | `BasicAuthService` | Single admin | Unchanged |
 | `simplified` (SSO default) | `acl.AuthService` | Groups with an ACL dropdown | Unchanged, plus the §3.3 fixes |
 | **`internal`** (new for SSO) | `acl.AuthService` wrapped as `rbacAuthService` | Full Users / Groups / Policies UI | Policy RBAC |
-| `external` | — | — | Rejected with SSO: no remote auth service exists in this fork |
+| `external` | — | — | Warn, then `simplified` (§4.2): no remote auth service exists in this fork |
 
 `internal` already exists as a constant (`pkg/config/config.go:43`) and is already treated as "advanced" by
 `IsAdvancedAuth()`. The web UI already renders the policy pages for any mode other than `simplified` or `none`. **No
@@ -178,7 +178,8 @@ func (rbacAuthService) IsAdvancedAuth() bool { return true }
    - `""`/`none` → `simplified` (unchanged default);
    - `simplified` → `simplified`;
    - `internal` → `internal`;
-   - `external` → warn, then `simplified`.
+   - `external` → warn, then `simplified` (the same resolution runs in `setup` and `superuser`, so they create
+     the local admin instead of exiting early).
 2. Always: `EnsureACLBaseGroups`, then `ReconcileACLPolicies` (§4.5).
 3. If `internal`:
    - `EnsureRBACBase(ctx, svc)` (§4.3);
