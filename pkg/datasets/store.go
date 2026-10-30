@@ -41,6 +41,7 @@ const (
 	metadataKeyKeyPrefix = "metadata_keys"
 	pinKeyPrefix         = "pins"
 	grantKeyPrefix       = "grants"
+	taskKeyPrefix        = "tasks"
 
 	// versionKeyWidth is the zero padding of the version number in
 	// versions/<name>/<n:010d>, chosen so that lexicographic key order equals
@@ -82,6 +83,18 @@ const (
 	PrincipalTypeUser  = "user"
 	PrincipalTypeGroup = "group"
 )
+
+// TaskRecord.Status values (§6.5, §10.1 Task).
+const (
+	TaskStatusPending   = "pending"
+	TaskStatusRunning   = "running"
+	TaskStatusCompleted = "completed"
+	TaskStatusFailed    = "failed"
+)
+
+// TaskKindPublish is the Kind of a TaskRecord that runs a publish asynchronously into
+// the goroutine of §6.5.
+const TaskKindPublish = "publish"
 
 // pinCASRetries bounds the read-modify-write attempts of the pin reference helpers.
 // Losing a pin reference would let GC collect data a dataset still serves (§8.2),
@@ -205,6 +218,26 @@ type GrantRecord struct {
 	PolicyName    string    `json:"policy_name,omitempty"` // managed read policy of §9.2
 	GrantedBy     string    `json:"granted_by"`
 	GrantedAt     time.Time `json:"granted_at"`
+}
+
+// TaskRecord is the control-plane record of one asynchronous operation (§6.5, §10.1
+// GET /datasets/{ds}/tasks/{task}), stored at tasks/<name>/<id>.
+//
+// The record is the observable side of the goroutine that runs a publish above
+// datasets.sync_publish_max_objects: the API answers 202 with it, the client polls it,
+// and it is the only trace a node restart leaves behind besides the dataset record
+// itself, which stays in state "publishing" for the reconciler to resume or roll back
+// (§12.3 item 1). Unlike a DatasetRecord or a VersionRecord it is mutable (pending ->
+// running -> completed|failed), so it is written with a plain Set.
+type TaskRecord struct {
+	ID        string    `json:"id"`      // ULID
+	Dataset   string    `json:"dataset"` //
+	Kind      string    `json:"kind"`    // publish
+	Status    string    `json:"status"`  // pending | running | completed | failed
+	Version   int       `json:"version,omitempty"`
+	Error     string    `json:"error,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // PinRecord is the GC pin of one (source repository, commit) pair, stored at
@@ -351,6 +384,17 @@ func grantsPrefix(dataset string) ([]byte, error) {
 		return nil, err
 	}
 	return []byte(kv.FormatPath(grantKeyPrefix, dataset, "")), nil
+}
+
+// taskKey returns tasks/<name>/<id>.
+func taskKey(dataset, id string) ([]byte, error) {
+	if err := checkDatasetName(dataset); err != nil {
+		return nil, err
+	}
+	if err := checkSegment("task id", id); err != nil {
+		return nil, err
+	}
+	return []byte(kv.FormatPath(taskKeyPrefix, dataset, id)), nil
 }
 
 // checkDatasetName rejects every name that §5.2 rule 1 would reject, including the
@@ -1109,6 +1153,48 @@ func (s *Store) DeleteGrant(ctx context.Context, dataset, principalType, princip
 		return err
 	}
 	return s.delete(ctx, key)
+}
+
+// ----------------------------------------------------------------------------
+// Task records (§6.5, §10.1)
+// ----------------------------------------------------------------------------
+
+// GetTask reads one asynchronous task record, returning kv.ErrNotFound unchanged when
+// it does not exist.
+func (s *Store) GetTask(ctx context.Context, dataset, id string) (*TaskRecord, error) {
+	key, err := taskKey(dataset, id)
+	if err != nil {
+		return nil, err
+	}
+	value, err := s.get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	rec, err := decodeRecord[TaskRecord]("task record", key, value)
+	if err != nil {
+		return nil, err
+	}
+	if rec.Dataset != dataset || rec.ID != id {
+		return nil, fmt.Errorf("%w: task key %q holds record %q/%q", ErrRecordMismatch, key, rec.Dataset, rec.ID)
+	}
+	return rec, nil
+}
+
+// PutTask writes a task record. Task status is a forward-only state machine owned by
+// the single goroutine that runs the task (§6.5), so this is a plain Set.
+func (s *Store) PutTask(ctx context.Context, rec *TaskRecord) error {
+	if rec == nil {
+		return fmt.Errorf("datasets: %w", ErrNilRecord)
+	}
+	key, err := taskKey(rec.Dataset, rec.ID)
+	if err != nil {
+		return err
+	}
+	value, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("datasets: encode task record %q: %w", rec.ID, err)
+	}
+	return s.put(ctx, key, value)
 }
 
 // ListGrants returns every grant of dataset, ordered by principal type then

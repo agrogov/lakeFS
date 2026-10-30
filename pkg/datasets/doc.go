@@ -14,8 +14,8 @@
 // validate.go, metadata_keys.go), the publish primitive that turns a resolved definition
 // into a dataset version (resolve.go, materialize.go), the GC pins of §8.2 (pins.go), the
 // control-plane KV persistence layer (store.go, §5.3), the service that owns the dataset
-// lifecycle, the validate dry run and the access grants (service.go), the HTTP handlers
-// (handlers.go, http.go) and the design-phase spike evidence (S2 and S4) as executable
-// tests. Publishing a new version, diffs, proposals, metadata key CRUD and the reconciler
-// land in later phases.
+// lifecycle, publishing (synchronous and asynchronous, §6.2 and §6.5), the version reads
+// and the access grants (service.go), the HTTP handlers (handlers.go, http.go) and the
+// design-phase spike evidence (S2 and S4) as executable tests. Diffs, proposals, metadata
+// key CRUD and the reconciler land in later phases.
 package datasets

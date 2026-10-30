@@ -75,7 +75,14 @@ func newControlPlane(t *testing.T) (*chi.Mux, string, string) {
 // inspect the KV store or the auth service.
 func newControlPlaneWithDeps(t *testing.T) (*chi.Mux, cmdpkg.ServerDeps, string, string) {
 	t.Helper()
-	useConfig(t, "datasets:\n  enabled: true\n  storage_namespace_prefix: \"mem://datasets\"\n")
+	return newControlPlaneWithConfig(t, "datasets:\n  enabled: true\n  storage_namespace_prefix: \"mem://datasets\"\n")
+}
+
+// newControlPlaneWithConfig is newControlPlaneWithDeps with a caller-supplied datasets
+// configuration section, for tests that need a different sync_publish_max_objects and so on.
+func newControlPlaneWithConfig(t *testing.T, datasetsConfig string) (*chi.Mux, cmdpkg.ServerDeps, string, string) {
+	t.Helper()
+	useConfig(t, datasetsConfig)
 
 	deps := testDeps(t)
 	ctx := t.Context()
@@ -393,9 +400,8 @@ func TestDatasetsNotImplemented501(t *testing.T) {
 		{"GetMetadataKey", http.MethodGet, "/metadata-keys/classification", ""},
 		{"UpdateMetadataKey", http.MethodPut, "/metadata-keys/classification", `{"required": true}`},
 		{"DeleteMetadataKey", http.MethodDelete, "/metadata-keys/classification", ""},
-		{"ListVersions", http.MethodGet, "/customer-360/versions", ""},
-		{"PublishVersion", http.MethodPost, "/customer-360/versions", validPublishBody},
-		{"GetVersion", http.MethodGet, "/customer-360/versions/latest", ""},
+		// The version and task routes of §10.1 are implemented; their HTTP contract is covered
+		// by versions_http_test.go, so they no longer answer 501 here.
 		{"DiffRefs", http.MethodGet, "/customer-360/refs/v1/diff/v2", ""},
 		{"ListProposals", http.MethodGet, "/customer-360/proposals?status=open", ""},
 		{"CreateProposal", http.MethodPost, "/customer-360/proposals",
@@ -403,7 +409,6 @@ func TestDatasetsNotImplemented501(t *testing.T) {
 		{"GetProposal", http.MethodGet, "/customer-360/proposals/01J8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8", ""},
 		{"UpdateProposal", http.MethodPatch, "/customer-360/proposals/01J8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8", `{"status": "closed"}`},
 		{"MergeProposal", http.MethodPost, "/customer-360/proposals/01J8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8/merge", ""},
-		{"GetTask", http.MethodGet, "/customer-360/tasks/01J8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.operation, func(t *testing.T) {

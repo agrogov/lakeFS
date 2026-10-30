@@ -109,9 +109,9 @@ func writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
 		})
 	case errors.Is(err, ErrUnsupported):
 		httputil.WriteAPIError(w, r, http.StatusNotImplemented, err.Error())
-	case errors.Is(err, ErrDatasetNotFound) || isNotFound(err):
+	case errors.Is(err, ErrDatasetNotFound), errors.Is(err, ErrVersionNotFound), errors.Is(err, ErrTaskNotFound), isNotFound(err):
 		httputil.WriteAPIError(w, r, http.StatusNotFound, err.Error())
-	case errors.Is(err, ErrNameTaken), errors.Is(err, ErrDatasetConflict), errors.Is(err, kv.ErrPredicateFailed):
+	case errors.Is(err, ErrNameTaken), errors.Is(err, ErrDatasetConflict), errors.Is(err, ErrPublishInProgress), errors.Is(err, kv.ErrPredicateFailed):
 		httputil.WriteAPIError(w, r, http.StatusConflict, err.Error())
 	default:
 		httputil.WriteAPIError(w, r, http.StatusInternalServerError, err.Error())
@@ -317,16 +317,86 @@ func (s *server) DeleteMetadataKey(w http.ResponseWriter, r *http.Request, _ api
 	notImplemented(w, r, "DeleteMetadataKey")
 }
 
-func (s *server) ListVersions(w http.ResponseWriter, r *http.Request, _ apigen.DatasetName, _ apigen.ListVersionsParams) {
-	notImplemented(w, r, "ListVersions")
+func (s *server) ListVersions(w http.ResponseWriter, r *http.Request, dataset apigen.DatasetName, params apigen.ListVersionsParams) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	result, err := s.svc.ListVersions(r.Context(), caller, string(dataset),
+		string(valueOrZero(params.After)), int(valueOrZero(params.Amount)))
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	body := apigen.VersionList{
+		Results: make([]apigen.Version, 0, len(result.Versions)),
+		Pagination: apigen.Pagination{
+			HasMore:    result.HasMore,
+			NextOffset: result.NextOffset,
+			Results:    len(result.Versions),
+			MaxPerPage: result.MaxPerPage,
+		},
+	}
+	for _, version := range result.Versions {
+		body.Results = append(body.Results, versionToAPI(version))
+	}
+	httputil.WriteAPIResponse(w, r, http.StatusOK, body)
 }
 
-func (s *server) PublishVersion(w http.ResponseWriter, r *http.Request, _ apigen.PublishVersionJSONRequestBody, _ apigen.DatasetName) {
-	notImplemented(w, r, "PublishVersion")
+func (s *server) PublishVersion(w http.ResponseWriter, r *http.Request, body apigen.PublishVersionJSONRequestBody, dataset apigen.DatasetName) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	outcome, err := s.svc.PublishVersion(r.Context(), caller, string(dataset), PublishVersionRequest{
+		Definition:      definitionFromAPI(body.Definition),
+		Message:         body.Message,
+		ExpectedVersion: body.ExpectedVersion,
+	})
+	if err != nil {
+		if writeVersionConflict(w, r, err) {
+			return
+		}
+		writeServiceError(w, r, err)
+		return
+	}
+	// §6.5: a publish above datasets.sync_publish_max_objects answers 202 with the task
+	// to poll at GET /datasets/{ds}/tasks/{task} instead of blocking the request.
+	if outcome.Accepted() {
+		httputil.WriteAPIResponse(w, r, http.StatusAccepted, taskToAPI(outcome.Task))
+		return
+	}
+	httputil.WriteAPIResponse(w, r, http.StatusCreated, versionToAPI(outcome.Version))
 }
 
-func (s *server) GetVersion(w http.ResponseWriter, r *http.Request, _ apigen.DatasetName, _ apigen.VersionRef) {
-	notImplemented(w, r, "GetVersion")
+func (s *server) GetVersion(w http.ResponseWriter, r *http.Request, dataset apigen.DatasetName, version apigen.VersionRef) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	rec, err := s.svc.GetVersion(r.Context(), caller, string(dataset), string(version))
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	httputil.WriteAPIResponse(w, r, http.StatusOK, versionToAPI(rec))
+}
+
+func (s *server) GetTask(w http.ResponseWriter, r *http.Request, dataset apigen.DatasetName, taskID apigen.TaskID) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	task, err := s.svc.GetTask(r.Context(), caller, string(dataset), string(taskID))
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	httputil.WriteAPIResponse(w, r, http.StatusOK, taskToAPI(task))
 }
 
 func (s *server) DiffRefs(w http.ResponseWriter, r *http.Request, _ apigen.DatasetName, _ apigen.LeftRef, _ apigen.RightRef, _ apigen.DiffRefsParams) {
@@ -351,10 +421,6 @@ func (s *server) UpdateProposal(w http.ResponseWriter, r *http.Request, _ apigen
 
 func (s *server) MergeProposal(w http.ResponseWriter, r *http.Request, _ apigen.MergeProposalJSONRequestBody, _ apigen.DatasetName, _ apigen.ProposalID) {
 	notImplemented(w, r, "MergeProposal")
-}
-
-func (s *server) GetTask(w http.ResponseWriter, r *http.Request, _ apigen.DatasetName, _ apigen.TaskID) {
-	notImplemented(w, r, "GetTask")
 }
 
 // --- API type conversions (§10.2) ---
@@ -470,6 +536,71 @@ func statsToAPI(in ItemStats) apigen.DatasetStats {
 		})
 	}
 	return out
+}
+
+// versionToAPI renders a VersionRecord as the §10.2 Version schema.
+func versionToAPI(rec *VersionRecord) apigen.Version {
+	out := apigen.Version{
+		Version:     rec.Version,
+		CommitId:    rec.CommitID,
+		PublishedAt: rec.PublishedAt.UnixMilli(),
+		Publisher:   rec.Publisher,
+	}
+	if rec.Message != "" {
+		message := rec.Message
+		out.Message = &message
+	}
+	if rec.ProposalID != "" {
+		proposalID := rec.ProposalID
+		out.ProposalId = &proposalID
+	}
+	if !definitionIsZero(rec.Definition) {
+		definition := definitionToAPI(rec.Definition)
+		out.Definition = &definition
+	}
+	stats := statsToAPI(rec.Stats)
+	out.Stats = &stats
+	return out
+}
+
+// taskToAPI renders a TaskRecord as the §10.2 Task schema.
+func taskToAPI(rec *TaskRecord) apigen.Task {
+	out := apigen.Task{
+		Id:        rec.ID,
+		Status:    rec.Status,
+		CreatedAt: rec.CreatedAt.UnixMilli(),
+		UpdatedAt: rec.UpdatedAt.UnixMilli(),
+	}
+	if rec.Version > 0 {
+		version := rec.Version
+		out.Version = &version
+	}
+	if rec.Error != "" {
+		message := rec.Error
+		out.Error = &message
+	}
+	return out
+}
+
+// versionConflictBody is the 409 body of §5.4: the core Error shape plus the current
+// latest_version, so a client whose expected_version lost can retry with the right value
+// instead of re-reading the dataset.
+type versionConflictBody struct {
+	Message       string `json:"message"`
+	LatestVersion int    `json:"latest_version"`
+}
+
+// writeVersionConflict writes the expected_version 409 and reports whether it did.
+func writeVersionConflict(w http.ResponseWriter, r *http.Request, err error) bool {
+	var conflict *VersionConflictError
+	if !errors.As(err, &conflict) {
+		return false
+	}
+	httputil.WriteAPIResponse(w, r, http.StatusConflict, versionConflictBody{
+		Message:       conflict.Error(),
+		LatestVersion: conflict.LatestVersion,
+	})
+	return true
 }
 
 // grantToAPI renders one access grant (§10.2).
