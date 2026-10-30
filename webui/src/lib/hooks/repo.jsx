@@ -44,12 +44,21 @@ export const resolveRef = async (repoId, refId) => {
     throw new NotFoundError('ref not found');
 };
 
-const RefContext = createContext(null);
+// Exported so a fork-owned page that browses a repository without the repository router
+// (the dataset data/compare pages, DATASETS_DESIGN.md §11.2) can provide the repo/ref pair to
+// the repository components it reuses. The provider below stays the only writer for the
+// repository pages themselves.
+export const RefContext = createContext(null);
 
 export const useRefs = () => {
     const [refsState] = useContext(RefContext);
     return refsState;
 };
+
+/** A `RefContext` value that no repository component can tell apart from the real one. */
+export const refContextValue = ({ repo, reference, compare = null, loading = false, error = null }) => [
+    { repo, reference, compare, loading, error },
+];
 
 export const RefContextProvider = ({ children }) => {
     const router = useRouter();

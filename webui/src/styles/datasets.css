@@ -138,3 +138,102 @@
 .dataset-path-picker-breadcrumb .breadcrumb-item {
     cursor: pointer;
 }
+
+/* Dataset overview (DATASETS_DESIGN.md §11.2) */
+.dataset-overview-name {
+    word-break: break-word;
+}
+
+.dataset-overview-header .dataset-version-picker {
+    width: auto;
+    min-width: 9rem;
+}
+
+.dataset-overview-origin {
+    line-height: 1.6;
+}
+
+.dataset-version-message {
+    font-style: italic;
+}
+
+.dataset-stat-value {
+    font-size: 1.15rem;
+    font-weight: 600;
+}
+
+.dataset-items-table td,
+.dataset-metadata-table td {
+    vertical-align: middle;
+}
+
+.dataset-items-table .dataset-item-repository,
+.dataset-item-source .dataset-item-repository {
+    font-weight: 600;
+}
+
+.dataset-items-table .dataset-item-path,
+.dataset-item-source .dataset-item-path {
+    word-break: break-all;
+}
+
+.dataset-metadata-table-key {
+    width: 30%;
+    font-weight: 600;
+}
+
+/* Dataset data browser (DATASETS_DESIGN.md §11.2) */
+.dataset-data-header .dataset-version-picker {
+    width: auto;
+    min-width: 8rem;
+}
+
+.dataset-data-viewing code {
+    font-size: 0.85em;
+}
+
+/* Dataset versions timeline (DATASETS_DESIGN.md §11.2) */
+.dataset-versions-timeline {
+    position: relative;
+    padding-left: 0.5rem;
+}
+
+.dataset-version-entry {
+    position: relative;
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+}
+
+.dataset-version-marker {
+    flex: 0 0 auto;
+    padding-top: 0.75rem;
+}
+
+.dataset-version-marker .badge {
+    min-width: 3rem;
+    font-size: 0.85rem;
+}
+
+.dataset-version-entry .dataset-version-card {
+    flex: 1 1 auto;
+}
+
+.dataset-version-message-title {
+    word-break: break-word;
+}
+
+/* Dataset compare (DATASETS_DESIGN.md §11.2) */
+.dataset-compare-header .dataset-version-picker {
+    width: auto;
+    min-width: 9rem;
+}
+
+.dataset-diff-items td,
+.dataset-diff-metadata td {
+    vertical-align: middle;
+}
+
+.dataset-change-badge svg {
+    vertical-align: text-bottom;
+}

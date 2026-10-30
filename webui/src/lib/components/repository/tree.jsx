@@ -458,7 +458,7 @@ const PathLink = ({ repoId, reference, path, children, presign = false, as = nul
     return React.createElement(as, { href: link, download: name }, children);
 };
 
-const EntryRow = ({ config, repo, reference, path, entry, onDelete, showActions }) => {
+const EntryRow = ({ config, repo, reference, path, entry, onDelete, showActions, entryURLBuilder }) => {
     let rowClass = 'change-entry-row ';
     switch (entry.diff_type) {
         case 'changed':
@@ -480,9 +480,22 @@ const EntryRow = ({ config, repo, reference, path, entry, onDelete, showActions 
     const params = { repoId: repo.id };
     const query = { ref: reference.id, path: entry.path };
 
+    // `entryURLBuilder` is optional and only used by fork-owned pages that show a repository
+    // under a different route (datasets, DATASETS_DESIGN.md §11.2). Without it the links stay
+    // exactly where the repository pages expect them.
     let button;
     if (entry.path_type === 'common_prefix') {
-        button = <Link href={{ pathname: '/repositories/:repoId/objects', query, params }}>{buttonText}</Link>;
+        button = (
+            <Link
+                href={
+                    entryURLBuilder
+                        ? entryURLBuilder(entry)
+                        : { pathname: '/repositories/:repoId/objects', query, params }
+                }
+            >
+                {buttonText}
+            </Link>
+        );
     } else if (entry.diff_type === 'removed') {
         button = <span>{buttonText}</span>;
     } else {
@@ -492,11 +505,15 @@ const EntryRow = ({ config, repo, reference, path, entry, onDelete, showActions 
         };
         button = (
             <Link
-                href={{
-                    pathname: '/repositories/:repoId/object',
-                    query: filePathQuery,
-                    params: params,
-                }}
+                href={
+                    entryURLBuilder
+                        ? entryURLBuilder(entry)
+                        : {
+                              pathname: '/repositories/:repoId/object',
+                              query: filePathQuery,
+                              params: params,
+                          }
+                }
             >
                 {buttonText}
             </Link>
@@ -965,6 +982,9 @@ export const Tree = ({
     onDelete,
     showActions = false,
     path = '',
+    pathURLBuilder,
+    entryURLBuilder,
+    hasMountButton = true,
 }) => {
     let body;
     if (results.length === 0 && path === '' && reference.type === RefTypeBranch) {
@@ -995,6 +1015,7 @@ export const Tree = ({
                                 reference={reference}
                                 showActions={showActions}
                                 onDelete={onDelete}
+                                entryURLBuilder={entryURLBuilder}
                             />
                         ))}
                     </tbody>
@@ -1012,7 +1033,8 @@ export const Tree = ({
                         repo={repo}
                         reference={reference}
                         hasCopyButton={true}
-                        hasMountButton={true}
+                        hasMountButton={hasMountButton}
+                        pathURLBuilder={pathURLBuilder}
                     />
                 </Card.Header>
                 <Card.Body>{body}</Card.Body>

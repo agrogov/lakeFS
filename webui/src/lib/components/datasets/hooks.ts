@@ -1,6 +1,17 @@
-import { auth } from '../../api';
-import { DatasetsConfig, datasets, getDatasetNames, isDatasetsDisabledError } from '../../api/datasets';
+import { MAX_LISTING_AMOUNT, auth } from '../../api';
+import {
+    Dataset,
+    DatasetDefinition,
+    DatasetStats,
+    DatasetsConfig,
+    Version,
+    VersionList,
+    datasets,
+    getDatasetNames,
+    isDatasetsDisabledError,
+} from '../../api/datasets';
 import { useAPI } from '../../hooks/api';
+import { VersionSelection, normaliseSelection, selectionToVersion } from './versions';
 
 /**
  * Hooks shared by the dataset pages (DATASETS_DESIGN.md §11).
@@ -127,4 +138,84 @@ const fetchCanCreateDataset = async (): Promise<boolean> => {
     const policies = await auth.listUserPolicies(user.id, true);
     const results: PolicyLike[] = policies?.results ?? [];
     return policiesAllow(results, DATASETS_CREATE_ACTION, SAMPLE_DATASET_ARN);
+};
+
+// ---------------------------------------------------------------------------
+// Reads (§11.2 pages)
+// ---------------------------------------------------------------------------
+
+/**
+ * `GET /datasets/{dataset}`: the record plus the latest definition and stats. Every detail page
+ * needs it - the overview for the header, the data page for the version count, the compare page
+ * for the default left/right versions.
+ */
+export const useDataset = (name: string) => {
+    const { response, loading, error } = useAPI(() => datasets.get(name), [name]);
+    return { dataset: (response ?? null) as Dataset | null, loading, error: (error ?? null) as Error | null };
+};
+
+/**
+ * Every published version, newest first. The timeline shows them all and the pickers choose
+ * among them, and each version carries its definition (§10.1), so one request serves both -
+ * including the "items changed" count that `versionChangeCounts` derives locally.
+ */
+export const useDatasetVersions = (name: string) => {
+    const { response, loading, error } = useAPI(
+        () => datasets.listVersions(name, { amount: MAX_LISTING_AMOUNT }),
+        [name],
+    );
+    const versions = ((response as VersionList | null)?.results ?? []) as Version[];
+    return { versions, loading, error: (error ?? null) as Error | null };
+};
+
+/** The version numbers of `useDatasetVersions`, newest first, for the version pickers. */
+export const versionNumbers = (versions: Version[]): number[] => versions.map((version) => version.version);
+
+export interface DatasetVersionState {
+    dataset: Dataset | null;
+    /** Every published version, newest first. */
+    versions: Version[];
+    /** The record of the selected version; `null` when nothing is published yet. */
+    version: Version | null;
+    /** The selection actually in force: `latest`, or the requested `vN` when it exists. */
+    selection: VersionSelection;
+    /** The selected version number; `0` when the dataset has no versions. */
+    versionNumber: number;
+    definition?: DatasetDefinition;
+    stats?: DatasetStats;
+    loading: boolean;
+    error: Error | null;
+}
+
+/**
+ * The record, definition and stats of one dataset version (DATASETS_DESIGN.md §11.2).
+ *
+ * The version list already carries a definition and stats per version (§10.1), so a page that
+ * shows "latest or vN" needs exactly two requests - the dataset record and the version list -
+ * and no `GET .../versions/{version}` round trip when the selection changes.
+ *
+ * A selection that names a version the dataset does not have (a stale link to `v7` of a `v3`
+ * dataset) falls back to `latest` instead of rendering an empty page.
+ */
+export const useDatasetVersion = (name: string, requested: VersionSelection): DatasetVersionState => {
+    const { dataset, loading: datasetLoading, error: datasetError } = useDataset(name);
+    const { versions, loading: versionsLoading, error: versionsError } = useDatasetVersions(name);
+
+    const latest = dataset?.latest_version ?? 0;
+    const selection = normaliseSelection(requested, latest);
+    const wanted = selectionToVersion(selection);
+    const version =
+        wanted === null ? (versions[0] ?? null) : (versions.find((candidate) => candidate.version === wanted) ?? null);
+
+    return {
+        dataset,
+        versions,
+        version,
+        selection,
+        versionNumber: version?.version ?? latest,
+        definition: version?.definition ?? dataset?.definition,
+        stats: version?.stats ?? dataset?.stats,
+        loading: datasetLoading || versionsLoading,
+        error: datasetError ?? versionsError,
+    };
 };
