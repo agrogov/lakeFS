@@ -1893,6 +1893,170 @@ func TestListBranchesPolicyConditions(t *testing.T) {
 	})
 }
 
+// TestListRepositoriesPolicyConditions verifies that listing repositories evaluates policy conditions
+// with the request's condition context, per repository: a conditional allow grants the repository, a
+// conditional deny hides it (deny-first), and a lakefs:RepositoryMetadata/<key> condition sees that
+// repository's metadata.
+func TestListRepositoriesPolicyConditions(t *testing.T) {
+	_, deps := setupHandler(t)
+	ctx := t.Context()
+
+	repo := testUniqueRepoName() + "-data"
+	otherRepo := testUniqueRepoName() + "-other"
+	for i, name := range []string{repo, otherRepo} {
+		_, err := deps.catalog.CreateRepository(ctx, name, config.SingleBlockstoreID, onBlock(deps, fmt.Sprintf("repolist%d", i)), "main", false)
+		testutil.Must(t, err)
+	}
+	testutil.Must(t, deps.catalog.UpdateRepositoryMetadata(ctx, repo, graveler.RepositoryMetadata{"team": "data"}))
+	testutil.Must(t, deps.catalog.UpdateRepositoryMetadata(ctx, otherRepo, graveler.RepositoryMetadata{"team": "other"}))
+
+	const (
+		allowedIP = "203.0.113.5"
+		otherIP   = "198.51.100.7"
+	)
+	ipCondition := func(ip string) map[string]map[string][]string {
+		return map[string]map[string][]string{
+			auth.OperatorNameIpAddress: {"SourceIp": {ip + "/32"}},
+		}
+	}
+	repoMetadataCondition := func(value string) map[string]map[string][]string {
+		return map[string]map[string][]string{
+			auth.OperatorNameStringEquals: {auth.RepositoryMetadataConditionKeyPrefix + "team": {value}},
+		}
+	}
+	allowAllRepos := model.Statement{
+		Effect:   model.StatementEffectAllow,
+		Action:   []string{permissions.ListRepositoriesAction},
+		Resource: permissions.RepoArn("*"),
+	}
+
+	policies := map[string][]*model.Policy{
+		"conditional-repo-allow": {
+			{DisplayName: "conditional-repo-allow-policy", Statement: model.Statements{{
+				Effect:    model.StatementEffectAllow,
+				Action:    []string{permissions.ListRepositoriesAction},
+				Resource:  permissions.RepoArn(repo),
+				Condition: ipCondition(allowedIP),
+			}}},
+		},
+		"conditional-repo-deny": {
+			{DisplayName: "conditional-repo-deny-policy", Statement: model.Statements{
+				allowAllRepos,
+				{
+					Effect:    model.StatementEffectDeny,
+					Action:    []string{permissions.ListRepositoriesAction},
+					Resource:  permissions.RepoArn(repo),
+					Condition: ipCondition(allowedIP),
+				},
+			}},
+		},
+		"conditional-repo-metadata-allow": {
+			{DisplayName: "conditional-repo-metadata-allow-policy", Statement: model.Statements{{
+				Effect:    model.StatementEffectAllow,
+				Action:    []string{permissions.ListRepositoriesAction},
+				Resource:  permissions.RepoArn(repo),
+				Condition: repoMetadataCondition("data"),
+			}}},
+		},
+	}
+
+	controller := &api.Controller{
+		Catalog:   deps.catalog,
+		Auth:      &policyAuthService{Service: deps.authService, policies: policies},
+		Logger:    logging.FromContext(ctx),
+		Collector: deps.collector,
+	}
+
+	both := []string{otherRepo, repo}
+	tests := []struct {
+		name       string
+		user       string
+		clientIP   string
+		wantStatus int
+		wantRepos  []string
+	}{
+		{
+			name:       "conditional allow from matching IP lists the repository",
+			user:       "conditional-repo-allow",
+			clientIP:   allowedIP,
+			wantStatus: http.StatusOK,
+			wantRepos:  []string{repo},
+		},
+		{
+			name:       "conditional allow from other IP lists nothing",
+			user:       "conditional-repo-allow",
+			clientIP:   otherIP,
+			wantStatus: http.StatusOK,
+			wantRepos:  []string{},
+		},
+		{
+			name:       "conditional deny from matching IP is enforced deny-first",
+			user:       "conditional-repo-deny",
+			clientIP:   allowedIP,
+			wantStatus: http.StatusOK,
+			wantRepos:  []string{otherRepo},
+		},
+		{
+			name:       "conditional deny from other IP does not apply",
+			user:       "conditional-repo-deny",
+			clientIP:   otherIP,
+			wantStatus: http.StatusOK,
+			wantRepos:  both,
+		},
+		{
+			name:       "repository metadata conditioned grant with matching metadata is honoured",
+			user:       "conditional-repo-metadata-allow",
+			clientIP:   otherIP,
+			wantStatus: http.StatusOK,
+			wantRepos:  []string{repo},
+		},
+	}
+
+	withClientIP := func(ip string) func(*http.Request) {
+		return func(r *http.Request) {
+			r.RemoteAddr = net.JoinHostPort(ip, "1234")
+		}
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, repos := listRepositoriesAsUser(t, controller, tt.user, withClientIP(tt.clientIP))
+			require.Equal(t, tt.wantStatus, status)
+			if tt.wantStatus == http.StatusOK {
+				require.Equal(t, tt.wantRepos, repos)
+			}
+		})
+	}
+
+	t.Run("user without ListRepositories is rejected", func(t *testing.T) {
+		status, _ := listRepositoriesAsUser(t, controller, "no-such-user", withClientIP(otherIP))
+		require.Equal(t, http.StatusUnauthorized, status)
+	})
+}
+
+func listRepositoriesAsUser(t *testing.T, controller *api.Controller, username string, opts ...func(*http.Request)) (int, []string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/repositories", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), &model.User{Username: username}))
+	for _, opt := range opts {
+		opt(req)
+	}
+	recorder := httptest.NewRecorder()
+	controller.ListRepositories(recorder, req, apigen.ListRepositoriesParams{
+		Amount: apiutil.Ptr(apigen.PaginationAmount(-1)),
+	})
+	if recorder.Code != http.StatusOK {
+		return recorder.Code, nil
+	}
+	var result apigen.RepositoryList
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &result))
+	ids := make([]string, 0, len(result.Results))
+	for _, repository := range result.Results {
+		ids = append(ids, repository.Id)
+	}
+	sort.Strings(ids)
+	return recorder.Code, ids
+}
+
 func TestPresignPolicyConditions(t *testing.T) {
 	_, deps := setupHandler(t)
 	ctx := t.Context()
@@ -5494,6 +5658,144 @@ func TestSetGroupACL(t *testing.T) {
 	require.Equal(t, http.StatusConflict, resp.StatusCode())
 	require.NotNil(t, resp.JSONDefault)
 	require.Equal(t, "group ACLs are not used in RBAC mode; attach policies instead", resp.JSONDefault.Message)
+}
+
+// groupPolicyAuthService is a minimal in-memory auth.Service for the SetGroupACL mode-gate test: it
+// records Authorize calls and holds the group's policy attachments, so a test can tell both whether
+// the handler authorized the caller and whether it mutated the group's policies. Every method it
+// does not override is inherited from the embedded service.
+type groupPolicyAuthService struct {
+	auth.Service
+	policies       map[string]*model.Policy
+	groups         map[string][]string // group ID -> attached policy display names
+	authorizeCalls int
+	allowed        bool
+}
+
+func newGroupPolicyAuthService(svc auth.Service) *groupPolicyAuthService {
+	return &groupPolicyAuthService{
+		Service:  svc,
+		policies: make(map[string]*model.Policy),
+		groups:   make(map[string][]string),
+	}
+}
+
+func (s *groupPolicyAuthService) Authorize(context.Context, *auth.AuthorizationRequest) (*auth.AuthorizationResponse, error) {
+	s.authorizeCalls++
+	if !s.allowed {
+		return &auth.AuthorizationResponse{Allowed: false, Error: auth.ErrInsufficientPermissions}, nil
+	}
+	return &auth.AuthorizationResponse{Allowed: true}, nil
+}
+
+func (s *groupPolicyAuthService) WritePolicy(_ context.Context, policy *model.Policy, update bool) error {
+	if _, exists := s.policies[policy.DisplayName]; exists && !update {
+		return auth.ErrAlreadyExists
+	}
+	s.policies[policy.DisplayName] = policy
+	return nil
+}
+
+func (s *groupPolicyAuthService) ListGroupPolicies(_ context.Context, groupID string, _ *model.PaginationParams) ([]*model.Policy, *model.Paginator, error) {
+	names := s.groups[groupID]
+	policies := make([]*model.Policy, 0, len(names))
+	for _, name := range names {
+		policies = append(policies, s.policies[name])
+	}
+	return policies, &model.Paginator{Amount: len(policies)}, nil
+}
+
+func (s *groupPolicyAuthService) AttachPolicyToGroup(_ context.Context, policyName, groupID string) error {
+	for _, name := range s.groups[groupID] {
+		if name == policyName {
+			return auth.ErrAlreadyExists
+		}
+	}
+	s.groups[groupID] = append(s.groups[groupID], policyName)
+	return nil
+}
+
+func (s *groupPolicyAuthService) DetachPolicyFromGroup(_ context.Context, policyName, groupID string) error {
+	for i, name := range s.groups[groupID] {
+		if name == policyName {
+			s.groups[groupID] = append(s.groups[groupID][:i], s.groups[groupID][i+1:]...)
+			return nil
+		}
+	}
+	return auth.ErrNotFound
+}
+
+// groupPolicyNames returns the sorted display names of the policies attached to groupID.
+func (s *groupPolicyAuthService) groupPolicyNames(groupID string) []string {
+	names := append([]string(nil), s.groups[groupID]...)
+	sort.Strings(names)
+	return names
+}
+
+// TestSetGroupACLModeGate pins the RBAC-mode gate of SetGroupACL: outside simplified mode the
+// endpoint returns 409 before it authorizes the caller or touches group state, so a group's policy
+// attachments are left intact. The design accepts that the 409 comes before authorization (so an
+// unauthenticated caller learns the RBAC mode): the non-simplified cases below assert that no
+// authorization call was made at all, and the simplified case shows the gate is what stops them.
+func TestSetGroupACLModeGate(t *testing.T) {
+	_, deps := setupHandler(t)
+	ctx := t.Context()
+	const (
+		groupID        = "TestSetGroupACLModeGateGroup"
+		existingPolicy = "TestSetGroupACLModeGateExistingPolicy"
+	)
+
+	tests := []struct {
+		name           string
+		mode           string
+		wantStatus     int
+		wantAuthorized int
+	}{
+		{name: "rbac none", mode: config.AuthRBACNone, wantStatus: http.StatusConflict, wantAuthorized: 0},
+		{name: "rbac internal", mode: config.AuthRBACInternal, wantStatus: http.StatusConflict, wantAuthorized: 0},
+		{name: "rbac external", mode: config.AuthRBACExternal, wantStatus: http.StatusConflict, wantAuthorized: 0},
+		{name: "rbac unset", mode: "", wantStatus: http.StatusConflict, wantAuthorized: 0},
+		{name: "rbac simplified authorizes", mode: config.AuthRBACSimplified, wantStatus: http.StatusUnauthorized, wantAuthorized: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := newGroupPolicyAuthService(deps.authService)
+			// Seed a policy attachment the handler would detach if it wrote an ACL.
+			testutil.Must(t, svc.WritePolicy(ctx, &model.Policy{
+				DisplayName: existingPolicy,
+				Statement: model.Statements{{
+					Effect:   model.StatementEffectAllow,
+					Action:   []string{permissions.ReadRepositoryAction},
+					Resource: permissions.RepoArn("some-repo"),
+				}},
+			}, false))
+			testutil.Must(t, svc.AttachPolicyToGroup(ctx, existingPolicy, groupID))
+
+			controller := &api.Controller{
+				Config: &config.ConfigImpl{Auth: config.Auth{
+					AuthUIConfig: config.AuthUIConfig{RBAC: tt.mode},
+				}},
+				Catalog:   deps.catalog,
+				Auth:      svc,
+				Logger:    logging.FromContext(ctx),
+				Collector: deps.collector,
+			}
+			req := httptest.NewRequest(http.MethodPut, "/auth/groups/"+groupID+"/acl", nil)
+			req = req.WithContext(auth.WithUser(req.Context(), &model.User{Username: "caller"}))
+			recorder := httptest.NewRecorder()
+
+			controller.SetGroupACL(recorder, req, apigen.SetGroupACLJSONRequestBody{Permission: "Write"}, groupID)
+
+			require.Equal(t, tt.wantStatus, recorder.Code)
+			require.Equal(t, tt.wantAuthorized, svc.authorizeCalls)
+			require.Equal(t, []string{existingPolicy}, svc.groupPolicyNames(groupID), "group policies must not change")
+			require.Len(t, svc.policies, 1, "no ACL policy may be written")
+			if tt.wantStatus == http.StatusConflict {
+				require.Contains(t, recorder.Body.String(), "group ACLs are not used in RBAC mode")
+			}
+		})
+	}
 }
 
 func TestController_GetPhysicalAddress(t *testing.T) {

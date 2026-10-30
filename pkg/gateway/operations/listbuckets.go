@@ -1,6 +1,7 @@
 package operations
 
 import (
+	"context"
 	"errors"
 	"net/http"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/catalog"
 	gwerrors "github.com/treeverse/lakefs/pkg/gateway/errors"
 	"github.com/treeverse/lakefs/pkg/gateway/serde"
+	"github.com/treeverse/lakefs/pkg/httputil"
 	"github.com/treeverse/lakefs/pkg/permissions"
 )
 
@@ -59,7 +61,18 @@ func (controller *ListBuckets) Handle(w http.ResponseWriter, req *http.Request, 
 			_ = o.EncodeError(w, req, nil, gwerrors.Codes.ToAPIErr(gwerrors.ErrAccessDenied))
 			return
 		}
-		opts = append(opts, catalog.WithListReposPermissionFilter(user.Username, policies))
+		// Filter with a condition context built per repository: it carries the request's client IP
+		// and that repository's lakefs:RepositoryMetadata/<key> fields, so a conditional deny is
+		// enforced and a conditional allow is not lost.
+		clientIP := httputil.ExtractClientIP(req.Header, req.RemoteAddr)
+		opts = append(opts, catalog.WithListReposPermissionFilter(
+			func(repoID string) context.Context {
+				fields := auth.NewRepositoryMetadataFields(func() (map[string]string, error) {
+					return o.Catalog.GetRepositoryMetadata(ctx, repoID)
+				})
+				return auth.WithConditionContext(ctx, auth.NewConditionContextWithProvider(clientIP, fields))
+			},
+			user.Username, policies))
 	}
 
 	buckets := make([]serde.Bucket, 0)
