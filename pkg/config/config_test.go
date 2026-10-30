@@ -128,6 +128,27 @@ func TestConfig_AuthorizationFailureStatus(t *testing.T) {
 		}
 	})
 
+	t.Run("default when unset", func(t *testing.T) {
+		// valid_config.yaml does not set the key: an unset value must keep the 401 default.
+		cfg, err := newConfigFromFile("testdata/valid_config.yaml")
+		require.NoError(t, err)
+		require.Equal(t, http.StatusUnauthorized, cfg.AuthConfig().GetBaseAuthConfig().AuthorizationFailureStatus)
+	})
+
+	t.Run("explicit values pass startup validation", func(t *testing.T) {
+		for _, tt := range []struct {
+			file string
+			want int
+		}{
+			{file: "testdata/authorization_failure_status_unauthorized.yaml", want: http.StatusUnauthorized},
+			{file: "testdata/authorization_failure_status_forbidden.yaml", want: http.StatusForbidden},
+		} {
+			cfg, err := newConfigFromFile(tt.file)
+			require.NoError(t, err, tt.file)
+			require.Equal(t, tt.want, cfg.AuthConfig().GetBaseAuthConfig().AuthorizationFailureStatus, tt.file)
+		}
+	})
+
 	t.Run("rejected values", func(t *testing.T) {
 		// Any status other than 401/403 is rejected: a typo such as 200 would make an
 		// authorization failure look like a success to the UI and SDK clients.
