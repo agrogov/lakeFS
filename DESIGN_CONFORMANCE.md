@@ -14,6 +14,30 @@ Review-only. No source, test, ledger or design file was changed. Findings about 
 **Status legend:** IMPLEMENTED, PARTIAL, DEVIATION-JUSTIFIED, MISSING, OUT-OF-SCOPE.
 **Severity legend:** BLOCKER (unsafe to ship), MAJOR (a promised behaviour is broken or its core wiring is unguarded), MINOR (works, but a test, doc or edge is missing), NIT.
 
+## Status since this review
+
+This review is a point-in-time snapshot at HEAD `ba109abe7`. The matrix in §2 is left as it was written, with one
+exception: R11 and GAP-18 were amended **in place** by the card that made the licence guard fail closed
+(`481b59325`), because that card was the fix for them. Everything else has been closed since without touching the
+row; this section records what was closed, by which card/commit, so a reader can tell a live gap from a stale row.
+The review itself changed nothing; this section and the design amendments it points at were added afterwards.
+
+| Row | Gap | Closed by | What the fix does |
+|---|---|---|---|
+| R50, R105 | GAP-13 (R1 m3) | `2ab5ba6e4` (R1-F7) | Both template-version records now share one convention: `acl.TemplateVersionKey` → `metadata/<name>` in the `auth` partition, with the old bare and snake_case keys migrated on read. Two records remain, but they are now documented as a deliberate deviation in both files; the stale comment that claimed one shared key is gone. |
+| R72, R94, R106 | GAP-12 (R1 m5) | `a625e8de3` (R1-m5) | `CreateRBACBasePolicies` creates the `Datasets*` policies only when `WithDatasetsEnabled(true)` is passed, default off, so no installation gets unattached datasets policies. Enabling them still waits for the datasets feature (the option has no production caller yet), and installations bootstrapped by an earlier binary keep the two orphan policies — the bootstrap never deletes. |
+| R95, R96, R107 (m4 part 1) | GAP-09 (R1 m4, API half) | `11282c39f` (R1-F4) | `authorizeCallback` applies `auth.authorization_failure_status` to the plain `Allowed=false` branch as well, and `TestAuthorizeCallback_AuthorizationFailureStatus` tables both denial shapes over 0/401/403, so the 500→401 fix and the 403 opt-in are both pinned. |
+| R52, R107 (m4 part 2) | GAP-10, webui half | `b3de7592e` (R1 m4 webui) | `webui/src/pages/auth/groups/index.test.jsx` drives the real page over a faked `fetch` (badge for multi-policy groups, dropdown for single-ACL groups, plain 404 as an error, no badge outside `simplified`), and `webui/src/lib/api/index.test.js` pins the `no_acl` → `NoAclError` mapping. The message-substring fallbacks were dropped because the tests show they are not load-bearing. |
+| — (m4 part 3) | 409 gate ordering test | `a627b2031` (R1 nits) | `TestSetGroupACLModeGate` tables `none`/`internal`/`external`/unset against `simplified` and asserts that every non-simplified mode returns 409 without authorizing or touching a policy. The same commit also made the `ListRepositories` permission filter condition-aware (`pkg/catalog/list_repository_options.go`, gateway `listbuckets.go`) and corrected the per-request memoisation comments. |
+| — | R1-F10 (test flake) | `e8c63463f` | `TestListRepositoriesPolicyConditions` compares repository sets (`require.ElementsMatch`) instead of an order the API does not guarantee, so the review's intermittent failure is gone; expectations were not weakened. |
+| — | R1 nit (`UpdateUserProfile`) | `39045669e` (M1 follow-up) | The no-op profile update no longer drops the cached user entry (the invalidation `defer` moved below the early return), plus `TestAuthService_DeleteUserRecreateDropsGroupPermissions`. |
+| R11 | GAP-18 (R1 m6) | `481b59325` (R1-F6) | The §2.5 guard fails closed when ancestry cannot be decided (shallow clone, unborn HEAD, no repository), has a `--self-test`, a `make check-license-base` target wired into `checks-validator` and a `license-base` CI job. R11 and the GAP-18 row were updated by that commit, as its message records. |
+| R05, R31, R66, R74, R98, R101 | GAP-14, GAP-15, GAP-16, GAP-20, GAP-05, GAP-19 | the documentation commit that adds this section | The design's §4.8 ARN/action example, §6 phase contents, §4.9 file list and §8 scope statement now match the code and the commit history; the committer change and the audit-log level requirement are in `CHANGELOG_SSO.md` and the example config. |
+
+Still open from the gap list in §6 of this review at the time of writing: GAP-01, GAP-02 (both MAJOR), GAP-03,
+GAP-04, GAP-06, GAP-07, GAP-08, GAP-10's controller half (R80, R82), GAP-11, GAP-17. Rows that rest on those gaps
+are unchanged above.
+
 ## 1. Verdict
 
 **107 matrix rows:** 84 IMPLEMENTED, 15 PARTIAL, 4 DEVIATION-JUSTIFIED, 2 MISSING, 2 OUT-OF-SCOPE. **20 gaps:** 0 BLOCKER, 2 MAJOR, 14 MINOR, 4 NIT. (R105–R107 repeat the R1 open items from earlier rows, so they are counted twice in the row totals.)

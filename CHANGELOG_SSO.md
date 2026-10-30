@@ -27,6 +27,23 @@ Rollback and notes:
 - After a rollback, a group that holds more than one policy shows no ACL in the simplified UI (RBAC_DESIGN.md §3.3 #5). `rbac-migrate` prints the same warning.
 - The authorization cache is per process (`auth.cache.ttl`, default 20s plus jitter). Policy revocations apply immediately on the replica that handled the request, but other replicas converge only within the TTL. For multi-replica deployments use `auth.cache.ttl: 5s` (RBAC_DESIGN.md §4.7); see `cmd/lakefs-sso/config.example.yaml`.
 
+:memo: Notes for operators:
+
+- **Commit identity is the email.** SSO users are keyed by the immutable Entra object ID (`oid`), which is also
+  their lakeFS username. Since the ID token's `email` claim (or a UPN-shaped `preferred_username`) is now stored on
+  the user record, new commits and merges are recorded with the committer = the user's **email** instead of the
+  `oid`. This applies to commits created from that point on: commits written before the change keep the `oid` they
+  were created with, because the committer is stored inside the commit. Users with no email claim still commit
+  under their user ID. (Entra B2B guest emails can look like `alice_contoso.com#EXT#@tenant.onmicrosoft.com`;
+  they are stored as-is.)
+- **Audit-style request logs are level-gated.** In `internal` mode every request logs an audit line
+  (`HTTP call ended`) carrying `log_audit=true`, the client, the response size and the request ID, for the REST
+  API and for the S3 gateway. Those lines are written at `logging.audit_log_level`, which defaults to `DEBUG`,
+  while `logging.level` defaults to `INFO` — so **with the defaults no audit line is emitted at all**. Set
+  `logging.audit_log_level` at or below `logging.level` (`audit_log_level: INFO` is enough) to see them; raising
+  `logging.level` to `DEBUG` also works but is noisier everywhere else. In `simplified` mode the same lines are
+  emitted without `log_audit`, `client` and `sent_bytes`. See `cmd/lakefs-sso/config.example.yaml`.
+
 :bug: Bugs fixed:
 
 - First SSO login now receives its groups. The user is provisioned in the OIDC callback before group sync runs; previously sync failed with "not found" and the user had no permissions until logging in a second time.
