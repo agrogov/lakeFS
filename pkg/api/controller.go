@@ -5304,9 +5304,10 @@ func (c *Controller) ListObjects(w http.ResponseWriter, r *http.Request, reposit
 }
 
 func (c *Controller) StatObject(w http.ResponseWriter, r *http.Request, repository, ref string, params apigen.StatObjectParams) {
-	// Derive the request once so every authorization on this path - including the presign branch -
-	// evaluates policy conditions with the request's condition context.
-	r = c.withConditionContext(r, repository)
+	// No withConditionContext here: StatObject authorizes exactly once, through authorize, which
+	// builds the condition context itself (authorizeCallback -> conditionContext). Nothing after
+	// the authorization - including the presign branch - authorizes again, so a derived request
+	// context would not be read by any policy evaluation.
 	if !c.authorize(w, r, permissions.Node{
 		Permission: permissions.Permission{
 			Action:   permissions.ReadObjectAction,
