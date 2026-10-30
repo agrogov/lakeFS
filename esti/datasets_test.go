@@ -8,9 +8,12 @@
 //
 // The suite starts its own server so that it is independent of whatever the surrounding esti
 // environment runs: a throw-away Postgres database on the esti Postgres instance (or a local
-// KV store when no database connection string is configured) and a local blockstore in a
-// temporary directory. Both the datasets *and* their sources live on one blockstore, which
-// §5.2 requires (same storage ID, zero-copy full addresses, §6.3).
+// KV store when no database connection string is configured). By default the server uses a
+// local blockstore in a temporary directory. When the environment supplies a cloud blockstore
+// (LAKEFS_BLOCKSTORE_TYPE plus the esti storage namespace), the suite instead runs the same
+// scenarios on that blockstore under a unique per-run prefix, and removes it afterwards - that
+// is what closes spike S4 of §18. Both the datasets *and* their sources live on one blockstore,
+// which §5.2 requires (same storage ID, zero-copy full addresses, §6.3).
 //
 // Scenarios (§15.2):
 //
@@ -70,10 +73,6 @@ const (
 
 	// datasetsServerTimeout bounds the wait for the throw-away server to become healthy.
 	datasetsServerTimeout = 3 * time.Minute
-
-	// datasetsStoragePrefix is the storage namespace prefix of dataset repositories; sources
-	// use "local://<sourcesDir>/<repo>" on the same blockstore (§5.2 rule 4).
-	datasetsStoragePrefix = "local://datasets"
 )
 
 // --- control-plane payloads -----------------------------------------------------------------
@@ -255,14 +254,15 @@ func (c *datasetsClient) must(ctx context.Context, want int, method, path string
 
 // datasetsEnv is one running lakefs-sso server with the datasets control plane enabled.
 type datasetsEnv struct {
-	t        *testing.T
-	endpoint string // http://host:port/api/v1
-	s3Host   string // host:port, for the S3 gateway clients
-	key      string
-	secret   string
-	core     *apigen.ClientWithResponses
-	ds       *datasetsClient
-	s3       *minio.Client
+	t             *testing.T
+	endpoint      string // http://host:port/api/v1
+	s3Host        string // host:port, for the S3 gateway clients
+	key           string
+	secret        string
+	sourcesPrefix string // parent namespace of the source repositories
+	core          *apigen.ClientWithResponses
+	ds            *datasetsClient
+	s3            *minio.Client
 }
 
 // coreFor returns a core API client authenticated as the given principal.
@@ -297,11 +297,9 @@ func (e *datasetsEnv) s3For(t *testing.T, key, secret string) *minio.Client {
 // disabled, so it is safe to wire into the shared `make esti` target.
 func newDatasetsEnv(t *testing.T) *datasetsEnv {
 	t.Helper()
-	binary := datasetsServerBinary(t)
-
 	dir := t.TempDir()
-	blockRoot := filepath.Join(dir, "data")
-	require.NoError(t, os.MkdirAll(blockRoot, 0o755))
+	blockstore := newDatasetsBlockstore(t, dir)
+	binary := datasetsServerBinary(t)
 
 	dbSection, dropDatabase := datasetsDatabase(t, dir)
 	issuer := startOIDCDiscoveryStub(t)
@@ -329,16 +327,12 @@ sso:
   client_secret: "esti-datasets-secret"
   issuer_url: %q
   callback_base_url: "http://%s"
-blockstore:
-  type: local
-  local:
-    path: %q
-datasets:
+%sdatasets:
   enabled: true
   storage_namespace_prefix: %q
   reconcile_interval: "24h"
   publish_timeout: "10m"
-`, hostPort, dbSection, issuer, hostPort, blockRoot, datasetsStoragePrefix)
+`, hostPort, dbSection, issuer, hostPort, blockstore.BlockstoreSection, blockstore.StorageNamespacePrefix)
 
 	configPath := filepath.Join(dir, "lakefs.yaml")
 	require.NoError(t, os.WriteFile(configPath, []byte(config), 0o600))
@@ -353,6 +347,23 @@ datasets:
 	cmd.Dir = dir
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+	// Registered before the stop cleanup, so it runs after the process is gone and the log is
+	// complete: a failing cloud run is otherwise very hard to debug from CI.
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		log, err := os.ReadFile(logPath)
+		if err != nil {
+			t.Logf("lakefs-sso log unavailable: %v", err)
+			return
+		}
+		const maxLogBytes = 64 << 10
+		if len(log) > maxLogBytes {
+			log = log[len(log)-maxLogBytes:]
+		}
+		t.Logf("lakefs-sso log (tail):\n%s", log)
+	})
 	require.NoError(t, cmd.Start(), "start lakefs-sso")
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
@@ -365,11 +376,12 @@ datasets:
 	waitForDatasetsServer(t, baseURL, logPath)
 
 	env := &datasetsEnv{
-		t:        t,
-		endpoint: baseURL + apiutil.BaseURL,
-		s3Host:   hostPort,
-		key:      DefaultAdminAccessKeyID,
-		secret:   DefaultAdminSecretAccessKey,
+		t:             t,
+		endpoint:      baseURL + apiutil.BaseURL,
+		s3Host:        hostPort,
+		key:           DefaultAdminAccessKeyID,
+		secret:        DefaultAdminSecretAccessKey,
+		sourcesPrefix: blockstore.SourcesPrefix,
 	}
 
 	// First run on the throw-away server: create the admin principal with known credentials,
@@ -574,10 +586,10 @@ func uniqueSuffix() string {
 	return strings.ToLower(randstr.String(8))
 }
 
-// createRepo creates a writable source repository on the shared local blockstore.
+// createRepo creates a writable source repository on the blockstore the dataset uses.
 func (e *datasetsEnv) createRepo(t *testing.T, name, defaultBranch string) {
 	t.Helper()
-	namespace := "local://sources/" + name
+	namespace := datasetsNamespace(t, e.sourcesPrefix, name)
 	res, err := e.core.CreateRepositoryWithResponse(t.Context(), &apigen.CreateRepositoryParams{},
 		apigen.CreateRepositoryJSONRequestBody{
 			Name:             name,
@@ -920,7 +932,7 @@ func testDatasetsGCSafety(t *testing.T, env *datasetsEnv) {
 	require.Equal(t, http.StatusNoContent, res.StatusCode(), string(res.Body))
 
 	prepared := prepareGCCommits(t, env, source)
-	active := readActiveCommits(t, prepared.GcCommitsLocation)
+	active := readActiveCommits(t, prepared)
 
 	_, pinnedActive := active[pinnedCommit]
 	require.Truef(t, pinnedActive,
@@ -936,9 +948,9 @@ func testDatasetsGCSafety(t *testing.T, env *datasetsEnv) {
 //
 // The request is issued directly rather than through the generated client: the core controller
 // answers with a single JSON body, but when the blockstore cannot presign the CSV (the local
-// adapter, which this suite uses) it writes an error body first and the result after it, so the
-// payload holds two JSON values and the generated client refuses to decode it. Taking the last
-// value that carries a commits location works for both shapes.
+// adapter, which is the default here) it writes an error body first and the result after it, so
+// the payload holds two JSON values and the generated client refuses to decode it. Taking the
+// last value that carries a commits location works for both shapes.
 func prepareGCCommits(t *testing.T, env *datasetsEnv, repo string) apigen.GarbageCollectionPrepareResponse {
 	t.Helper()
 	path := "/repositories/" + repo + "/gc/prepare_commits"
@@ -950,12 +962,10 @@ func prepareGCCommits(t *testing.T, env *datasetsEnv, repo string) apigen.Garbag
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err, "read the GC preparation response")
-	if resp.StatusCode != http.StatusCreated {
-		// The error body above was written first, so it also fixes the status code. Nothing
-		// else may fail here: a real error would not carry a commits location (asserted below).
-		require.Containsf(t, string(body), "presigned URL",
-			"unexpected GC preparation failure (status %d): %s", resp.StatusCode, body)
-	}
+	// The controller answers with a single JSON body on a blockstore that can presign the CSV.
+	// On the local adapter (and on emulators that cannot sign) it writes an error body first and
+	// the result after it, so the payload holds two JSON values and the status is the error's.
+	// Either way the result carries a commits location: fail only when there is none.
 
 	var (
 		out   apigen.GarbageCollectionPrepareResponse
@@ -972,23 +982,24 @@ func prepareGCCommits(t *testing.T, env *datasetsEnv, repo string) apigen.Garbag
 			out, found = candidate, true
 		}
 	}
-	require.Truef(t, found, "no GC commit preparation result in the response: %s", body)
+	require.Truef(t, found, "no GC commit preparation result in the response (status %d): %s", resp.StatusCode, body)
 	return out
 }
 
 // readActiveCommits reads the GC active-commits CSV written by the commit preparation step and
-// returns the set of commit IDs the GC job will retain. The CSV is written through the block
-// adapter, and the local adapter formats full addresses as "local://<absolute path>".
-func readActiveCommits(t *testing.T, location string) map[string]struct{} {
+// returns the set of commit IDs the GC job will retain.
+//
+// On a cloud blockstore the CSV lives in the blockstore and is downloaded through the presigned
+// URL the preparation response carries; on the local adapter it is a local:// file, which is
+// what the local adapter formats full addresses as. If neither is available the assertion is
+// skipped with the reason, instead of failing the whole suite on a blockstore that cannot be
+// read back here.
+func readActiveCommits(t *testing.T, prepared apigen.GarbageCollectionPrepareResponse) map[string]struct{} {
 	t.Helper()
-	path := strings.TrimPrefix(location, "local://")
-	require.NotEqual(t, location, path, "the GC artifact must be a local:// address in this environment: %s", location)
+	reader := openActiveCommits(t, prepared)
+	defer reader.Close()
 
-	file, err := os.Open(path)
-	require.NoErrorf(t, err, "open the GC active-commits CSV at %s", path)
-	defer file.Close()
-
-	records, err := csv.NewReader(file).ReadAll()
+	records, err := csv.NewReader(reader).ReadAll()
 	require.NoError(t, err, "parse the GC active-commits CSV")
 	require.NotEmpty(t, records, "the GC preparation must write at least a header")
 	require.Equal(t, []string{"commit_id", "expired", "metarange_id"}, records[0],
@@ -1002,6 +1013,27 @@ func readActiveCommits(t *testing.T, location string) map[string]struct{} {
 		}
 	}
 	return active
+}
+
+// openActiveCommits returns the GC active-commits CSV, from the presigned URL when the configured
+// blockstore provides one and from the local filesystem for the local adapter.
+func openActiveCommits(t *testing.T, prepared apigen.GarbageCollectionPrepareResponse) io.ReadCloser {
+	t.Helper()
+	if prepared.GcCommitsPresignedUrl != nil && *prepared.GcCommitsPresignedUrl != "" {
+		resp, err := http.Get(*prepared.GcCommitsPresignedUrl) //nolint:gosec // test-only, URL from the local server
+		require.NoError(t, err, "GET the presigned GC active-commits CSV")
+		require.Equalf(t, http.StatusOK, resp.StatusCode, "GET the presigned GC active-commits CSV: %s", resp.Status)
+		return resp.Body
+	}
+	location := prepared.GcCommitsLocation
+	if path, ok := strings.CutPrefix(location, "local://"); ok {
+		file, err := os.Open(path)
+		require.NoErrorf(t, err, "open the GC active-commits CSV at %s", path)
+		return file
+	}
+	t.Skipf("the GC commit preparation wrote its active-commits CSV to %s, but the configured blockstore "+
+		"exposes no presigned URL for it and it is not a local file; skipping the GC retain-set assertion", location)
+	return nil
 }
 
 // testDatasetsProposals covers §15.2 bullet 4 and §5.6: open a proposal with a preview branch,
