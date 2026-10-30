@@ -53,11 +53,12 @@ func WithConditionContext(ctx context.Context, cc *ConditionContext) context.Con
 	return context.WithValue(ctx, contextKeyConditionContext, cc)
 }
 
-// NewRepositoryMetadataFields returns a lazy, request-memoised provider of
+// NewRepositoryMetadataFields returns a lazy, memoised provider of
 // lakefs:RepositoryMetadata/<key> condition fields, to be used as AuthorizationRequest.Fields.
-// load is called at most once, and only when a condition actually references a repository
-// metadata key. A load error, or a key that does not exist, reports the field as missing, which
-// makes the condition (and so the statement) fail.
+// load is called at most once per returned provider - not once per request: a request that builds
+// more than one provider (e.g. one per repository) loads the metadata once per provider - and only
+// when a condition actually references a repository metadata key. A load error, or a key that does
+// not exist, reports the field as missing, which makes the condition (and so the statement) fail.
 func NewRepositoryMetadataFields(load func() (map[string]string, error)) func(key string) (string, bool) {
 	var (
 		once     sync.Once

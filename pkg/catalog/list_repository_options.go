@@ -1,6 +1,8 @@
 package catalog
 
 import (
+	"context"
+
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/model"
 	"github.com/treeverse/lakefs/pkg/permissions"
@@ -26,8 +28,16 @@ func NewListRepositoriesOptions(opts []ListRepositoriesOptionsFunc) *ListReposit
 }
 
 // WithListReposPermissionFilter creates a filter predicate based on user policies.
-// It filters repositories where the user has fs:ListRepositories permission.
-func WithListReposPermissionFilter(username string, policies []*model.Policy) ListRepositoriesOptionsFunc {
+// It filters repositories where the user has fs:ListRepositories permission, evaluating policy
+// conditions with the condition context that conditionContext builds for each repository: the
+// client IP and, lazily, that repository's lakefs:RepositoryMetadata/<key> fields. Evaluation is
+// deny-first - CheckPermissions reports CheckDeny for any matching deny statement, conditional or
+// not, and only CheckAllow makes the repository visible - so a conditional deny hides the
+// repository and a conditional allow grants it.
+//
+// conditionContext must return a context carrying an auth.ConditionContext: catalog has no
+// *http.Request, so the caller (the API handler) supplies it.
+func WithListReposPermissionFilter(conditionContext func(repoID string) context.Context, username string, policies []*model.Policy) ListRepositoriesOptionsFunc {
 	return func(opts *ListRepositoriesOptions) {
 		if len(policies) == 0 {
 			// No policies means no access to any specific repository
@@ -37,7 +47,12 @@ func WithListReposPermissionFilter(username string, policies []*model.Policy) Li
 			return
 		}
 		opts.FilterFunc = func(repoID string) bool {
-			return auth.CheckPermission(permissions.RepoArn(repoID), username, policies, permissions.ListRepositoriesAction, nil)
+			return auth.CheckPermissions(conditionContext(repoID), permissions.Node{
+				Permission: permissions.Permission{
+					Action:   permissions.ListRepositoriesAction,
+					Resource: permissions.RepoArn(repoID),
+				},
+			}, username, policies, &auth.MissingPermissions{}) == auth.CheckAllow
 		}
 	}
 }

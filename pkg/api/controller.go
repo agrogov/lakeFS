@@ -2223,7 +2223,15 @@ func (c *Controller) ListRepositories(w http.ResponseWriter, r *http.Request, pa
 			writeError(w, r, c.authorizationFailureStatus(), auth.ErrInsufficientPermissions)
 			return
 		}
-		opts = append(opts, catalog.WithListReposPermissionFilter(user.Username, policies))
+		// Filter with the request's condition context, built per repository: it carries that
+		// repository's lakefs:RepositoryMetadata/<key> fields. Without it a conditional deny on
+		// ListRepositories would not be enforced and a conditional allow would be lost.
+		opts = append(opts, catalog.WithListReposPermissionFilter(
+			func(repoID string) context.Context {
+				repoCtx, _, _ := c.conditionContext(r, repoID)
+				return repoCtx
+			},
+			user.Username, policies))
 	}
 
 	c.LogAction(ctx, "list_repos", r, "", "", "")
@@ -6376,9 +6384,11 @@ func (c *Controller) conditionContext(r *http.Request, repository string) (conte
 	clientIP := httputil.ExtractClientIP(r.Header, r.RemoteAddr)
 
 	// Repository metadata is exposed to policy conditions as lakefs:RepositoryMetadata/<key>.
-	// The provider is lazy, so the metadata is loaded at most once per request, and only when a
-	// statement actually carries such a condition. Without a repository every repository metadata
-	// condition is missing, and so denies.
+	// The provider is lazy, so the metadata is loaded at most once per condition context - that is,
+	// once per call here - and only when a statement actually carries such a condition. It is not
+	// shared with other condition contexts, so a request that authorizes more than once (or for
+	// more than one repository) loads the metadata again. Without a repository every repository
+	// metadata condition is missing, and so denies.
 	fields := c.repositoryMetadataFields(ctx, repository)
 	return auth.WithConditionContext(ctx, auth.NewConditionContextWithProvider(clientIP, fields)), clientIP, fields
 }
@@ -6446,10 +6456,11 @@ func (c *Controller) authorize(w http.ResponseWriter, r *http.Request, perms per
 	return c.authorizeCallback(w, r, perms, writeError)
 }
 
-// repositoryMetadataFields returns a lazy, request-memoised provider of the
-// lakefs:RepositoryMetadata/<key> condition fields of repository. It returns nil when the request
-// does not name a repository, or when the repository metadata cannot be loaded - in both cases a
-// statement requiring such a field does not match, and so does not grant permission.
+// repositoryMetadataFields returns a lazy provider of the lakefs:RepositoryMetadata/<key> condition
+// fields of repository, memoised for the lifetime of the returned provider (a single condition
+// context, not the whole request). It returns nil when the request does not name a repository, or
+// when the repository metadata cannot be loaded - in both cases a statement requiring such a field
+// does not match, and so does not grant permission.
 func (c *Controller) repositoryMetadataFields(ctx context.Context, repository string) func(key string) (string, bool) {
 	if repository == "" || c.Catalog == nil {
 		return nil

@@ -327,10 +327,11 @@ func withConditionContext(req *http.Request, cat *catalog.Catalog, bucket string
 	return req
 }
 
-// repositoryMetadataFields returns a lazy, request-memoised provider of the
-// lakefs:RepositoryMetadata/<key> condition fields of the bucket's repository. It returns nil when
-// the request has no bucket, or when the metadata cannot be loaded - in both cases a statement
-// requiring such a field does not match, and so does not grant permission.
+// repositoryMetadataFields returns a lazy provider of the lakefs:RepositoryMetadata/<key> condition
+// fields of the bucket's repository, memoised for the lifetime of the returned provider (a single
+// condition context, not the whole request). It returns nil when the request has no bucket, or when
+// the metadata cannot be loaded - in both cases a statement requiring such a field does not match,
+// and so does not grant permission.
 func repositoryMetadataFields(ctx context.Context, cat *catalog.Catalog, bucket string) func(key string) (string, bool) {
 	if bucket == "" || cat == nil {
 		return nil
