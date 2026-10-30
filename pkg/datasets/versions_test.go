@@ -684,13 +684,13 @@ func TestEstimateSourceObjects(t *testing.T) {
 	require.NoError(t, Validate(&def, ValidateOptions{}))
 
 	t.Run("capped at the threshold", func(t *testing.T) {
-		stats, err := f.svc.estimateSourceObjects(f.ctx, &def, 3)
+		stats, err := f.svc.estimateSourceObjects(f.ctx, f.caller(), &def, 3)
 		require.NoError(t, err)
 		require.Equal(t, int64(4), stats.Objects, "counting stops just past the threshold")
 	})
 
 	t.Run("exact when uncapped", func(t *testing.T) {
-		stats, err := f.svc.sourceStats(f.ctx, &def)
+		stats, err := f.svc.sourceStats(f.ctx, f.caller(), &def)
 		require.NoError(t, err)
 		require.Equal(t, int64(count), stats.Objects)
 		require.Equal(t, int64(count*len("payload")), stats.Bytes)
@@ -718,7 +718,7 @@ func TestEstimateSourceObjects(t *testing.T) {
 			},
 		}
 		require.NoError(t, Validate(&withEmpty, ValidateOptions{}))
-		_, err := f.svc.estimateSourceObjects(f.ctx, &withEmpty, 3)
+		_, err := f.svc.estimateSourceObjects(f.ctx, f.caller(), &withEmpty, 3)
 		require.Error(t, err, "the empty item must fail even though the cap was passed already")
 		var validation *ValidationError
 		require.ErrorAs(t, err, &validation)

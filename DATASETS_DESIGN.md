@@ -708,8 +708,20 @@ read is done by the server with its own blockstore credentials. That matches the
 
 On create, publish, and proposal create/update, for every item the service checks **as the caller**:
 
-- `fs:ReadCommit` on `RepoArn(src)` and
-- `fs:ReadObject` + `fs:ListObjects` on `ObjectArn(src, path)` (object) or `ObjectArn(src, prefix+"*")` (prefix).
+- `fs:ListObjects` on `RepoArn(src)` - the ARN the core API authorises listing against
+  (`Controller.DiffBranch`, `Controller.ListObjects`),
+- `fs:ReadObject` on `ObjectArn(src, path)` (object) or `ObjectArn(src, prefix+"*")` (prefix) for the item, and
+- `fs:ReadObject` on `ObjectArn(src, <key>)` for **every object** the item materialises.
+
+The per-object check is what makes a `Deny` on a sub-path work. `ArnMatch` treats the policy resource as the pattern, so
+a deny on `arn:lakefs:fs:::repository/hr/object/salaries/*` never matches the literal request
+`arn:lakefs:fs:::repository/hr/object/*`: authorising only the item ARN would copy the denied objects into the dataset.
+Decisions are cached per (policy set, path prefix), and a denial names the item and the first denied path. Source paths
+are literal repository keys - `*` and `?` are rejected in `object.path` and `prefix.path` - so an item cannot widen the
+ARN its own check authorises.
+
+`fs:ReadCommit` is deliberately **not** required: the public documentation asks for `fs:ListObjects` + `fs:ReadObject`
+on the source path, and every object is checked individually anyway.
 
 Any failure → `403` naming the item. When a proposal is merged, the check runs for the **author** (at creation) and the
 **merger** (at merge) — the merger is publishing the data under their authority.

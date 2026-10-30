@@ -76,7 +76,14 @@ type SourceError struct {
 	Item       int
 	Repository string
 	Ref        SourceRef
-	Err        error
+
+	// Path is the source path the error is about, when it is about one object rather than the
+	// whole item: the per-object source read check of SEC-3 sets it to the first path the
+	// caller is denied, so the message names the data that was refused and not only the item
+	// that referenced it. It is empty for every item-level source error.
+	Path string
+
+	Err error
 }
 
 // Error implements error.
@@ -87,6 +94,9 @@ func (e *SourceError) Error() string {
 	if e.Ref.ID != "" {
 		fmt.Fprintf(&b, " ref %s %q", e.Ref.Type, e.Ref.ID)
 	}
+	if e.Path != "" {
+		fmt.Fprintf(&b, " object %q", e.Path)
+	}
 	fmt.Fprintf(&b, ": %v", e.Err)
 	return b.String()
 }
@@ -95,15 +105,21 @@ func (e *SourceError) Error() string {
 func (e *SourceError) Unwrap() error { return e.Err }
 
 // HTTPStatusCode is the status the control plane answers with when it returns err
-// (§10.4): 422 for a storage-ID mismatch, which is a deployment problem, and 400
-// for the other source problems, which are document problems. It mirrors the
+// (§10.4): 422 for a storage-ID mismatch, which is a deployment problem, 403 for a
+// source the caller is denied to read (the per-object check of SEC-3 wraps its
+// *PermissionError in a *SourceError so the item and the path survive), and 400 for
+// the other source problems, which are document problems. It mirrors the
 // HTTPStatusCode of authz.go's *PermissionError, so the API can map any error the
 // resolve/publish path returns without type-switching on the concrete error.
 func (e *SourceError) HTTPStatusCode() int {
-	if errors.Is(e.Err, ErrStorageIDMismatch) {
+	switch {
+	case errors.Is(e.Err, ErrStorageIDMismatch):
 		return http.StatusUnprocessableEntity
+	case errors.Is(e.Err, ErrPermissionDenied):
+		return http.StatusForbidden
+	default:
+		return http.StatusBadRequest
 	}
-	return http.StatusBadRequest
 }
 
 // Resolver resolves the refs of a definition and checks its sources (§5.2 rule 4,

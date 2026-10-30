@@ -8,14 +8,17 @@ package datasets
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/treeverse/lakefs/contrib/auth/acl"
 	"github.com/treeverse/lakefs/pkg/auth/model"
 	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/datasets/apigen"
 	"github.com/treeverse/lakefs/pkg/graveler"
+	"github.com/treeverse/lakefs/pkg/permissions"
 )
 
 // seedHandlerSource creates a source repository with one committed object and returns the
@@ -188,6 +191,83 @@ func TestDatasetsHTTPValidationErrors(t *testing.T) {
 		message := decodeError(t, rec).Message
 		require.Contains(t, message, "data[0]")
 		require.Contains(t, message, "handler-src")
+	})
+}
+
+// TestDatasetsHTTPPrefixSourceDeny is the SEC-3 end-to-end case from the review: a principal with
+// a blanket fs:* allow and a Deny on a sub-path of a source repository must not be able to attach
+// the prefix that covers it. Both the whole-repository prefix ("") and the prefix that merely
+// starts like the denied path ("sec") answer 403 naming the item, instead of silently copying the
+// denied objects into the dataset.
+func TestDatasetsHTTPPrefixSourceDeny(t *testing.T) {
+	handler, deps, accessKey, secret := newControlPlaneWithDeps(t)
+	ctx := t.Context()
+
+	// The source repository holds one secret and one public object, committed together.
+	const src = "exfil-src"
+	_, err := deps.Catalog.CreateRepository(ctx, src, "", "mem://exfil-src-ns", "main", false)
+	require.NoError(t, err)
+	for _, path := range []string{"secret/salaries.csv", "public/report.csv"} {
+		require.NoError(t, deps.Catalog.CreateEntry(ctx, src, "main", catalog.DBEntry{
+			Path:            path,
+			PhysicalAddress: "objects/" + strings.ReplaceAll(path, "/", "-"),
+			AddressType:     catalog.AddressTypeRelative,
+			CreationDate:    time.Now(),
+			Size:            7,
+			Checksum:        "deadbeef",
+			ContentType:     "text/csv",
+		}))
+	}
+	log, err := deps.Catalog.Commit(ctx, src, "main", "seed", "tester", nil, nil, nil, false)
+	require.NoError(t, err)
+	commit := graveler.CommitID(log.Reference)
+
+	// The exfiltrating principal: the ACL base grants (fs:*) through Admins, DatasetsFullAccess
+	// through DatasetAdmins, and one deny on the secrets directory of the source repository.
+	const exfiltrator = "exfiltrator"
+	_, err = deps.AuthService.CreateUser(ctx, &model.User{Username: exfiltrator})
+	require.NoError(t, err)
+	cred, err := deps.AuthService.AddCredentials(ctx, exfiltrator, "AKIAEXFILTRATOR00001", "exfil-secret")
+	require.NoError(t, err)
+	require.NoError(t, deps.AuthService.AddUserToGroup(ctx, exfiltrator, acl.AdminsGroup))
+	require.NoError(t, deps.AuthService.AddUserToGroup(ctx, exfiltrator, DatasetAdminsGroup))
+	deny := &model.Policy{
+		DisplayName: "exfiltrator-deny-secrets",
+		CreatedAt:   time.Now(),
+		Statement: model.Statements{{
+			Effect:   model.StatementEffectDeny,
+			Action:   []string{permissions.ReadObjectAction},
+			Resource: permissions.ObjectArn(src, "secret/*"),
+		}},
+	}
+	require.NoError(t, deps.AuthService.WritePolicy(ctx, deny, false))
+	require.NoError(t, deps.AuthService.AttachPolicyToUser(ctx, deny.DisplayName, exfiltrator))
+
+	t.Run("whole-repository prefix", func(t *testing.T) {
+		body := createDatasetBody(t, "exfil-all", prefixDefinition(src, commit.String(), "", ""), true)
+		rec := doRequest(t, handler, http.MethodPost, "", body, cred.AccessKeyID, cred.SecretAccessKey)
+		require.Equal(t, http.StatusForbidden, rec.Code, "body: %s", rec.Body.String())
+		message := decodeError(t, rec).Message
+		require.Contains(t, message, "data[0]", "the 403 names the item (§9.3)")
+		require.Contains(t, message, "secret/*", "the 403 names the deny that made it fail")
+		// Nothing was created: the check runs before the dataset exists.
+		getRec := doRequest(t, handler, http.MethodGet, "/exfil-all", "", accessKey, secret)
+		require.Equal(t, http.StatusNotFound, getRec.Code)
+	})
+
+	t.Run("prefix that only starts like the denied path", func(t *testing.T) {
+		body := createDatasetBody(t, "exfil-sec", prefixDefinition(src, commit.String(), "", "sec"), true)
+		rec := doRequest(t, handler, http.MethodPost, "", body, cred.AccessKeyID, cred.SecretAccessKey)
+		require.Equal(t, http.StatusForbidden, rec.Code, "body: %s", rec.Body.String())
+		message := decodeError(t, rec).Message
+		require.Contains(t, message, "data[0]")
+		require.Contains(t, message, "secret/*")
+	})
+
+	t.Run("a prefix outside the deny still publishes", func(t *testing.T) {
+		body := createDatasetBody(t, "exfil-public", prefixDefinition(src, commit.String(), "", "public/"), true)
+		rec := doRequest(t, handler, http.MethodPost, "", body, cred.AccessKeyID, cred.SecretAccessKey)
+		require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
 	})
 }
 
