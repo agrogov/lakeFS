@@ -26,17 +26,29 @@ const (
 	DatasetsReadAllPolicy    = "DatasetsReadAll"
 )
 
+// defaultDatasetsEnabled is the production default of the datasets feature switch: off.
+//
+// The datasets feature is not part of this binary yet, so nothing can turn it on: the
+// production bootstrap (pkg/sso.EnsureRBACBase) calls the bootstrap without options and
+// therefore gets the off behaviour. When the feature lands, the flag has to be plumbed from
+// configuration into EnsureRBACBaseGroups, and that wiring has to be coordinated with
+// RBACBootstrapVersion in pkg/sso/rbac_bootstrap.go: the version guard skips the bootstrap
+// once a version has been recorded, so a later switch from off to on must either bump the
+// version or bypass the guard, otherwise the datasets policies are never created.
+const defaultDatasetsEnabled = false
+
 // BaseGroupsOption configures optional parts of the RBAC bootstrap.
 type BaseGroupsOption func(*baseGroupsConfig)
 
 type baseGroupsConfig struct {
-	// datasetsEnabled attaches the datasets built-in policies to the base groups.
+	// datasetsEnabled creates the datasets built-in policies and attaches them to the base groups.
 	datasetsEnabled bool
 }
 
-// WithDatasetsEnabled makes the RBAC bootstrap attach the datasets policies when the datasets feature is enabled
-// (RBAC_DESIGN.md §5.4). Without it the bootstrap is unchanged, so installations without datasets get no
-// datasets policies attached.
+// WithDatasetsEnabled turns the datasets built-in policy set on (RBAC_DESIGN.md §5.4): the
+// policies are created *and* attached to the base groups. With it off - the production
+// default - CreateRBACBasePolicies does not create the datasets policies at all, so an
+// installation that does not use datasets never gets unattached policies in the Policies UI.
 func WithDatasetsEnabled(enabled bool) BaseGroupsOption {
 	return func(c *baseGroupsConfig) {
 		c.datasetsEnabled = enabled
@@ -44,7 +56,12 @@ func WithDatasetsEnabled(enabled bool) BaseGroupsOption {
 }
 
 func newBaseGroupsConfig(opts ...BaseGroupsOption) *baseGroupsConfig {
-	cfg := &baseGroupsConfig{}
+	cfg := &baseGroupsConfig{
+		// Policy creation and attachment are gated by the same flag, so the bootstrap can
+		// never leave an orphan datasets policy behind. The default is stated explicitly
+		// rather than left to the zero value.
+		datasetsEnabled: defaultDatasetsEnabled,
+	}
 	for _, opt := range opts {
 		opt(cfg)
 	}
@@ -71,10 +88,14 @@ func createPolicies(ctx context.Context, authService auth.Service, policies []*m
 	return nil
 }
 
-func CreateRBACBasePolicies(ctx context.Context, authService auth.Service, ts time.Time) error {
+// CreateRBACBasePolicies creates the built-in RBAC policies. The datasets policies are part of
+// the template only when WithDatasetsEnabled(true) is passed, mirroring the group attachments in
+// EnsureRBACBaseGroups: an installation either gets the datasets policies attached or not at all.
+func CreateRBACBasePolicies(ctx context.Context, authService auth.Service, ts time.Time, opts ...BaseGroupsOption) error {
+	cfg := newBaseGroupsConfig(opts...)
 	all := []string{permissions.All}
 
-	return createPolicies(ctx, authService, []*model.Policy{
+	policies := []*model.Policy{
 		{
 			CreatedAt:   ts,
 			DisplayName: "FSFullAccess",
@@ -122,18 +143,6 @@ func CreateRBACBasePolicies(ctx context.Context, authService auth.Service, ts ti
 			DisplayName: "CatalogReadWriteAll",
 			Statement:   auth.MakeStatementForPolicyTypeOrDie("CatalogReadWrite", all),
 		},
-		// Datasets control-plane policies (DATASETS_DESIGN.md §9.5). They are attached to the base groups by
-		// EnsureRBACBaseGroups only when the datasets feature is enabled.
-		{
-			CreatedAt:   ts,
-			DisplayName: DatasetsFullAccessPolicy,
-			Statement:   auth.MakeStatementForPolicyTypeOrDie("DatasetsFull", all),
-		},
-		{
-			CreatedAt:   ts,
-			DisplayName: DatasetsReadAllPolicy,
-			Statement:   auth.MakeStatementForPolicyTypeOrDie("DatasetsRead", all),
-		},
 		{
 			CreatedAt:   ts,
 			DisplayName: "RepoManagementReadAll",
@@ -160,7 +169,26 @@ func CreateRBACBasePolicies(ctx context.Context, authService auth.Service, ts ti
 				[]string{permissions.UserArn("${user}")},
 			),
 		},
-	})
+	}
+
+	if cfg.datasetsEnabled {
+		// Datasets control-plane policies (DATASETS_DESIGN.md §9.5). Created only when the datasets feature is
+		// enabled, together with their attachments in EnsureRBACBaseGroups.
+		policies = append(policies,
+			&model.Policy{
+				CreatedAt:   ts,
+				DisplayName: DatasetsFullAccessPolicy,
+				Statement:   auth.MakeStatementForPolicyTypeOrDie("DatasetsFull", all),
+			},
+			&model.Policy{
+				CreatedAt:   ts,
+				DisplayName: DatasetsReadAllPolicy,
+				Statement:   auth.MakeStatementForPolicyTypeOrDie("DatasetsRead", all),
+			},
+		)
+	}
+
+	return createPolicies(ctx, authService, policies)
 }
 
 func attachPolicies(ctx context.Context, authService auth.Service, groupID string, policyIDs []string) error {
@@ -173,6 +201,11 @@ func attachPolicies(ctx context.Context, authService auth.Service, groupID strin
 	return nil
 }
 
+// EnsureRBACBaseGroups creates the groups, built-in policies and attachments of the RBAC base
+// template. It is idempotent: existing groups, policies and attachments are left unchanged.
+//
+// WithDatasetsEnabled(true) adds the datasets built-in policies to both the policy set and the
+// group attachments; with the default (off) no datasets policy is created or attached at all.
 func EnsureRBACBaseGroups(ctx context.Context, authService auth.Service, ts time.Time, opts ...BaseGroupsOption) error {
 	cfg := newBaseGroupsConfig(opts...)
 
@@ -186,7 +219,7 @@ func EnsureRBACBaseGroups(ctx context.Context, authService auth.Service, ts time
 		return err
 	}
 
-	err = CreateRBACBasePolicies(ctx, authService, ts)
+	err = CreateRBACBasePolicies(ctx, authService, ts, opts...)
 	if err != nil {
 		return err
 	}
@@ -220,7 +253,8 @@ func EnsureRBACBaseGroups(ctx context.Context, authService auth.Service, ts time
 }
 
 // CreateRBACBaseGroups creates the RBAC base groups, policies and attachments.
-// It is idempotent and keeps existing policies unchanged.
+// It is idempotent and keeps existing policies unchanged. It takes the same options as
+// EnsureRBACBaseGroups, including WithDatasetsEnabled (off by default).
 func CreateRBACBaseGroups(ctx context.Context, authService auth.Service, ts time.Time, opts ...BaseGroupsOption) error {
 	return EnsureRBACBaseGroups(ctx, authService, ts, opts...)
 }
