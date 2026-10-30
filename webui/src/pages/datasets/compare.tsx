@@ -9,6 +9,9 @@ import { DefinitionDiff, datasets } from '../../lib/api/datasets';
 import { AlertError, Loading } from '../../lib/components/controls';
 import { useDatasetVersion, versionNumbers } from '../../lib/components/datasets/hooks';
 import { DefinitionDiffTable } from '../../lib/components/datasets/definitionDiffTable';
+// The proposal detail renders the same object diff as a table, so the `_dataset/` filtering
+// lives beside both of them. Re-exported here for the compare page's own callers.
+import { dataDiffEntries, INTERNAL_DATASET_PREFIX } from '../../lib/components/datasets/dataDiffTable';
 import { DatasetVersionPicker } from '../../lib/components/datasets/versionPicker';
 import { VersionSelection, normaliseSelection, versionTag } from '../../lib/components/datasets/versions';
 import { ChangesTreeContainer } from '../../lib/components/repository/changes';
@@ -35,10 +38,7 @@ export const isCompareTab = (value: string | undefined): value is CompareTabKey 
  * The synthetic `_dataset/` entries every version carries: the definition document, not data
  * (§6.4, §10.3). The control plane's own data diff filters them out, and so does this page.
  */
-export const INTERNAL_DATASET_PREFIX = '_dataset/';
-
-export const dataDiffEntries = <T extends { path: string }>(entries: T[] | undefined): T[] =>
-    (entries ?? []).filter((entry) => !entry.path.startsWith(INTERNAL_DATASET_PREFIX));
+export { dataDiffEntries, INTERNAL_DATASET_PREFIX };
 
 /** The default comparison: the newest version against the one before it. */
 export const defaultCompareRefs = (latest: number): { left: string; right: string } => {

@@ -69,6 +69,15 @@ const fetchDatasetNames = async (): Promise<Set<string>> => getDatasetNames();
 // ---------------------------------------------------------------------------
 
 export const DATASETS_CREATE_ACTION = 'datasets:CreateDataset';
+export const DATASETS_PUBLISH_ACTION = 'datasets:PublishVersion';
+export const DATASETS_MANAGE_ACCESS_ACTION = 'datasets:ManageAccess';
+export const DATASETS_MANAGE_METADATA_KEYS_ACTION = 'datasets:ManageMetadataKeys';
+
+/** The `§9.1` ARN of one dataset: `arn:lakefs:datasets:::dataset/<name>`. */
+export const datasetResource = (name: string): string => `arn:lakefs:datasets:::dataset/${name}`;
+
+/** The `§9.1` ARN of one metadata key: `arn:lakefs:datasets:::metadata-key/<key>`. */
+export const metadataKeyResource = (key: string): string => `arn:lakefs:datasets:::metadata-key/${key}`;
 
 /** Policy shape returned by `GET /auth/users/{id}/policies?effective=true`. */
 interface PolicyStatementLike {
@@ -125,19 +134,41 @@ export const policiesAllow = (policies: PolicyLike[], action: string, resource: 
  * falls back to "yes": the server enforces the permission anyway, and hiding a button from a
  * user who is allowed is worse than showing one that fails with `403`.
  */
-export const useCanCreateDataset = (): boolean => {
-    const { response, loading, error } = useAPI(fetchCanCreateDataset, []);
-    if (loading) return false;
-    if (error) return true;
-    return response ?? true;
+export const useCanCreateDataset = (): boolean => useCan(DATASETS_CREATE_ACTION, SAMPLE_DATASET_ARN);
+
+export interface PermissionState {
+    /** The decision; `false` while it is still unknown, so nothing appears before it arrives. */
+    allowed: boolean;
+    loading: boolean;
+    /** Set when the policies could not be read (e.g. `501` in simplified ACL mode). */
+    error: Error | null;
+}
+
+/**
+ * `datasets:<action>` on one resource, from the user's effective policies.
+ *
+ * This only decides what the UI *offers*; the control plane re-checks every permission and
+ * answers `403` regardless. A failure to read the policies counts as "allowed" for the same
+ * reason as `useCanCreateDataset`: the server is the authority, and a permitted user must not
+ * lose a control because the policy listing is unavailable (simplified ACL mode answers
+ * `501` there).
+ */
+export const usePermission = (action: string, resource: string): PermissionState => {
+    const { response, loading, error } = useAPI(() => fetchCan(action, resource), [action, resource]);
+    if (loading) return { allowed: false, loading: true, error: null };
+    if (error) return { allowed: true, loading: false, error: error as Error };
+    return { allowed: response ?? true, loading: false, error: null };
 };
 
-const fetchCanCreateDataset = async (): Promise<boolean> => {
+/** `usePermission` when only the yes/no answer is needed. */
+export const useCan = (action: string, resource: string): boolean => usePermission(action, resource).allowed;
+
+const fetchCan = async (action: string, resource: string): Promise<boolean> => {
     const user = await auth.getCurrentUserWithCache();
     if (!user?.id) return false;
     const policies = await auth.listUserPolicies(user.id, true);
     const results: PolicyLike[] = policies?.results ?? [];
-    return policiesAllow(results, DATASETS_CREATE_ACTION, SAMPLE_DATASET_ARN);
+    return policiesAllow(results, action, resource);
 };
 
 // ---------------------------------------------------------------------------
