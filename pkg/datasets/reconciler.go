@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/treeverse/lakefs/pkg/auth"
+	"github.com/treeverse/lakefs/pkg/auth/model"
 	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/graveler"
 	"github.com/treeverse/lakefs/pkg/kv"
@@ -581,6 +582,9 @@ func (r *Reconciler) finishDelete(ctx context.Context, rec *DatasetRecord, repor
 	if err := r.catalog.DeleteRepository(ctx, dataset, graveler.WithForce(true)); err != nil && !isNotFound(err) {
 		return fmt.Errorf("datasets: finish delete of repository %q: %w", dataset, err)
 	}
+	// §9.4: the repository is gone, so the authorizer guard must stop denying on its name (the
+	// per-dataset immutability policy is dropped a few lines below).
+	r.svc.forgetDatasetRepo(dataset)
 
 	var errs []error
 	// §6.6 step 3: the pins of every version.
@@ -715,9 +719,21 @@ func (r *Reconciler) ensureInstallationPolicies(ctx context.Context, names []str
 		{DatasetConsumersGroup, []string{DatasetsReadAllPolicyName, DatasetsAllReadPolicyName}},
 	}
 	for _, attachment := range attachments {
-		if err := attachDatasetPolicies(ctx, r.svc.authService, attachment.group, attachment.policies); err != nil {
+		if err := attachDatasetPolicies(ctx, r.svc.authService, r.log, attachment.group, attachment.policies); err != nil {
 			return err
 		}
+	}
+
+	// §8.2: re-create and re-attach the installation-wide pin protection too. It is the defence in
+	// depth of the §9.4 authorizer guard (immutability_guard.go): a principal the guard does not
+	// cover is still stopped by the deny policy, so neither a deleted policy nor a detached
+	// attachment may survive a pass. createDatasetPolicies never overwrites an existing policy, so an
+	// administrator's edit is left alone (the same promise the bootstrap makes).
+	if err := createDatasetPolicies(ctx, r.svc.authService, []*model.Policy{PinsProtectPolicy(r.now())}); err != nil {
+		return err
+	}
+	if err := attachPinsProtectPolicy(ctx, r.svc.authService, r.log, r.svc.cfg.ImmutableGuardGroups); err != nil {
+		return err
 	}
 	return nil
 }

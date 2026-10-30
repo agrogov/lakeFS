@@ -202,12 +202,14 @@ func TestImmutabilityPolicy(t *testing.T) {
 	require.Equal(t, ts, policy.CreatedAt)
 	require.NoError(t, acl.ValidatePolicy(policy), "the immutability policy must be a valid lakeFS policy")
 
-	// §9.4: the full deny action list.
+	// §9.4: the full deny action list, including the import/pull-request/catalog mutations SEC-2
+	// of DATASETS_REVIEW.md added.
 	wantActions := []string{
 		"fs:WriteObject", "fs:DeleteObject", "fs:CreateCommit", "fs:CreateBranch", "fs:DeleteBranch",
 		"fs:RevertBranch", "fs:CreateTag", "fs:DeleteTag", "fs:UpdateRepository", "fs:DeleteRepository",
-		"fs:ImportFromStorage", "fs:AttachStorageNamespace", "branches:SetBranchProtectionRules",
-		"retention:SetGarbageCollectionRules", "ci:WriteAction",
+		"fs:ImportFromStorage", "fs:ImportCancel", "fs:AttachStorageNamespace", "branches:SetBranchProtectionRules",
+		"retention:SetGarbageCollectionRules", "pr:WritePullRequest",
+		"catalog:Create*", "catalog:Update*", "catalog:Delete*", "ci:WriteAction",
 	}
 	require.Len(t, policy.Statement, 2, "exactly two statements: repository and repository/*")
 	for i, stmt := range policy.Statement {

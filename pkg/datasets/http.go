@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/getkin/kin-openapi/openapi3filter"
@@ -71,6 +72,25 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 	if err != nil {
 		return err
 	}
+
+	// §9.5 and §8.2: the installation-wide policies and groups, the per-group immutability
+	// attachments and the datasets-pins-protect deny policy must exist on every start. Without
+	// this call nothing in production ever created them (SEC-1 of DATASETS_REVIEW.md): a plain
+	// member of Developers could delete pin branches, and GC would then collect data published
+	// dataset versions still serve. Bootstrap is idempotent, so running it on every start is
+	// what keeps a hand-edited installation honest; a failure is fatal, because a server that
+	// silently runs without the pin protection corrupts data later.
+	if err := Bootstrap(ctx, deps.AuthService, time.Now(),
+		WithBootstrapLogger(deps.Logger),
+		WithPinsProtectGroups(ImmutabilityGuardGroups(cfg.ImmutableGuardGroups)),
+	); err != nil {
+		return fmt.Errorf("datasets: bootstrap installation policies: %w", err)
+	}
+
+	// §9.4: the authorizer decorator installed by the auth-service builder keeps the set of
+	// dataset repositories in immutable_guard.go; the service updates it as it creates and
+	// deletes datasets, so a dataset repository is protected from the moment it exists.
+	svc.setDatasetRepoIndex(installedOrNewDatasetRepoIndex(deps.KVStore, deps.Logger))
 
 	// The core AuthMiddleware is bound to the swagger routes, so the datasets router wraps
 	// itself with the exported GenericAuthMiddleware. It honours the same schemes as the core

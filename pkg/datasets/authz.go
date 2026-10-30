@@ -475,9 +475,13 @@ func ImmutabilityPolicyName(dataset string) string {
 }
 
 // immutabilityDeniedActions is the deny action list of §9.4. It covers every way a writer could
-// change the dataset repository through the data plane or the management API: objects, commits,
-// branches, tags, repository settings, storage attachment, GC rules, branch protection rules and
-// CI actions.
+// change the dataset repository through the data plane, the management API or the Iceberg catalog
+// API: objects, commits, branches, tags, imports, pull requests, repository settings, storage
+// attachment, GC rules, branch protection rules, catalog objects and CI actions.
+//
+// The list is also read by the authorizer guard of immutability_guard.go, so an action that is
+// missing here is a way around the immutability guarantee for callers the per-group attachment
+// does not cover (SEC-2 of DATASETS_REVIEW.md).
 var immutabilityDeniedActions = []string{
 	permissions.WriteObjectAction,
 	permissions.DeleteObjectAction,
@@ -490,9 +494,14 @@ var immutabilityDeniedActions = []string{
 	permissions.UpdateRepositoryAction,
 	permissions.DeleteRepositoryAction,
 	permissions.ImportFromStorageAction,
+	permissions.ImportCancelAction,
 	permissions.AttachStorageNamespaceAction,
 	permissions.SetBranchProtectionRulesAction,
 	permissions.SetGarbageCollectionRulesAction,
+	permissions.WritePullRequestAction,
+	catalogCreateActionPattern,
+	catalogUpdateActionPattern,
+	catalogDeleteActionPattern,
 	ciWriteAction,
 }
 
@@ -501,9 +510,29 @@ var immutabilityDeniedActions = []string{
 // (design §4.4).
 const ciWriteAction = "ci:WriteAction"
 
+// Iceberg catalog mutation actions (ICEBERG_CATALOG_PLAN.md §7.2): creating, updating or deleting
+// a namespace, table or view rewrites the catalog state of the dataset repository, so it must be
+// denied on a dataset repository like any other write.
+//
+// They are patterns rather than the concrete permissions.Catalog* constants on purpose: a catalog
+// mutation action added later is denied by default instead of silently bypassing the guard.
+// pkg/permissions.IsValidAction validates the service prefix of an action pattern, not the whole
+// name, so a pattern is a valid policy action and the deny list matches exactly the way the policy
+// engine matches actions (wildcard.Match, pkg/auth/service.go CheckPermissions).
+const (
+	catalogCreateActionPattern = "catalog:Create*"
+	catalogUpdateActionPattern = "catalog:Update*"
+	catalogDeleteActionPattern = "catalog:Delete*"
+)
+
 // ImmutabilityPolicy builds the immutability deny policy of dataset name, byte-for-byte the
 // statements of design §9.4: the deny action list on the dataset repository ARN and on
 // arn:lakefs:fs:::repository/<name>/*.
+//
+// It is the defence in depth of the §9.4 guarantee: the guarantee itself is enforced in the
+// authorizer (immutability_guard.go), because a policy can only deny the principals it is attached
+// to, and write power under `internal` RBAC also comes from custom groups, SSO-synced groups and
+// policies attached directly to a user (SEC-2 of DATASETS_REVIEW.md).
 //
 // It uses two exact resources - repository/<name> and repository/<name>/* - and NOT
 // repository/<name>*, which would also deny access to an unrelated repository named
@@ -549,21 +578,26 @@ var PinBranchResourcePattern = "arn:lakefs:fs:::repository/*/branch/" + PinBranc
 
 // pinsProtectDeniedActions is the deny action list of the datasets-pins-protect policy (§8.2).
 // fs:DeleteBranch is the action the design names: it removes the pin and disarms the protection of
-// every dataset version pinned to that commit. The other two are the remaining ways a principal can
-// defeat a pin through the API, and both are authorized against a *branch* ARN
-// (pkg/api Controller.Commit and Controller.ResetBranch), so the pin resource pattern matches them:
-// fs:CreateCommit moves the pin's HEAD off the pinned commit, and fs:RevertBranch does the same by
-// pointing it at an ancestor. Deleting the whole source repository also deletes its pins, but that
+// every dataset version pinned to that commit. The other three are the remaining ways a principal
+// can defeat a pin through the API. All of them are authorized against a *branch* ARN
+// (pkg/api Controller.DeleteBranch, Controller.CreateBranch, Controller.Commit and
+// Controller.ResetBranch), so the pin resource pattern matches them: fs:CreateCommit moves the
+// pin's HEAD off the pinned commit, fs:RevertBranch does the same by pointing it at an ancestor,
+// and fs:CreateBranch lets a principal *squat* on the name before a publish pins the commit - the
+// pre-created branch then fails pins.verifyPinBranch with ErrPinBranchConflict, which makes every
+// publish of that commit fail. Deleting the whole source repository also deletes its pins, but that
 // action is authorized against a repository ARN (which this branch pattern deliberately does not
 // match); it is the "source repo deleted" risk of §8.2, handled by degraded detection instead.
 var pinsProtectDeniedActions = []string{
 	permissions.DeleteBranchAction,
+	permissions.CreateBranchAction,
 	permissions.CreateCommitAction,
 	permissions.RevertBranchAction,
 }
 
 // PinsProtectPolicy builds the datasets-pins-protect deny policy of §8.2: no principal may delete a
-// hidden pin branch, in any repository, and pin branches are not writable.
+// hidden pin branch, in any repository, no principal may create one (a squatted name makes every
+// publish of the commit it impersonates fail), and pin branches are not writable.
 //
 // It is installation-wide (no dataset name in it) because pins live in the source repositories,
 // whose names have nothing to do with the datasets that pinned them. Bootstrap attaches it to the

@@ -152,6 +152,11 @@ type Service struct {
 	// onTaskUpdate observes every TaskRecord transition. It is nil in production and is
 	// what makes the pending -> running -> completed sequence of §6.5 assertable in tests.
 	onTaskUpdate func(TaskRecord)
+
+	// datasetRepos is the cached set of dataset repository names the §9.4 authorizer guard
+	// (immutability_guard.go) reads. The service keeps it in step with its own writes; it is
+	// nil when no guard is installed in this process (a test that builds a bare Service).
+	datasetRepos *DatasetRepoIndex
 }
 
 // NewService builds the control-plane service. It requires the datasets configuration, the
@@ -208,6 +213,31 @@ func (s *Service) Wait() { s.wg.Wait() }
 
 // Config returns the configuration the service was built with, for GET /datasets/config.
 func (s *Service) Config() *Config { return s.cfg }
+
+// setDatasetRepoIndex attaches the dataset repository index the authorizer guard reads, so that a
+// dataset repository is immutable from the moment it exists (immutability_guard.go). RoutesBuilder
+// passes the index the decorator installed; a nil index leaves the service without one, which only
+// matters for the guard, not for the control plane.
+func (s *Service) setDatasetRepoIndex(index *DatasetRepoIndex) {
+	s.datasetRepos = index
+}
+
+// rememberDatasetRepo marks name as a dataset repository: from here on the authorizer guard denies
+// every §9.4 write action on it, whichever group or direct policy granted the caller the write.
+func (s *Service) rememberDatasetRepo(name string) {
+	if s.datasetRepos != nil {
+		s.datasetRepos.Add(name)
+	}
+}
+
+// forgetDatasetRepo drops name from the guard's set, after the dataset repository is gone. The
+// per-dataset immutability policy is dropped in the same step, so nothing keeps denying on a name
+// that a later dataset may reuse.
+func (s *Service) forgetDatasetRepo(name string) {
+	if s.datasetRepos != nil {
+		s.datasetRepos.Remove(name)
+	}
+}
 
 // CreateRequest is the input of Service.Create: the §5.1 envelope without its name (which
 // travels separately, because it is also the URL/record key).
@@ -308,6 +338,9 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 		}
 		return nil, fmt.Errorf("datasets: create repository %q: %w", req.Name, err)
 	}
+	// §9.4: the repository exists from here on, so it is already immutable for every principal
+	// the authorizer guard covers, before it holds a single object.
+	s.rememberDatasetRepo(req.Name)
 	metadata := graveler.RepositoryMetadata{
 		RepositoryMetadataIsDatasetKey: "true",
 		RepositoryMetadataFormatKey:    strconv.Itoa(FormatVersion),
@@ -517,6 +550,7 @@ func (s *Service) Delete(ctx context.Context, caller Caller, name string) error 
 	if err := s.catalog.DeleteRepository(ctx, name, graveler.WithForce(true)); err != nil && !isNotFound(err) {
 		return fmt.Errorf("datasets: delete repository %q: %w", name, err)
 	}
+	s.forgetDatasetRepo(name)
 
 	// §6.6 step 3: release the GC pins of every version. Releasing works from the pin
 	// records, so it also covers a version whose definition is stored out of line (§5.3).

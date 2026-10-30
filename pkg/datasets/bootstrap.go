@@ -19,6 +19,7 @@ import (
 
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/model"
+	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/permissions"
 )
 
@@ -264,6 +265,10 @@ type BootstrapConfig struct {
 	// in addition to the base groups of both group templates. The server passes
 	// datasets.immutable_guard_groups, the same list that extends the immutability guard.
 	PinsProtectGroups []string
+
+	// Logger reports the attachments that are skipped because the group does not exist in this
+	// installation's group template. The zero value is replaced by logging.FromContext(ctx).
+	Logger logging.Logger
 }
 
 // BootstrapOption configures Bootstrap.
@@ -282,6 +287,14 @@ func WithBootstrapDatasets(datasetNames []string) BootstrapOption {
 func WithPinsProtectGroups(groups []string) BootstrapOption {
 	return func(c *BootstrapConfig) {
 		c.PinsProtectGroups = groups
+	}
+}
+
+// WithBootstrapLogger passes the server logger, so a skipped attachment can be logged instead of
+// being silent.
+func WithBootstrapLogger(logger logging.Logger) BootstrapOption {
+	return func(c *BootstrapConfig) {
+		c.Logger = logger
 	}
 }
 
@@ -308,7 +321,11 @@ func WithPinsProtectGroups(groups []string) BootstrapOption {
 // reading the data it publishes is a separate grant - per dataset through the consumer read
 // policy of §9.2, or installation-wide by putting the publisher in DatasetAdmins.
 //
-// Bootstrap is idempotent: it is safe to run on every startup.
+// Bootstrap is idempotent: it is safe to run on every startup. RoutesBuilder calls it on every
+// start of the server (SEC-1 of DATASETS_REVIEW.md), because without it the installation-wide
+// datasets-pins-protect deny policy and the built-in groups simply do not exist: a plain member of
+// Developers could delete pin branches, which lets GC collect data published dataset versions
+// still serve.
 //
 //   - Policies and groups are created with "create if absent" semantics and auth.ErrAlreadyExists
 //     is treated as success, so a second run creates nothing. Existing built-in policies are
@@ -317,7 +334,10 @@ func WithPinsProtectGroups(groups []string) BootstrapOption {
 //     pkg/auth/setup makes the same promise).
 //   - Attachments likewise tolerate auth.ErrAlreadyExists, so re-running re-creates attachments
 //     that were detached by hand - including the datasets-all-read attachment - without
-//     duplicating anything.
+//     duplicating anything. A group that does not exist in this installation's group template
+//     (the simplified ACL template and the RBAC template ship different base groups) is skipped at
+//     debug level rather than reported as a failure: the reconciler calls the same helper and must
+//     still reach its pin repair.
 //   - The one exception is datasets-all-read, which is machine-managed: it is rewritten only when
 //     its statement set differs from the current dataset list (see EnsureDatasetsAllReadPolicy).
 //
@@ -333,6 +353,10 @@ func Bootstrap(ctx context.Context, authService auth.Service, ts time.Time, opts
 	cfg := &BootstrapConfig{}
 	for _, opt := range opts {
 		opt(cfg)
+	}
+	log := cfg.Logger
+	if log == nil {
+		log = logging.FromContext(ctx)
 	}
 
 	if err := createDatasetPolicies(ctx, authService, []*model.Policy{
@@ -366,11 +390,11 @@ func Bootstrap(ctx context.Context, authService auth.Service, ts time.Time, opts
 		{DatasetConsumersGroup, []string{DatasetsReadAllPolicyName, DatasetsAllReadPolicyName}},
 	}
 	for _, attachment := range attachments {
-		if err := attachDatasetPolicies(ctx, authService, attachment.group, attachment.policies); err != nil {
+		if err := attachDatasetPolicies(ctx, authService, log, attachment.group, attachment.policies); err != nil {
 			return err
 		}
 	}
-	return attachPinsProtectPolicy(ctx, authService, cfg.PinsProtectGroups)
+	return attachPinsProtectPolicy(ctx, authService, log, cfg.PinsProtectGroups)
 }
 
 // attachPinsProtectPolicy attaches datasets-pins-protect (§8.2) to the non-service groups of the
@@ -381,10 +405,17 @@ func Bootstrap(ctx context.Context, authService auth.Service, ts time.Time, opts
 // runs both, so most of the names are expected to be absent. Tolerating auth.ErrNotFound keeps the
 // deny policy out of the way of a template the installation does not use, while still covering every
 // principal that is a member of a group the installation does have.
-func attachPinsProtectPolicy(ctx context.Context, authService auth.Service, extraGroups []string) error {
+func attachPinsProtectPolicy(ctx context.Context, authService auth.Service, log logging.Logger, extraGroups []string) error {
 	for _, group := range PinsProtectGroups(extraGroups) {
 		err := authService.AttachPolicyToGroup(ctx, DatasetsPinsProtectPolicyName, group)
-		if err != nil && !errors.Is(err, auth.ErrAlreadyExists) && !errors.Is(err, auth.ErrNotFound) {
+		switch {
+		case err == nil, errors.Is(err, auth.ErrAlreadyExists):
+		case errors.Is(err, auth.ErrNotFound):
+			log.WithFields(logging.Fields{
+				"policy": DatasetsPinsProtectPolicyName,
+				"group":  group,
+			}).Debug("datasets: group does not exist in this installation's group template; not attaching the pins-protect policy")
+		default:
 			return err
 		}
 	}
@@ -416,10 +447,22 @@ func createDatasetGroups(ctx context.Context, authService auth.Service, ts time.
 // attachDatasetPolicies attaches policies to group, ignoring auth.ErrAlreadyExists. It is a
 // re-attach, not a replace: detaching a built-in policy from a built-in group is undone on the
 // next bootstrap, which is what the reconciler promises for the immutability guard too (§12.3).
-func attachDatasetPolicies(ctx context.Context, authService auth.Service, group string, policies []string) error {
+//
+// A group that does not exist is skipped at debug level instead of failing the caller. Under RBAC a
+// group is only missing when the installation does not use that template, and failing here would
+// stop Reconcile before it repairs pins and guards (SEC-1 of DATASETS_REVIEW.md) - the very repair
+// that keeps GC from collecting published dataset data.
+func attachDatasetPolicies(ctx context.Context, authService auth.Service, log logging.Logger, group string, policies []string) error {
 	for _, policy := range policies {
 		err := authService.AttachPolicyToGroup(ctx, policy, group)
-		if err != nil && !errors.Is(err, auth.ErrAlreadyExists) {
+		switch {
+		case err == nil, errors.Is(err, auth.ErrAlreadyExists):
+		case errors.Is(err, auth.ErrNotFound):
+			log.WithFields(logging.Fields{
+				"policy": policy,
+				"group":  group,
+			}).Debug("datasets: group does not exist in this installation's group template; not attaching the managed policy")
+		default:
 			return err
 		}
 	}

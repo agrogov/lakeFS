@@ -118,8 +118,10 @@ func TestBootstrapCreatesTheBuiltins(t *testing.T) {
 		},
 		DatasetsPinsProtectPolicyName: {
 			{
-				Effect:   model.StatementEffectDeny,
-				Action:   []string{permissions.DeleteBranchAction, permissions.CreateCommitAction, permissions.RevertBranchAction},
+				Effect: model.StatementEffectDeny,
+				// fs:CreateBranch stops a principal from squatting on the pin branch name before a
+				// publish pins the commit (SEC-1 of DATASETS_REVIEW.md).
+				Action:   []string{permissions.DeleteBranchAction, permissions.CreateBranchAction, permissions.CreateCommitAction, permissions.RevertBranchAction},
 				Resource: "arn:lakefs:fs:::repository/*/branch/_lakefs_ds_pin_*",
 			},
 		},
