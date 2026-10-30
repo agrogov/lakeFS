@@ -530,6 +530,64 @@ func ImmutabilityPolicy(dataset string, ts time.Time) *model.Policy {
 	}
 }
 
+// DatasetsPinsProtectPolicyName is the display name of the installation-wide deny policy that keeps
+// ordinary principals from deleting GC pin branches in source repositories (§8.2):
+// "datasets-pins-protect".
+//
+// It is a deny, so it wins over the fs:* allow of an administrator: only the service itself can
+// delete a pin branch, and it does that through the catalog directly instead of through Authorize
+// (§4.6). Without it, a source-repository admin deleting a pin branch would silently disarm the
+// protection of every dataset version pinned to that commit, and the next GC run in the source
+// repository would delete objects datasets still serve.
+const DatasetsPinsProtectPolicyName = "datasets-pins-protect"
+
+// PinBranchResourcePattern is the resource of the datasets-pins-protect policy (§8.2):
+// arn:lakefs:fs:::repository/*/branch/_lakefs_ds_pin_*. Spike S2b (spikes_pins_test.go) proves that
+// auth.ArnMatch wildcard-matches the middle of an ARN resource, that it spans "/", that it selects
+// pin branches in every repository, and that it leaves ordinary branches alone.
+var PinBranchResourcePattern = "arn:lakefs:fs:::repository/*/branch/" + PinBranchPrefix + "*"
+
+// pinsProtectDeniedActions is the deny action list of the datasets-pins-protect policy (§8.2).
+// fs:DeleteBranch is the action the design names: it removes the pin and disarms the protection of
+// every dataset version pinned to that commit. The other two are the remaining ways a principal can
+// defeat a pin through the API, and both are authorized against a *branch* ARN
+// (pkg/api Controller.Commit and Controller.ResetBranch), so the pin resource pattern matches them:
+// fs:CreateCommit moves the pin's HEAD off the pinned commit, and fs:RevertBranch does the same by
+// pointing it at an ancestor. Deleting the whole source repository also deletes its pins, but that
+// action is authorized against a repository ARN (which this branch pattern deliberately does not
+// match); it is the "source repo deleted" risk of §8.2, handled by degraded detection instead.
+var pinsProtectDeniedActions = []string{
+	permissions.DeleteBranchAction,
+	permissions.CreateCommitAction,
+	permissions.RevertBranchAction,
+}
+
+// PinsProtectPolicy builds the datasets-pins-protect deny policy of §8.2: no principal may delete a
+// hidden pin branch, in any repository, and pin branches are not writable.
+//
+// It is installation-wide (no dataset name in it) because pins live in the source repositories,
+// whose names have nothing to do with the datasets that pinned them. Bootstrap attaches it to the
+// base groups plus the extra groups the installation lists in datasets.immutable_guard_groups; the
+// service is not a group member, and it bypasses Authorize anyway (§4.6).
+func PinsProtectPolicy(ts time.Time) *model.Policy {
+	return &model.Policy{
+		CreatedAt:   ts,
+		DisplayName: DatasetsPinsProtectPolicyName,
+		Statement: model.Statements{{
+			Effect:   model.StatementEffectDeny,
+			Action:   append([]string(nil), pinsProtectDeniedActions...),
+			Resource: PinBranchResourcePattern,
+		}},
+	}
+}
+
+// PinsProtectGroups returns the groups the datasets-pins-protect policy is attached to (§8.2): the
+// same non-service principals the immutability guard covers - the base groups of both group
+// templates plus extra - deduplicated and in a stable order.
+func PinsProtectGroups(extra []string) []string {
+	return ImmutabilityGuardGroups(extra)
+}
+
 // immutabilityGuardBaseGroups are the groups every installation guards (§9.4): the base groups of
 // both lakeFS group templates, so the guard covers members of either one. The simplified ACL
 // template ships Admins/Supers/Writers/Readers and the RBAC template ships

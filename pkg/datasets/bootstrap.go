@@ -259,6 +259,11 @@ type BootstrapConfig struct {
 	// policy; when they are unknown at startup the policy is created with the list statement
 	// alone and the service adds data-plane statements on the next create/delete.
 	Datasets []string
+
+	// PinsProtectGroups lists extra groups that get the datasets-pins-protect deny policy (§8.2)
+	// in addition to the base groups of both group templates. The server passes
+	// datasets.immutable_guard_groups, the same list that extends the immutability guard.
+	PinsProtectGroups []string
 }
 
 // BootstrapOption configures Bootstrap.
@@ -272,10 +277,19 @@ func WithBootstrapDatasets(datasetNames []string) BootstrapOption {
 	}
 }
 
-// Bootstrap creates the built-in datasets policies and groups of DATASETS_DESIGN.md §9.5:
+// WithPinsProtectGroups passes extra groups that must also receive the datasets-pins-protect deny
+// policy of §8.2 (datasets.immutable_guard_groups).
+func WithPinsProtectGroups(groups []string) BootstrapOption {
+	return func(c *BootstrapConfig) {
+		c.PinsProtectGroups = groups
+	}
+}
+
+// Bootstrap creates the built-in datasets policies and groups of DATASETS_DESIGN.md §9.5, plus the
+// installation-wide datasets-pins-protect deny policy of §8.2:
 //
 //	policies: DatasetsFullAccess, DatasetsReadWriteAll, DatasetsReadAll,
-//	          DatasetsManageMetadataKeys, and the managed datasets-all-read
+//	          DatasetsManageMetadataKeys, datasets-pins-protect, and the managed datasets-all-read
 //	groups:   DatasetAdmins, DatasetPublishers, DatasetConsumers
 //
 // and attaches the policies to the groups:
@@ -283,6 +297,11 @@ func WithBootstrapDatasets(datasetNames []string) BootstrapOption {
 //	DatasetAdmins     DatasetsFullAccess, datasets-all-read
 //	DatasetPublishers DatasetsReadWriteAll
 //	DatasetConsumers  DatasetsReadAll, datasets-all-read
+//
+// datasets-pins-protect is not attached to a dataset group: it protects *source* repositories, so
+// it goes to the base groups of both group templates (§9.4's non-service principals) plus the
+// extra groups of datasets.immutable_guard_groups. Attaching it to a group that does not exist in
+// this installation is skipped rather than fatal (see attachPinsProtectPolicy).
 //
 // The data-plane read of every dataset is granted by the managed datasets-all-read policy (§9.5
 // note), which only the admins and the consumers get: a publisher may publish a definition, and
@@ -321,6 +340,7 @@ func Bootstrap(ctx context.Context, authService auth.Service, ts time.Time, opts
 		datasetsReadWriteAllPolicy(ts),
 		datasetsReadAllPolicy(ts),
 		datasetsManageMetadataKeysPolicy(ts),
+		PinsProtectPolicy(ts),
 	}); err != nil {
 		return err
 	}
@@ -347,6 +367,24 @@ func Bootstrap(ctx context.Context, authService auth.Service, ts time.Time, opts
 	}
 	for _, attachment := range attachments {
 		if err := attachDatasetPolicies(ctx, authService, attachment.group, attachment.policies); err != nil {
+			return err
+		}
+	}
+	return attachPinsProtectPolicy(ctx, authService, cfg.PinsProtectGroups)
+}
+
+// attachPinsProtectPolicy attaches datasets-pins-protect (§8.2) to the non-service groups of the
+// installation, tolerating groups that do not exist.
+//
+// Unlike the §9.5 attachments, a missing group is not an error here: the base group list covers both
+// group templates (simplified ACL and RBAC, see immutabilityGuardBaseGroups), and no installation
+// runs both, so most of the names are expected to be absent. Tolerating auth.ErrNotFound keeps the
+// deny policy out of the way of a template the installation does not use, while still covering every
+// principal that is a member of a group the installation does have.
+func attachPinsProtectPolicy(ctx context.Context, authService auth.Service, extraGroups []string) error {
+	for _, group := range PinsProtectGroups(extraGroups) {
+		err := authService.AttachPolicyToGroup(ctx, DatasetsPinsProtectPolicyName, group)
+		if err != nil && !errors.Is(err, auth.ErrAlreadyExists) && !errors.Is(err, auth.ErrNotFound) {
 			return err
 		}
 	}

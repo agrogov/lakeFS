@@ -62,14 +62,16 @@ func TestBootstrapCreatesTheBuiltins(t *testing.T) {
 
 	require.NoError(t, Bootstrap(t.Context(), f.svc, ts))
 
-	// §9.5: four built-in policies plus the managed all-read policy. policyNames sorts with
-	// sort.Strings, so upper-case names come first.
+	// §9.5: four built-in policies plus the managed all-read policy, and the installation-wide
+	// §8.2 datasets-pins-protect deny policy. policyNames sorts with sort.Strings, so upper-case
+	// names come first.
 	require.Equal(t, []string{
 		DatasetsFullAccessPolicyName,
 		DatasetsManageMetadataKeysPolicyName,
 		DatasetsReadAllPolicyName,
 		DatasetsReadWriteAllPolicyName,
 		DatasetsAllReadPolicyName,
+		DatasetsPinsProtectPolicyName,
 	}, f.policyNames(t))
 
 	// §9.5: three groups.
@@ -113,6 +115,13 @@ func TestBootstrapCreatesTheBuiltins(t *testing.T) {
 			{Effect: model.StatementEffectAllow, Resource: permissions.All, Action: []string{
 				"fs:ListRepositories", "datasets:ListDatasets",
 			}},
+		},
+		DatasetsPinsProtectPolicyName: {
+			{
+				Effect:   model.StatementEffectDeny,
+				Action:   []string{permissions.DeleteBranchAction, permissions.CreateCommitAction, permissions.RevertBranchAction},
+				Resource: "arn:lakefs:fs:::repository/*/branch/_lakefs_ds_pin_*",
+			},
 		},
 	}
 	for name, want := range tests {
@@ -305,6 +314,57 @@ func TestBootstrapAllReadGrantsDataPlaneRead(t *testing.T) {
 	}
 	// A repository that is not a dataset stays out of reach.
 	require.Error(t, f.authz.Check(ctx, consumer, objectRead("lakehouse-repo", "data/customers/c1.parquet"), ""))
+}
+
+// TestBootstrapPinsProtectDeniesPinBranchDeletion pins the §8.2 mitigation end to end: bootstrap
+// creates the deny policy, attaches it to the base groups that exist in the installation, and hides
+// none of it behind a group the installation does not have. A member of a base group can no longer
+// delete a pin branch, in any repository, while ordinary branches stay deletable and re-creatable.
+func TestBootstrapPinsProtectDeniesPinBranchDeletion(t *testing.T) {
+	t.Parallel()
+	f := newAuthzFixture(t)
+	ts := time.Date(2026, 10, 28, 10, 0, 0, 0, time.UTC)
+	ctx := t.Context()
+
+	// The base group this installation has (the simplified ACL template ships Writers).
+	f.group(t, "Writers")
+	f.group(t, "custom-operators")
+	f.user(t, "writer")
+	f.user(t, "operator")
+	f.addToGroup(t, "writer", "Writers")
+	f.addToGroup(t, "operator", "custom-operators")
+
+	require.NoError(t, Bootstrap(ctx, f.svc, ts, WithPinsProtectGroups([]string{"custom-operators", "missing-group"})))
+
+	// The policy is attached to the existing base group and to the configured extra group; the
+	// unknown group is skipped instead of failing the bootstrap.
+	require.Contains(t, f.groupPolicyNames(t, "Writers"), DatasetsPinsProtectPolicyName)
+	require.Contains(t, f.groupPolicyNames(t, "custom-operators"), DatasetsPinsProtectPolicyName)
+
+	deleteBranch := func(repo, branch string) permissions.Node {
+		return permissions.Node{Permission: permissions.Permission{
+			Action:   permissions.DeleteBranchAction,
+			Resource: permissions.BranchArn(repo, branch),
+		}}
+	}
+	for _, user := range []string{"writer", "operator"} {
+		caller := Caller{Username: user}
+		require.ErrorIs(t, f.authz.Check(ctx, caller, deleteBranch("lakehouse-repo", "_lakefs_ds_pin_30f9eb1c"), ""),
+			ErrPermissionDenied, "%s must not be able to delete a pin branch", user)
+		require.ErrorIs(t, f.authz.Check(ctx, caller, deleteBranch("ref-data", "_lakefs_ds_pin_abc"), ""),
+			ErrPermissionDenied, "%s must not be able to delete a pin branch in another repository", user)
+	}
+
+	// The deny is scoped to pin branches: with the default deny-all base policy, an ordinary branch
+	// delete is still decided by the ordinary allow rules, not by this policy.
+	f.policy(t, "allow-delete-feature", model.Statements{{
+		Effect:   model.StatementEffectAllow,
+		Action:   []string{permissions.DeleteBranchAction},
+		Resource: permissions.BranchArn("lakehouse-repo", "feature"),
+	}})
+	f.attachToGroup(t, "allow-delete-feature", "Writers")
+	require.NoError(t, f.authz.Check(ctx, Caller{Username: "writer"}, deleteBranch("lakehouse-repo", "feature"), ""),
+		"datasets-pins-protect must not affect ordinary branches")
 }
 
 // TestBootstrapWithoutServiceFailsClosed pins that a missing auth service is an error, not a
