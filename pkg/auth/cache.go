@@ -29,6 +29,10 @@ type Cache interface {
 
 	// InvalidateUser removes the cached user entries for the given keys.
 	InvalidateUser(keys ...UserKey)
+	// InvalidateCredential removes the cached credential of a single access key
+	// ID.  Credentials are cached by access key ID alone, so they are not covered
+	// by the user-keyed invalidations.
+	InvalidateCredential(accessKeyID string)
 	// InvalidateUserPolicies removes the cached policies of a single user.
 	InvalidateUserPolicies(userID string)
 	// PurgePolicies removes all cached user policies.
@@ -90,6 +94,10 @@ func (c *LRUCache) InvalidateUser(keys ...UserKey) {
 	}
 }
 
+func (c *LRUCache) InvalidateCredential(accessKeyID string) {
+	c.credentialsCache.Delete(accessKeyID)
+}
+
 func (c *LRUCache) InvalidateUserPolicies(userID string) {
 	c.policyCache.Delete(userID)
 }
@@ -118,6 +126,8 @@ func (d *DummyCache) GetExternalPrincipal(_ string, setFn ExternalPrincipalFn) (
 }
 
 func (d *DummyCache) InvalidateUser(_ ...UserKey) {}
+
+func (d *DummyCache) InvalidateCredential(_ string) {}
 
 func (d *DummyCache) InvalidateUserPolicies(_ string) {}
 

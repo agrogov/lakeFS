@@ -688,6 +688,305 @@ func TestAuthService_RevocationIsImmediate(t *testing.T) {
 	}
 }
 
+// newLongTTLService returns an ACL service with the LRU cache enabled and a TTL
+// far beyond any test, so a cache hit can only be explained by the absence of
+// an invalidation - never by expiry.
+func newLongTTLService(ctx context.Context, t *testing.T) *authacl.AuthService {
+	t.Helper()
+	s := authacl.NewAuthService(kvtest.GetStore(ctx, t), crypt.NewSecretStore(someSecret), authparams.ServiceCache{
+		Enabled: true,
+		Size:    1024,
+		TTL:     time.Hour,
+		Jitter:  0,
+	})
+	// The property under test is cache invalidation, so make sure the service is
+	// not falling back to the no-op DummyCache.
+	require.IsType(t, &auth.LRUCache{}, s.Cache())
+	return s
+}
+
+// TestAuthService_GrantIsImmediate is the grant-direction counterpart of
+// TestAuthService_RevocationIsImmediate (design §4.10): every grant performed
+// through the service API allows the very next Authorize call, while the
+// negative decision that preceded it is still cached.
+//
+// Each case primes an empty effective-policy list (two consecutive denies, so
+// the list is definitely cached), applies the grant, and then requires that the
+// very next Authorize allows. With a one-hour TTL an allow cannot come from
+// expiry, only from explicit invalidation.
+func TestAuthService_GrantIsImmediate(t *testing.T) {
+	t.Parallel()
+
+	type fixture struct {
+		username   string
+		groupName  string
+		policyName string
+	}
+
+	// writeAllowWritePolicy writes a policy that does *not* allow ReadObject, so
+	// the update case starts from a cached deny.
+	writeAllowWritePolicy := func(t *testing.T, ctx context.Context, s *authacl.AuthService, policyName string) {
+		t.Helper()
+		err := s.WritePolicy(ctx, &model.Policy{
+			DisplayName: policyName,
+			Statement: model.Statements{
+				{Action: []string{permissions.WriteObjectAction}, Resource: "*", Effect: model.StatementEffectAllow},
+			},
+		}, false)
+		require.NoError(t, err)
+	}
+
+	tests := []struct {
+		name string
+		// setup establishes everything the grant needs, leaving the user denied.
+		setup func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture)
+		// grant applies the mutation under test.
+		grant func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture)
+	}{
+		{
+			// Kills the mutant that drops the policy invalidation in
+			// AttachPolicyToUser.
+			name: "attach_user_policy",
+			setup: func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture) {
+				t.Helper()
+				writeAllowReadPolicy(t, ctx, s, f.policyName)
+			},
+			grant: func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture) {
+				t.Helper()
+				require.NoError(t, s.AttachPolicyToUser(ctx, f.policyName, f.username))
+			},
+		},
+		{
+			// Kills the mutant that drops the policy invalidation in
+			// AttachPolicyToGroup.
+			name: "attach_group_policy",
+			setup: func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture) {
+				t.Helper()
+				_, err := s.CreateGroup(ctx, &model.Group{DisplayName: f.groupName})
+				require.NoError(t, err)
+				require.NoError(t, s.AddUserToGroup(ctx, f.username, f.groupName))
+				writeAllowReadPolicy(t, ctx, s, f.policyName)
+			},
+			grant: func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture) {
+				t.Helper()
+				require.NoError(t, s.AttachPolicyToGroup(ctx, f.policyName, f.groupName))
+			},
+		},
+		{
+			// Kills the mutant that drops the policy invalidation in
+			// AddUserToGroup.
+			name: "add_user_to_group",
+			setup: func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture) {
+				t.Helper()
+				_, err := s.CreateGroup(ctx, &model.Group{DisplayName: f.groupName})
+				require.NoError(t, err)
+				writeAllowReadPolicy(t, ctx, s, f.policyName)
+				require.NoError(t, s.AttachPolicyToGroup(ctx, f.policyName, f.groupName))
+			},
+			grant: func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture) {
+				t.Helper()
+				require.NoError(t, s.AddUserToGroup(ctx, f.username, f.groupName))
+			},
+		},
+		{
+			// Kills the mutant that drops the policy purge in
+			// WritePolicy(update=true).
+			name: "update_policy",
+			setup: func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture) {
+				t.Helper()
+				writeAllowWritePolicy(t, ctx, s, f.policyName)
+				require.NoError(t, s.AttachPolicyToUser(ctx, f.policyName, f.username))
+			},
+			grant: func(t *testing.T, ctx context.Context, s *authacl.AuthService, f fixture) {
+				t.Helper()
+				require.NoError(t, s.WritePolicy(ctx, &model.Policy{
+					DisplayName: f.policyName,
+					Statement: model.Statements{
+						{Action: []string{permissions.ReadObjectAction}, Resource: "*", Effect: model.StatementEffectAllow},
+					},
+				}, true))
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			s := newLongTTLService(ctx, t)
+
+			f := fixture{username: "grant-user", groupName: "grant-group", policyName: "grant-policy"}
+			_, err := s.CreateUser(ctx, &model.User{Username: f.username})
+			require.NoError(t, err)
+			tt.setup(t, ctx, s, f)
+
+			// Warm the effective-policy cache with the deny that precedes the grant.
+			for range 2 { // twice: the second call is served from the cache
+				resp, err := authorizeReadObject(ctx, s, f.username)
+				require.NoError(t, err)
+				require.NotNil(t, resp)
+				require.False(t, resp.Allowed, "grant should not exist before the mutation")
+			}
+
+			tt.grant(t, ctx, s, f)
+
+			// Well inside the TTL: an allow now proves the cache was invalidated.
+			resp, err := authorizeReadObject(ctx, s, f.username)
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+			require.True(t, resp.Allowed, "grant did not take effect until the cache TTL expired")
+		})
+	}
+}
+
+// TestAuthService_UpdateUserProfileIsImmediate pins design §1.1 #1 and R55: a
+// profile write through the service API is visible immediately, under both the
+// username and the email lookup keys, while the entries are still cached.
+func TestAuthService_UpdateUserProfileIsImmediate(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s := newLongTTLService(ctx, t)
+
+	const (
+		username  = "profile-user"
+		oldEmail  = "old@example.com"
+		newEmail  = "new@example.com"
+		oldName   = "Old Name"
+		newName   = "New Name"
+		newerName = "Newer Name"
+	)
+	_, err := s.CreateUser(ctx, &model.User{
+		Username:     username,
+		Email:        ptr(oldEmail),
+		FriendlyName: ptr(oldName),
+	})
+	require.NoError(t, err)
+
+	// Warm the username and the email lookup keys, with a long TTL.
+	_, err = s.GetUser(ctx, username)
+	require.NoError(t, err)
+	_, err = s.GetUserByEmail(ctx, oldEmail)
+	require.NoError(t, err)
+
+	// Change the email and the friendly name through UpdateUserProfile.
+	require.NoError(t, s.UpdateUserProfile(ctx, username, newEmail, newName))
+
+	// The username-keyed entry must already reflect the new profile.
+	user, err := s.GetUser(ctx, username)
+	require.NoError(t, err)
+	require.NotNil(t, user.Email)
+	require.Equal(t, newEmail, *user.Email)
+	require.NotNil(t, user.FriendlyName)
+	require.Equal(t, newName, *user.FriendlyName)
+
+	// The old email lookup key must no longer resolve, and the new one must.
+	_, err = s.GetUserByEmail(ctx, oldEmail)
+	require.ErrorIs(t, err, auth.ErrNotFound, "stale email lookup key survived the profile update")
+	byEmail, err := s.GetUserByEmail(ctx, newEmail)
+	require.NoError(t, err)
+	require.Equal(t, username, byEmail.Username)
+
+	// UpdateUserFriendlyName delegates to UpdateUserProfile and must invalidate too.
+	require.NoError(t, s.UpdateUserFriendlyName(ctx, username, newerName))
+	user, err = s.GetUser(ctx, username)
+	require.NoError(t, err)
+	require.NotNil(t, user.FriendlyName)
+	require.Equal(t, newerName, *user.FriendlyName)
+	// The email is untouched by a friendly-name-only update.
+	require.NotNil(t, user.Email)
+	require.Equal(t, newEmail, *user.Email)
+	byEmail, err = s.GetUserByEmail(ctx, newEmail)
+	require.NoError(t, err)
+	require.Equal(t, username, byEmail.Username)
+}
+
+// TestAuthService_DeleteCredentialsIsImmediate pins GAP-07 / R64: revoking a
+// credential must deny the very next authentication attempt, even though
+// GetCredentials serves credentials from a cache keyed by access key ID.
+func TestAuthService_DeleteCredentialsIsImmediate(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s := newLongTTLService(ctx, t)
+
+	const username = "credential-user"
+	_, err := s.CreateUser(ctx, &model.User{Username: username})
+	require.NoError(t, err)
+	cred, err := s.CreateCredentials(ctx, username)
+	require.NoError(t, err)
+
+	// Warm the credential cache and check the credential is live.
+	for range 2 { // twice: the second call is served from the cache
+		c, err := s.GetCredentials(ctx, cred.AccessKeyID)
+		require.NoError(t, err)
+		require.Equal(t, username, c.Username)
+	}
+	// Authentication goes through the same cached lookup.
+	authenticator := auth.NewBuiltinAuthenticator(s)
+	gotUser, err := authenticator.AuthenticateUser(ctx, cred.AccessKeyID, cred.SecretAccessKey)
+	require.NoError(t, err)
+	require.Equal(t, username, gotUser)
+
+	require.NoError(t, s.DeleteCredentials(ctx, username, cred.AccessKeyID))
+
+	// Well inside the TTL: the revoked access key must not resolve any more.
+	_, err = s.GetCredentials(ctx, cred.AccessKeyID)
+	require.ErrorIs(t, err, auth.ErrNotFound, "revoked credential survived in the cache")
+
+	gotUser, err = authenticator.AuthenticateUser(ctx, cred.AccessKeyID, cred.SecretAccessKey)
+	require.Error(t, err, "revoked credential still authenticates")
+	require.ErrorIs(t, err, auth.ErrNotFound)
+	require.Equal(t, auth.InvalidUserID, gotUser)
+}
+
+// TestAuthService_AddCredentialsInvalidatesCredentialCache pins the creation half
+// of the credential cache pair (GAP-07): credentials are cached by access key ID
+// alone, so writing a credential must drop any entry left behind for the same
+// access key ID by another writer of the same KV partition (a second lakeFS
+// replica's ACL service, a restore, or a migration). Without the invalidation the
+// re-created credential would be shadowed by the stale cached one until the TTL.
+func TestAuthService_AddCredentialsInvalidatesCredentialCache(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	kvStore := kvtest.GetStore(ctx, t)
+	s := authacl.NewAuthService(kvStore, crypt.NewSecretStore(someSecret), authparams.ServiceCache{
+		Enabled: true,
+		Size:    1024,
+		TTL:     time.Hour, // far beyond the test: only invalidation can refresh
+		Jitter:  0,
+	})
+	require.IsType(t, &auth.LRUCache{}, s.Cache())
+
+	const (
+		username    = "recreate-credential-user"
+		accessKeyID = "AKIAREADDFIRST"
+	)
+	_, err := s.CreateUser(ctx, &model.User{Username: username})
+	require.NoError(t, err)
+	_, err = s.AddCredentials(ctx, username, accessKeyID, "first-secret")
+	require.NoError(t, err)
+
+	// Warm the credential cache with the original secret.
+	cached, err := s.GetCredentials(ctx, accessKeyID)
+	require.NoError(t, err)
+	require.Equal(t, "first-secret", cached.SecretAccessKey)
+
+	// A different writer removes the record without going through this service's
+	// cache-aware delete path, then the same access key ID is re-created.
+	require.NoError(t, kvStore.Delete(ctx, []byte(model.PartitionKey), model.CredentialPath(username, accessKeyID)))
+	_, err = s.AddCredentials(ctx, username, accessKeyID, "second-secret")
+	require.NoError(t, err)
+
+	// The very next lookup must see the new secret, not the cached one.
+	got, err := s.GetCredentials(ctx, accessKeyID)
+	require.NoError(t, err)
+	require.Equal(t, "second-secret", got.SecretAccessKey, "stale credential cache entry shadowed the new credential")
+}
+
+// ptr returns a pointer to v.
+func ptr[T any](v T) *T {
+	return &v
+}
+
 func TestAuthService_DeleteGroupWithRelations(t *testing.T) {
 	t.Parallel()
 	userNames := []string{"first", "second", "third"}
