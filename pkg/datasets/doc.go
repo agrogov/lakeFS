@@ -10,14 +10,12 @@
 // this package may import pkg/catalog, pkg/graveler, pkg/auth, pkg/block, pkg/kv,
 // pkg/permissions and pkg/api (only for GenericAuthMiddleware).
 //
-// The package currently holds five layers. The definition model and its metadata
-// validation live in definition.go, validate.go and metadata_keys.go (§5.1-§5.2,
-// §5.5). The control-plane KV persistence layer lives in store.go (§5.3-§5.4). The
-// authorization building blocks and bootstrap policies live in authz.go and
-// bootstrap.go (§9). The control-plane OpenAPI spec (api/datasets.yml) and its
-// generated stubs (pkg/datasets/apigen, wired by http.go and handlers.go) define the
-// REST surface of §10. The materialisation primitive in resolve.go and materialize.go
-// resolves refs, merges the source iterators and commits and tags a dataset version
-// (§6.2-§6.4), as the library the service layer will call. The design-phase spike
-// evidence (S2 and S4) remains as executable tests.
+// The package holds the definition model and metadata validation (definition.go,
+// validate.go, metadata_keys.go), the publish primitive that turns a resolved definition
+// into a dataset version (resolve.go, materialize.go), the GC pins of §8.2 (pins.go), the
+// control-plane KV persistence layer (store.go, §5.3), the service that owns the dataset
+// lifecycle, the validate dry run and the access grants (service.go), the HTTP handlers
+// (handlers.go, http.go) and the design-phase spike evidence (S2 and S4) as executable
+// tests. Publishing a new version, diffs, proposals, metadata key CRUD and the reconciler
+// land in later phases.
 package datasets

@@ -44,11 +44,12 @@ func newSpikeFixture(t *testing.T) *spikeFixture {
 	_, err := config.NewConfig("", cfg)
 	testutil.MustDo(t, "build config", err)
 	cfg.Committed.LocalCache.Dir = t.TempDir()
-	// The catalog caches repository records for ~5s by default, which would hide a repository
-	// deletion from the pin tests (degraded detection, release after the source repository is gone).
-	// Disable that cache, as the branch-protection cache is shortened below; the pin manager reads
-	// repository state through the catalog.
+	// Disable the repository and commit caches: they are wall-clock caches (default expiry is
+	// seconds), so a create-after-delete assertion would race with them. This is a test-only
+	// knob, like the settings cache override below. The pin manager reads repository state
+	// through the catalog.
 	cfg.Graveler.RepositoryCache.Size = 0
+	cfg.Graveler.CommitCache.Size = 0
 
 	store, err := kv.Open(ctx, kvparams.Config{Type: "mem"})
 	require.NoError(t, err, "open mem kv store")
