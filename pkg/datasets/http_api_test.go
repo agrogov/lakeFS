@@ -383,8 +383,9 @@ func TestDatasetsBadRequest400(t *testing.T) {
 
 // TestDatasetsNotImplemented501 is the 501 mapping for the operations of later phases: they
 // are still stubs and say so, and the answer is reached only after authentication and request
-// validation succeed. The create/get/list/delete/validate and access-grant operations of this
-// phase are covered by the CRUD tests instead.
+// validation succeed. The implemented operations - CRUD, validate, access grants, version
+// publish/read and the version diff - are covered by the CRUD, versions_http_test.go and
+// diff_test.go tests instead, so their routes are absent from the table below.
 func TestDatasetsNotImplemented501(t *testing.T) {
 	handler, accessKey, secret := newControlPlane(t)
 
@@ -401,8 +402,9 @@ func TestDatasetsNotImplemented501(t *testing.T) {
 		{"UpdateMetadataKey", http.MethodPut, "/metadata-keys/classification", `{"required": true}`},
 		{"DeleteMetadataKey", http.MethodDelete, "/metadata-keys/classification", ""},
 		// The version and task routes of §10.1 are implemented; their HTTP contract is covered
-		// by versions_http_test.go, so they no longer answer 501 here.
-		{"DiffRefs", http.MethodGet, "/customer-360/refs/v1/diff/v2", ""},
+		// by versions_http_test.go. The DiffRefs route of §10.3 is implemented too; its HTTP
+		// contract is covered by TestDatasetsHTTPDiff in diff_test.go. None of them answer 501
+		// any more, so none has a row here.
 		{"ListProposals", http.MethodGet, "/customer-360/proposals?status=open", ""},
 		{"CreateProposal", http.MethodPost, "/customer-360/proposals",
 			`{"title": "add countries", "definition": ` + enterpriseDefinition + `}`},

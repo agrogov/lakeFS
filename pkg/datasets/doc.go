@@ -11,11 +11,12 @@
 // pkg/permissions and pkg/api (only for GenericAuthMiddleware).
 //
 // The package holds the definition model and metadata validation (definition.go,
-// validate.go, metadata_keys.go), the publish primitive that turns a resolved definition
-// into a dataset version (resolve.go, materialize.go), the GC pins of §8.2 (pins.go), the
-// control-plane KV persistence layer (store.go, §5.3), the service that owns the dataset
-// lifecycle, publishing (synchronous and asynchronous, §6.2 and §6.5), the version reads
-// and the access grants (service.go), the HTTP handlers (handlers.go, http.go) and the
-// design-phase spike evidence (S2 and S4) as executable tests. Diffs, proposals, metadata
-// key CRUD and the reconciler land in later phases.
+// validate.go, metadata_keys.go), the control-plane KV persistence layer (store.go, §5.3),
+// authorization and bootstrap (authz.go, bootstrap.go), the OpenAPI spec and its generated
+// server stubs (api/datasets.yml, apigen, http.go, handlers.go), materialisation
+// (resolve.go, materialize.go), the GC pins with degraded detection of §8.2 (pins.go), the
+// service that owns the dataset lifecycle including publish/versions and the validate dry
+// run (service.go), the version diff of §10.3 (diff.go), and the design-phase spike evidence
+// (S2 and S4) as executable tests. Proposals, metadata-key CRUD, the reconciler, the CLI and
+// the remaining UI pages land in later phases.
 package datasets
