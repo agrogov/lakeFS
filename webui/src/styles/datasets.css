@@ -112,3 +112,29 @@
     text-decoration: none;
     vertical-align: middle;
 }
+
+/* Dataset editor (DATASETS_DESIGN.md §11.2) */
+.dataset-editor-definition .policy-document {
+    min-height: 320px;
+}
+
+.dataset-items-table td,
+.dataset-items-table th {
+    vertical-align: top;
+}
+
+.dataset-item-problems {
+    border-top: 1px dashed var(--border);
+}
+
+.dataset-metadata-chip-input {
+    max-width: 420px;
+}
+
+.dataset-path-picker-table td {
+    vertical-align: middle;
+}
+
+.dataset-path-picker-breadcrumb .breadcrumb-item {
+    cursor: pointer;
+}

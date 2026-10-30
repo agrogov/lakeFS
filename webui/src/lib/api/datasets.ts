@@ -172,8 +172,13 @@ export interface DataItem {
     namespace?: Record<string, unknown>;
 }
 
-/** Metadata values are `string | number | boolean | string[]` (§5.1). */
-export type MetadataValue = string | number | boolean | string[];
+/**
+ * A metadata value is a JSON scalar, or an array of scalars for an `allow_multiple` key (§5.1,
+ * §5.5). The array element type follows the key type: strings/dates/enums are strings, numbers
+ * are numbers and booleans are booleans (see `pkg/datasets/metadata_validate.go`).
+ */
+export type MetadataScalarValue = string | number | boolean;
+export type MetadataValue = MetadataScalarValue | MetadataScalarValue[];
 
 export interface DatasetDefinition {
     format_version: 1;
