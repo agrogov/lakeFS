@@ -271,6 +271,7 @@ var runCmd = &cobra.Command{
 			baseCfg.Logging.TraceRequestHeaders,
 			baseCfg.Gateways.S3.VerifyUnsupported,
 			authService.IsAdvancedAuth(),
+			baseCfg.Security.TrustedProxies,
 		)
 		s3gatewayHandler = apiAuthenticator(s3gatewayHandler)
 

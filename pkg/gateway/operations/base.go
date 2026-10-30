@@ -62,6 +62,7 @@ type Operation struct {
 	MatchedHost       bool
 	PathProvider      upload.PathProvider
 	VerifyUnsupported bool
+	ClientIPResolver  *httputil.ClientIPResolver
 }
 
 // reportBytes reports the number of bytes transferred by a data operation. It is
@@ -83,6 +84,12 @@ func StorageClassFromHeader(header http.Header) *string {
 
 func (o *Operation) Log(req *http.Request) logging.Logger {
 	return logging.FromContext(req.Context())
+}
+
+// ClientIP returns the request client IP used by auth policy conditions, honouring forwarding
+// headers only from security.trusted_proxies. A nil resolver trusts no proxy.
+func (o *Operation) ClientIP(req *http.Request) string {
+	return o.ClientIPResolver.Extract(req.Header, req.RemoteAddr)
 }
 
 func EncodeXMLBytes(w http.ResponseWriter, t []byte, statusCode int) error {

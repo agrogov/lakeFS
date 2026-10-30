@@ -150,7 +150,8 @@ func EnrichWithOperation(sc *ServerContext, next http.Handler) http.Handler {
 					Client:     client,
 				}, uint64(size)) //nolint:gosec
 			},
-			PathProvider: sc.pathProvider,
+			PathProvider:     sc.pathProvider,
+			ClientIPResolver: sc.clientIPResolver,
 		}
 
 		// Parse URL to determine operation ID
@@ -189,14 +190,14 @@ func MetricsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func EnrichWithRepositoryOrFallback(c *catalog.Catalog, authService auth.GatewayService, fallbackProxy http.Handler, next http.Handler) http.Handler {
+func EnrichWithRepositoryOrFallback(c *catalog.Catalog, authService auth.GatewayService, fallbackProxy http.Handler, clientIPResolver *httputil.ClientIPResolver, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		ctx := req.Context()
 		repoID := ctx.Value(ContextKeyRepositoryID).(string)
 		// Attach the authorization condition context once the bucket is known. Every authorization
 		// from here on - including per-object re-authorization inside an operation handler - then
 		// evaluates policy conditions against the request.
-		req = withConditionContext(req, c, repoID)
+		req = withConditionContext(req, c, repoID, clientIPResolver)
 		ctx = req.Context()
 		user, _ := auth.GetUser(ctx)
 		username := user.Username
@@ -208,7 +209,7 @@ func EnrichWithRepositoryOrFallback(c *catalog.Catalog, authService auth.Gateway
 		}
 		repo, err := c.GetRepository(ctx, repoID)
 		if errors.Is(err, graveler.ErrNotFound) {
-			clientIP := httputil.ExtractClientIP(req.Header, req.RemoteAddr)
+			clientIP := clientIPResolver.Extract(req.Header, req.RemoteAddr)
 
 			authResp, authErr := authService.Authorize(ctx, &auth.AuthorizationRequest{
 				Username: username,

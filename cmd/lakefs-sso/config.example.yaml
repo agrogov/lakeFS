@@ -88,6 +88,20 @@ auth:
       - "internal_auth_session"
       - "oidc_auth_session"
 
+# Client IP resolution for IpAddress / SourceIp policy conditions (and audit logs).
+# By default lakeFS does NOT trust X-Forwarded-For or X-Real-IP: the client IP is the transport
+# peer address (RemoteAddr), so a caller cannot spoof the IP that an IP-conditioned policy sees.
+# If lakeFS runs behind a reverse proxy or load balancer, list that proxy here; only then are the
+# forwarding headers honoured, walking X-Forwarded-For from right to left to the first untrusted
+# hop. Use CIDRs, single IPs, or "*" to trust every peer (which restores the old, spoofable
+# behaviour and should be used only when the proxy strips client-supplied forwarding headers).
+# This is a behaviour change from earlier versions, which always trusted the leftmost XFF entry:
+# deployments behind a proxy that do not configure this will see the proxy address as the client.
+# security:
+#   trusted_proxies:
+#     - "10.0.0.0/8"
+#     - "2001:db8:1::/48"
+
 sso:
   enabled: true
   client_id: "<Application (client) ID from Azure>"

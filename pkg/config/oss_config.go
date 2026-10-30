@@ -27,6 +27,9 @@ func (c *ConfigImpl) Validate() error {
 	if err := c.Auth.ValidateAuthorizationFailureStatus(); err != nil {
 		return err
 	}
+	if err := c.ValidateTrustedProxies(); err != nil {
+		return err
+	}
 	missingKeys := ValidateMissingRequiredKeys(c, "mapstructure", "squash")
 	if len(missingKeys) > 0 {
 		return fmt.Errorf("%w: %v", ErrMissingRequiredKeys, missingKeys)

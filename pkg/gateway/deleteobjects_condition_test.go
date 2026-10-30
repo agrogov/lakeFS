@@ -99,6 +99,7 @@ func newBulkDeleteConditionHandler(t *testing.T, svc auth.GatewayService) http.H
 		false,
 		false,
 		false,
+		nil,
 	)
 }
 
@@ -133,18 +134,24 @@ func TestDeleteObjectsPolicyConditions(t *testing.T) {
 	handler := newBulkDeleteConditionHandler(t, svc)
 
 	tests := []struct {
-		name     string
-		clientIP string
-		wantDeny bool
+		name          string
+		clientIP      string
+		xForwardedFor string
+		wantDeny      bool
 	}{
 		{name: "conditional deny from matching IP blocks the delete", clientIP: allowedIP, wantDeny: true},
 		{name: "conditional deny from another IP does not apply", clientIP: "198.51.100.7", wantDeny: false},
+		{name: "spoofed X-Forwarded-For does not evade a matching-IP deny", clientIP: allowedIP, xForwardedFor: "198.51.100.7", wantDeny: true},
+		{name: "spoofed X-Forwarded-For does not trigger a deny for another IP", clientIP: "198.51.100.7", xForwardedFor: allowedIP, wantDeny: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			body := `<Delete><Object><Key>main/file.txt</Key></Object></Delete>`
 			req := httptest.NewRequest(http.MethodPost, "/"+bulkDeleteConditionRepo+"/?delete", strings.NewReader(body))
 			req.Header.Set("Content-Type", "application/xml")
+			if tt.xForwardedFor != "" {
+				req.Header.Set("X-Forwarded-For", tt.xForwardedFor)
+			}
 			req.RemoteAddr = net.JoinHostPort(tt.clientIP, "1234")
 			req = req.WithContext(auth.WithUser(req.Context(), &model.User{Username: "user1"}))
 

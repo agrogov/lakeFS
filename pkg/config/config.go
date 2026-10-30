@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/viper"
 	apiparams "github.com/treeverse/lakefs/pkg/api/params"
 	blockparams "github.com/treeverse/lakefs/pkg/block/params"
+	"github.com/treeverse/lakefs/pkg/httputil"
 	"github.com/treeverse/lakefs/pkg/logging"
 )
 
@@ -30,6 +31,10 @@ var (
 // ErrInvalidAuthorizationFailureStatus is returned when auth.authorization_failure_status is not a
 // status code lakeFS can return for an authorization failure.
 var ErrInvalidAuthorizationFailureStatus = fmt.Errorf("%w: auth.authorization_failure_status must be 401 (unauthorized) or 403 (forbidden)", ErrBadConfiguration)
+
+// ErrInvalidTrustedProxy is returned when security.trusted_proxies contains an entry that is not a
+// CIDR, an IP address or the "*" wildcard.
+var ErrInvalidTrustedProxy = fmt.Errorf("%w: security.trusted_proxies", ErrBadConfiguration)
 
 // UseLocalConfiguration set to true will add defaults that enable a lakeFS run
 // without any other configuration like DB or blockstore.
@@ -564,6 +569,12 @@ type BaseConfig struct {
 		CheckLatestVersionCache time.Duration `mapstructure:"check_latest_version_cache"`
 		AuditCheckInterval      time.Duration `mapstructure:"audit_check_interval"`
 		AuditCheckURL           string        `mapstructure:"audit_check_url"`
+		// TrustedProxies lists the proxies whose X-Forwarded-For / X-Real-IP headers are honoured
+		// when resolving the client IP used by IpAddress/SourceIp policy conditions. Entries are
+		// CIDRs, single IPs, or "*" to trust every peer. Empty (the default) trusts no proxy and
+		// uses the transport peer address, so a client cannot spoof its source IP. Deployments
+		// behind a proxy must list that proxy here for X-Forwarded-For to take effect.
+		TrustedProxies []string `mapstructure:"trusted_proxies"`
 	} `mapstructure:"security"`
 	UsageReport struct {
 		// Deprecated: Value ignored
@@ -684,7 +695,19 @@ func (c *BaseConfig) Validate() error {
 	if len(missingKeys) > 0 {
 		return fmt.Errorf("%w: %v", ErrMissingRequiredKeys, missingKeys)
 	}
+	if err := c.ValidateTrustedProxies(); err != nil {
+		return err
+	}
 	return ValidateBlockstore(&c.Blockstore)
+}
+
+// ValidateTrustedProxies validates security.trusted_proxies. An empty list is valid and means no
+// proxy is trusted.
+func (c *BaseConfig) ValidateTrustedProxies() error {
+	if _, err := httputil.NewClientIPResolver(c.Security.TrustedProxies); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidTrustedProxy, err)
+	}
+	return nil
 }
 
 const (

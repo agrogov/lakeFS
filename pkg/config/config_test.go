@@ -168,6 +168,50 @@ func TestConfig_AuthorizationFailureStatus(t *testing.T) {
 	})
 }
 
+func TestConfig_TrustedProxies(t *testing.T) {
+	t.Run("default trusts no proxy", func(t *testing.T) {
+		cfg, err := newConfigFromFile("testdata/valid_config.yaml")
+		require.NoError(t, err)
+		require.Empty(t, cfg.GetBaseConfig().Security.TrustedProxies,
+			"an unset security.trusted_proxies must trust no proxy")
+	})
+
+	t.Run("accepted entries", func(t *testing.T) {
+		for _, proxies := range [][]string{
+			nil,
+			{},
+			{"10.0.0.0/8", "2001:db8:1::/48", "192.0.2.10", "*"},
+		} {
+			cfg := &config.ConfigImpl{}
+			cfg.Security.TrustedProxies = proxies
+			require.NoError(t, cfg.ValidateTrustedProxies(), "proxies %v should be accepted", proxies)
+		}
+	})
+
+	t.Run("configuration is loaded", func(t *testing.T) {
+		cfg, err := newConfigFromFile("testdata/trusted_proxies.yaml")
+		require.NoError(t, err)
+		require.Equal(t, []string{"10.0.0.0/8", "2001:db8:1::/48", "192.0.2.10", "*"},
+			cfg.GetBaseConfig().Security.TrustedProxies)
+	})
+
+	t.Run("rejected entries", func(t *testing.T) {
+		for _, entry := range []string{"not-a-cidr", "10.0.0.0/33", "2001:db8::/129"} {
+			cfg := &config.ConfigImpl{}
+			cfg.Security.TrustedProxies = []string{entry}
+			err := cfg.ValidateTrustedProxies()
+			require.ErrorIs(t, err, config.ErrInvalidTrustedProxy, "entry %q should be rejected", entry)
+			require.Contains(t, err.Error(), "security.trusted_proxies", "error should name the setting")
+		}
+	})
+
+	t.Run("startup validation", func(t *testing.T) {
+		_, err := newConfigFromFile("testdata/invalid_trusted_proxies.yaml")
+		require.ErrorIs(t, err, config.ErrInvalidTrustedProxy)
+		require.Contains(t, err.Error(), "not-a-cidr")
+	})
+}
+
 func TestConfig_DomainNamePrefix(t *testing.T) {
 	_, err := newConfigFromFile("testdata/domain_name_prefix.yaml")
 	if !errors.Is(err, config.ErrBadDomainNames) {

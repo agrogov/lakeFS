@@ -30,6 +30,16 @@ Rollback and notes:
 
 :memo: Notes for operators:
 
+- **Client IPs are no longer taken from an untrusted `X-Forwarded-For`.** `IpAddress` / `SourceIp`
+  policy conditions (and the audit log's client field) now use the transport peer address by default.
+  A client-supplied `X-Forwarded-For` or `X-Real-IP` is ignored, so it can no longer spoof the IP a
+  conditional allow or deny sees. If lakeFS runs behind a proxy or load balancer, configure the
+  proxy CIDRs in `security.trusted_proxies`; lakeFS then honours the forwarding headers and walks
+  `X-Forwarded-For` from right to left to the first untrusted hop. Use `"*"` only when the proxy
+  strips client-supplied forwarding headers, as it trusts every peer (the old behaviour). This is a
+  behaviour change: a deployment behind an unconfigured proxy now sees the proxy address as the
+  client IP. See `cmd/lakefs-sso/config.example.yaml`.
+
 - **Commit identity is the email.** SSO users are keyed by the immutable Entra object ID (`oid`), which is also
   their lakeFS username. Since the ID token's `email` claim (or a UPN-shaped `preferred_username`) is now stored on
   the user record, new commits and merges are recorded with the committer = the user's **email** instead of the
