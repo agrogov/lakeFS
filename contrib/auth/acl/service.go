@@ -852,6 +852,10 @@ func (s *AuthService) AddCredentials(ctx context.Context, username, accessKeyID,
 		return nil, fmt.Errorf("save credentials (credentialsKey %s): %w", credentialsKey, err)
 	}
 
+	// Symmetric with DeleteCredentials: credentials are read through the cache by
+	// access key ID (see GetCredentials), so a freshly written credential must not be
+	// shadowed by an entry left behind for the same access key ID.
+	s.cache.InvalidateCredential(accessKeyID)
 	return c, nil
 }
 
@@ -873,6 +877,11 @@ func (s *AuthService) DeleteCredentials(ctx context.Context, username, accessKey
 	if err != nil {
 		return fmt.Errorf("delete credentials (credentialsKey %s): %w", credPath, err)
 	}
+	// Authentication reads credentials through the cache (GetCredentials caches by
+	// access key ID alone), so drop the entry: revoking a credential must deny the
+	// very next request rather than wait for the TTL to expire.  The user-keyed
+	// entries do not gate credential lookups - GetCredentials scans users directly.
+	s.cache.InvalidateCredential(accessKeyID)
 	return nil
 }
 

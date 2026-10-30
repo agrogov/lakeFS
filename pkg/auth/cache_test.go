@@ -32,6 +32,53 @@ func countingUserPoliciesSetFn(userID string, calls *int) auth.UserPoliciesSetFn
 	}
 }
 
+// countingCredentialSetFn returns a setFn that returns a credential for
+// accessKeyID and counts how many times it was called.
+func countingCredentialSetFn(accessKeyID string, calls *int) auth.CredentialSetFn {
+	return func() (*model.Credential, error) {
+		*calls++
+		return &model.Credential{
+			BaseCredential: model.BaseCredential{AccessKeyID: accessKeyID},
+			Username:       "credential-user-" + accessKeyID,
+		}, nil
+	}
+}
+
+func TestLRUCacheInvalidateCredential(t *testing.T) {
+	t.Parallel()
+	c := auth.NewLRUCache(testCacheSize, testCacheTTL, 0)
+
+	firstCalls, secondCalls := 0, 0
+
+	cred, err := c.GetCredential("AKIAFIRST", countingCredentialSetFn("AKIAFIRST", &firstCalls))
+	require.NoError(t, err)
+	require.Equal(t, "AKIAFIRST", cred.AccessKeyID)
+	_, err = c.GetCredential("AKIASECOND", countingCredentialSetFn("AKIASECOND", &secondCalls))
+	require.NoError(t, err)
+	require.Equal(t, 1, firstCalls)
+	require.Equal(t, 1, secondCalls)
+
+	// Both entries are cached.
+	_, err = c.GetCredential("AKIAFIRST", countingCredentialSetFn("AKIAFIRST", &firstCalls))
+	require.NoError(t, err)
+	_, err = c.GetCredential("AKIASECOND", countingCredentialSetFn("AKIASECOND", &secondCalls))
+	require.NoError(t, err)
+	require.Equal(t, 1, firstCalls)
+	require.Equal(t, 1, secondCalls)
+
+	// Invalidating a single access key ID refetches only that credential.
+	c.InvalidateCredential("AKIAFIRST")
+	_, err = c.GetCredential("AKIAFIRST", countingCredentialSetFn("AKIAFIRST", &firstCalls))
+	require.NoError(t, err)
+	_, err = c.GetCredential("AKIASECOND", countingCredentialSetFn("AKIASECOND", &secondCalls))
+	require.NoError(t, err)
+	require.Equal(t, 2, firstCalls)
+	require.Equal(t, 1, secondCalls)
+
+	// Invalidating an access key ID that is not cached is a no-op.
+	c.InvalidateCredential("AKIANOBODY")
+}
+
 func TestLRUCacheInvalidateUser(t *testing.T) {
 	t.Parallel()
 	c := auth.NewLRUCache(testCacheSize, testCacheTTL, 0)
@@ -141,9 +188,17 @@ func TestDummyCacheInvalidationIsNoop(t *testing.T) {
 
 	// Invalidation calls must not panic and must not change DummyCache semantics.
 	c.InvalidateUser(auth.UserKey{Username: "alice"})
+	c.InvalidateCredential("AKIAALICE")
 	c.InvalidateUserPolicies("alice")
 	c.PurgePolicies()
 	_, err = c.GetUser(auth.UserKey{Username: "alice"}, countingUserSetFn("alice", &calls))
 	require.NoError(t, err)
 	require.Equal(t, 3, calls)
+
+	credentialCalls := 0
+	_, err = c.GetCredential("AKIAALICE", countingCredentialSetFn("AKIAALICE", &credentialCalls))
+	require.NoError(t, err)
+	_, err = c.GetCredential("AKIAALICE", countingCredentialSetFn("AKIAALICE", &credentialCalls))
+	require.NoError(t, err)
+	require.Equal(t, 2, credentialCalls)
 }
