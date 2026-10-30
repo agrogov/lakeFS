@@ -101,17 +101,10 @@ const getACLMaybe = async (groupId: string) => {
     try {
         return await auth.getACL(groupId);
     } catch (e) {
-        const message = typeof e?.message === 'string' ? e.message.toLowerCase() : '';
-        if (
-            e instanceof NoAclError ||
-            e?.noAcl === true ||
-            e?.no_acl === true ||
-            message.includes('multiple policies')
-        ) {
+        // The API reports "group has no ACL" only through the `no_acl` flag in the 404
+        // body, which the API client maps to NoAclError. Anything else is a real error.
+        if (e instanceof NoAclError) {
             return { customPolicies: true };
-        }
-        if (message.includes('no acl')) {
-            return null;
         }
         throw e;
     }
