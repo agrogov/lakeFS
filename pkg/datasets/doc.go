@@ -10,6 +10,7 @@
 // this package may import pkg/catalog, pkg/graveler, pkg/auth, pkg/block, pkg/kv,
 // pkg/permissions and pkg/api (only for GenericAuthMiddleware).
 //
-// This package currently holds the design-phase spike evidence (S2 and S4) as executable
-// tests; the service itself lands in later phases.
+// The package currently holds the design-phase spike evidence (S2 and S4) as executable
+// tests, the definition model and metadata validation, and the control-plane KV
+// persistence layer (store.go, §5.3); the service itself lands in later phases.
 package datasets
