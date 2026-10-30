@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/treeverse/lakefs/pkg/config"
@@ -158,5 +159,37 @@ func TestMapLoggingFieldsMasksSecretSection(t *testing.T) {
 	}
 	if got := fields["empty"]; got != config.FieldMaskedNoValue {
 		t.Errorf("empty = %v, want %q", got, config.FieldMaskedNoValue)
+	}
+}
+
+func TestMapLoggingFieldsMasksBlockstoreCredentials(t *testing.T) {
+	t.Parallel()
+	const secret = "blockstore-credential"
+	value := config.Blockstore{
+		Azure: &config.BlockstoreAzure{StorageAccount: "account", StorageAccessKey: secret},
+		GS: &config.BlockstoreGS{
+			CredentialsJSON:                      secret,
+			DataCredentialsJSON:                  secret,
+			ServerSideEncryptionCustomerSupplied: secret,
+		},
+	}
+	fields := config.MapLoggingFields(value)
+	for _, key := range []string{
+		"azure.storage_access_key",
+		"gs.credentials_json",
+		"gs.data_credentials_json",
+		"gs.server_side_encryption_customer_supplied",
+	} {
+		if got := fields[key]; got != config.FieldMaskedValue {
+			t.Errorf("%s = %v, want %q", key, got, config.FieldMaskedValue)
+		}
+	}
+	for key, v := range fields {
+		if strings.Contains(fmt.Sprint(v), secret) {
+			t.Errorf("%s leaks the credential: %v", key, v)
+		}
+	}
+	if got := fmt.Sprint(fields["azure.storage_account"]); got != "account" {
+		t.Errorf("azure.storage_account = %q, want %q", got, "account")
 	}
 }

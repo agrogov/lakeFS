@@ -236,7 +236,7 @@ type BlockstoreS3 struct {
 type BlockstoreAzure struct {
 	TryTimeout       time.Duration `mapstructure:"try_timeout"`
 	StorageAccount   string        `mapstructure:"storage_account"`
-	StorageAccessKey string        `mapstructure:"storage_access_key"`
+	StorageAccessKey SecureString  `mapstructure:"storage_access_key"`
 	// Deprecated: Value ignored
 	AuthMethodDeprecated string        `mapstructure:"auth_method"`
 	PreSignedExpiry      time.Duration `mapstructure:"pre_signed_expiry"`
@@ -251,16 +251,16 @@ type BlockstoreAzure struct {
 type BlockstoreGS struct {
 	S3Endpoint                           string        `mapstructure:"s3_endpoint"`
 	CredentialsFile                      string        `mapstructure:"credentials_file"`
-	CredentialsJSON                      string        `mapstructure:"credentials_json"`
+	CredentialsJSON                      SecureString  `mapstructure:"credentials_json"`
 	PreSignedExpiry                      time.Duration `mapstructure:"pre_signed_expiry"`
 	DisablePreSigned                     bool          `mapstructure:"disable_pre_signed"`
 	DisablePreSignedUI                   bool          `mapstructure:"disable_pre_signed_ui"`
-	ServerSideEncryptionCustomerSupplied string        `mapstructure:"server_side_encryption_customer_supplied"`
+	ServerSideEncryptionCustomerSupplied SecureString  `mapstructure:"server_side_encryption_customer_supplied"`
 	ServerSideEncryptionKmsKeyID         string        `mapstructure:"server_side_encryption_kms_key_id"`
 
 	// Dual adapter configuration for network-restricted access **experimental**
-	DataCredentialsFile string `mapstructure:"data_credentials_file"`
-	DataCredentialsJSON string `mapstructure:"data_credentials_json"`
+	DataCredentialsFile string       `mapstructure:"data_credentials_file"`
+	DataCredentialsJSON SecureString `mapstructure:"data_credentials_json"`
 }
 
 type Blockstore struct {
@@ -345,7 +345,7 @@ func (b *Blockstore) BlockstoreLocalParams() (blockparams.Local, error) {
 func (b *Blockstore) BlockstoreGSParams() (blockparams.GS, error) {
 	var customerSuppliedKey []byte = nil
 	if b.GS.ServerSideEncryptionCustomerSupplied != "" {
-		v, err := hex.DecodeString(b.GS.ServerSideEncryptionCustomerSupplied)
+		v, err := hex.DecodeString(b.GS.ServerSideEncryptionCustomerSupplied.SecureValue())
 		if err != nil {
 			return blockparams.GS{}, err
 		}
@@ -373,14 +373,14 @@ func (b *Blockstore) BlockstoreGSParams() (blockparams.GS, error) {
 
 	return blockparams.GS{
 		CredentialsFile:                      credPath,
-		CredentialsJSON:                      b.GS.CredentialsJSON,
+		CredentialsJSON:                      b.GS.CredentialsJSON.SecureValue(),
 		PreSignedExpiry:                      b.GS.PreSignedExpiry,
 		DisablePreSigned:                     b.GS.DisablePreSigned,
 		DisablePreSignedUI:                   b.GS.DisablePreSignedUI,
 		ServerSideEncryptionCustomerSupplied: customerSuppliedKey,
 		ServerSideEncryptionKmsKeyID:         b.GS.ServerSideEncryptionKmsKeyID,
 		DataCredentialsFile:                  dataCredPath,
-		DataCredentialsJSON:                  b.GS.DataCredentialsJSON,
+		DataCredentialsJSON:                  b.GS.DataCredentialsJSON.SecureValue(),
 	}, nil
 }
 
@@ -394,7 +394,7 @@ func (b *Blockstore) BlockstoreAzureParams() (blockparams.Azure, error) {
 	}
 	return blockparams.Azure{
 		StorageAccount:     b.Azure.StorageAccount,
-		StorageAccessKey:   b.Azure.StorageAccessKey,
+		StorageAccessKey:   b.Azure.StorageAccessKey.SecureValue(),
 		TryTimeout:         b.Azure.TryTimeout,
 		PreSignedExpiry:    b.Azure.PreSignedExpiry,
 		TestEndpointURL:    b.Azure.TestEndpointURL,
