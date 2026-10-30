@@ -71,7 +71,6 @@ var setupCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		var authService auth.Service
 		kvStore, err := kv.Open(ctx, kvParams)
 		if err != nil {
 			fmt.Printf("Failed to connect to DB: %s", err)
@@ -80,10 +79,9 @@ var setupCmd = &cobra.Command{
 		defer kvStore.Close()
 
 		authMetadataManager := auth.NewKVMetadataManager(version.Version, baseConfig.Installation.FixedID, baseConfig.Database.Type, kvStore)
-		authService = authServiceBuilder(ctx, cfg, logger, kvStore, authMetadataManager)
 		metadata := initStatsMetadata(ctx, logger, authMetadataManager, cfg)
 
-		credentials, err := setupLakeFS(ctx, cfg, authMetadataManager, authService, userName, accessKeyID, secretAccessKey, noCheck)
+		credentials, err := setupWithAuthService(ctx, cfg, logger, kvStore, authMetadataManager, userName, accessKeyID, secretAccessKey, noCheck)
 		if err != nil {
 			fmt.Printf("Setup failed: %s\n", err)
 			os.Exit(1)
@@ -116,6 +114,16 @@ var setupCmd = &cobra.Command{
 // (GAP-04).
 func setupCreatesLocalAdmin(cfg config.Config, logger logging.Logger) bool {
 	return sso.ResolveAuthMode(cfg, logger) != config.AuthRBACExternal
+}
+
+// setupWithAuthService builds the auth service through the configured builder - in the
+// lakefs-sso binary that is sso.BuildAuthService - and creates the initial admin against it.
+// Going through authServiceBuilder is what makes `lakefs-sso setup` write to the ACL/RBAC store
+// instead of the upstream factory (GAP-02); keeping it a named function lets a test exercise
+// exactly that seam.
+func setupWithAuthService(ctx context.Context, cfg config.Config, logger logging.Logger, kvStore kv.Store, metadataManager *auth.KVMetadataManager, userName, accessKeyID, secretAccessKey string, noCheck bool) (*model.Credential, error) {
+	authService := authServiceBuilder(ctx, cfg, logger, kvStore, metadataManager)
+	return setupLakeFS(ctx, cfg, metadataManager, authService, userName, accessKeyID, secretAccessKey, noCheck)
 }
 
 func setupLakeFS(ctx context.Context, cfg config.Config, metadataManager auth.MetadataManager, authService auth.Service, userName string, accessKeyID string, secretAccessKey string, noSetupCheck bool) (*model.Credential, error) {
