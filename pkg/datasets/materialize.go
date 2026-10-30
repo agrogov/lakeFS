@@ -173,6 +173,12 @@ type PublishRequest struct {
 	// Previous describes the version this publish supersedes, for the no-op check of
 	// §6.2 step 8. Leave it zero when publishing the first version.
 	Previous PreviousVersion
+
+	// Guard, when set, is called right before the commit and again right before the tag.
+	// It is how the service re-verifies that it still owns the dataset record before it
+	// writes anything other than the metarange (BUG-3): a long command that lost the record
+	// to a takeover must not commit a version it no longer owns. A preview leaves it nil.
+	Guard func(ctx context.Context) error
 }
 
 // PreviousVersion is the version a publish supersedes. Callers that cannot supply
@@ -325,6 +331,11 @@ func (m *Materializer) Publish(ctx context.Context, req PublishRequest) (*Publis
 
 	// §6.2 step 10: the tag is what turns the commit into a version ref (§7.1). Only a
 	// version is tagged; MaterializePreview is the untagged form used by a proposal.
+	if req.Guard != nil {
+		if err := req.Guard(ctx); err != nil {
+			return nil, err
+		}
+	}
 	tag := VersionTag(req.Version)
 	if err := m.tag(ctx, req.Dataset, tag, result.CommitID); err != nil {
 		return nil, err
@@ -425,6 +436,11 @@ func (m *Materializer) materialize(ctx context.Context, req PublishRequest, bran
 	}
 
 	// §6.2 step 9.
+	if req.Guard != nil {
+		if err := req.Guard(ctx); err != nil {
+			return nil, err
+		}
+	}
 	commitID, err := m.commit(ctx, req, branch, *metaRangeID)
 	if err != nil {
 		return nil, err

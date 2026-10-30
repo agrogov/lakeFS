@@ -513,7 +513,14 @@ func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, 
 	// removed instead of being promoted to a dataset with no repository.
 	if rec.State == DatasetStateCreating {
 		if _, err := r.catalog.GetRepository(ctx, dataset); isNotFound(err) {
-			if err := r.store.DeleteDataset(ctx, dataset, predicate); err != nil && !errors.Is(err, kv.ErrPredicateFailed) {
+			err := r.store.DeleteDataset(ctx, dataset, predicate)
+			switch {
+			case errors.Is(err, kv.ErrPredicateFailed):
+				// A live create refreshed the record between the staleness check and here.
+				r.log.WithField("dataset", dataset).
+					Info("datasets: an interrupted create moved while it was being removed; leaving it alone")
+				return nil
+			case err != nil:
 				return err
 			}
 			report.StatesRepaired++
@@ -521,15 +528,24 @@ func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, 
 			return nil
 		}
 	}
-	if err := r.pins.ReleaseVersion(ctx, dataset, version); err != nil {
-		return fmt.Errorf("datasets: release pins of %s@v%d: %w", dataset, version, err)
-	}
+	// The record CAS comes before the pin release (BUG-3). A publish that is still alive
+	// refreshes UpdatedAt, so the CAS fails and the pass leaves its pins alone; releasing
+	// them first would strip a live publish of its GC protection. Over-retaining a pin until
+	// the next pass is safe (§14); under-retaining it is not.
 	next := *rec
 	next.State = DatasetStateActive
 	next.PendingVersion = 0
 	next.UpdatedAt = r.now()
 	if _, err := r.store.PutDatasetIf(ctx, &next, predicate); err != nil {
+		if errors.Is(err, kv.ErrPredicateFailed) {
+			r.log.WithField("dataset", dataset).
+				Info("datasets: an interrupted publish moved while it was being repaired; leaving it alone")
+			return nil
+		}
 		return fmt.Errorf("datasets: roll %q back to active: %w", dataset, err)
+	}
+	if err := r.pins.ReleaseVersion(ctx, dataset, version); err != nil {
+		return fmt.Errorf("datasets: release pins of %s@v%d: %w", dataset, version, err)
 	}
 	report.StatesRepaired++
 	r.log.WithFields(logging.Fields{
@@ -542,63 +558,23 @@ func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, 
 // completeVersion rebuilds the missing VersionRecord of a committed version from the
 // version's _dataset/definition.json and marks the dataset active (§5.4: the tag and the
 // definition object are authoritative, the KV record is derived).
+//
+// The KV writes - the rebuilt record and the head CAS - are the service's finishVersion, so a
+// repair retries them with the same backoff a publish does (BUG-2) instead of leaving a
+// half-finished version behind. predicate is the predicate of rec as it was read, which is what
+// that CAS is conditioned on (BUG-1).
 func (r *Reconciler) completeVersion(ctx context.Context, rec *DatasetRecord, predicate kv.Predicate, version int, commitID string, report *ReconcileReport) error {
-	dataset := rec.Name
-	_, err := r.store.GetVersion(ctx, dataset, version)
-	switch {
-	case err == nil:
-		// The record exists; only the head needs to catch up.
-	case errors.Is(err, kv.ErrNotFound):
-		doc, docErr := r.svc.readDefinitionDocument(ctx, dataset, commitID, DefinitionPath)
-		if docErr != nil {
-			return fmt.Errorf("datasets: rebuild version %d of %q: %w", version, dataset, docErr)
-		}
-		commitLog, commitErr := r.catalog.GetCommit(ctx, dataset, commitID)
-		if commitErr != nil {
-			return fmt.Errorf("datasets: read commit %s of %q: %w", commitID, dataset, commitErr)
-		}
-		stats, statsErr := r.rebuildStats(ctx, dataset, commitID, doc.Definition)
-		if statsErr != nil {
-			return fmt.Errorf("datasets: rebuild stats of %s@v%d: %w", dataset, version, statsErr)
-		}
-		rebuilt := VersionRecord{
-			Dataset:     dataset,
-			Version:     version,
-			Definition:  doc.Definition,
-			Message:     doc.Message,
-			Publisher:   doc.Publisher,
-			PublishedAt: commitLog.CreationDate,
-			CommitID:    commitID,
-			MetaRangeID: commitLog.MetaRangeID,
-			ProposalID:  commitLog.Metadata[CommitMetadataProposalKey],
-			Stats:       stats,
-		}
-		if _, err := r.store.PutVersion(ctx, rebuilt); err != nil {
-			return fmt.Errorf("datasets: write rebuilt version %d of %q: %w", version, dataset, err)
-		}
+	_, rebuilt, err := r.svc.finishVersion(ctx, rec, predicate, version, commitID)
+	if err != nil {
+		return err
+	}
+	if rebuilt {
 		report.VersionsRebuilt++
 		r.log.WithFields(logging.Fields{
-			"dataset": dataset,
+			"dataset": rec.Name,
 			"version": version,
 			"commit":  commitID,
 		}).Warn("datasets: rebuilt a missing version record from the dataset repository")
-	default:
-		return err
-	}
-
-	next := *rec
-	next.State = DatasetStateActive
-	next.PendingVersion = 0
-	if next.LatestVersion < version {
-		next.LatestVersion = version
-	}
-	next.UpdatedAt = r.now()
-	if _, err := r.store.PutDatasetIf(ctx, &next, predicate); err != nil {
-		if errors.Is(err, kv.ErrPredicateFailed) {
-			// Somebody else moved the record; the next pass converges on the new value.
-			return nil
-		}
-		return fmt.Errorf("datasets: activate %q after rebuilding version %d: %w", dataset, version, err)
 	}
 	report.StatesRepaired++
 	return nil
@@ -867,45 +843,6 @@ func datasetOfPinReference(ref string) (string, bool) {
 		return "", false
 	}
 	return ref[:idx], true
-}
-
-// rebuildStats recomputes the ItemStats of a version from its dataset repository commit
-// (§5.3 VersionRecord.Stats), so a rebuilt record is not left with zeroes. Entries are
-// attributed to the definition item whose target contains them; §5.2 rule 3 keeps targets
-// disjoint, so the attribution is unambiguous. The synthetic definition entry is skipped.
-func (r *Reconciler) rebuildStats(ctx context.Context, dataset, commitID string, def Definition) (ItemStats, error) {
-	items := make([]ItemStat, len(def.Data))
-	for i := range def.Data {
-		items[i].Target = def.Data[i].Target
-	}
-	after := ""
-	for {
-		entries, hasMore, err := r.catalog.ListEntries(ctx, dataset, commitID, "", after, "", catalog.ListEntriesLimitMax)
-		if err != nil {
-			return ItemStats{}, err
-		}
-		for _, entry := range entries {
-			if entry.Path == DefinitionPath {
-				continue
-			}
-			idx := definitionItemIndex(&def, entry.Path)
-			if idx < 0 {
-				continue
-			}
-			items[idx].Objects++
-			items[idx].Bytes += entry.Size
-		}
-		if !hasMore || len(entries) == 0 {
-			break
-		}
-		after = entries[len(entries)-1].Path
-	}
-	stats := ItemStats{Items: items}
-	for _, item := range items {
-		stats.Objects += item.Objects
-		stats.Bytes += item.Bytes
-	}
-	return stats, nil
 }
 
 // definitionItemIndex returns the index of the definition item that owns path, or -1 when no

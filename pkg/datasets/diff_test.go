@@ -364,13 +364,18 @@ func (f *serviceFixture) publishNextVersion(t *testing.T, name string, def Defin
 	_, err = f.svc.sourceStats(ctx, f.caller(), resolved)
 	require.NoError(t, err)
 
-	version, err := f.svc.publish(ctx, f.caller(), previous, *resolved, message, "")
+	// The publish runs under a lease, as it does in the service (BUG-3), and the record CAS
+	// below rides on the predicate that lease now holds (BUG-1).
+	lease, publishCtx := f.svc.newPublishLease(ctx, previous, previousPredicate)
+	version, err := f.svc.publish(publishCtx, f.caller(), lease, *resolved, message, "")
+	lease.stop()
 	require.NoError(t, err)
 
-	next := *previous
+	current := lease.current()
+	next := *current
 	next.LatestVersion = version.Version
 	next.UpdatedAt = f.svc.now()
-	_, err = f.svc.store.PutDatasetIf(ctx, &next, previousPredicate)
+	_, err = f.svc.store.PutDatasetIf(ctx, &next, lease.currentPredicate())
 	require.NoError(t, err)
 	return version
 }

@@ -44,6 +44,19 @@ const (
 	MaxListAmount     = 1000
 )
 
+// publishHeartbeatDivisor is how many heartbeats fit into one datasets.publish_timeout: a
+// running publish refreshes its record every timeout/3, so the reconciler has to miss two
+// refreshes in a row before it can mistake a live publish for a crashed one (BUG-3).
+const publishHeartbeatDivisor = 3
+
+// postCommitRetries and postCommitRetryDelay bound the KV writes that finish a version whose
+// commit already exists (BUG-2): the VersionRecord and the record CAS are retried with
+// exponential backoff before the publish gives up and leaves the version to the reconciler.
+const (
+	postCommitRetries    = 4
+	postCommitRetryDelay = 25 * time.Millisecond
+)
+
 // Service-level errors. The HTTP layer maps them to the status codes of §10.4; see
 // writeServiceError in handlers.go.
 var (
@@ -82,6 +95,12 @@ var (
 	// It is a wiring error, never a request error.
 	ErrIncompleteService = errors.New("datasets: incomplete service")
 )
+
+// errPublishLeaseLost reports a publish that no longer owns its dataset record because another
+// writer - a reconciler taking the record over, or a later publish - moved it (BUG-3). The
+// publish aborts without committing and without releasing the pins, which belong to whoever
+// owns the record now. It wraps ErrDatasetConflict, so the HTTP layer still answers 409.
+var errPublishLeaseLost = fmt.Errorf("%w: the publish no longer owns the dataset record", ErrDatasetConflict)
 
 // VersionConflictError is the 409 of §5.4 when expected_version does not match the
 // dataset's latest_version. It wraps ErrDatasetConflict, so the generic error mapping
@@ -137,6 +156,12 @@ type Service struct {
 	now     func() time.Time
 	newULID func(time.Time) (string, error)
 
+	// retryDelay is the base backoff of the writes that finish an already-committed version
+	// (BUG-2) and heartbeatInterval overrides the publish heartbeat period derived from
+	// datasets.publish_timeout (BUG-3). Production uses the defaults; tests shorten them.
+	retryDelay        time.Duration
+	heartbeatInterval time.Duration
+
 	// publishFn runs the materialisation primitive (materialize.go). It is a field rather
 	// than a direct call so tests can inject a failure between the CAS to "publishing" and
 	// the version record write, which is exactly the window the best-effort rollback of
@@ -187,6 +212,7 @@ func NewService(cfg *Config, kvs kv.Store, cat *catalog.Catalog, authService aut
 		now:          time.Now,
 		newULID:      newULID,
 		publishFn:    publishWithMaterializer,
+		retryDelay:   postCommitRetryDelay,
 		bgCtx:        context.Background(),
 	}, nil
 }
@@ -358,10 +384,18 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 
 	var version *VersionRecord
 	if req.Publish {
-		version, err = s.publish(ctx, caller, rec, *resolved, req.Message, "")
+		// The initial version runs under the same heartbeat as any other publish, so a slow
+		// first materialisation is not mistaken for a crashed create (BUG-3). The lease carries
+		// the predicate of the record it CASes, so the CAS back to active below rides on the
+		// same chain (BUG-1).
+		lease, publishCtx := s.newPublishLease(ctx, rec, recordPredicate)
+		version, err = s.publish(publishCtx, caller, lease, *resolved, req.Message, "")
+		lease.stop()
 		if err != nil {
 			return nil, err
 		}
+		rec = lease.current()
+		recordPredicate = lease.currentPredicate()
 	}
 
 	active := *rec
@@ -720,10 +754,26 @@ func (s *Service) PublishVersion(ctx context.Context, caller Caller, name string
 	// §5.4 steps 1-3: read the record, check expected_version and the current state, and
 	// win or lose the CAS to "publishing". The predicate of that write travels with the
 	// record through the rest of the publish, so its later CASes condition on the value
-	// they actually wrote (§5.4).
-	publishing, publishingPredicate, err := s.beginPublish(ctx, name, req.ExpectedVersion)
+	// they actually wrote (§5.4, BUG-1). When tag vN already carries the version, nothing is
+	// CASed and beginPublish hands back that commit instead (BUG-2).
+	publishing, publishingPredicate, adoptCommit, err := s.beginPublish(ctx, name, req.ExpectedVersion)
 	if err != nil {
 		return nil, err
+	}
+	if adoptCommit != "" {
+		// BUG-2: an earlier attempt committed and tagged version N but failed before it could
+		// finish the KV records. Adopt that version instead of materialising it again, which
+		// could only collide with its own tag.
+		version, adoptErr := s.adoptVersion(ctx, publishing, publishingPredicate, nextVersion(publishing), adoptCommit)
+		if adoptErr != nil {
+			return nil, adoptErr
+		}
+		logging.FromContext(ctx).WithFields(logging.Fields{
+			"dataset": publishing.Name,
+			"version": version.Version,
+			"commit":  adoptCommit,
+		}).Warn("datasets: adopted a version that was already committed and tagged")
+		return &PublishOutcome{Version: version}, nil
 	}
 
 	if !req.Sync && s.publishIsAsync(estimate) {
@@ -739,24 +789,30 @@ func (s *Service) PublishVersion(ctx context.Context, caller Caller, name string
 // beginPublish applies §5.4 steps 1-3: it reads the dataset record, enforces
 // expected_version and the state machine, and compare-and-swaps the record to
 // State="publishing" with PendingVersion=N+1. It returns the record it wrote together with
-// the predicate of that write, which the rest of the publish CASes on.
+// the predicate of that write, which the rest of the publish CASes on (BUG-1).
 //
 // A record may be in "publishing" already when the previous attempt crashed; §5.4 allows
 // taking that state over once the record has not moved for datasets.publish_timeout, which
 // is what keeps a single crashed publish from blocking a dataset until the reconciler runs
 // (§12.3). A non-stale publish in flight is a 409 (ErrPublishInProgress).
-func (s *Service) beginPublish(ctx context.Context, name string, expected *int) (*DatasetRecord, kv.Predicate, error) {
+//
+// When tag vN already exists and points at a commit whose metadata says dataset.version=N, the
+// version was committed by an earlier attempt that failed before it could finish the KV
+// records. In that case beginPublish returns the record as read, the predicate of that read
+// and that commit, and the caller adopts the version instead of publishing it again (BUG-2);
+// the record is not CASed to "publishing" at all. The second result is empty otherwise.
+func (s *Service) beginPublish(ctx context.Context, name string, expected *int) (*DatasetRecord, kv.Predicate, string, error) {
 	rec, predicate, err := s.store.GetDataset(ctx, name)
 	if errors.Is(err, kv.ErrNotFound) {
-		return nil, nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, name)
+		return nil, nil, "", fmt.Errorf("%w: %q", ErrDatasetNotFound, name)
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
 	}
 
 	// §5.4: expected_version behaves like an ETag on the dataset head.
 	if expected != nil && *expected != rec.LatestVersion {
-		return nil, nil, &VersionConflictError{Dataset: name, Expected: *expected, LatestVersion: rec.LatestVersion}
+		return nil, nil, "", &VersionConflictError{Dataset: name, Expected: *expected, LatestVersion: rec.LatestVersion}
 	}
 
 	switch rec.State {
@@ -765,7 +821,7 @@ func (s *Service) beginPublish(ctx context.Context, name string, expected *int) 
 		// replace the sources that disappeared, and repairing is better than blocking.
 	case DatasetStatePublishing:
 		if !s.pendingIsStale(rec) {
-			return nil, nil, fmt.Errorf("%w: dataset %q version %d started at %s", ErrPublishInProgress,
+			return nil, nil, "", fmt.Errorf("%w: dataset %q version %d started at %s", ErrPublishInProgress,
 				name, rec.PendingVersion, rec.UpdatedAt.UTC().Format(time.RFC3339))
 		}
 		logging.FromContext(ctx).WithFields(logging.Fields{
@@ -774,10 +830,14 @@ func (s *Service) beginPublish(ctx context.Context, name string, expected *int) 
 			"updated_at":      rec.UpdatedAt.UTC().Format(time.RFC3339),
 		}).Warn("datasets: taking over a stale publishing state")
 	default:
-		return nil, nil, fmt.Errorf("%w: dataset %q is %s", ErrDatasetConflict, name, rec.State)
+		return nil, nil, "", fmt.Errorf("%w: dataset %q is %s", ErrDatasetConflict, name, rec.State)
 	}
 
-	version := rec.LatestVersion + 1
+	version := nextVersion(rec)
+	if commitID, ok := s.committedTag(ctx, name, version); ok {
+		return rec, predicate, commitID, nil
+	}
+
 	next := *rec
 	next.State = DatasetStatePublishing
 	next.PendingVersion = version
@@ -785,11 +845,20 @@ func (s *Service) beginPublish(ctx context.Context, name string, expected *int) 
 	publishingPredicate, err := s.store.PutDatasetIf(ctx, &next, predicate)
 	if err != nil {
 		if errors.Is(err, kv.ErrPredicateFailed) {
-			return nil, nil, fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, name)
+			return nil, nil, "", fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, name)
 		}
-		return nil, nil, err
+		return nil, nil, "", err
 	}
-	return &next, publishingPredicate, nil
+	return &next, publishingPredicate, "", nil
+}
+
+// nextVersion is the version a publish of rec produces: the pending version of a record that
+// is already publishing, otherwise the version after the latest published one.
+func nextVersion(rec *DatasetRecord) int {
+	if rec.PendingVersion > 0 {
+		return rec.PendingVersion
+	}
+	return rec.LatestVersion + 1
 }
 
 // pendingIsStale reports whether a record in "publishing" has been left alone for longer
@@ -812,17 +881,30 @@ func (s *Service) publishIsAsync(estimate ItemStats) bool {
 
 // runPublish performs §6.2 steps 4-11 for a record that is already CASed to "publishing":
 // materialise (which takes the pins first), write the VersionRecord, and advance the
-// dataset record. Any failure is rolled back to "active" on a best-effort basis.
+// dataset record. The publish runs under a publishLease that keeps the record fresh for the
+// reconciler (BUG-3). A failure before the commit is rolled back to "active" on a
+// best-effort basis; once the commit exists it never is (BUG-2).
 //
-// predicate is the predicate of the "publishing" write, the value every CAS below replaces
-// (BUG-1). caller is the publisher, whose identity authorizes every source object the
-// materialisation reads (SEC-3).
+// predicate is the predicate of the "publishing" write, the value the lease - and every CAS
+// that follows it - is conditioned on (BUG-1). caller is the publisher, whose identity
+// authorizes every source object the materialisation reads (SEC-3).
 func (s *Service) runPublish(ctx context.Context, publishing *DatasetRecord, predicate kv.Predicate, def Definition, req PublishVersionRequest, caller Caller) (*VersionRecord, error) {
 	started := time.Now()
 	publisher := caller.Username
-	version, err := s.publish(ctx, caller, publishing, def, req.Message, req.ProposalID)
+	lease, publishCtx := s.newPublishLease(ctx, publishing, predicate)
+	version, err := s.publish(publishCtx, caller, lease, def, req.Message, req.ProposalID)
+	// Stop the heartbeat before the record is advanced: it must not CAS the record after the
+	// publish stopped owning it.
+	lease.stop()
 	if err != nil {
-		err = s.rollbackPublish(ctx, publishing, predicate, err)
+		if !lease.hasLost() && !errors.Is(err, errPublishLeaseLost) {
+			// BUG-2: a failure after the commit is not rolled back. The version is already served
+			// by `latest`, so the record stays in publishing(PendingVersion=N) with its pins and
+			// the reconciler finishes it from the tag.
+			if _, committed := s.committedVersion(ctx, publishing.Name, nextVersion(lease.current())); !committed {
+				err = s.rollbackPublish(ctx, lease.current(), lease.currentPredicate(), err)
+			}
+		}
 		// §12.4: every attempt is observed, with the same classification the HTTP layer uses.
 		dsMetrics.observePublish(publishResultOf(err), time.Since(started).Seconds(), 0)
 		return nil, err
@@ -830,7 +912,7 @@ func (s *Service) runPublish(ctx context.Context, publishing *DatasetRecord, pre
 	// §5.4 step 4: the version is durable; advance the head. This CAS losing is not a
 	// rollback case - the version exists - so it is reported as a conflict and left to
 	// the reconciler (§5.4, §12.3).
-	if err := s.activateDataset(ctx, publishing, predicate, version.Version); err != nil {
+	if err := s.advanceActive(ctx, lease.current(), lease.currentPredicate(), version.Version); err != nil {
 		dsMetrics.observePublish(publishResultOf(err), time.Since(started).Seconds(), 0)
 		return nil, err
 	}
@@ -846,27 +928,10 @@ func (s *Service) runPublish(ctx context.Context, publishing *DatasetRecord, pre
 	return version, nil
 }
 
-// activateDataset advances the head record to the version that was just published
-// (§6.2 step 11).
-func (s *Service) activateDataset(ctx context.Context, publishing *DatasetRecord, predicate kv.Predicate, version int) error {
-	next := *publishing
-	next.State = DatasetStateActive
-	next.PendingVersion = 0
-	next.LatestVersion = version
-	next.UpdatedAt = s.now()
-	if _, err := s.store.PutDatasetIf(ctx, &next, predicate); err != nil {
-		if errors.Is(err, kv.ErrPredicateFailed) {
-			return fmt.Errorf("%w: dataset %q changed while publishing version %d; the reconciler will repair it",
-				ErrDatasetConflict, publishing.Name, version)
-		}
-		return err
-	}
-	return nil
-}
-
 // rollbackPublish is the best-effort CAS back to "active" of §5.4 step 5. It never masks
 // cause: a rollback that itself fails is logged and the reconciler (§12.3 item 1) finishes
-// the job from the record left in "publishing".
+// the job from the record left in "publishing". predicate is the predicate of the record this
+// attempt wrote (BUG-1).
 func (s *Service) rollbackPublish(ctx context.Context, publishing *DatasetRecord, predicate kv.Predicate, cause error) error {
 	next := *publishing
 	next.State = DatasetStateActive
@@ -879,6 +944,371 @@ func (s *Service) rollbackPublish(ctx context.Context, publishing *DatasetRecord
 		}).Warn("datasets: could not roll a failed publish back to active; the reconciler will")
 	}
 	return cause
+}
+
+// --- finish a version whose commit exists (BUG-2) ---
+
+// committedTag reports the commit of tag vN when it exists and its commit metadata says
+// dataset.version=N. Pins and the tag are the version's source of truth (§5.4), so such a tag
+// means the version was committed by an earlier attempt that did not finish its KV records.
+func (s *Service) committedTag(ctx context.Context, dataset string, version int) (string, bool) {
+	if version <= 0 {
+		return "", false
+	}
+	commitID, err := s.catalog.GetTag(ctx, dataset, VersionTag(version))
+	if err != nil || !s.commitCarriesVersion(ctx, dataset, commitID, version) {
+		return "", false
+	}
+	return commitID, true
+}
+
+// committedVersion reports the commit that already carries version, if one exists: tag vN, or
+// the "latest" head whose commit metadata says dataset.version=N. It is how a publish
+// recognises that its commit landed before a KV write failed, so it must finish the version
+// instead of rolling it back (BUG-2: a failure after the commit must never release pins).
+func (s *Service) committedVersion(ctx context.Context, dataset string, version int) (string, bool) {
+	if commitID, ok := s.committedTag(ctx, dataset, version); ok {
+		return commitID, true
+	}
+	if version <= 0 {
+		return "", false
+	}
+	head, err := s.catalog.GetBranchReference(ctx, dataset, DefaultBranch)
+	if err != nil {
+		return "", false
+	}
+	if s.commitCarriesVersion(ctx, dataset, head, version) {
+		return head, true
+	}
+	return "", false
+}
+
+// commitCarriesVersion reports whether commitID is the commit of version, by the commit
+// metadata of §6.2 step 9.
+func (s *Service) commitCarriesVersion(ctx context.Context, dataset, commitID string, version int) bool {
+	if commitID == "" {
+		return false
+	}
+	commitLog, err := s.catalog.GetCommit(ctx, dataset, commitID)
+	if err != nil {
+		return false
+	}
+	return commitLog.Metadata[CommitMetadataVersionKey] == strconv.Itoa(version)
+}
+
+// ensureVersionTag creates tag vN for commitID, tolerating only the tag an earlier attempt
+// already created at that very commit (the same rule materialize.tag applies).
+func (s *Service) ensureVersionTag(ctx context.Context, dataset string, version int, commitID string) error {
+	tag := VersionTag(version)
+	_, err := s.catalog.CreateTag(ctx, dataset, tag, commitID, graveler.WithForce(true))
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, graveler.ErrTagAlreadyExists) {
+		return fmt.Errorf("datasets: create tag %q on %s: %w", tag, dataset, err)
+	}
+	existing, getErr := s.catalog.GetTag(ctx, dataset, tag)
+	if getErr == nil && existing == commitID {
+		return nil
+	}
+	return fmt.Errorf("datasets: create tag %q on %s: %w", tag, dataset, err)
+}
+
+// adoptVersion finishes a version whose commit and tag already exist, without materialising
+// anything. It is what a retried publish does when an earlier attempt failed after the commit
+// (BUG-2). predicate is the predicate of rec as it was read, which the head CAS conditions on
+// (BUG-1).
+func (s *Service) adoptVersion(ctx context.Context, rec *DatasetRecord, predicate kv.Predicate, version int, commitID string) (*VersionRecord, error) {
+	if err := s.ensureVersionTag(ctx, rec.Name, version, commitID); err != nil {
+		return nil, err
+	}
+	stored, _, err := s.finishVersion(ctx, rec, predicate, version, commitID)
+	return stored, err
+}
+
+// finishVersion makes a version durable once its commit and tag exist: it rebuilds the missing
+// VersionRecord from the version's _dataset/definition.json and CASes the dataset record to
+// active at version. Both writes are retried with backoff (BUG-2); a failure leaves the record
+// in publishing and the pins in place, so the reconciler finishes it from the tag. The second
+// result reports whether the version record had to be rebuilt. predicate is the predicate of
+// rec as it was read (BUG-1).
+func (s *Service) finishVersion(ctx context.Context, rec *DatasetRecord, predicate kv.Predicate, version int, commitID string) (*VersionRecord, bool, error) {
+	dataset := rec.Name
+	stored, err := s.store.GetVersion(ctx, dataset, version)
+	rebuilt := false
+	switch {
+	case err == nil:
+		// The record exists; only the head has to catch up.
+	case errors.Is(err, kv.ErrNotFound):
+		doc, docErr := s.readDefinitionDocument(ctx, dataset, commitID, DefinitionPath)
+		if docErr != nil {
+			return nil, false, fmt.Errorf("datasets: rebuild version %d of %q: %w", version, dataset, docErr)
+		}
+		commitLog, commitErr := s.catalog.GetCommit(ctx, dataset, commitID)
+		if commitErr != nil {
+			return nil, false, fmt.Errorf("datasets: read commit %s of %q: %w", commitID, dataset, commitErr)
+		}
+		stats, statsErr := s.rebuildStats(ctx, dataset, commitID, doc.Definition)
+		if statsErr != nil {
+			return nil, false, fmt.Errorf("datasets: rebuild stats of %s@v%d: %w", dataset, version, statsErr)
+		}
+		record := VersionRecord{
+			Dataset:     dataset,
+			Version:     version,
+			Definition:  doc.Definition,
+			Message:     doc.Message,
+			Publisher:   doc.Publisher,
+			PublishedAt: commitLog.CreationDate,
+			CommitID:    commitID,
+			MetaRangeID: commitLog.MetaRangeID,
+			ProposalID:  commitLog.Metadata[CommitMetadataProposalKey],
+			Stats:       stats,
+		}
+		stored, err = s.writeVersion(ctx, record)
+		if err != nil {
+			return nil, false, fmt.Errorf("datasets: write rebuilt version %d of %q: %w", version, dataset, err)
+		}
+		rebuilt = true
+	default:
+		return nil, false, err
+	}
+	if err := s.advanceActive(ctx, rec, predicate, version); err != nil {
+		return nil, rebuilt, fmt.Errorf("datasets: activate %q after finishing version %d: %w", dataset, version, err)
+	}
+	return stored, rebuilt, nil
+}
+
+// writeVersion stores the VersionRecord of a committed version, retrying with backoff
+// (BUG-2). Version records are immutable, so a record already stored by an earlier attempt for
+// the same commit is adopted instead of overwritten; a record of a different commit is a
+// conflict and is returned as is.
+func (s *Service) writeVersion(ctx context.Context, rec VersionRecord) (*VersionRecord, error) {
+	var stored *VersionRecord
+	err := s.retryWrite(ctx, func() error {
+		var err error
+		stored, err = s.store.PutVersion(ctx, rec)
+		if err == nil {
+			return nil
+		}
+		existing, getErr := s.store.GetVersion(ctx, rec.Dataset, rec.Version)
+		if getErr == nil && existing.CommitID == rec.CommitID {
+			stored = existing
+			return nil
+		}
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return stored, nil
+}
+
+// advanceActive CASes rec - the "publishing" record of this attempt, with the predicate that
+// was read or written for it (BUG-1) - to active at version, retrying the write with backoff
+// (BUG-2). A lost predicate is re-read together with its fresh predicate: a record that already
+// reached version counts as success, because finishing a version is idempotent, while a record
+// that another writer moved to a different publish or to deleting is a conflict.
+func (s *Service) advanceActive(ctx context.Context, rec *DatasetRecord, predicate kv.Predicate, version int) error {
+	current, currentPredicate := rec, predicate
+	var next DatasetRecord
+	err := s.retryWrite(ctx, func() error {
+		next = *current
+		next.State = DatasetStateActive
+		next.PendingVersion = 0
+		if next.LatestVersion < version {
+			next.LatestVersion = version
+		}
+		next.UpdatedAt = s.now()
+		_, err := s.store.PutDatasetIf(ctx, &next, currentPredicate)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, kv.ErrPredicateFailed) {
+			return err
+		}
+		fresh, freshPredicate, getErr := s.store.GetDataset(ctx, next.Name)
+		if getErr != nil {
+			return err
+		}
+		switch {
+		case fresh.State == DatasetStateDeleting:
+			return fmt.Errorf("%w: dataset %q is being deleted", ErrDatasetConflict, fresh.Name)
+		case fresh.State == DatasetStatePublishing && fresh.PendingVersion != version:
+			return fmt.Errorf("%w: dataset %q is publishing version %d", ErrDatasetConflict, fresh.Name, fresh.PendingVersion)
+		case fresh.LatestVersion >= version && fresh.State != DatasetStatePublishing:
+			// Somebody (the reconciler, or a retry of this very write) already finished it.
+			next = *fresh
+			return nil
+		}
+		current, currentPredicate = fresh, freshPredicate
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, kv.ErrPredicateFailed) {
+			return fmt.Errorf("%w: dataset %q changed while publishing version %d; the reconciler will repair it",
+				ErrDatasetConflict, rec.Name, version)
+		}
+		return err
+	}
+	return nil
+}
+
+// retryWrite runs fn until it succeeds, the context is done, or the attempt budget is spent.
+// It retries every error: the writes it wraps are idempotent (a version record is created only
+// once, and a lost record CAS is re-read), so a retry after an ambiguous failure cannot
+// corrupt anything (BUG-2).
+func (s *Service) retryWrite(ctx context.Context, fn func() error) error {
+	delay := s.retryDelay
+	var err error
+	for attempt := 0; attempt <= postCommitRetries; attempt++ {
+		if attempt > 0 && delay > 0 {
+			select {
+			case <-ctx.Done():
+				return err
+			case <-time.After(delay):
+			}
+			delay *= 2
+		}
+		if err = fn(); err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return err
+		}
+	}
+	return err
+}
+
+// publishLease owns the "publishing" dataset record of one publish (§5.4). While the
+// materialisation runs it refreshes UpdatedAt with a compare-and-swap, so a publish that
+// legitimately takes longer than datasets.publish_timeout is not mistaken for a crashed one and
+// taken over (BUG-3). It is also the record every write of the publish CASes against - carrying
+// the store's predicate for it (BUG-1) - and the guard the materialiser calls right before the
+// commit and the tag.
+type publishLease struct {
+	svc      *Service
+	name     string
+	interval time.Duration
+	cancel   context.CancelFunc
+
+	mu        sync.Mutex
+	rec       *DatasetRecord // the record as this publish last read or wrote it
+	predicate kv.Predicate   // the predicate of rec, as the store reported it (BUG-1)
+	lost      bool
+	stopOnce  sync.Once
+	stopped   chan struct{}
+}
+
+// newPublishLease starts the heartbeat of one publish and returns the lease plus the context
+// the publish runs on. predicate is the predicate of rec as the caller read or wrote it: every
+// refresh CASes on it and adopts the predicate the write returns, so the lease keeps owning the
+// record on a backend whose predicate is an ETag (BUG-1). The caller must call stop.
+func (s *Service) newPublishLease(parent context.Context, rec *DatasetRecord, predicate kv.Predicate) (*publishLease, context.Context) {
+	interval := s.heartbeatInterval
+	if interval <= 0 {
+		timeout := s.cfg.PublishTimeout
+		if timeout <= 0 {
+			timeout = DefaultPublishTimeout
+		}
+		interval = timeout / publishHeartbeatDivisor
+		if interval <= 0 {
+			interval = timeout
+		}
+	}
+	ctx, cancel := context.WithCancel(parent)
+	lease := &publishLease{
+		svc:       s,
+		name:      rec.Name,
+		interval:  interval,
+		cancel:    cancel,
+		rec:       rec,
+		predicate: predicate,
+		stopped:   make(chan struct{}),
+	}
+	go lease.heartbeat(ctx)
+	return lease, ctx
+}
+
+// heartbeat refreshes the record every interval until the publish ends or a refresh loses it. A
+// lost refresh cancels the publish context, so a materialisation that is still running stops
+// instead of committing a version it no longer owns (BUG-3).
+func (l *publishLease) heartbeat(ctx context.Context) {
+	defer close(l.stopped)
+	ticker := time.NewTicker(l.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := l.refresh(ctx); err != nil {
+				l.cancel()
+				return
+			}
+		}
+	}
+}
+
+// refresh CASes a fresh UpdatedAt onto the record. It is the heartbeat and, through check, the
+// ownership re-verification before the commit and the tag. A failed CAS marks the lease lost;
+// the record now belongs to another writer. A cancelled context is not a takeover (the publish
+// itself or its caller stopped), so it is returned without marking the lease lost.
+func (l *publishLease) refresh(ctx context.Context) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.lost {
+		return errPublishLeaseLost
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	next := *l.rec
+	next.UpdatedAt = l.svc.now()
+	predicate, err := l.svc.store.PutDatasetIf(ctx, &next, l.predicate)
+	if err != nil {
+		l.lost = true
+		return fmt.Errorf("%w: refresh dataset %q: %v", errPublishLeaseLost, l.name, err)
+	}
+	l.rec = &next
+	l.predicate = predicate
+	return nil
+}
+
+// check is the materialiser's guard: it re-verifies ownership with a CAS right before the
+// commit and right before the tag (BUG-3).
+func (l *publishLease) check(ctx context.Context) error {
+	return l.refresh(ctx)
+}
+
+// current returns the record this publish last wrote. It is the value the next CAS replaces;
+// currentPredicate is what that CAS must present.
+func (l *publishLease) current() *DatasetRecord {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.rec
+}
+
+// currentPredicate returns the predicate of the value current returns, as the store reported it
+// for the write that produced it. It is what the next PutDatasetIf or DeleteDataset is
+// conditioned on (BUG-1).
+func (l *publishLease) currentPredicate() kv.Predicate {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.predicate
+}
+
+// hasLost reports whether another writer took the record over.
+func (l *publishLease) hasLost() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.lost
+}
+
+// stop ends the heartbeat and waits for it, so it can no longer CAS the record while the publish
+// advances the head.
+func (l *publishLease) stop() {
+	l.stopOnce.Do(func() { l.cancel() })
+	<-l.stopped
 }
 
 // startAsyncPublish turns an accepted large publish into a TaskRecord and a goroutine
@@ -1347,18 +1777,20 @@ func (s *Service) checkNameAvailable(ctx context.Context, name string) error {
 
 // publish materialises one version of the dataset and writes its VersionRecord (§6.2). It
 // is called only when the dataset record already exists and after resolve/validate/authorize:
-// the caller passes the resolved definition.
+// the caller passes the resolved definition and the lease of the record.
 //
 // Pins are taken before any data is written (§6.2 step 5, pins.go): a crash can then only
 // over-retain source data, never under-retain it (§14). A failed materialisation releases the
-// reference this attempt took.
-func (s *Service) publish(ctx context.Context, caller Caller, rec *DatasetRecord, def Definition, message, proposalID string) (*VersionRecord, error) {
+// reference this attempt took - but only before the commit exists. Once the commit is there the
+// pins stay and the version is finished from its tag instead (BUG-2).
+//
+// The lease owns the record version calculates from and carries the store's predicate for it
+// (BUG-1); caller is the principal every materialised source object is authorised for (SEC-3).
+func (s *Service) publish(ctx context.Context, caller Caller, lease *publishLease, def Definition, message, proposalID string) (*VersionRecord, error) {
+	rec := lease.current()
+	version := nextVersion(rec)
 	publisher := caller.Username
 
-	version := rec.PendingVersion
-	if version <= 0 {
-		version = rec.LatestVersion + 1
-	}
 	// The previous version's record is what the no-op check of §6.2 step 8 compares
 	// against; v1 has none. A record whose definition lives behind a DefinitionRef still
 	// contributes its metarange ID, so a re-publish that changes no data is rejected.
@@ -1381,6 +1813,7 @@ func (s *Service) publish(ctx context.Context, caller Caller, rec *DatasetRecord
 		Publisher:  publisher,
 		ProposalID: proposalID,
 		Previous:   previous,
+		Guard:      lease.check,
 	}
 
 	// §5.2 rule 6 is enforced on every publish, not only on create, so the materialiser
@@ -1392,6 +1825,21 @@ func (s *Service) publish(ctx context.Context, caller Caller, rec *DatasetRecord
 	}
 	result, err := s.publishFn(ctx, materializer, req)
 	if err != nil {
+		if lease.hasLost() || errors.Is(err, errPublishLeaseLost) {
+			// BUG-3: another writer owns the record now and its pins; touching them would
+			// strip the protection of a publish that is still alive.
+			return nil, err
+		}
+		// BUG-2: a commit that exists is never rolled back. Finish the version from the tag
+		// (or from the HEAD that carries dataset.version=N) and keep the pins. If even that
+		// fails the record stays in publishing, so the reconciler finishes it from the tag.
+		if commitID, committed := s.committedVersion(ctx, rec.Name, version); committed {
+			stored, adoptErr := s.adoptVersion(ctx, lease.current(), lease.currentPredicate(), version, commitID)
+			if adoptErr == nil {
+				return stored, nil
+			}
+			return nil, errors.Join(err, adoptErr)
+		}
 		if releaseErr := s.pins.Release(ctx, def, ref); releaseErr != nil {
 			err = errors.Join(err, releaseErr)
 		}
@@ -1403,12 +1851,11 @@ func (s *Service) publish(ctx context.Context, caller Caller, rec *DatasetRecord
 		return nil, err
 	}
 
-	stored, err := s.store.PutVersion(ctx, *result.VersionRecord(req, s.now()))
+	stored, err := s.writeVersion(ctx, *result.VersionRecord(req, s.now()))
 	if err != nil {
-		if releaseErr := s.pins.Release(ctx, def, ref); releaseErr != nil {
-			err = errors.Join(err, releaseErr)
-		}
-		return nil, err
+		// BUG-2: the commit and tag exist, so latest already serves the version. Keep the pins
+		// and leave the record in publishing(PendingVersion=N) for the reconciler.
+		return nil, fmt.Errorf("datasets: write version %d of %q after its commit: %w", version, rec.Name, err)
 	}
 	return stored, nil
 }
@@ -1428,6 +1875,45 @@ func (s *Service) previousVersion(ctx context.Context, rec *DatasetRecord) (Prev
 		return PreviousVersion{}, err
 	}
 	return PreviousVersionFromRecord(previous), nil
+}
+
+// rebuildStats recomputes the ItemStats of a version from its dataset repository commit
+// (§5.3 VersionRecord.Stats), so a rebuilt record is not left with zeroes. Entries are
+// attributed to the definition item whose target contains them; §5.2 rule 3 keeps targets
+// disjoint, so the attribution is unambiguous. The synthetic definition entry is skipped.
+func (s *Service) rebuildStats(ctx context.Context, dataset, commitID string, def Definition) (ItemStats, error) {
+	items := make([]ItemStat, len(def.Data))
+	for i := range def.Data {
+		items[i].Target = def.Data[i].Target
+	}
+	after := ""
+	for {
+		entries, hasMore, err := s.catalog.ListEntries(ctx, dataset, commitID, "", after, "", catalog.ListEntriesLimitMax)
+		if err != nil {
+			return ItemStats{}, err
+		}
+		for _, entry := range entries {
+			if entry.Path == DefinitionPath {
+				continue
+			}
+			idx := definitionItemIndex(&def, entry.Path)
+			if idx < 0 {
+				continue
+			}
+			items[idx].Objects++
+			items[idx].Bytes += entry.Size
+		}
+		if !hasMore || len(entries) == 0 {
+			break
+		}
+		after = entries[len(entries)-1].Path
+	}
+	stats := ItemStats{Items: items}
+	for _, item := range items {
+		stats.Objects += item.Objects
+		stats.Bytes += item.Bytes
+	}
+	return stats, nil
 }
 
 // materializerFor returns the publish primitive with the current metadata key rules (§5.5) and
