@@ -36,9 +36,16 @@ GOGET=$(GOCMD) get
 GOFMT=$(GOCMD)fmt
 
 GOTEST_FLAGS=-count=1 -race -failfast
+
+# Go build tags of the system tests. `datasets` adds esti/datasets_test.go, the Datasets suite of
+# DATASETS_DESIGN.md §15.2; it skips itself when the lakefs-sso binary or the datasets control
+# plane is unavailable, so it is safe to run with the rest of esti.
+ESTI_TAGS=datasets
+
 LAKEFS_BINARY_NAME=lakefs
 LAKECTL_BINARY_NAME=lakectl
 LAKECTL_DATASETS_BINARY_NAME=lakectl-datasets
+LAKEFS_SSO_BINARY_NAME=lakefs-sso
 
 UI_DIR=webui
 UI_BUILD_DIR=$(UI_DIR)/dist
@@ -63,6 +70,7 @@ clean:
 		$(LAKECTL_BINARY_NAME) \
 		$(LAKECTL_DATASETS_BINARY_NAME) \
 		$(LAKEFS_BINARY_NAME) \
+		$(LAKEFS_SSO_BINARY_NAME) \
 		$(UI_BUILD_DIR) \
 		$(UI_DIR)/node_modules
 	@mkdir -p $(UI_BUILD_DIR) && touch $(UI_BUILD_DIR)/.gitkeep
@@ -168,13 +176,17 @@ build-binaries:
 	$(GOBUILD) -o $(LAKEFS_BINARY_NAME) -ldflags $(LD_FLAGS) -v ./cmd/$(LAKEFS_BINARY_NAME)
 	$(GOBUILD) -o $(LAKECTL_BINARY_NAME) -ldflags $(LD_FLAGS) -v ./cmd/$(LAKECTL_BINARY_NAME)
 	$(GOBUILD) -o $(LAKECTL_DATASETS_BINARY_NAME) -ldflags $(LD_FLAGS) -v ./cmd/$(LAKECTL_DATASETS_BINARY_NAME)
+	$(GOBUILD) -o $(LAKEFS_SSO_BINARY_NAME) -ldflags $(LD_FLAGS) -v ./cmd/$(LAKEFS_SSO_BINARY_NAME)
 
 lint: ## Lint code
 	$(GOCMD) tool golangci-lint run ./... $(GOLANGCI_LINT_FLAGS)
 	cd $(UI_DIR) && npm run lint
 
 esti: ## run esti (system testing)
-	$(GOTEST) -v ./esti --args --system-tests
+	$(GOTEST) -tags $(ESTI_TAGS) -v ./esti --args --system-tests
+
+esti-datasets: ## run only the datasets system tests (starts its own lakefs-sso; needs Go and optionally Postgres)
+	ESTI_SETUP_LAKEFS=false $(GOTEST) -count=1 -tags $(ESTI_TAGS) -run TestDatasets -v ./esti --args --system-tests
 
 test: test-go test-hadoopfs  ## Run tests for the project
 
