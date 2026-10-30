@@ -61,7 +61,7 @@ func TestEnsureRBACBaseGroups(t *testing.T) {
 
 	expectedAttachments := map[string][]string{
 		setup.AdminsGroup:     {"FSFullAccess", "CatalogReadWriteAll", "AuthFullAccess", "RepoManagementFullAccess"},
-		setup.SuperUsersGroup: {"FSFullAccess", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll"},
+		setup.SuperUsersGroup: {"FSFullAccess", "PRReadWriteAll", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll"},
 		setup.DevelopersGroup: {"FSReadWriteAll", "PRReadWriteAll", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll"},
 		setup.ViewersGroup:    {"FSReadAll", "CatalogReadAll", "AuthManageOwnCredentials"},
 	}
@@ -162,7 +162,7 @@ func TestEnsureRBACBaseGroupsDatasetsEnabled(t *testing.T) {
 
 	expectedAttachments := map[string][]string{
 		setup.AdminsGroup:     {"FSFullAccess", "CatalogReadWriteAll", "AuthFullAccess", "RepoManagementFullAccess", setup.DatasetsFullAccessPolicy},
-		setup.SuperUsersGroup: {"FSFullAccess", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll", setup.DatasetsFullAccessPolicy},
+		setup.SuperUsersGroup: {"FSFullAccess", "PRReadWriteAll", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll", setup.DatasetsFullAccessPolicy},
 		setup.DevelopersGroup: {"FSReadWriteAll", "PRReadWriteAll", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll", setup.DatasetsReadAllPolicy},
 		setup.ViewersGroup:    {"FSReadAll", "CatalogReadAll", "AuthManageOwnCredentials", setup.DatasetsReadAllPolicy},
 	}

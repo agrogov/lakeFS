@@ -229,7 +229,11 @@ func EnsureRBACBaseGroups(ctx context.Context, authService auth.Service, ts time
 		policies []string
 	}{
 		{AdminsGroup, []string{"FSFullAccess", "CatalogReadWriteAll", "AuthFullAccess", "RepoManagementFullAccess"}},
-		{SuperUsersGroup, []string{"FSFullAccess", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll"}},
+		// SuperUsers gets PRReadWriteAll because ACL Super (the template Supers is migrated from) grants
+		// PRReadWrite: without it, `rbac-migrate` downgraded every existing Super by taking away the ability
+		// to open, update or merge a pull request. FSFullAccess/RepoManagementReadAll only grant pr:Read* and
+		// pr:List*. See RBAC_DESIGN.md §4.4, §4.5 #1 and DESIGN_CONFORMANCE.md GAP-06.
+		{SuperUsersGroup, []string{"FSFullAccess", "PRReadWriteAll", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll"}},
 		{DevelopersGroup, []string{"FSReadWriteAll", "PRReadWriteAll", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll"}},
 		{ViewersGroup, []string{"FSReadAll", "CatalogReadAll", "AuthManageOwnCredentials"}},
 	}
