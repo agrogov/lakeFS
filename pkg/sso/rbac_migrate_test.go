@@ -247,6 +247,12 @@ func TestRBACMigrate_CleanupDeletesLegacyGroupsAndPolicies(t *testing.T) {
 		_, err = svc.GetPolicy(ctx, acl.PolicyName(group))
 		require.ErrorIs(t, err, auth.ErrNotFound)
 	}
+	// The ACL policy detached from Admins by the first run is attached to nothing, so it goes too.
+	require.Contains(t, out.String(), "delete legacy policy "+acl.PolicyName(acl.AdminsGroup))
+	_, err = svc.GetPolicy(ctx, acl.PolicyName(acl.AdminsGroup))
+	require.ErrorIs(t, err, auth.ErrNotFound)
+	_, err = svc.GetGroup(ctx, acl.AdminsGroup)
+	require.NoError(t, err)
 	requireUserInGroup(t, ctx, svc, migrationSuperUser, setup.SuperUsersGroup)
 	requireUserInGroup(t, ctx, svc, migrationWriter, setup.DevelopersGroup)
 	requireUserInGroup(t, ctx, svc, migrationReader, setup.ViewersGroup)
@@ -265,4 +271,72 @@ func TestRBACMigrate_CleanupDeletesLegacyGroupsAndPolicies(t *testing.T) {
 	require.Contains(t, out.String(), "no authorization changes")
 	_, err = svc.GetGroup(ctx, acl.ReadersGroup)
 	require.ErrorIs(t, err, auth.ErrNotFound)
+}
+
+// TestRBACMigrate_CleanupInOneRunDeletesAdminACLPolicy covers --yes --cleanup on a legacy
+// installation: the policy is still attached to Admins when the plan is made, and the planned
+// detach makes it deletable in the same run.
+func TestRBACMigrate_CleanupInOneRunDeletesAdminACLPolicy(t *testing.T) {
+	ctx, _, _, svc := newACLService(t)
+	setupLegacyMigrationState(t, ctx, svc)
+
+	adminACLPolicy := acl.PolicyName(acl.AdminsGroup)
+	plan, err := sso.PlanRBACMigration(ctx, svc, true)
+	require.NoError(t, err)
+	require.Equal(t, []string{adminACLPolicy}, plan.DetachAdminPolicies)
+	require.Contains(t, plan.DeletePolicies, adminACLPolicy)
+
+	require.NoError(t, sso.MigrateACLToRBAC(ctx, svc, sso.RBACMigrationOptions{Apply: true, Cleanup: true}, &bytes.Buffer{}))
+	_, err = svc.GetPolicy(ctx, adminACLPolicy)
+	require.ErrorIs(t, err, auth.ErrNotFound)
+	require.NotContains(t, groupPolicyNames(t, ctx, svc, setup.AdminsGroup), adminACLPolicy)
+	requireGroupPolicy(t, ctx, svc, setup.AdminsGroup, "AuthFullAccess")
+}
+
+// TestRBACMigrate_CleanupKeepsAdminACLPolicyStillInUse checks that cleanup does not delete the
+// detached Admins ACL policy while an admin has attached it to another group or to a user.
+func TestRBACMigrate_CleanupKeepsAdminACLPolicyStillInUse(t *testing.T) {
+	adminACLPolicy := acl.PolicyName(acl.AdminsGroup)
+	tests := []struct {
+		name   string
+		attach func(t *testing.T, ctx context.Context, svc *acl.AuthService)
+		holder string
+	}{
+		{
+			name: "attached to a group",
+			attach: func(t *testing.T, ctx context.Context, svc *acl.AuthService) {
+				require.NoError(t, svc.AttachPolicyToGroup(ctx, adminACLPolicy, migrationTeamNoACL))
+			},
+			holder: "group " + migrationTeamNoACL,
+		},
+		{
+			name: "attached to a user",
+			attach: func(t *testing.T, ctx context.Context, svc *acl.AuthService) {
+				require.NoError(t, svc.AttachPolicyToUser(ctx, adminACLPolicy, migrationWriter))
+			},
+			holder: "user " + migrationWriter,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _, _, svc := newACLService(t)
+			setupLegacyMigrationState(t, ctx, svc)
+			tc.attach(t, ctx, svc)
+
+			var out bytes.Buffer
+			require.NoError(t, sso.MigrateACLToRBAC(ctx, svc, sso.RBACMigrationOptions{Apply: true, Cleanup: true}, &out))
+			require.Contains(t, out.String(), "keep legacy policy "+adminACLPolicy+": still attached to "+tc.holder)
+
+			_, err := svc.GetPolicy(ctx, adminACLPolicy)
+			require.NoError(t, err)
+			require.NotContains(t, groupPolicyNames(t, ctx, svc, setup.AdminsGroup), adminACLPolicy)
+
+			// Keeping the policy is guidance, not a pending change: a rerun is a no-op.
+			plan, err := sso.PlanRBACMigration(ctx, svc, true)
+			require.NoError(t, err)
+			require.True(t, plan.Empty(), "plan should be empty: %+v", plan)
+			require.Len(t, plan.KeptPolicies, 1)
+		})
+	}
 }

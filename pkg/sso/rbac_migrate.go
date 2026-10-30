@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/treeverse/lakefs/contrib/auth/acl"
@@ -65,11 +66,18 @@ type RBACMigrationPlan struct {
 	MemberCopies         []RBACMemberCopy
 	DeleteGroups         []string
 	DeletePolicies       []string
+	KeptPolicies         []RBACKeptPolicy
 	GroupMappingRewrites []RBACGroupMappingRewrite
 }
 
+// RBACKeptPolicy is a legacy policy that cleanup leaves in place because it is still attached.
+type RBACKeptPolicy struct {
+	Policy     string
+	AttachedTo []string
+}
+
 // Empty reports whether applying the plan would change any authorization state.
-// GroupMappingRewrites are operator guidance, not changes.
+// GroupMappingRewrites and KeptPolicies are operator guidance, not changes.
 func (p *RBACMigrationPlan) Empty() bool {
 	return len(p.AttachAdminPolicies) == 0 &&
 		len(p.DetachAdminPolicies) == 0 &&
@@ -159,6 +167,14 @@ func PlanRBACMigration(ctx context.Context, svc auth.Service, cleanup bool) (*RB
 		}
 	}
 
+	// ACL(_-_)Admins is detached from Admins rather than deleted with a group, so cleanup
+	// deletes it only once nothing else holds it: an admin may have attached it elsewhere.
+	if cleanup {
+		if err := planAdminACLPolicyCleanup(ctx, svc, plan, adminACLPolicy); err != nil {
+			return nil, err
+		}
+	}
+
 	return plan, nil
 }
 
@@ -239,36 +255,89 @@ func legacyGroupUsers(ctx context.Context, svc auth.Service, group string) ([]*m
 }
 
 func listAllGroupUsers(ctx context.Context, svc auth.Service, group string) ([]*model.User, error) {
-	var all []*model.User
-	after := ""
-	for {
-		users, paginator, err := svc.ListGroupUsers(ctx, group, &model.PaginationParams{
-			Amount: auth.MaxPage,
-			After:  after,
-		})
-		if err != nil {
-			return nil, err
-		}
-		all = append(all, users...)
-		if paginator == nil || paginator.NextPageToken == "" {
-			return all, nil
-		}
-		after = paginator.NextPageToken
-	}
+	return listAll(func(params *model.PaginationParams) ([]*model.User, *model.Paginator, error) {
+		return svc.ListGroupUsers(ctx, group, params)
+	})
 }
 
 func listAllGroupPolicies(ctx context.Context, svc auth.Service, group string) ([]*model.Policy, error) {
-	var all []*model.Policy
+	return listAll(func(params *model.PaginationParams) ([]*model.Policy, *model.Paginator, error) {
+		return svc.ListGroupPolicies(ctx, group, params)
+	})
+}
+
+// planAdminACLPolicyCleanup adds the Admins ACL policy to plan.DeletePolicies when no group
+// or user holds it once the planned detach from Admins is applied. Otherwise it records the
+// holders in plan.KeptPolicies.
+func planAdminACLPolicyCleanup(ctx context.Context, svc auth.Service, plan *RBACMigrationPlan, policy string) error {
+	exists, err := policyExists(ctx, svc, policy)
+	if err != nil || !exists {
+		return err
+	}
+	holders, err := policyHolders(ctx, svc, policy)
+	if err != nil {
+		return err
+	}
+	detaching := slices.Contains(plan.DetachAdminPolicies, policy)
+	holders = slices.DeleteFunc(holders, func(holder string) bool {
+		return detaching && holder == "group "+acl.AdminsGroup
+	})
+	if len(holders) > 0 {
+		plan.KeptPolicies = append(plan.KeptPolicies, RBACKeptPolicy{Policy: policy, AttachedTo: holders})
+		return nil
+	}
+	plan.DeletePolicies = append(plan.DeletePolicies, policy)
+	return nil
+}
+
+// policyHolders returns every group and user the policy is attached to, as "group <name>"
+// and "user <name>".
+func policyHolders(ctx context.Context, svc auth.Service, policy string) ([]string, error) {
+	var holders []string
+	groups, err := listAll(func(params *model.PaginationParams) ([]*model.Group, *model.Paginator, error) {
+		return svc.ListGroups(ctx, params)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list groups: %w", err)
+	}
+	for _, group := range groups {
+		policies, err := listAllGroupPolicies(ctx, svc, group.DisplayName)
+		if err != nil {
+			return nil, fmt.Errorf("list policies of group %s: %w", group.DisplayName, err)
+		}
+		if slices.ContainsFunc(policies, func(p *model.Policy) bool { return p.DisplayName == policy }) {
+			holders = append(holders, "group "+group.DisplayName)
+		}
+	}
+	users, err := listAll(func(params *model.PaginationParams) ([]*model.User, *model.Paginator, error) {
+		return svc.ListUsers(ctx, params)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list users: %w", err)
+	}
+	for _, user := range users {
+		policies, err := listAll(func(params *model.PaginationParams) ([]*model.Policy, *model.Paginator, error) {
+			return svc.ListUserPolicies(ctx, user.Username, params)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list policies of user %s: %w", user.Username, err)
+		}
+		if slices.ContainsFunc(policies, func(p *model.Policy) bool { return p.DisplayName == policy }) {
+			holders = append(holders, "user "+user.Username)
+		}
+	}
+	return holders, nil
+}
+
+func listAll[T any](list func(*model.PaginationParams) ([]T, *model.Paginator, error)) ([]T, error) {
+	var all []T
 	after := ""
 	for {
-		policies, paginator, err := svc.ListGroupPolicies(ctx, group, &model.PaginationParams{
-			Amount: auth.MaxPage,
-			After:  after,
-		})
+		items, paginator, err := list(&model.PaginationParams{Amount: auth.MaxPage, After: after})
 		if err != nil {
 			return nil, err
 		}
-		all = append(all, policies...)
+		all = append(all, items...)
 		if paginator == nil || paginator.NextPageToken == "" {
 			return all, nil
 		}
@@ -310,6 +379,9 @@ func writeRBACMigrationPlan(out io.Writer, plan *RBACMigrationPlan, applied bool
 	}
 	for _, policy := range plan.DeletePolicies {
 		fmt.Fprintf(out, "  (--cleanup) delete legacy policy %s\n", policy)
+	}
+	for _, kept := range plan.KeptPolicies {
+		fmt.Fprintf(out, "  (--cleanup) keep legacy policy %s: still attached to %s\n", kept.Policy, strings.Join(kept.AttachedTo, ", "))
 	}
 	fmt.Fprintln(out, "  custom groups are left untouched; their ACL policies are kept")
 
