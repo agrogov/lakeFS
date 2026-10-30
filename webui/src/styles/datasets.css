@@ -38,8 +38,16 @@
     background-color: #7c3aed;
 }
 
-/* Datasets Enterprise gate */
-.datasets-gate-content {
+/*
+ * Datasets are disabled on this server (DATASETS_DESIGN.md §11). Replaces the old Enterprise
+ * upsell, so the block is deliberately neutral: it states the fact and points at the admin.
+ */
+.datasets-disabled-card {
+    border: none;
+    background-color: transparent;
+}
+
+.datasets-disabled-content {
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -49,34 +57,58 @@
     min-height: 40vh;
 }
 
-.datasets-gate-icon {
+.datasets-disabled-icon {
     width: 56px;
     height: 56px;
     border-radius: 50%;
-    background-color: #fef3c7;
+    background-color: var(--background-alt);
+    color: var(--text-light);
     display: flex;
     align-items: center;
     justify-content: center;
     margin-bottom: 20px;
-    color: #b45309;
 }
 
-[data-bs-theme='dark'] .datasets-gate-icon {
-    background-color: rgba(251, 191, 36, 0.15);
-    color: #fbbf24;
-}
-
-.datasets-gate-content h4 {
+.datasets-disabled-content h4 {
     margin-bottom: 8px;
     font-weight: 600;
 }
 
-.datasets-gate-content p {
+.datasets-disabled-content p {
     max-width: 460px;
-    margin-bottom: 24px;
+    margin-bottom: 0;
 }
 
-.datasets-gate-actions {
-    display: flex;
-    gap: 8px;
+/* Dataset list (DATASETS_DESIGN.md §11.2) */
+.datasets-list-page .datasets-search-form {
+    min-width: 280px;
+}
+
+.datasets-list-page .datasets-table th {
+    white-space: nowrap;
+    font-weight: 600;
+}
+
+.datasets-list-page .dataset-description-cell {
+    max-width: 320px;
+}
+
+.datasets-empty-state {
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    padding: 48px 24px;
+}
+
+.dataset-metadata-badge {
+    max-width: 220px;
+    font-weight: 400;
+}
+
+.dataset-metadata-badge .dataset-metadata-key {
+    font-weight: 600;
+}
+
+.dataset-badge {
+    text-decoration: none;
+    vertical-align: middle;
 }

@@ -5,7 +5,19 @@ import { WithLoginConfigContext } from '../lib/hooks/conf';
 
 // pages
 import RepositoriesPage from './repositories';
-import DatasetsPage from './datasets';
+import DatasetsLayout from './datasets';
+import DatasetsListPage from './datasets/list';
+import DatasetPageLayout from './datasets/datasetPageLayout';
+import DatasetOverviewPage from './datasets/overview';
+import DatasetDataPage from './datasets/data';
+import DatasetVersionsPage from './datasets/versions';
+import DatasetComparePage from './datasets/compare';
+import DatasetEditorPage from './datasets/editor';
+import DatasetAccessPage from './datasets/access';
+import DatasetProposalsPage from './datasets/proposals';
+import DatasetProposalPage from './datasets/proposals/proposal';
+import DatasetProposalsAllPage from './datasets/proposals/all';
+import DatasetsSettingsPage from './datasets/settings';
 import { RepositoryPageLayout } from '../lib/components/repository/layout.jsx';
 import RepositoryObjectsPage from './repositories/repository/objects';
 import RepositoryObjectsViewPage from './repositories/repository/objectViewer';
@@ -100,7 +112,26 @@ export const IndexPage = () => {
                                     </Route>
                                 </Route>
                                 <Route path="datasets" element={<Layout />}>
-                                    <Route index element={<DatasetsPage />} />
+                                    {/* The tabbed views: datasets | pull requests | settings (DATASETS_DESIGN.md §11.1) */}
+                                    <Route element={<DatasetsLayout />}>
+                                        <Route index element={<DatasetsListPage />} />
+                                        <Route path="pulls" element={<DatasetProposalsAllPage />} />
+                                        <Route path="settings" element={<DatasetsSettingsPage />} />
+                                    </Route>
+                                    <Route path="create" element={<DatasetEditorPage mode="create" />} />
+                                    <Route path=":datasetId" element={<DatasetPageLayout />}>
+                                        <Route index element={<Navigate to="overview" />} />
+                                        <Route path="overview" element={<DatasetOverviewPage />} />
+                                        <Route path="data" element={<DatasetDataPage />} />
+                                        <Route path="versions" element={<DatasetVersionsPage />} />
+                                        <Route path="compare" element={<DatasetComparePage />} />
+                                        <Route path="edit" element={<DatasetEditorPage mode="edit" />} />
+                                        <Route path="proposals">
+                                            <Route index element={<DatasetProposalsPage />} />
+                                            <Route path=":proposalId" element={<DatasetProposalPage />} />
+                                        </Route>
+                                        <Route path="access" element={<DatasetAccessPage />} />
+                                    </Route>
                                 </Route>
                                 <Route path="auth" element={<Layout />}>
                                     <Route index element={<Navigate to="credentials" replace />} />

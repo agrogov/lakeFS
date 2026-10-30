@@ -22,6 +22,8 @@ import { Link } from '../../lib/components/nav';
 import { useRouter } from '../../lib/hooks/router';
 import { useConfigContext } from '../../lib/hooks/configProvider';
 import { ReadOnlyBadge } from '../../lib/components/badges';
+import { partitionDatasetRepos } from '../../lib/components/datasets/metadata';
+import { useDatasetNames } from '../../lib/components/datasets/hooks';
 
 import Button from 'react-bootstrap/Button';
 import Alert from 'react-bootstrap/Alert';
@@ -193,6 +195,10 @@ const RepositoryList = ({
     creatingRepo,
     createRepoError,
 }) => {
+    // Dataset repositories are listed under /datasets (DATASETS_DESIGN.md §11.3). The
+    // repository listing carries no metadata, so their names come from the control plane; an
+    // empty set (datasets disabled or unreachable) filters nothing out.
+    const { names: datasetNames } = useDatasetNames();
     const { results, loading, error, nextPage } = useAPIWithPagination(() => {
         return repositories.list(search, after);
         // TODO: Review and remove this eslint-disable once dependencies are validated
@@ -203,6 +209,7 @@ const RepositoryList = ({
     }, [toggleShowActionsBar]);
     if (loading) return <Loading />;
     if (error) return <AlertError error={error} />;
+    const { repositories: visibleRepos, datasets } = partitionDatasetRepos(results, datasetNames);
     if (!after && !search && results.length === 0) {
         return (
             <GetStarted
@@ -215,9 +222,20 @@ const RepositoryList = ({
         );
     }
 
+    // Datasets were the only thing on this page: point at where they are listed instead of
+    // rendering an empty list.
+    if (visibleRepos.length === 0 && datasets.length > 0) {
+        return (
+            <Alert variant="secondary">
+                {datasets.length === 1 ? 'This repository is a dataset.' : 'These repositories are datasets.'} Datasets
+                are listed on the <Link href={{ pathname: '/datasets' }}>Datasets</Link> page.
+            </Alert>
+        );
+    }
+
     return (
         <div>
-            {results.map((repo) => (
+            {visibleRepos.map((repo) => (
                 <Row key={repo.id} className="repository-item">
                     <Col className={'mb-3 mt-1'}>
                         <Card className="h-100 repository-card">
