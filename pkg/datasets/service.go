@@ -776,14 +776,19 @@ func (s *Service) publishIsAsync(estimate ItemStats) bool {
 // materialise (which takes the pins first), write the VersionRecord, and advance the
 // dataset record. Any failure is rolled back to "active" on a best-effort basis.
 func (s *Service) runPublish(ctx context.Context, publishing *DatasetRecord, def Definition, req PublishVersionRequest, publisher string) (*VersionRecord, error) {
+	started := time.Now()
 	version, err := s.publish(ctx, publishing, def, req.Message, publisher, req.ProposalID)
 	if err != nil {
-		return nil, s.rollbackPublish(ctx, publishing, err)
+		err = s.rollbackPublish(ctx, publishing, err)
+		// §12.4: every attempt is observed, with the same classification the HTTP layer uses.
+		dsMetrics.observePublish(publishResultOf(err), time.Since(started).Seconds(), 0)
+		return nil, err
 	}
 	// §5.4 step 4: the version is durable; advance the head. This CAS losing is not a
 	// rollback case - the version exists - so it is reported as a conflict and left to
 	// the reconciler (§5.4, §12.3).
 	if err := s.activateDataset(ctx, publishing, version.Version); err != nil {
+		dsMetrics.observePublish(publishResultOf(err), time.Since(started).Seconds(), 0)
 		return nil, err
 	}
 	// §12.4: one audit line per published version, in the same Fields shape as
@@ -794,6 +799,7 @@ func (s *Service) runPublish(ctx context.Context, publishing *DatasetRecord, def
 		"user":    publisher,
 		"action":  "PublishVersion",
 	}).Info("datasets: published a version")
+	dsMetrics.observePublish(publishResultSuccess, time.Since(started).Seconds(), version.Stats.Objects)
 	return version, nil
 }
 

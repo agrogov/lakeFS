@@ -959,16 +959,23 @@ later. Reads already work through the `lakefs` SDK.
 ### 12.3 Reconciler
 
 Background goroutine started by `RoutesBuilder`, every `datasets.reconcile_interval` (default 10m), with a KV lease
-`datasets/_lease` (SetIf with expiry) so only one node runs it:
+`datasets/_lease` (SetIf with expiry) so only one node runs it. The pass is also a directly callable function
+(`Reconciler.Reconcile`), not only reachable through the ticker, and the lease is released when the pass ends so a
+crashed node only blocks the others until its lease expires:
 
 1. Datasets stuck in `creating`/`publishing`/`deleting` longer than `publish_timeout` → resume or roll back:
    - if tag `vN` exists → write the missing `VersionRecord` from `_dataset/definition.json`, mark `active`;
    - else if `latest` HEAD has `dataset.version = N` → create the tag, then as above;
    - else → release the pins added for N and mark `active`.
+   A `deleting` record is finished instead of resumed: the repository, the pins, the policies/grants and the
+   control-plane records are removed, because every delete step tolerates not-found (§6.6).
 2. Pins: every `(repo, commit)` referenced by a version has its pin branch; recreate if missing (log at WARN, metric
    `datasets_pins_recreated_total`). Orphan pins (no references) are deleted.
 3. Policies: immutability guard and managed read policies exist and are attached; re-attach if not.
-4. Source repos deleted → mark dataset `degraded` (shown in UI/API).
+4. Source repos deleted → mark dataset `degraded` (shown in UI/API); the mark is cleared once every pinned source is
+   reachable again.
+
+Every step is idempotent: a second pass over a converged state repairs nothing.
 
 ### 12.4 Observability
 
@@ -1014,6 +1021,7 @@ Also add a commented `datasets:` block to `cmd/lakefs-sso/config.example.yaml`.
 |---|---|
 | Two concurrent publishes on one dataset | Second gets `409` from the CAS in §5.4 step 3. |
 | Node crashes mid-publish | Dataset stays `publishing`; the reconciler resumes or rolls back after `publish_timeout`. Pins may briefly over-retain data; never under-retain (pins come before the commit). |
+| Node crashes mid-delete | Dataset stays `deleting`; the reconciler finishes the delete after `publish_timeout`, since every delete step tolerates not-found (§6.6). |
 | Source branch moves after create | No effect: items are pinned to commits. |
 | Source object deleted on a branch | No effect: pinned commit still references it; pin branch protects it from GC. |
 | Source repo GC with expired retention | Protected by pin branches (§8.2). |

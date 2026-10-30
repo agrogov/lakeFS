@@ -31,6 +31,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/datasets/apigen"
 	"github.com/treeverse/lakefs/pkg/httputil"
 	"github.com/treeverse/lakefs/pkg/kv"
+	"github.com/treeverse/lakefs/pkg/logging"
 )
 
 // ErrNotImplemented is wrapped by every datasets control-plane handler that has no business
@@ -145,6 +146,23 @@ func writeUnauthenticated(w http.ResponseWriter, r *http.Request) {
 
 // --- generated server interface: implemented operations ---
 
+// logAction writes the audit line of a mutating handler (DATASETS_DESIGN.md §12.4): the
+// same dataset/version/user/action Fields shape the core Controller.LogAction uses, so
+// dataset history is greppable next to the API audit log whatever endpoint produced it.
+func logAction(r *http.Request, action, dataset string, version int) {
+	user, _ := auth.GetUser(r.Context()) // requireUser already rejected an anonymous request
+	username := ""
+	if user != nil {
+		username = user.Username
+	}
+	logging.FromContext(r.Context()).WithFields(logging.Fields{
+		"dataset": dataset,
+		"version": version,
+		"user":    username,
+		"action":  action,
+	}).Info("datasets: control-plane action")
+}
+
 func (s *server) ListDatasets(w http.ResponseWriter, r *http.Request, params apigen.ListDatasetsParams) {
 	caller, err := s.caller(r)
 	if err != nil {
@@ -201,6 +219,7 @@ func (s *server) CreateDataset(w http.ResponseWriter, r *http.Request, body apig
 		writeServiceError(w, r, err)
 		return
 	}
+	logAction(r, "CreateDataset", view.Record.Name, view.Record.LatestVersion)
 	httputil.WriteAPIResponse(w, r, http.StatusCreated, datasetToAPI(view))
 }
 
@@ -228,6 +247,7 @@ func (s *server) DeleteDataset(w http.ResponseWriter, r *http.Request, dataset a
 		writeServiceError(w, r, err)
 		return
 	}
+	logAction(r, "DeleteDataset", string(dataset), 0)
 	httputil.WriteAPIResponse(w, r, http.StatusNoContent, nil)
 }
 
@@ -284,6 +304,7 @@ func (s *server) GrantAccess(w http.ResponseWriter, r *http.Request, body apigen
 		writeServiceError(w, r, err)
 		return
 	}
+	logAction(r, "GrantAccess", string(dataset), 0)
 	httputil.WriteAPIResponse(w, r, http.StatusCreated, grantToAPI(grant))
 }
 
@@ -297,6 +318,7 @@ func (s *server) RevokeAccess(w http.ResponseWriter, r *http.Request, dataset ap
 		writeServiceError(w, r, err)
 		return
 	}
+	logAction(r, "RevokeAccess", string(dataset), 0)
 	httputil.WriteAPIResponse(w, r, http.StatusNoContent, nil)
 }
 
@@ -374,9 +396,11 @@ func (s *server) PublishVersion(w http.ResponseWriter, r *http.Request, body api
 	// §6.5: a publish above datasets.sync_publish_max_objects answers 202 with the task
 	// to poll at GET /datasets/{ds}/tasks/{task} instead of blocking the request.
 	if outcome.Accepted() {
+		logAction(r, "PublishVersion", string(dataset), 0)
 		httputil.WriteAPIResponse(w, r, http.StatusAccepted, taskToAPI(outcome.Task))
 		return
 	}
+	logAction(r, "PublishVersion", string(dataset), outcome.Version.Version)
 	httputil.WriteAPIResponse(w, r, http.StatusCreated, versionToAPI(outcome.Version))
 }
 

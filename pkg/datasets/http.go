@@ -45,9 +45,12 @@ var ErrAuthenticationRequired = errors.New("authentication required")
 // through cmd.AddExtraRoutesBuilder (DATASETS_DESIGN.md §4.4). It returns an error for an
 // invalid configuration; the hook loop in run.go turns that into a fatal startup error.
 //
-// ctx bounds the background goroutines the builder may start (the reconciler, §12.3). It is
-// unused until the reconciler lands.
-func RoutesBuilder(_ context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) error {
+// ctx bounds the background repair loop (§12.3): the loop runs until ctx is cancelled, so it
+// stops with the server. A nil ctx is treated as a process-lifetime context.
+func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cfg, err := LoadConfig()
 	if err != nil {
 		return err
@@ -85,6 +88,13 @@ func RoutesBuilder(_ context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) error 
 		return err
 	}
 	r.Mount(APIBasePath, datasetsRouter)
+
+	// §12.3: the repair loop. It acquires the datasets/_lease KV lease before each pass, so
+	// running it on every node is safe: only one node per interval actually repairs. The
+	// goroutine exits when ctx is cancelled.
+	reconciler := NewReconciler(svc)
+	reconciler.log = deps.Logger
+	go reconciler.Run(ctx)
 	return nil
 }
 

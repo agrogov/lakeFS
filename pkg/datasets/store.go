@@ -526,6 +526,12 @@ func (s *Store) ListDatasets(ctx context.Context) ([]*DatasetRecord, error) {
 	prefix := []byte(datasetKeyPrefix + kv.PathDelimiter)
 	records := make([]*DatasetRecord, 0)
 	err := s.scanPrefix(ctx, prefix, func(key, value []byte) error {
+		// The reconcile lease (§12.3) lives at datasets/_lease, under the same prefix as the
+		// dataset records. It is a lease, not a dataset, so it is skipped by name rather than
+		// decoded (its value would look like a record with an empty name and state).
+		if bytes.Equal(key, []byte(ReconcileLeaseKey)) {
+			return nil
+		}
 		rec, err := decodeRecord[DatasetRecord]("dataset record", key, value)
 		if err != nil {
 			return err
