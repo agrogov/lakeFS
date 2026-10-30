@@ -10,14 +10,25 @@
 // this package may import pkg/catalog, pkg/graveler, pkg/auth, pkg/block, pkg/kv,
 // pkg/permissions and pkg/api (only for GenericAuthMiddleware).
 //
-// The package holds the definition model and metadata validation (definition.go,
-// validate.go, metadata_keys.go), the control-plane KV persistence layer (store.go, §5.3),
-// authorization and bootstrap (authz.go, bootstrap.go), the OpenAPI spec and its generated
-// server stubs (api/datasets.yml, apigen, http.go, handlers.go), materialisation
-// (resolve.go, materialize.go), the GC pins with degraded detection of §8.2 (pins.go), the
-// service that owns the dataset lifecycle including publish/versions and the validate dry
-// run (service.go), the version diff of §10.3 (diff.go), the proposals of §5.6 with their
-// preview branches (proposals.go), and the design-phase spike evidence (S2 and S4) as
-// executable tests. Metadata-key CRUD, the reconciler, the CLI and the remaining UI pages
-// land in later phases.
+// The package holds, layer by layer:
+//
+//   - the configuration section and its validation (config.go, §13);
+//   - the definition model with metadata validation (definition.go, validate.go,
+//     metadata_validate.go, metadata_keys.go);
+//   - the control-plane KV store (store.go, §5.3);
+//   - authorization and bootstrap: actions, ARNs, per-dataset managed policies and grants
+//     (authz.go), and the installation-wide policies and groups (bootstrap.go, §9);
+//   - the OpenAPI spec, its generated stubs and the HTTP plumbing (api/datasets.yml,
+//     apigen, http.go, handlers.go, §10);
+//   - materialisation (resolve.go, materialize.go, §6);
+//   - the service that owns the dataset lifecycle, publish/versions and the validate dry run
+//     (service.go), the version diff of §10.3 (diff.go) and the proposals of §5.6 with their
+//     preview branches (proposals.go);
+//   - the GC pin manager, including degraded-source detection (pins.go, §8.2);
+//   - the background reconciler that repairs state, pins and policies (reconciler.go, §12.3);
+//   - the metrics of §12.4 (metrics.go);
+//   - the design-phase spike evidence (S2 and S4) as executable tests.
+//
+// The metadata-key records are persisted by store.go; the CLI and the UI pages live outside
+// this package (cmd/lakectl-datasets, webui/src/pages/datasets).
 package datasets
