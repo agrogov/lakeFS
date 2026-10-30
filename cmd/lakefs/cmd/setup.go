@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/treeverse/lakefs/pkg/auth"
@@ -14,6 +15,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/kv/kvparams"
 	"github.com/treeverse/lakefs/pkg/logging"
+	"github.com/treeverse/lakefs/pkg/sso"
 	"github.com/treeverse/lakefs/pkg/stats"
 	"github.com/treeverse/lakefs/pkg/version"
 )
@@ -25,10 +27,10 @@ var setupCmd = &cobra.Command{
 	Short:   "Setup a new lakeFS instance with initial credentials",
 	Run: func(cmd *cobra.Command, args []string) {
 		cfg := LoadConfig()
-		authConfig := cfg.AuthConfig()
 		baseConfig := cfg.GetBaseConfig()
 
 		ctx := cmd.Context()
+		logger := logging.FromContext(ctx)
 		kvParams, err := kvparams.NewConfig(&baseConfig.Database)
 		if err != nil {
 			_, _ = fmt.Fprintf(os.Stderr, "KV params: %s\n", err)
@@ -42,8 +44,8 @@ var setupCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		if authConfig.GetAuthUIConfig().RBAC == config.AuthRBACExternal {
-			// nothing to do - users are managed elsewhere
+		if !setupCreatesLocalAdmin(cfg, logger) {
+			// nothing to do - users are managed by an external auth service
 			return
 		}
 
@@ -77,7 +79,6 @@ var setupCmd = &cobra.Command{
 		}
 		defer kvStore.Close()
 
-		logger := logging.FromContext(ctx)
 		authMetadataManager := auth.NewKVMetadataManager(version.Version, baseConfig.Installation.FixedID, baseConfig.Database.Type, kvStore)
 		authService = authServiceBuilder(ctx, cfg, logger, kvStore, authMetadataManager)
 		metadata := initStatsMetadata(ctx, logger, authMetadataManager, cfg)
@@ -108,6 +109,15 @@ var setupCmd = &cobra.Command{
 	},
 }
 
+// setupCreatesLocalAdmin reports whether `setup` should create the initial admin user. A
+// genuinely external auth service manages its users elsewhere, so there is nothing to set up.
+// The mode is resolved first: with SSO enabled "external" is not supported and the installation
+// runs in-process as "simplified" (RBAC_DESIGN.md §4.1), which does need a local initial admin
+// (GAP-04).
+func setupCreatesLocalAdmin(cfg config.Config, logger logging.Logger) bool {
+	return sso.ResolveAuthMode(cfg, logger) != config.AuthRBACExternal
+}
+
 func setupLakeFS(ctx context.Context, cfg config.Config, metadataManager auth.MetadataManager, authService auth.Service, userName string, accessKeyID string, secretAccessKey string, noSetupCheck bool) (*model.Credential, error) {
 	var (
 		err            error
@@ -133,6 +143,32 @@ func setupLakeFS(ctx context.Context, cfg config.Config, metadataManager auth.Me
 		_, err := metadataManager.UpdateCommPrefs(ctx, nil)
 		if err != nil {
 			return nil, fmt.Errorf("update comm prefs: %w", err)
+		}
+	}
+
+	// The auth-service builder runs before this setup and, when SSO is enabled, it seeds the
+	// optional break-glass admin from installation.*. On a fresh KV, run then asks for exactly
+	// that admin and access key, and creating them again would fail with "already exists". If
+	// that user and key already exist the installation is complete: record the setup time and
+	// return the credentials instead of failing. Any other pre-existing user or key still takes
+	// the normal path, so the "already exists" error is preserved for genuine conflicts.
+	if accessKeyID != "" {
+		if _, credErr := authService.GetCredentialsForUser(ctx, userName, accessKeyID); credErr == nil {
+			if err := authService.AddUserToGroup(ctx, userName, setup.AdminsGroup); err != nil && !errors.Is(err, auth.ErrAlreadyExists) {
+				return nil, fmt.Errorf("add user to group - %w", err)
+			}
+			if err := metadataManager.UpdateSetupTimestamp(ctx, time.Now(), cfg.AuthConfig().GetAuthUIConfig().RBAC); err != nil {
+				return nil, fmt.Errorf("update setup timestamp: %w", err)
+			}
+			return &model.Credential{
+				Username: userName,
+				BaseCredential: model.BaseCredential{
+					AccessKeyID:     accessKeyID,
+					SecretAccessKey: secretAccessKey,
+				},
+			}, nil
+		} else if !errors.Is(credErr, auth.ErrNotFound) {
+			return nil, fmt.Errorf("check initial admin credentials: %w", credErr)
 		}
 	}
 

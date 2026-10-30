@@ -100,6 +100,22 @@ func BuildAuthService(ctx context.Context, cfg config.Config, logger logging.Log
 	return svc
 }
 
+// ResolveAuthMode returns the effective auth.ui_config.rbac value the auth service will run
+// with, normalizing the shared config in place so that callers reading it later agree.
+//
+// `lakefs setup` and `lakefs superuser` need the effective mode before they build the service:
+// under SSO neither "none" nor "external" is what the in-process ACL service runs with, and
+// they must decide from that whether the user joins Admins and whether a local admin can exist
+// at all (GAP-03, GAP-04). With SSO disabled the configured value is returned unchanged - there
+// the upstream auth service builds from it, and "external" still means a remote auth API.
+func ResolveAuthMode(cfg config.Config, logger logging.Logger) string {
+	uiCfg := cfg.AuthConfig().GetAuthUIConfig()
+	if !LoadSSOConfig().Enabled {
+		return uiCfg.RBAC
+	}
+	return resolveAuthMode(uiCfg, logger)
+}
+
 // resolveAuthMode normalizes auth.ui_config.rbac for the in-process ACL auth service and
 // returns the effective mode. Empty and "none" mean the SSO default, "simplified"; "internal"
 // enables policy RBAC; "external" is rejected because no remote auth service exists in this
