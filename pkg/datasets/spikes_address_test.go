@@ -6,10 +6,13 @@ package datasets
 // the dataset repository's own namespace holds none of that data.
 //
 //	S4: Do adapters read IdentifierTypeFull addresses outside the repository namespace?
-//	    ANSWER: YES for the adapters that can run without cloud credentials (mem and local). An entry
-//	    whose PhysicalAddress is a full URI into the source repository's namespace resolves and reads
-//	    through the very code path the S3 gateway uses (ObjectPointer{IdentifierType: Full}), while the
-//	    dataset repository's own namespace stays empty. The local adapter additionally requires the
+//	    ANSWER: YES. This file verifies it end to end for mem (through a real catalog) and for the local
+//	    adapter, including its allowed_external_prefixes restriction; the shared adapter suite verifies it
+//	    for every adapter that runs it, including the docker-backed ones (see "Adapter-level conformance"
+//	    below). Concretely: an entry whose PhysicalAddress is a full URI into the source repository's
+//	    namespace resolves and reads through the very code path the S3 gateway uses
+//	    (ObjectPointer{IdentifierType: Full}), while the dataset repository's own namespace stays empty.
+//	    The local adapter additionally requires the
 //	    source path to be inside its configured root directory, or listed in
 //	    blockstore.local.allowed_external_prefixes — with the default configuration a source namespace
 //	    outside the adapter root is rejected with block.ErrForbidden. Required configuration when the
@@ -27,11 +30,27 @@ package datasets
 //	    design section 6.3 specifies (only RELATIVE addresses are converted).
 //	    The local adapter is exercised at the adapter level, because that is where its restriction lives;
 //	    the catalog-level test uses mem and covers the adapter-independent part (entry round trip + read).
-//	    NOT VERIFIED HERE: S3, Azure and GCS. The repository has no in-process fake for them — their
-//	    adapter tests spawn docker containers (minio, azurite, fake-gcs-server) — so this spike does not
-//	    claim an answer for them. The read path is adapter-independent (resolveFull -> adapter.Get), and
-//	    none of those adapters restricts identifiers to the repository namespace, so no restriction beyond
-//	    local's allowed_external_prefixes is expected; confirm on a real deployment in a system test.
+//
+//	    Adapter-level conformance (S4 for all backends): testAdapterGetFullAddressInOtherNamespace in
+//	    pkg/block/blocktest/basic_suite.go, wired into AdapterBasicObjectTest and therefore into
+//	    AdapterTest, runs for all five adapters: mem, local, s3, gs and azure. It writes a source object
+//	    with a RELATIVE identifier into namespace A, then reads it from a DIFFERENT namespace B with
+//	    IdentifierTypeFull and an address pointing into A — an object this adapter instance never wrote
+//	    through that address, and one that never existed in B, which is exactly the shape of a dataset
+//	    read (design sections 4.2, 6.3). It also asserts the object is NOT visible through a relative
+//	    identifier in B, so the successful read provably goes through the full address instead of a
+//	    lucky namespace fallback. B is allocated as a sibling of A (same bucket/container/account, or a
+//	    sibling directory under the local adapter root), which keeps the case inside each backend's
+//	    addressing rules and inside local's allowed paths — so no adapter needs a skip.
+//	    Executed: mem, local, gs (fake-gcs-server) and azure (azurite) all pass. S3 runs the same case
+//	    but could not be executed in the environment where this was validated: its dockertest container
+//	    needs minio/minio:RELEASE.2023-06-09T07-32-12Z, a pinned tag that is not pullable there (Docker
+//	    Hub no longer serves old minio tags), so only the s3 package was compiled, not run. The S3 read
+//	    path is resolveFull -> adapter.Get -> SDK call with no namespace restriction, so no restriction
+//	    beyond local's is expected — but that stays an expectation until the pinned image is reachable.
+//	    The end-to-end datasets-on-cloud-blockstore case (dataset repository + publish + gateway read
+//	    against a real cloud storage account) is not covered here: it needs cloud credentials and a
+//	    deployed lakeFS, and is tracked by a separate esti card.
 
 import (
 	"bytes"
