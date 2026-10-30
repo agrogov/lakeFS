@@ -1967,6 +1967,8 @@ func TestListRepositoriesPolicyConditions(t *testing.T) {
 		Collector: deps.collector,
 	}
 
+	// both is the set of repositories expected in the cases that list everything; the
+	// assertions below compare order-insensitively because ListRepositories does not sort.
 	both := []string{otherRepo, repo}
 	tests := []struct {
 		name       string
@@ -2022,7 +2024,9 @@ func TestListRepositoriesPolicyConditions(t *testing.T) {
 			status, repos := listRepositoriesAsUser(t, controller, tt.user, withClientIP(tt.clientIP))
 			require.Equal(t, tt.wantStatus, status)
 			if tt.wantStatus == http.StatusOK {
-				require.Equal(t, tt.wantRepos, repos)
+				// ListRepositories does not guarantee the order of the returned repositories, so
+				// compare sets: the same repositories must be listed, in any order.
+				require.ElementsMatch(t, tt.wantRepos, repos)
 			}
 		})
 	}
@@ -2053,7 +2057,6 @@ func listRepositoriesAsUser(t *testing.T, controller *api.Controller, username s
 	for _, repository := range result.Results {
 		ids = append(ids, repository.Id)
 	}
-	sort.Strings(ids)
 	return recorder.Code, ids
 }
 

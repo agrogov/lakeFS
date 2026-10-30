@@ -2,6 +2,8 @@ package catalog_test
 
 import (
 	"context"
+	"slices"
+	"sort"
 	"testing"
 
 	"github.com/treeverse/lakefs/pkg/auth"
@@ -214,14 +216,13 @@ func TestWithListReposPermissionFilter(t *testing.T) {
 				}
 			}
 
-			if len(visible) != len(tt.want) {
-				t.Errorf("visible repos = %v, want %v", visible, tt.want)
-				return
-			}
-			for i, v := range visible {
-				if v != tt.want[i] {
-					t.Errorf("visible[%d] = %s, want %s", i, v, tt.want[i])
-				}
+			// ListRepositories does not guarantee an order, so compare sets: the same repositories
+			// must be visible, in any order.
+			sort.Strings(visible)
+			want := append([]string(nil), tt.want...)
+			sort.Strings(want)
+			if !slices.Equal(visible, want) {
+				t.Errorf("visible repos = %v, want %v", visible, want)
 			}
 		})
 	}
