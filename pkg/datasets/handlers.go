@@ -109,7 +109,12 @@ func writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
 		})
 	case errors.Is(err, ErrUnsupported):
 		httputil.WriteAPIError(w, r, http.StatusNotImplemented, err.Error())
-	case errors.Is(err, ErrDatasetNotFound), errors.Is(err, ErrVersionNotFound), errors.Is(err, ErrTaskNotFound), isNotFound(err):
+	// The 404 union spans both implemented cards: ErrDatasetNotFound, ErrVersionNotFound and
+	// ErrTaskNotFound came in with the publish/versions card (§10.1 version and task reads),
+	// ErrRefNotFound came in with the diff card (§10.3 bad left/right ref), and isNotFound
+	// covers the store/catalog path. Every one of them must map to 404: dropping any sends a
+	// client-fixable case to 500.
+	case errors.Is(err, ErrDatasetNotFound), errors.Is(err, ErrVersionNotFound), errors.Is(err, ErrTaskNotFound), errors.Is(err, ErrRefNotFound), isNotFound(err):
 		httputil.WriteAPIError(w, r, http.StatusNotFound, err.Error())
 	case errors.Is(err, ErrNameTaken), errors.Is(err, ErrDatasetConflict), errors.Is(err, ErrPublishInProgress), errors.Is(err, kv.ErrPredicateFailed):
 		httputil.WriteAPIError(w, r, http.StatusConflict, err.Error())
@@ -399,8 +404,38 @@ func (s *server) GetTask(w http.ResponseWriter, r *http.Request, dataset apigen.
 	httputil.WriteAPIResponse(w, r, http.StatusOK, taskToAPI(task))
 }
 
-func (s *server) DiffRefs(w http.ResponseWriter, r *http.Request, _ apigen.DatasetName, _ apigen.LeftRef, _ apigen.RightRef, _ apigen.DiffRefsParams) {
-	notImplemented(w, r, "DiffRefs")
+// DiffRefs answers GET /datasets/{ds}/refs/{leftRef}/diff/{rightRef} (§10.3). The response
+// body is a DefinitionDiff or a DataDiffList, so it is written directly instead of through
+// a generated response type.
+func (s *server) DiffRefs(w http.ResponseWriter, r *http.Request, dataset apigen.DatasetName, leftRef apigen.LeftRef, rightRef apigen.RightRef, params apigen.DiffRefsParams) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	req := DiffRequest{
+		Dataset:  string(dataset),
+		LeftRef:  string(leftRef),
+		RightRef: string(rightRef),
+		After:    string(valueOrZero(params.After)),
+		Amount:   int(valueOrZero(params.Amount)),
+	}
+	if params.Type != nil {
+		req.Type = *params.Type
+	}
+	if params.Prefix != nil {
+		req.Prefix = string(*params.Prefix)
+	}
+	result, err := s.svc.Diff(r.Context(), caller, req)
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	if result.Type == DiffTypeData {
+		httputil.WriteAPIResponse(w, r, http.StatusOK, dataDiffToAPI(result.Data))
+		return
+	}
+	httputil.WriteAPIResponse(w, r, http.StatusOK, definitionDiffToAPI(result.Definition))
 }
 
 func (s *server) ListProposals(w http.ResponseWriter, r *http.Request, _ apigen.DatasetName, _ apigen.ListProposalsParams) {
@@ -517,6 +552,67 @@ func dataItemToAPI(in DataItem) apigen.DataItem {
 	}
 	if in.Prefix != nil {
 		out.Prefix = &apigen.PathSource{Path: in.Prefix.Path}
+	}
+	return out
+}
+
+// definitionDiffToAPI converts a definition diff into the DefinitionDiff schema (§10.2).
+func definitionDiffToAPI(in *DefinitionDiff) apigen.DefinitionDiff {
+	out := apigen.DefinitionDiff{Items: []apigen.ItemChange{}}
+	if in == nil {
+		return out
+	}
+	if in.Description != nil {
+		out.Description = &apigen.StringChange{From: in.Description.From, To: in.Description.To}
+	}
+	if len(in.Metadata) > 0 {
+		metadata := make([]apigen.MetadataChange, 0, len(in.Metadata))
+		for _, change := range in.Metadata {
+			metadata = append(metadata, apigen.MetadataChange{
+				Key:    change.Key,
+				Change: string(change.Change),
+				From:   change.From,
+				To:     change.To,
+			})
+		}
+		out.Metadata = &metadata
+	}
+	for _, change := range in.Items {
+		item := apigen.ItemChange{Target: change.Target, Change: string(change.Change)}
+		if change.From != nil {
+			from := dataItemToAPI(*change.From)
+			item.From = &from
+		}
+		if change.To != nil {
+			to := dataItemToAPI(*change.To)
+			item.To = &to
+		}
+		out.Items = append(out.Items, item)
+	}
+	return out
+}
+
+// dataDiffToAPI converts one page of a data diff into the DataDiffList schema (§10.2).
+func dataDiffToAPI(in *DataDiff) apigen.DataDiffList {
+	if in == nil {
+		return apigen.DataDiffList{Results: []apigen.DataDiffEntry{}}
+	}
+	out := apigen.DataDiffList{
+		Results: make([]apigen.DataDiffEntry, 0, len(in.Entries)),
+		Pagination: apigen.Pagination{
+			HasMore:    in.HasMore,
+			NextOffset: in.NextOffset,
+			Results:    len(in.Entries),
+			MaxPerPage: in.MaxPerPage,
+		},
+	}
+	for _, entry := range in.Entries {
+		size := entry.SizeBytes
+		out.Results = append(out.Results, apigen.DataDiffEntry{
+			Path:      entry.Path,
+			Type:      string(entry.Type),
+			SizeBytes: &size,
+		})
 	}
 	return out
 }
