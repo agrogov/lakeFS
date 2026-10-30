@@ -1,6 +1,6 @@
 import React, { FC, ReactElement } from 'react';
 import Card from 'react-bootstrap/Card';
-import { DatabaseIcon } from '@primer/octicons-react';
+import { DatabaseIcon, ShieldIcon } from '@primer/octicons-react';
 
 import { AlertError, Loading } from '../controls';
 import { DATASETS_DISABLED_MESSAGE } from '../../api/datasets';
@@ -38,3 +38,24 @@ export const DatasetsGate: FC<{ children: ReactElement | ReactElement[] }> = ({ 
     if (error) return <AlertError error={error} />;
     return <>{children}</>;
 };
+
+/**
+ * A dataset page the caller may not use (DATASETS_DESIGN.md §9.1, §11.2).
+ *
+ * Access management and metadata-key management are each gated on one action, and a `403` from
+ * the control plane means exactly the same thing as the policy check saying no. Saying which
+ * permission is missing beats a bare "forbidden": the reader knows who to ask.
+ */
+export const DatasetPermissionRequired: FC<{ action: string; what: string }> = ({ action, what }) => (
+    <Card className="dataset-permission-required text-center">
+        <Card.Body>
+            <div className="datasets-disabled-icon">
+                <ShieldIcon size={24} />
+            </div>
+            <h4>Permission required</h4>
+            <p className="text-muted mb-0">
+                {what} requires the <code>{action}</code> permission. Ask an administrator to grant it on this server.
+            </p>
+        </Card.Body>
+    </Card>
+);

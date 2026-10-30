@@ -40,18 +40,33 @@ export interface ErrorDetail {
 /**
  * A failed control-plane request. `message` is the server's human-readable message and
  * `errors` lists every validation problem (empty for non-validation failures).
+ *
+ * `latestVersion` carries the extra member of the two stale-version `409`s of §5.4/§5.6, so
+ * a caller never has to re-read the dataset to find out what the current version is.
  */
 export class DatasetsError extends Error {
     readonly status: number;
     readonly errors: ErrorDetail[];
+    readonly latestVersion?: number;
 
-    constructor(message: string, status: number, errors: ErrorDetail[] = []) {
+    constructor(message: string, status: number, errors: ErrorDetail[] = [], latestVersion?: number) {
         super(message);
         this.name = 'DatasetsError';
         this.status = status;
         this.errors = errors;
+        this.latestVersion = latestVersion;
     }
 }
+
+/**
+ * True for the stale-base `409` of §5.6: merging a proposal whose `base_version` is behind
+ * the dataset's `latest_version` requires a rebase (an explicit "Update proposal") first.
+ * The status is decisive; the message is a fallback for servers that omit `latest_version`.
+ */
+export const isRebaseRequiredError = (error: unknown): error is DatasetsError =>
+    error instanceof DatasetsError &&
+    error.status === 409 &&
+    (typeof error.latestVersion === 'number' || /rebase required/i.test(error.message));
 
 /**
  * True when the control plane is switched off on this server, so clients should say so
@@ -61,14 +76,21 @@ export class DatasetsError extends Error {
 export const isDatasetsDisabledError = (error: unknown): boolean =>
     error instanceof DatasetsError && (error.status === 404 || error.status === 501);
 
-const parseErrorBody = async (response: Response): Promise<{ message: string; errors: ErrorDetail[] }> => {
+/** True for a `403`: the caller is authenticated but does not hold the required permission. */
+export const isForbiddenError = (error: unknown): error is DatasetsError =>
+    error instanceof DatasetsError && error.status === 403;
+
+const parseErrorBody = async (
+    response: Response,
+): Promise<{ message: string; errors: ErrorDetail[]; latestVersion?: number }> => {
     try {
         const body = await response.json();
         const errors: ErrorDetail[] = Array.isArray(body?.errors)
             ? body.errors.filter((detail: ErrorDetail) => detail && typeof detail.message === 'string')
             : [];
         const message = typeof body?.message === 'string' && body.message !== '' ? body.message : response.statusText;
-        return { message: message || 'request failed', errors };
+        const latestVersion = typeof body?.latest_version === 'number' ? body.latest_version : undefined;
+        return { message: message || 'request failed', errors, latestVersion };
     } catch {
         // Not a JSON body (a proxy error page, for example): fall back to the status line.
         return { message: response.statusText || 'request failed', errors: [] };
@@ -88,8 +110,8 @@ const datasetsRequest = async <T>(path: string, requestData: RequestInit = {}): 
         throw new AuthenticationError(message, response.status);
     }
     if (!response.ok) {
-        const { message, errors } = await parseErrorBody(response);
-        throw new DatasetsError(message, response.status, errors);
+        const { message, errors, latestVersion } = await parseErrorBody(response);
+        throw new DatasetsError(message, response.status, errors, latestVersion);
     }
     if (response.status === 204) return undefined as T;
     return (await response.json()) as T;

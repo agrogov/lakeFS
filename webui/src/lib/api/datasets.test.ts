@@ -1,7 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AuthenticationError } from './index';
-import { clearDatasetNamesCache, DatasetsError, datasets, isDatasetsDisabledError, listDatasetNames } from './datasets';
+import {
+    clearDatasetNamesCache,
+    DatasetsError,
+    datasets,
+    isDatasetsDisabledError,
+    isRebaseRequiredError,
+    listDatasetNames,
+} from './datasets';
 
 const jsonResponse = (status, body) => ({
     status,
@@ -75,6 +82,33 @@ describe('datasets client error mapping', () => {
         expect(error).toBeInstanceOf(DatasetsError);
         expect(error.status).toBe(409);
         expect(error.errors).toEqual([]);
+        expect(error.latestVersion).toBeUndefined();
+    });
+
+    it('carries the latest_version of a stale-base 409 and recognises it as a rebase', async () => {
+        fetchMock.mockResolvedValue(
+            jsonResponse(409, {
+                message: 'conflict: rebase required: proposal p1 of dataset d is based on version 1, latest is 4',
+                latest_version: 4,
+            }),
+        );
+
+        const error = await datasets.mergeProposal('d', 'p1').catch((e) => e);
+
+        expect(error).toBeInstanceOf(DatasetsError);
+        expect(error.status).toBe(409);
+        expect(error.latestVersion).toBe(4);
+        expect(isRebaseRequiredError(error)).toBe(true);
+    });
+
+    it('does not treat a 409 without a rebase indication as a rebase', async () => {
+        fetchMock.mockResolvedValue(jsonResponse(409, { message: 'proposal is not open' }));
+
+        const error = await datasets.mergeProposal('d', 'p1').catch((e) => e);
+
+        expect(error.status).toBe(409);
+        expect(isRebaseRequiredError(error)).toBe(false);
+        expect(isRebaseRequiredError(new Error('rebase required'))).toBe(false);
     });
 
     it('falls back to the status line when the body is not JSON', async () => {

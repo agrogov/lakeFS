@@ -17,12 +17,20 @@ import { Tree } from '../../lib/components/repository/tree';
 import { useAPI, useAPIWithPagination } from '../../lib/hooks/api';
 import { useConfigContext } from '../../lib/hooks/configProvider';
 import { useRouter } from '../../lib/hooks/router';
-import { RefTypeTag } from '../../constants';
+import { RefTypeBranch, RefTypeTag } from '../../constants';
 import { getRepoStorageConfig } from '../repositories/repository/utils';
 import { FileContents, getContentType, getFileExtension } from '../repositories/repository/objectViewer';
 
-/** Query parameters of the page: the version, the prefix to list and the pagination cursor. */
-export const DATA_QUERY_KEYS = { version: 'version', path: 'path', after: 'after' } as const;
+/**
+ * Query parameters of the page: the version, an explicit ref, the prefix to list and the
+ * pagination cursor.
+ *
+ * `version` selects a published version and is the normal way in. `ref` browses an arbitrary
+ * ref of the dataset repository, which is how a proposal's preview branch is reached
+ * (`data?ref=_proposal-<id>`, DATASETS_DESIGN.md §5.6, §11.2). It wins over `version` when
+ * both are present, and selecting a version clears it.
+ */
+export const DATA_QUERY_KEYS = { version: 'version', ref: 'ref', path: 'path', after: 'after' } as const;
 
 // The repository tree renders "modified 3 days ago" with the relative-time plugin, which the
 // repository pages register on import. This page imports the tree directly, so it registers it.
@@ -57,6 +65,9 @@ const DatasetDataPage: FC = () => {
     const after = router.query[DATA_QUERY_KEYS.after] ?? '';
     const isObjectView = path !== '' && !path.endsWith('/');
 
+    // A proposal preview branch (`_proposal-<id>`, §5.6) is not a version: browse it directly.
+    const previewRef = router.query[DATA_QUERY_KEYS.ref] ?? '';
+
     const {
         response: repo,
         loading: repoLoading,
@@ -66,9 +77,15 @@ const DatasetDataPage: FC = () => {
     const { storageConfig, error: storageConfigError } = getRepoStorageConfig(config?.storages, repo as never);
 
     // Browse through the immutable tag of the version, so the listing can never move and no
-    // write control can appear (see the component comment).
-    const browseRef = versionNumber > 0 ? versionTag(versionNumber) : '';
-    const reference = useMemo(() => ({ id: browseRef, type: RefTypeTag }), [browseRef]);
+    // write control can appear (see the component comment). A proposal preview branch is
+    // browsed through its own branch ref instead: it is a hidden, throw-away ref that the
+    // control plane deletes on merge/close (§5.6), and the page hides every write control.
+    const browseRef = previewRef !== '' ? previewRef : versionNumber > 0 ? versionTag(versionNumber) : '';
+    const reference = useMemo(
+        () => ({ id: browseRef, type: previewRef !== '' ? RefTypeBranch : RefTypeTag }),
+        [browseRef, previewRef],
+    );
+    const isPreview = previewRef !== '';
 
     const {
         results,
@@ -94,12 +111,24 @@ const DatasetDataPage: FC = () => {
 
     const pushPath = (nextPath: string, nextAfter = '') => {
         const query: Record<string, string> = {};
-        if (selection !== 'latest') query[DATA_QUERY_KEYS.version] = selection;
+        if (isPreview) query[DATA_QUERY_KEYS.ref] = previewRef;
+        else if (selection !== 'latest') query[DATA_QUERY_KEYS.version] = selection;
         if (nextPath !== '') query[DATA_QUERY_KEYS.path] = nextPath;
         if (nextAfter !== '') query[DATA_QUERY_KEYS.after] = nextAfter;
         router.push({ pathname: '/datasets/:datasetId/data', params: { datasetId }, query });
     };
 
+    // Leaving the preview keeps the browsed path but drops `ref`, so the page goes back to the
+    // published data. Picking `latest` in the version picker cannot do this: it is already the
+    // selected value while previewing, so no change event would fire.
+    const exitPreview = () => {
+        const query: Record<string, string> = {};
+        if (path !== '') query[DATA_QUERY_KEYS.path] = path;
+        router.push({ pathname: '/datasets/:datasetId/data', params: { datasetId }, query });
+    };
+
+    // Picking a version leaves the preview branch: the version picker is the way back to the
+    // published data, so it drops `ref` instead of combining the two.
     const onSelectVersion = (value: VersionSelection) => {
         const query: Record<string, string> = {};
         if (value !== 'latest') query[DATA_QUERY_KEYS.version] = value;
@@ -131,14 +160,25 @@ const DatasetDataPage: FC = () => {
                     className="ms-auto"
                     size="sm"
                     dataset={datasetId}
-                    versionRef={selectionToRef(selection)}
+                    versionRef={isPreview ? previewRef : selectionToRef(selection)}
                     path={path}
                 />
             </Card.Body>
         </Card>
     );
 
-    if (versionNumber < 1) {
+    const previewNotice = isPreview ? (
+        <Alert variant="info" className="dataset-data-preview d-flex flex-wrap align-items-center gap-2">
+            <span>
+                Previewing the proposal branch <code>{previewRef}</code>.
+            </span>
+            <Button variant="link" size="sm" className="dataset-data-preview-exit p-0" onClick={exitPreview}>
+                Back to published data
+            </Button>
+        </Alert>
+    ) : null;
+
+    if (!isPreview && versionNumber < 1) {
         return (
             <>
                 {header}
@@ -165,6 +205,7 @@ const DatasetDataPage: FC = () => {
         return (
             <>
                 {header}
+                {previewNotice}
                 <div className="d-flex align-items-center mb-2">
                     <Button variant="link" className="px-0" onClick={() => pushPath(parentPath)}>
                         &larr; Back to /{parentPath}
@@ -194,7 +235,8 @@ const DatasetDataPage: FC = () => {
     return (
         <>
             {header}
-            {browseRef !== selectionToRef(selection) && (
+            {previewNotice}
+            {!isPreview && browseRef !== selectionToRef(selection) && (
                 <div className="text-muted small mb-2 dataset-data-viewing">
                     <TagIcon className="me-1" />
                     Viewing the immutable tag <code>{browseRef}</code>
@@ -208,21 +250,25 @@ const DatasetDataPage: FC = () => {
                 results={results}
                 after={after}
                 nextPage={nextPage}
-                // Read-only repository: no upload, import or delete entry points (§7.3).
-                showActions={true}
+                // Read-only repository: no upload, import or delete entry points (§7.3). A
+                // proposal preview branch is a branch, which the tree would otherwise offer
+                // "Delete" for, so its row actions are off entirely.
+                showActions={!isPreview}
                 onPaginate={(nextAfter: string) => pushPath(path, nextAfter)}
                 onUpload={() => undefined}
                 onImport={() => undefined}
                 onDelete={() => undefined}
                 pathURLBuilder={(_params: unknown, query: Record<string, string>) => {
                     const next: Record<string, string> = {};
-                    if (selection !== 'latest') next[DATA_QUERY_KEYS.version] = selection;
+                    if (isPreview) next[DATA_QUERY_KEYS.ref] = previewRef;
+                    else if (selection !== 'latest') next[DATA_QUERY_KEYS.version] = selection;
                     if (query.path) next[DATA_QUERY_KEYS.path] = query.path;
                     return { pathname: '/datasets/:datasetId/data', params: { datasetId }, query: next };
                 }}
                 entryURLBuilder={(entry: { path: string }) => {
                     const next: Record<string, string> = {};
-                    if (selection !== 'latest') next[DATA_QUERY_KEYS.version] = selection;
+                    if (isPreview) next[DATA_QUERY_KEYS.ref] = previewRef;
+                    else if (selection !== 'latest') next[DATA_QUERY_KEYS.version] = selection;
                     if (entry.path) next[DATA_QUERY_KEYS.path] = entry.path;
                     return { pathname: '/datasets/:datasetId/data', params: { datasetId }, query: next };
                 }}

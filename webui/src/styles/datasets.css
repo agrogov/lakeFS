@@ -237,3 +237,26 @@
 .dataset-change-badge svg {
     vertical-align: text-bottom;
 }
+
+/* Dataset proposals (DATASETS_DESIGN.md §5.6, §11.2) */
+.dataset-proposal-title {
+    word-break: break-word;
+}
+
+.dataset-proposal-conflict {
+    border-left-width: 4px;
+}
+
+.dataset-proposals-table .dataset-proposal-title a {
+    font-weight: 600;
+}
+
+/* The stored data diff summary is a flat list of paths, which can be long. */
+.dataset-data-diff-path {
+    word-break: break-all;
+}
+
+.dataset-metadata-key-type-note {
+    display: block;
+    margin-top: 0.35rem;
+}

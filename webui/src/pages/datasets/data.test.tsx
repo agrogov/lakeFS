@@ -225,4 +225,19 @@ describe('DatasetDataPage', () => {
         expect(await screen.findByText(/no data to browse/i)).toBeInTheDocument();
         expect(fetchedUrls().some((url) => url.includes('/objects/ls'))).toBe(false);
     });
+
+    it('browses a proposal preview branch through ?ref=', async () => {
+        // A proposal's preview branch is `_proposal-<id>` (§5.6); `?ref=` browses it directly.
+        renderPage('/datasets/customer-360/data?ref=_proposal-p1');
+
+        expect(await screen.findByText('customers/')).toBeInTheDocument();
+        await waitFor(() =>
+            expect(fetchedUrls().some((url) => url.includes('/refs/_proposal-p1/objects/ls'))).toBe(true),
+        );
+        expect(screen.getAllByText(/_proposal-p1/).length).toBeGreaterThan(0);
+        // A branch would offer the tree's delete action; the preview keeps every write control off.
+        expect(screen.queryByText('Delete')).not.toBeInTheDocument();
+        // The preview is left by a dedicated control, since `latest` is already selected.
+        expect(screen.getByRole('button', { name: /Back to published data/i })).toBeInTheDocument();
+    });
 });
