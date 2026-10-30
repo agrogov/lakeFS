@@ -2,6 +2,7 @@ package permissions_test
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -37,6 +38,22 @@ func TestIsValidActionDatasets(t *testing.T) {
 			}
 			require.ErrorIs(t, err, tc.wantErr)
 		})
+	}
+}
+
+// TestDatasetsActionsNotInPicker records the deliberate deferral of the datasets action
+// constants (see the TODO on the "datasets" serviceSet entry in actions.go): the service is
+// validated by prefix, but no datasets:* action is listed in permissions.Actions, so the
+// policy-editor action picker does not offer them. actions.gen.go is generated from the
+// constants in actions.go only. When the datasets feature lands and the constants become
+// visible to the generator, this test must be inverted together with that TODO.
+func TestDatasetsActionsNotInPicker(t *testing.T) {
+	t.Parallel()
+
+	require.NoError(t, permissions.IsValidAction("datasets:ListDatasets"))
+	for _, action := range permissions.Actions {
+		require.NotEqual(t, "datasets", strings.SplitN(action, ":", 2)[0],
+			"permissions.Actions must not offer datasets actions until the datasets feature lands (see actions.go TODO); got %q", action)
 	}
 }
 

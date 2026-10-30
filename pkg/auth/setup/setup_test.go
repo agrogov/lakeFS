@@ -1,6 +1,7 @@
 package setup_test
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -78,6 +79,8 @@ func TestEnsureRBACBaseGroups(t *testing.T) {
 	}
 }
 
+// TestEnsureRBACBaseGroupsDatasetsDisabled checks the default: without WithDatasetsEnabled the
+// datasets policies are not created at all, so they cannot show up unattached in the Policies UI.
 func TestEnsureRBACBaseGroupsDatasetsDisabled(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
@@ -85,11 +88,48 @@ func TestEnsureRBACBaseGroupsDatasetsDisabled(t *testing.T) {
 
 	require.NoError(t, setup.EnsureRBACBaseGroups(ctx, authService, time.Now()))
 
-	policies, _, err := authService.ListGroupPolicies(ctx, setup.AdminsGroup, &model.PaginationParams{Amount: 100})
+	requireNoDatasetsPolicies(t, ctx, authService)
+
+	// An explicit off must behave the same as the default.
+	authServiceOff, _ := authtestutil.SetupService(t, ctx, []byte("secret"))
+	require.NoError(t, setup.EnsureRBACBaseGroups(ctx, authServiceOff, time.Now(), setup.WithDatasetsEnabled(false)))
+	requireNoDatasetsPolicies(t, ctx, authServiceOff)
+}
+
+// TestEnsureRBACBasePoliciesDatasetsDisabled pins the same default on the policy-creation entry
+// point, which is the one that used to create the datasets policies unconditionally.
+func TestEnsureRBACBasePoliciesDatasetsDisabled(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	authService, _ := authtestutil.SetupService(t, ctx, []byte("secret"))
+
+	require.NoError(t, setup.CreateRBACBasePolicies(ctx, authService, time.Now()))
+
+	requireNoDatasetsPolicies(t, ctx, authService)
+}
+
+func requireNoDatasetsPolicies(t *testing.T, ctx context.Context, authService auth.Service) {
+	t.Helper()
+
+	for _, name := range []string{setup.DatasetsFullAccessPolicy, setup.DatasetsReadAllPolicy} {
+		_, err := authService.GetPolicy(ctx, name)
+		require.ErrorIs(t, err, auth.ErrNotFound, "policy %s must not be created when the datasets feature is off", name)
+	}
+
+	policies, _, err := authService.ListPolicies(ctx, &model.PaginationParams{Amount: 100})
 	require.NoError(t, err)
 	for _, policy := range policies {
 		require.NotEqual(t, setup.DatasetsFullAccessPolicy, policy.DisplayName)
 		require.NotEqual(t, setup.DatasetsReadAllPolicy, policy.DisplayName)
+	}
+
+	for _, groupName := range []string{setup.AdminsGroup, setup.SuperUsersGroup, setup.DevelopersGroup, setup.ViewersGroup} {
+		attached, _, err := authService.ListGroupPolicies(ctx, groupName, &model.PaginationParams{Amount: 100})
+		require.NoError(t, err)
+		for _, policy := range attached {
+			require.NotEqual(t, setup.DatasetsFullAccessPolicy, policy.DisplayName)
+			require.NotEqual(t, setup.DatasetsReadAllPolicy, policy.DisplayName)
+		}
 	}
 }
 
@@ -141,6 +181,21 @@ func TestEnsureRBACBaseGroupsDatasetsEnabled(t *testing.T) {
 	policies, _, err := authService.ListGroupPolicies(ctx, setup.AdminsGroup, &model.PaginationParams{Amount: 100})
 	require.NoError(t, err)
 	require.Len(t, policies, len(expectedAttachments[setup.AdminsGroup]))
+}
+
+// TestEnsureRBACBasePoliciesDatasetsEnabled checks that the policy-creation entry point honours
+// the same option as the group attachments.
+func TestEnsureRBACBasePoliciesDatasetsEnabled(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	authService, _ := authtestutil.SetupService(t, ctx, []byte("secret"))
+
+	require.NoError(t, setup.CreateRBACBasePolicies(ctx, authService, time.Now(), setup.WithDatasetsEnabled(true)))
+
+	_, err := authService.GetPolicy(ctx, setup.DatasetsFullAccessPolicy)
+	require.NoError(t, err)
+	_, err = authService.GetPolicy(ctx, setup.DatasetsReadAllPolicy)
+	require.NoError(t, err)
 }
 
 func TestAddAdminUser(t *testing.T) {
