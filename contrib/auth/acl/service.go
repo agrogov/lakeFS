@@ -273,15 +273,9 @@ func (s *AuthService) UpdateUserProfile(ctx context.Context, username, email, fr
 		return fmt.Errorf("%s: %w", username, err)
 	}
 
-	// Drop every key under which this user can be cached, including the old and new
-	// email lookup keys. Profile changes must be visible before the cache TTL expires.
-	cacheKeys := []auth.UserKey{
-		{Username: username},
-		{Email: data.Email},
-		{Email: email},
-		{ExternalID: data.ExternalId},
-	}
-	defer s.cache.InvalidateUser(cacheKeys...)
+	// Keep the stored lookup keys before mutating the record, so the cache entries for
+	// the *old* email and external ID can be dropped as well.
+	oldEmail, externalID := data.Email, data.ExternalId
 
 	changed := false
 	if email != "" && data.Email != email {
@@ -293,6 +287,16 @@ func (s *AuthService) UpdateUserProfile(ctx context.Context, username, email, fr
 	if !changed {
 		return nil
 	}
+
+	// Drop every key under which this user can be cached, including the old and new
+	// email lookup keys. Profile changes must be visible before the cache TTL expires.
+	cacheKeys := []auth.UserKey{
+		{Username: username},
+		{Email: oldEmail},
+		{Email: email},
+		{ExternalID: externalID},
+	}
+	defer s.cache.InvalidateUser(cacheKeys...)
 
 	// A concurrent login writes the same values, so losing the race is fine.
 	if err = kv.SetMsgIf(ctx, s.store, model.PartitionKey, userKey, &data, pred); err != nil && !errors.Is(err, kv.ErrPredicateFailed) {

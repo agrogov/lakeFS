@@ -450,6 +450,62 @@ func TestAuthService_DeleteUserInvalidatesCache(t *testing.T) {
 	require.ErrorIs(t, resp.Error, auth.ErrInsufficientPermissions)
 }
 
+// TestAuthService_DeleteUserRecreateDropsGroupPermissions covers the group half of
+// R1-F2: a user that derived its permissions from group membership must not pass
+// them on to a user re-created with the same username. The policy cache is keyed by
+// username, so unless DeleteUser invalidates it the re-created user inherits the
+// deleted member's effective group policies.
+func TestAuthService_DeleteUserRecreateDropsGroupPermissions(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s := authacl.NewAuthService(kvtest.GetStore(ctx, t), crypt.NewSecretStore(someSecret), authparams.ServiceCache{
+		Enabled: true,
+		Size:    1024,
+		TTL:     time.Hour, // long TTL: only explicit invalidation can make the re-create visible
+		Jitter:  0,
+	})
+	require.IsType(t, &auth.LRUCache{}, s.Cache())
+
+	const (
+		username  = "recreate-group-user"
+		groupName = "recreate-group"
+		policy    = "recreate-group-policy"
+	)
+	_, err := s.CreateUser(ctx, &model.User{Username: username})
+	require.NoError(t, err)
+	_, err = s.CreateGroup(ctx, &model.Group{DisplayName: groupName})
+	require.NoError(t, err)
+	writeAllowReadPolicy(t, ctx, s, policy)
+	require.NoError(t, s.AttachPolicyToGroup(ctx, policy, groupName))
+	require.NoError(t, s.AddUserToGroup(ctx, username, groupName))
+
+	// Warm the user and effective-policy caches through the group-derived grant.
+	for range 2 { // twice: the second call is served from the cache
+		resp, err := authorizeReadObject(ctx, s, username)
+		require.NoError(t, err)
+		require.True(t, resp.Allowed, "group grant should be allowed before deletion")
+	}
+
+	require.NoError(t, s.DeleteUser(ctx, username))
+	_, err = s.CreateUser(ctx, &model.User{Username: username})
+	require.NoError(t, err)
+
+	// The group still exists and still carries the policy; the re-created user must
+	// simply not be a member of it any more.
+	groups, _, err := s.ListUserGroups(ctx, username, &model.PaginationParams{Amount: 100})
+	require.NoError(t, err)
+	require.Empty(t, groups)
+
+	policies, _, err := s.ListEffectivePolicies(ctx, username, &model.PaginationParams{Amount: -1})
+	require.NoError(t, err)
+	require.Empty(t, policies)
+
+	resp, err := authorizeReadObject(ctx, s, username)
+	require.NoError(t, err)
+	require.False(t, resp.Allowed, "group permissions were inherited by the re-created user")
+	require.ErrorIs(t, resp.Error, auth.ErrInsufficientPermissions)
+}
+
 // writeAllowReadPolicy writes a policy allowing fs:ReadObject on every
 // repository.
 func writeAllowReadPolicy(t *testing.T, ctx context.Context, s *authacl.AuthService, policyName string) {
