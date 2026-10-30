@@ -86,8 +86,16 @@ global ACLs with per-repository policies". This document provides exactly that.
    not copy doc prose or any Enterprise/"Fluffy" code.
 4. Keep `LICENSE`, `NOTICE` and `THIRD_PARTY_LICENSES` as they are. Every new file gets the repository's usual (lack
    of) header convention.
-5. A CI guard (`scripts/check-license-base.sh`) fails if `upstream/master` past `358544dd7` becomes an ancestor of
-   the branch (`git merge-base --is-ancestor 358544dd7 HEAD`).
+5. A guard fails if `upstream/master` past `358544dd7` becomes an ancestor of the branch
+   (`git merge-base --is-ancestor 358544dd7 HEAD`). It is `scripts/check-license-base.sh`, run with
+   `make check-license-base` (which first runs the script's `--self-test`, so CI proves the guard is not
+   vacuous). It runs in `make checks-validator` and in the `license-base` CI job
+   (`.github/workflows/test.yaml`, full clone plus a fetch of upstream master). The guard **fails closed**:
+   on a shallow clone, an unborn HEAD or no repository it exits 1 with the remedy (`git fetch --unshallow`)
+   rather than passing vacuously; `LICENSE_GUARD_SKIP_IF_INCONCLUSIVE=1` is the documented, local-only
+   opt-out and CI never sets it. With complete history it decides the ancestry for real, and a `358544dd7`
+   that is absent from a complete clone is reported as conclusively not an ancestor (the guard never fetches,
+   so it also works offline).
 
 > Not legal advice. Confirm rule 1 (Apache status of pre-relicense upstream commits) with legal before release.
 

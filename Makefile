@@ -77,6 +77,11 @@ check-licenses-npm:
 	# The -i arg is a workaround to ignore NPM scoped packages until https://github.com/senseyeio/diligent/issues/77 is fixed
 	$(GOBINPATH)/diligent check -w permissive -i ^@[^/]+?/[^/]+ $(UI_DIR)
 
+.PHONY: check-license-base
+check-license-base: ## Check that no upstream BSL 1.1 commit is an ancestor of HEAD (RBAC_DESIGN.md §2 rule 5)
+	bash scripts/check-license-base.sh --self-test
+	bash scripts/check-license-base.sh
+
 .PHONY: tools
 tools: ## Install tools
 	$(GOCMD) install github.com/bufbuild/buf/cmd/buf@$(BUF_CLI_VERSION)
@@ -264,7 +269,8 @@ checks-validator: lint validate-proto validate-ui-format \
 	validate-mockgen \
 	validate-permissions-gen \
 	validate-api \
-	validate-wrapper validate-wrapgen-testcode
+	validate-wrapper validate-wrapgen-testcode \
+	check-license-base
 
 python-wrapper-lint:
 	$(DOCKER) run --user $(UID_GID) --rm -v $(shell pwd):/mnt -e HOME=/tmp/ -w /mnt/clients/python-wrapper $(PYTHON_IMAGE) /bin/bash -c "./lint.sh"
