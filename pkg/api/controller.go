@@ -6420,7 +6420,7 @@ func (c *Controller) authorizeCallback(w http.ResponseWriter, r *http.Request, p
 		return false
 	}
 	if !resp.Allowed {
-		cb(w, r, http.StatusUnauthorized, "User does not have the required permissions")
+		cb(w, r, c.authorizationFailureStatus(), "User does not have the required permissions")
 		return false
 	}
 	return true
