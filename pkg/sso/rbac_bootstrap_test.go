@@ -24,9 +24,21 @@ var rbacBaseGroups = []string{
 	setup.ViewersGroup,
 }
 
+// legacyRBACVersionKeyName is the pre-R1 key of the RBAC bootstrap version record: a bare key in
+// the auth partition root, written before the version record moved under the shared
+// "metadata/" template-version path. Spelled out on purpose: the migration has to keep reading
+// what older binaries wrote.
+const legacyRBACVersionKeyName = "rbac-bootstrap-version"
+
 func setRBACVersion(t *testing.T, ctx context.Context, store kv.Store, raw string) {
 	t.Helper()
 	require.NoError(t, store.Set(ctx, []byte(model.PartitionKey), sso.RBACBootstrapVersionKey(), []byte(raw)))
+}
+
+// setLegacyRBACVersion records a version the way binaries before R1 did.
+func setLegacyRBACVersion(t *testing.T, ctx context.Context, store kv.Store, raw string) {
+	t.Helper()
+	require.NoError(t, store.Set(ctx, []byte(model.PartitionKey), []byte(legacyRBACVersionKeyName), []byte(raw)))
 }
 
 // storedRBACVersion returns the raw stored version and whether the key exists.
@@ -85,6 +97,7 @@ func (failingAuthService) CreateGroup(context.Context, *model.Group) (*model.Gro
 
 func TestEnsureRBACBase(t *testing.T) {
 	version := func(v string) *string { return &v }
+	current := strconv.Itoa(sso.RBACBootstrapVersion)
 
 	tests := []struct {
 		name string
@@ -97,14 +110,16 @@ func TestEnsureRBACBase(t *testing.T) {
 		wantErr bool
 		// wantVersion is nil when the version key must not exist.
 		wantVersion *string
+		// wantLegacyVersion is checked only when set: the pre-R1 key must keep its value.
+		wantLegacyVersion *string
 		// wantGroups is true when the base groups must exist after the run.
 		wantGroups bool
 		// wantViewersFSReadAll is checked only when wantGroups is true.
 		wantViewersFSReadAll bool
 	}{
 		{
-			name:                 "fresh install applies the template and records version 1",
-			wantVersion:          version("1"),
+			name:                 "fresh install applies the template and records the current version",
+			wantVersion:          version(current),
 			wantGroups:           true,
 			wantViewersFSReadAll: true,
 		},
@@ -116,16 +131,16 @@ func TestEnsureRBACBase(t *testing.T) {
 			arrange: func(t *testing.T, ctx context.Context, _ kv.Store, svc *acl.AuthService) {
 				detachViewersFSReadAll(t, ctx, svc)
 			},
-			wantVersion:          version("1"),
+			wantVersion:          version(current),
 			wantGroups:           true,
 			wantViewersFSReadAll: false,
 		},
 		{
 			name: "stored current version skips the bootstrap",
 			arrange: func(t *testing.T, ctx context.Context, store kv.Store, _ *acl.AuthService) {
-				setRBACVersion(t, ctx, store, "1")
+				setRBACVersion(t, ctx, store, current)
 			},
-			wantVersion:          version("1"),
+			wantVersion:          version(current),
 			wantGroups:           false,
 			wantViewersFSReadAll: false,
 		},
@@ -133,11 +148,36 @@ func TestEnsureRBACBase(t *testing.T) {
 			name:     "version bump re-applies the template once",
 			firstRun: true,
 			arrange: func(t *testing.T, ctx context.Context, store kv.Store, svc *acl.AuthService) {
-				// An older binary left version 0 behind, and an admin detached a base policy.
-				setRBACVersion(t, ctx, store, "0")
+				// An older binary left the previous version behind, and an admin detached a base
+				// policy.
+				setRBACVersion(t, ctx, store, strconv.Itoa(sso.RBACBootstrapVersion-1))
 				detachViewersFSReadAll(t, ctx, svc)
 			},
-			wantVersion:          version("1"),
+			wantVersion:          version(current),
+			wantGroups:           true,
+			wantViewersFSReadAll: true,
+		},
+		{
+			// A version recorded under the pre-R1 bare key is migrated, so the first boot of
+			// this binary does not re-run a bootstrap that already happened.
+			name: "version recorded under the legacy key is migrated and does not re-bootstrap",
+			arrange: func(t *testing.T, ctx context.Context, store kv.Store, _ *acl.AuthService) {
+				setLegacyRBACVersion(t, ctx, store, current)
+			},
+			wantVersion:       version(current),
+			wantLegacyVersion: version(current),
+			wantGroups:        false,
+		},
+		{
+			// The documented bump behaviour: existing installations re-apply the template once.
+			// The previous binary recorded its version under the legacy key and left no current
+			// record, so the bootstrap runs once and records the current version.
+			name: "legacy key with an older version re-applies the bootstrap once",
+			arrange: func(t *testing.T, ctx context.Context, store kv.Store, _ *acl.AuthService) {
+				setLegacyRBACVersion(t, ctx, store, strconv.Itoa(sso.RBACBootstrapVersion-1))
+			},
+			wantVersion:          version(current),
+			wantLegacyVersion:    version(strconv.Itoa(sso.RBACBootstrapVersion - 1)),
 			wantGroups:           true,
 			wantViewersFSReadAll: true,
 		},
@@ -197,6 +237,11 @@ func TestEnsureRBACBase(t *testing.T) {
 				require.True(t, ok, "version key is missing")
 				require.Equal(t, *tt.wantVersion, gotVersion)
 			}
+			if tt.wantLegacyVersion != nil {
+				value, err := store.Get(ctx, []byte(model.PartitionKey), []byte(legacyRBACVersionKeyName))
+				require.NoError(t, err, "the legacy record must stay readable for a rollback")
+				require.Equal(t, *tt.wantLegacyVersion, string(value.Value))
+			}
 
 			if !tt.wantGroups {
 				// The bootstrap was skipped (or failed before creating groups).
@@ -208,6 +253,16 @@ func TestEnsureRBACBase(t *testing.T) {
 			require.Equal(t, tt.wantViewersFSReadAll, containsString(viewersPolicies(t, ctx, svc), "FSReadAll"))
 		})
 	}
+}
+
+// TestRBACBootstrapVersionKeyConvention pins the shared template-version key convention: the RBAC
+// bootstrap record is built by the same helper (and so lives under the same path and partition)
+// as the ACL policy reconciler's record, while the two records stay distinct keys.
+func TestRBACBootstrapVersionKeyConvention(t *testing.T) {
+	key := sso.RBACBootstrapVersionKey()
+	require.Equal(t, acl.TemplateVersionKey(sso.RBACBootstrapVersionKeyName), key)
+	require.Equal(t, []byte(model.MetadataKeyPath(sso.RBACBootstrapVersionKeyName)), key, "the record lives under the metadata/ path in the auth partition")
+	require.NotEqual(t, acl.TemplateVersionKey(acl.ACLTemplateVersionKeyName), key, "the two template-version records must not collide")
 }
 
 // TestEnsureRBACBaseKeepsAdminEdits proves that a version bump does not overwrite built-in
