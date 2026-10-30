@@ -22,12 +22,6 @@ import (
 	_ "github.com/treeverse/lakefs/pkg/kv/mem" // register the "mem" KV driver
 )
 
-// testTime is a fixed timestamp without a monotonic reading, so it survives a JSON
-// round trip unchanged.
-func testTime() time.Time {
-	return time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
-}
-
 // newTestStore returns a Store over a fresh in-memory KV store, plus that KV store so
 // a test can inspect raw values and scan the partition.
 func newTestStore(t *testing.T) (*Store, kv.Store, context.Context) {
