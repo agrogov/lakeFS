@@ -5,9 +5,6 @@ import (
 	"strings"
 )
 
-// DefaultMaxItems is the default of the datasets.max_items setting (§13).
-const DefaultMaxItems = 1000
-
 // Problem is a single validation finding. It is rendered as one entry of the
 // "errors" array of a 400 response (§10.4):
 //
@@ -49,23 +46,24 @@ func (e *ValidationError) Error() string {
 // MetadataValidator checks Definition.Metadata against the registered metadata
 // keys (§5.2 rule 6, §5.5). It reports per-key problems such as
 //
-//	{Path: "metadata.tier", Message: `unknown metadata key`}
+//	{Path: "metadata.tier", Message: "unknown_key: ..."}
 //
-// so they can be returned alongside the structural problems.
-//
-// This is the extension point for the metadata-vs-keys validation owned by DS-03.
+// so they can be returned alongside the structural problems. MetadataKeysValidator
+// (metadata_validate.go) is the ready-made adapter: it pulls def.Metadata, runs
+// ValidateMetadata against the keys and applies datasets.metadata.strict.
 // Structural validation in this package never inspects metadata values: it only
 // calls the hook when one is supplied.
 type MetadataValidator func(def *Definition) []Problem
 
 // ValidateOptions tunes Validate and ValidateEnvelope. The zero value is usable
-// and means DefaultMaxItems with no metadata validation.
+// and means DefaultMaxItems with free-form metadata (no key validation).
 type ValidateOptions struct {
 	// MaxItems is datasets.max_items (§13). Values <= 0 mean DefaultMaxItems.
 	MaxItems int
 
 	// Metadata is the optional metadata-vs-keys validator (§5.2 rule 6). When nil,
-	// metadata is not validated at all, which is the behaviour of this card.
+	// metadata is not validated at all; Config.ValidateOptions sets it whenever the
+	// caller has metadata keys to enforce or datasets.metadata.strict is on.
 	Metadata MetadataValidator
 }
 
@@ -128,7 +126,7 @@ func ValidateEnvelope(env *Envelope, opts ValidateOptions) error {
 // repository exists, is not itself a dataset and shares the dataset's StorageID,
 // and whether the referenced source keys exist (and a prefix is non-empty unless
 // allow_empty_items). Rule 6 (metadata against metadata keys) is delegated to
-// opts.Metadata, which is owned by DS-03.
+// opts.Metadata; MetadataKeysValidator is the adapter that implements it.
 func Validate(d *Definition, opts ValidateOptions) error {
 	return newValidationError(definitionProblems(d, opts))
 }
@@ -164,6 +162,9 @@ func definitionProblems(d *Definition, opts ValidateOptions) []Problem {
 
 	problems = append(problems, validateItems(d)...)
 
+	// This is the only call site of the metadata hook: metadata is validated here,
+	// once, so a metadata problem is never reported twice (see
+	// TestValidateMetadataReportedOnce).
 	if opts.Metadata != nil {
 		problems = append(problems, opts.Metadata(d)...)
 	}
