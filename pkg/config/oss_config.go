@@ -6,9 +6,10 @@ import (
 
 type ConfigImpl struct {
 	BaseConfig `mapstructure:",squash"`
-	Auth       Auth          `mapstructure:"auth"`
-	UI         UI            `mapstructure:"ui"`
-	SSO        SecretSection `mapstructure:"sso"` // absorbed so viper.UnmarshalExact accepts the "sso:" YAML key; parsed by pkg/sso
+	Auth       Auth                   `mapstructure:"auth"`
+	UI         UI                     `mapstructure:"ui"`
+	SSO        SecretSection          `mapstructure:"sso"`      // absorbed so viper.UnmarshalExact accepts the "sso:" YAML key; parsed by pkg/sso
+	Datasets   map[string]interface{} `mapstructure:"datasets"` // absorbed so viper.UnmarshalExact accepts the "datasets:" YAML key; parsed by pkg/datasets
 }
 
 // SecretSection is a config section kept only so viper.UnmarshalExact accepts its key; it is
