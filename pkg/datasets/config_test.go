@@ -199,3 +199,49 @@ func TestLoadConfigValidationErrors(t *testing.T) {
 		})
 	}
 }
+
+// TestConfigValidateOptions checks that the config is what feeds definition validation:
+// datasets.max_items (§13) becomes ValidateOptions.MaxItems and datasets.metadata.strict
+// (§5.5) turns on validation against the registered metadata keys.
+func TestConfigValidateOptions(t *testing.T) {
+	useConfig(t, `
+datasets:
+  max_items: 2
+  metadata:
+    strict: true
+`)
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+
+	opts := cfg.ValidateOptions([]MetadataKey{strKey("owner")})
+	require.Equal(t, 2, opts.maxItems())
+	require.NotNil(t, opts.Metadata)
+
+	three := &Definition{FormatVersion: FormatVersion, Data: []DataItem{
+		objectItem("a", "f"), objectItem("b", "f"), objectItem("c", "f"),
+	}}
+	three.Metadata = map[string]any{"retention": "1y"} // undefined and strict: rejected
+
+	var verr *ValidationError
+	require.ErrorAs(t, Validate(three, opts), &verr)
+	require.Equal(t, []string{"data", "metadata.retention"}, problemPaths(verr.Problems))
+
+	// A default config keeps the §13 defaults and leaves metadata free-form.
+	useConfig(t, "{}\n")
+	cfg, err = LoadConfig()
+	require.NoError(t, err)
+	require.Equal(t, DefaultMaxItems, cfg.MaxItems)
+	defaults := cfg.ValidateOptions(nil)
+	require.Equal(t, DefaultMaxItems, defaults.maxItems())
+	require.Nil(t, defaults.Metadata, "no keys and no strict mode means no metadata hook")
+
+	// datasets.max_items really is the source of truth when set.
+	useConfig(t, "datasets:\n  max_items: 1\n")
+	cfg, err = LoadConfig()
+	require.NoError(t, err)
+	require.Equal(t, 1, cfg.ValidateOptions(nil).maxItems())
+
+	// A nil receiver is safe and means the package defaults.
+	var nilConfig *Config
+	require.Equal(t, ValidateOptions{}, nilConfig.ValidateOptions(nil))
+}

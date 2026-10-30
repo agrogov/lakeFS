@@ -30,6 +30,8 @@ const (
 	// accepted by the config schema only so that a typo-free future value is recognised.
 	AccessModelStrict = "strict"
 
+	// DefaultMaxItems is the default of the datasets.max_items setting, section 13. It is
+	// also the effective item limit of a zero ValidateOptions (see ValidateOptions.maxItems).
 	DefaultMaxItems              = 1000
 	DefaultSyncPublishMaxObjects = 100_000
 	DefaultMergeFanIn            = 64
@@ -186,6 +188,24 @@ func (c *Config) setDefaults() {
 	if c.AccessModel == "" {
 		c.AccessModel = AccessModelOpen
 	}
+}
+
+// ValidateOptions returns the definition-validation options this configuration
+// prescribes: the datasets.max_items limit (§13) and, when metadata is actually
+// constrained, metadata value validation against keys with
+// datasets.metadata.strict (§5.5). Callers load the key definitions from KV and
+// pass them in; a nil receiver yields the package defaults.
+func (c *Config) ValidateOptions(keys []MetadataKey) ValidateOptions {
+	if c == nil {
+		return ValidateOptions{}
+	}
+	opts := ValidateOptions{MaxItems: c.MaxItems}
+	// Without keys and without strict mode every metadata entry is free-form, so
+	// there is nothing to validate and the zero validation behaviour is correct.
+	if c.Metadata.Strict || len(keys) > 0 {
+		opts.Metadata = MetadataKeysValidator(keys, c.Metadata.Strict)
+	}
+	return opts
 }
 
 // Validate checks the dataset configuration (DATASETS_DESIGN.md §13). Storage and namespace
