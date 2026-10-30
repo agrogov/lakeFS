@@ -143,7 +143,7 @@ package: package-python
 
 .PHONY: gen-api
 gen-api: ## Run the swagger code generator
-	$(GOGENERATE) ./pkg/api/apigen ./pkg/auth ./pkg/authentication
+	$(GOGENERATE) ./pkg/api/apigen ./pkg/auth ./pkg/authentication ./pkg/datasets
 
 .PHONY: gen-code
 gen-code: gen-api ## Run the generator for inline commands
@@ -235,6 +235,7 @@ validate-api: gen-api
 	git diff --quiet -- pkg/api/apigen/lakefs.gen.go || (echo "Modification verification failed! pkg/api/apigen/lakefs.gen.go"; false)
 	git diff --quiet -- pkg/auth/client.gen.go || (echo "Modification verification failed! pkg/auth/client.gen.go"; false)
 	git diff --quiet -- pkg/authentication/apiclient/client.gen.go || (echo "Modification verification failed! pkg/authentication/apiclient/client.gen.go"; false)
+	git diff --quiet -- pkg/datasets/apigen/datasets.gen.go || (echo "Modification verification failed! pkg/datasets/apigen/datasets.gen.go"; false)
 
 .PHONY: validate-wrapper
 validate-wrapper: gen-code

@@ -1,0 +1,1701 @@
+openapi: "3.0.1"
+
+info:
+  title: lakeFS datasets API
+  description: |
+    Control plane of the lakeFS datasets feature (DATASETS_DESIGN.md §10).
+
+    A dataset is a named, versioned, read-only collection of data curated from one or more
+    repositories, materialised as a read-only lakeFS repository with the same name. This
+    specification covers the control plane only; reading dataset data uses the regular
+    repository/S3-gateway read paths (`lakefs://<dataset>/<ref>/<path>`).
+
+    Every operation requires authentication with one of the schemes declared below. Errors use
+    the core lakeFS error shape `{"message": "..."}`; validation failures add an `errors` list
+    with one entry per problem (§10.4).
+
+    Generated server stubs live in `pkg/datasets/apigen` (`//go:generate` in
+    `pkg/datasets/http.go`).
+  version: 0.1.0
+  license:
+    name: "Apache 2.0"
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+
+servers:
+  # Paths below are relative to this base path so the generated chi routes line up with the
+  # router the datasets package mounts (pkg/datasets.APIBasePath). The validator also resolves
+  # request paths through this server entry (DATASETS_DESIGN.md §10).
+  - url: "/api/v1/datasets"
+    description: lakeFS datasets control plane
+
+security:
+  - jwt_token: []
+  - basic_auth: []
+  - cookie_auth: []
+  - oidc_auth: []
+  - saml_auth: []
+
+tags:
+  - name: datasets
+    description: Dataset lifecycle, versions, diffs and proposals
+  - name: metadata-keys
+    description: Metadata key definitions used to type dataset metadata
+  - name: access
+    description: Dataset-level access grants
+  - name: config
+    description: Datasets feature configuration, for clients that need to gate themselves
+
+paths:
+  /:
+    get:
+      operationId: listDatasets
+      tags: [datasets]
+      summary: List datasets
+      description: |
+        Paginated list of datasets with the latest version summary (§10.1). Results are
+        filtered by `datasets:ReadDataset` in addition to requiring `datasets:ListDatasets`.
+
+        Metadata filters use dynamic query parameters of the form `metadata.<key>=<value>` and
+        match against the latest version's metadata. OpenAPI 3.0 cannot declare dynamic query
+        parameter names, so they are documented here rather than declared below; unknown query
+        parameters are passed through to the handler.
+      parameters:
+        - $ref: "#/components/parameters/Prefix"
+        - $ref: "#/components/parameters/After"
+        - $ref: "#/components/parameters/Amount"
+        - $ref: "#/components/parameters/Search"
+      responses:
+        "200":
+          description: Dataset list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatasetList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+    post:
+      operationId: createDataset
+      tags: [datasets]
+      summary: Create a dataset
+      description: |
+        Creates the dataset and its backing repository (§5.1, §6.1). Without `publish` the
+        dataset is created empty (no version; `latest` holds only the initial commit); with
+        `publish` version `v1` is published as well. Large publishes run asynchronously and
+        answer `202` with a task (§6.5).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DatasetCreateRequest"
+      responses:
+        "201":
+          description: Dataset created (and optionally published)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Dataset"
+        "202":
+          description: Dataset created; the initial publish runs asynchronously
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /config:
+    get:
+      operationId: getDatasetsConfig
+      tags: [config]
+      summary: Datasets feature configuration
+      description: |
+        Configuration the UI needs to gate itself (§10.1, §11). Requires authentication but no
+        dataset permission. Datasets disabled on this server is reported by the configured
+        value rather than by `501` when the control plane is reachable; a disabled control plane
+        answers `501` for every datasets route.
+      responses:
+        "200":
+          description: Datasets configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatasetsConfig"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /metadata-keys:
+    get:
+      operationId: listMetadataKeys
+      tags: [metadata-keys]
+      summary: List metadata keys
+      description: Every metadata key definition (needed by every definition editor, §5.5).
+      parameters:
+        - $ref: "#/components/parameters/After"
+        - $ref: "#/components/parameters/Amount"
+      responses:
+        "200":
+          description: Metadata key list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataKeyList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+    post:
+      operationId: createMetadataKey
+      tags: [metadata-keys]
+      summary: Create a metadata key
+      description: |
+        Creates a typed metadata key (§5.5). Metadata keys are global, not per dataset.
+        `datasets:ManageMetadataKeys` on `arn:lakefs:datasets:::metadata-key/<key>`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MetadataKeyCreateRequest"
+      responses:
+        "201":
+          description: Metadata key created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataKey"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /metadata-keys/{key}:
+    parameters:
+      - $ref: "#/components/parameters/MetadataKeyName"
+    get:
+      operationId: getMetadataKey
+      tags: [metadata-keys]
+      summary: Get a metadata key
+      responses:
+        "200":
+          description: Metadata key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataKey"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+    put:
+      operationId: updateMetadataKey
+      tags: [metadata-keys]
+      summary: Update a metadata key
+      description: |
+        Changes `required`, `allowed_values` and `description` (§5.5). Changing `type` is
+        rejected (`409`): delete and recreate the key instead. Existing dataset versions are
+        never re-validated, so a new required key affects only the next definition write.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MetadataKeyUpdateRequest"
+      responses:
+        "200":
+          description: Updated metadata key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataKey"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+    delete:
+      operationId: deleteMetadataKey
+      tags: [metadata-keys]
+      summary: Delete a metadata key
+      description: |
+        Deletes the definition only; existing metadata values become free-form (§5.5).
+      responses:
+        "204":
+          description: Metadata key deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /{dataset}:
+    parameters:
+      - $ref: "#/components/parameters/DatasetName"
+    get:
+      operationId: getDataset
+      tags: [datasets]
+      summary: Get a dataset
+      description: The dataset record plus the definition of its latest version (§10.1).
+      responses:
+        "200":
+          description: Dataset
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Dataset"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+    delete:
+      operationId: deleteDataset
+      tags: [datasets]
+      summary: Delete a dataset
+      description: |
+        Deletes the backing repository, releases the garbage-collection pins of every version
+        and removes the control-plane records (§6.6). Object data is not touched.
+      responses:
+        "204":
+          description: Dataset deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /{dataset}/validate:
+    parameters:
+      - $ref: "#/components/parameters/DatasetName"
+    post:
+      operationId: validateDataset
+      tags: [datasets]
+      summary: Validate a dataset definition
+      description: |
+        Dry run: normalises, resolves branch/tag refs to commits, validates the definition and
+        metadata, and authorises the caller against every source. Performs no writes (§10.1).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DatasetValidateRequest"
+      responses:
+        "200":
+          description: The resolved definition and a stats estimate
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatasetValidateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /{dataset}/versions:
+    parameters:
+      - $ref: "#/components/parameters/DatasetName"
+    get:
+      operationId: listVersions
+      tags: [datasets]
+      summary: List dataset versions
+      description: Versions newest first (§10.1).
+      parameters:
+        - $ref: "#/components/parameters/After"
+        - $ref: "#/components/parameters/Amount"
+      responses:
+        "200":
+          description: Version list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VersionList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+    post:
+      operationId: publishVersion
+      tags: [datasets]
+      summary: Publish a new version
+      description: |
+        Publishes `definition` as version `latest_version + 1` (§5.4, §6.2): materialises the
+        definition into the dataset repository, commits `latest`, tags `vN` and records the
+        version. `expected_version` behaves like an ETag: a mismatch answers `409` with the
+        current `latest_version`. Publishes above `sync_publish_max_objects` answer `202` with a
+        task to poll at `GET /{dataset}/tasks/{task_id}`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VersionPublishRequest"
+      responses:
+        "201":
+          description: Version published
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Version"
+        "202":
+          description: Publish accepted; runs asynchronously
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /{dataset}/versions/{version}:
+    parameters:
+      - $ref: "#/components/parameters/DatasetName"
+      - $ref: "#/components/parameters/VersionRef"
+    get:
+      operationId: getVersion
+      tags: [datasets]
+      summary: Get a dataset version
+      description: |
+        `version` is `vN`, `N` or `latest` (§10.1). Returns the full, resolved definition.
+      responses:
+        "200":
+          description: Version
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Version"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /{dataset}/refs/{leftRef}/diff/{rightRef}:
+    parameters:
+      - $ref: "#/components/parameters/DatasetName"
+      - $ref: "#/components/parameters/LeftRef"
+      - $ref: "#/components/parameters/RightRef"
+    get:
+      operationId: diffRefs
+      tags: [datasets]
+      summary: Diff two dataset refs
+      description: |
+        `leftRef` and `rightRef` accept `vN`, `latest` or `proposal-<id>` (§10.3).
+
+        `type=definition` (the default) returns a structural diff of the two resolved
+        definitions matched by `target`; an item is `changed` when repository, commit, type or
+        source path differs. `type=data` returns a native graveler diff of the dataset
+        repository, paginated, with `_dataset/` entries filtered out.
+      parameters:
+        - name: type
+          in: query
+          description: Which diff to compute
+          required: false
+          schema:
+            type: string
+            enum: [definition, data]
+            default: definition
+        - $ref: "#/components/parameters/Prefix"
+        - $ref: "#/components/parameters/After"
+        - $ref: "#/components/parameters/Amount"
+      responses:
+        "200":
+          description: |
+            Definition diff when `type=definition`, data diff when `type=data`.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/DefinitionDiff"
+                  - $ref: "#/components/schemas/DataDiffList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /{dataset}/proposals:
+    parameters:
+      - $ref: "#/components/parameters/DatasetName"
+    get:
+      operationId: listProposals
+      tags: [datasets]
+      summary: List dataset proposals
+      description: Dataset pull requests, optionally filtered by status (§5.6, §10.1).
+      parameters:
+        - name: status
+          in: query
+          description: Only return proposals in this state
+          required: false
+          schema:
+            type: string
+            enum: [open, closed, merged]
+        - $ref: "#/components/parameters/After"
+        - $ref: "#/components/parameters/Amount"
+      responses:
+        "200":
+          description: Proposal list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProposalList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+    post:
+      operationId: createProposal
+      tags: [datasets]
+      summary: Open a dataset proposal
+      description: |
+        Materialises the definition on the hidden preview branch `_proposal-<id>` so reviewers
+        can browse the actual data, and records the proposal (§5.6). Base version is the current
+        `latest_version`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProposalCreateRequest"
+      responses:
+        "201":
+          description: Proposal created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Proposal"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /{dataset}/proposals/{id}:
+    parameters:
+      - $ref: "#/components/parameters/DatasetName"
+      - $ref: "#/components/parameters/ProposalID"
+    get:
+      operationId: getProposal
+      tags: [datasets]
+      summary: Get a dataset proposal
+      description: Includes the definition and data diff summaries against `latest`.
+      responses:
+        "200":
+          description: Proposal
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Proposal"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+    patch:
+      operationId: updateProposal
+      tags: [datasets]
+      summary: Update or close a proposal
+      description: |
+        Updates title, description or definition, or closes the proposal with `status: closed`.
+        The author needs `datasets:CreateProposal`; another principal publishing on the author's
+        behalf needs `datasets:PublishVersion` (§10.1).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProposalUpdateRequest"
+      responses:
+        "200":
+          description: Updated proposal
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Proposal"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /{dataset}/proposals/{id}/merge:
+    parameters:
+      - $ref: "#/components/parameters/DatasetName"
+      - $ref: "#/components/parameters/ProposalID"
+    post:
+      operationId: mergeProposal
+      tags: [datasets]
+      summary: Merge a proposal
+      description: |
+        Publishing the proposal's definition deletes the preview branch and closes the proposal
+        (§5.6). Requires `base_version == latest_version`; otherwise `409` ("rebase required").
+        The source-read check runs again for the merging principal (§9.3).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProposalMergeRequest"
+      responses:
+        "201":
+          description: Proposal merged; new version published
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Version"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /{dataset}/access:
+    parameters:
+      - $ref: "#/components/parameters/DatasetName"
+    get:
+      operationId: listAccess
+      tags: [access]
+      summary: List dataset access grants
+      description: Users and groups that hold the managed read policy of this dataset (§9.2).
+      responses:
+        "200":
+          description: Access grant list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccessGrantList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+    post:
+      operationId: grantAccess
+      tags: [access]
+      summary: Grant dataset access
+      description: |
+        Attaches the managed policy `dataset-<name>-read` to a user or group (§9.2). Consumers
+        need a grant only on the dataset, never on its sources.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccessGrantRequest"
+      responses:
+        "201":
+          description: Access granted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccessGrant"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /{dataset}/access/{principal_type}/{principal_id}:
+    parameters:
+      - $ref: "#/components/parameters/DatasetName"
+      - $ref: "#/components/parameters/PrincipalType"
+      - $ref: "#/components/parameters/PrincipalID"
+    delete:
+      operationId: revokeAccess
+      tags: [access]
+      summary: Revoke dataset access
+      responses:
+        "204":
+          description: Access revoked
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /{dataset}/tasks/{task_id}:
+    parameters:
+      - $ref: "#/components/parameters/DatasetName"
+      - $ref: "#/components/parameters/TaskID"
+    get:
+      operationId: getTask
+      tags: [datasets]
+      summary: Get an asynchronous dataset task
+      description: |
+        Status of an asynchronous publish (`202` responses, §6.5, §10.1).
+      responses:
+        "200":
+          description: Task
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+components:
+  securitySchemes:
+    basic_auth:
+      type: http
+      scheme: basic
+    jwt_token:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    cookie_auth:
+      type: apiKey
+      in: cookie
+      name: internal_auth_session
+    oidc_auth:
+      type: apiKey
+      in: cookie
+      name: oidc_auth_session
+    saml_auth:
+      type: apiKey
+      in: cookie
+      name: saml_auth_session
+
+  parameters:
+    DatasetName:
+      name: dataset
+      in: path
+      required: true
+      description: Dataset name; shares the repository namespace (§3)
+      schema:
+        type: string
+        pattern: "^[a-z0-9][a-z0-9-]{2,62}$"
+
+    VersionRef:
+      name: version
+      in: path
+      required: true
+      description: "`vN`, `N` or `latest`"
+      schema:
+        type: string
+        pattern: "^(latest|[vV]?[0-9]{1,9})$"
+
+    LeftRef:
+      name: leftRef
+      in: path
+      required: true
+      description: "`vN`, `latest` or `proposal-<id>`"
+      schema:
+        type: string
+        pattern: "^(latest|[vV]?[0-9]{1,9}|proposal-[0-9A-Za-z]+)$"
+
+    RightRef:
+      name: rightRef
+      in: path
+      required: true
+      description: "`vN`, `latest` or `proposal-<id>`"
+      schema:
+        type: string
+        pattern: "^(latest|[vV]?[0-9]{1,9}|proposal-[0-9A-Za-z]+)$"
+
+    ProposalID:
+      name: id
+      in: path
+      required: true
+      description: Proposal identifier (ULID)
+      schema:
+        type: string
+        pattern: "^[0-9A-Za-z]{1,64}$"
+
+    TaskID:
+      name: task_id
+      in: path
+      required: true
+      description: |
+        Task identifier. The placeholder is `task_id` rather than `task` because the shared
+        chi server template binds the request context to a variable named `task`; the URL
+        shape is `/{dataset}/tasks/<id>` (§10.1).
+      schema:
+        type: string
+        pattern: "^[0-9A-Za-z_-]{1,64}$"
+
+    MetadataKeyName:
+      name: key
+      in: path
+      required: true
+      description: Metadata key name (§5.5)
+      schema:
+        type: string
+        pattern: "^[a-z][a-z0-9_]{0,62}$"
+
+    PrincipalType:
+      name: principal_type
+      in: path
+      required: true
+      description: Grant principal kind
+      schema:
+        type: string
+        enum: [user, group]
+
+    PrincipalID:
+      name: principal_id
+      in: path
+      required: true
+      description: User or group name
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 256
+
+    Prefix:
+      name: prefix
+      in: query
+      required: false
+      allowEmptyValue: true
+      description: Return datasets whose name starts with this prefix
+      schema:
+        type: string
+
+    After:
+      name: after
+      in: query
+      required: false
+      allowEmptyValue: true
+      description: Return items after this value (pagination token)
+      schema:
+        type: string
+
+    Amount:
+      name: amount
+      in: query
+      required: false
+      description: How many items to return
+      schema:
+        type: integer
+        minimum: -1
+        maximum: 1000
+        default: 100
+
+    Search:
+      name: search
+      in: query
+      required: false
+      allowEmptyValue: true
+      description: Case-insensitive search over dataset name and description
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: |
+        The request is malformed or the definition is invalid. The body lists every problem
+        (§10.4).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: The request is not authenticated.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: |
+        The caller is missing a required dataset permission, or cannot read one of the source
+        repositories/objects referenced by the definition (§9.3).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: The dataset, version, proposal, task, metadata key or source repository was not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: |
+        The name is already taken, the version conflicts (`expected_version`, concurrent publish,
+        no changes), the proposal base is stale, or a required metadata key change is invalid
+        (`type` change).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    UnprocessableEntity:
+      description: |
+        A source repository lives in a different storage ID than the dataset (§5.2).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotImplemented:
+      description: |
+        `table`/`namespace` items are not supported by this build, or datasets are disabled on
+        this server (§10.4).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      description: |
+        The core lakeFS error shape: a human readable `message`. Validation failures add one
+        entry per problem in `errors` (§10.4).
+      required:
+        - message
+      properties:
+        message:
+          type: string
+        errors:
+          type: array
+          description: Present on `400` responses, one entry per validation problem
+          items:
+            $ref: "#/components/schemas/ErrorDetail"
+
+    ErrorDetail:
+      type: object
+      required:
+        - message
+      properties:
+        path:
+          type: string
+          description: Location of the problem, for example `data[2].target`
+          example: "data[2].target"
+        message:
+          type: string
+          example: "target overlaps data[0] (\"customers\")"
+
+    Pagination:
+      type: object
+      required:
+        - has_more
+        - max_per_page
+        - results
+        - next_offset
+      properties:
+        has_more:
+          type: boolean
+          description: Next page is available
+        next_offset:
+          type: string
+          description: Token used to retrieve the next page
+        results:
+          type: integer
+          minimum: 0
+          description: Number of values found in the results
+        max_per_page:
+          type: integer
+          minimum: 0
+          description: Maximum page size
+
+    DatasetMetadata:
+      type: object
+      description: |
+        Free-form dataset metadata (§5.1): string, number, boolean or array of strings.
+        Values of defined metadata keys are validated against their type (§5.5).
+      additionalProperties: {}
+      x-go-type: "map[string]interface{}"
+
+    DatasetDefinition:
+      type: object
+      description: |
+        The Enterprise-compatible definition format, `format_version: 1` (§5.1). Stored
+        definitions only contain commit refs; branch and tag refs are resolved on input.
+      required:
+        - format_version
+        - data
+      properties:
+        format_version:
+          type: integer
+          enum: [1]
+        description:
+          type: string
+        metadata:
+          $ref: "#/components/schemas/DatasetMetadata"
+        data:
+          type: array
+          minItems: 1
+          description: Sorted by `target` once validated (§5.2)
+          items:
+            $ref: "#/components/schemas/DataItem"
+
+    DataItem:
+      type: object
+      description: |
+        One source of dataset data, materialised at `target` in the dataset repository (§5.2).
+
+        DataItem is a discriminated union on `type` (oneOf semantics):
+
+          * `type: object`  requires `object` and forbids `prefix`/`table`/`namespace`;
+            the source key lands exactly at `target`.
+          * `type: prefix`  requires `prefix` and forbids `object`/`table`/`namespace`;
+            `prefix/<rel>` lands at `target/<rel>`.
+          * `type: table` or `type: namespace` are reserved for the Iceberg phase and answered
+            with `501` (§1.2, §10.4).
+
+        The union is modelled as one object with optional per-type members rather than a literal
+        OpenAPI `oneOf` because the oapi-codegen release pinned by this repository (v1.5.6, see
+        go.sum) encodes `oneOf` as `interface{}`, which would leave the generated server and
+        client for the whole definition tree untyped. `pkg/datasets` validation enforces the
+        union (§5.2, validate.go); the spec keeps the per-type shape documented and typed.
+      required:
+        - target
+        - repository
+        - ref
+        - type
+      # Machine-readable form of the union above: `type` selects the member schema. The
+      # openapi3 validator and pkg/datasets validation both key off `type`.
+      x-one-of-by: type
+      properties:
+        target:
+          type: string
+          description: |
+            Path inside the dataset repository. No leading `/`; `.`/`..` segments and the
+            reserved `_dataset/` prefix are rejected; a trailing `/` is only meaningful for
+            `prefix` items and is stripped before use (§5.2, §6.4).
+          example: "customers"
+        repository:
+          type: string
+          description: Source repository; must not be a dataset and must share the dataset storage ID (§5.2)
+          example: "lakehouse-repo"
+        ref:
+          $ref: "#/components/schemas/SourceRef"
+        type:
+          type: string
+          enum: [object, prefix, table, namespace]
+        object:
+          $ref: "#/components/schemas/PathSource"
+        prefix:
+          $ref: "#/components/schemas/PathSource"
+        table:
+          $ref: "#/components/schemas/TableSource"
+        namespace:
+          $ref: "#/components/schemas/NamespaceSource"
+
+    SourceRef:
+      type: object
+      description: |
+        The source ref an item is pinned to (§5.3). `branch` and `tag` are accepted on input and
+        resolved to a commit id at write time; stored definitions only hold `commit`.
+      required:
+        - type
+        - id
+      properties:
+        type:
+          type: string
+          enum: [commit, branch, tag]
+        id:
+          type: string
+          example: "30f9eb1c9a3d4b8e8f0d0a6c1b7e5f2a9c4d3e1f"
+
+    PathSource:
+      type: object
+      required:
+        - path
+      properties:
+        path:
+          type: string
+          description: |
+            Source path inside the repository. For `prefix` items a missing trailing `/` is
+            added, and an empty path means the whole repository (§5.2).
+          example: "data/customers/"
+
+    TableSource:
+      type: object
+      description: Reserved for Iceberg `table` items; answered with `501` in this build (§1.2)
+      additionalProperties: {}
+
+    NamespaceSource:
+      type: object
+      description: Reserved for Iceberg `namespace` items; answered with `501` in this build (§1.2)
+      additionalProperties: {}
+
+    Dataset:
+      type: object
+      required:
+        - name
+        - created_at
+        - created_by
+        - latest_version
+        - state
+      properties:
+        name:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9-]{2,62}$"
+        description:
+          type: string
+        created_at:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds
+        created_by:
+          type: string
+        latest_version:
+          type: integer
+          description: 0 when no version was published yet
+        state:
+          type: string
+          enum: [creating, active, publishing, deleting, degraded]
+        definition:
+          $ref: "#/components/schemas/DatasetDefinition"
+        stats:
+          $ref: "#/components/schemas/DatasetStats"
+
+    DatasetList:
+      type: object
+      required:
+        - results
+        - pagination
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/Dataset"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    DatasetStats:
+      type: object
+      required:
+        - objects
+        - bytes
+        - items
+      properties:
+        objects:
+          type: integer
+          format: int64
+        bytes:
+          type: integer
+          format: int64
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ItemStats"
+
+    ItemStats:
+      type: object
+      required:
+        - target
+        - objects
+        - bytes
+      properties:
+        target:
+          type: string
+        objects:
+          type: integer
+          format: int64
+        bytes:
+          type: integer
+          format: int64
+
+    Version:
+      type: object
+      description: One immutable dataset version (§5.3).
+      required:
+        - version
+        - commit_id
+        - published_at
+        - publisher
+      properties:
+        version:
+          type: integer
+          minimum: 1
+        message:
+          type: string
+        publisher:
+          type: string
+        published_at:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds
+        commit_id:
+          type: string
+          description: Commit in the dataset repository
+        proposal_id:
+          type: string
+          description: Set when the version was published by merging a proposal
+        definition:
+          $ref: "#/components/schemas/DatasetDefinition"
+        stats:
+          $ref: "#/components/schemas/DatasetStats"
+
+    VersionList:
+      type: object
+      required:
+        - results
+        - pagination
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/Version"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    StringChange:
+      type: object
+      required:
+        - from
+        - to
+      properties:
+        from:
+          type: string
+        to:
+          type: string
+
+    MetadataChange:
+      type: object
+      required:
+        - key
+        - change
+      properties:
+        key:
+          type: string
+        change:
+          type: string
+          enum: [added, removed, changed]
+        from:
+          description: Previous value (absent when added)
+        to:
+          description: New value (absent when removed)
+
+    ItemChange:
+      type: object
+      required:
+        - target
+        - change
+      properties:
+        target:
+          type: string
+        change:
+          type: string
+          enum: [added, removed, changed]
+        from:
+          $ref: "#/components/schemas/DataItem"
+        to:
+          $ref: "#/components/schemas/DataItem"
+
+    DefinitionDiff:
+      type: object
+      description: Structural diff of two resolved definitions, matched by `target` (§10.3).
+      required:
+        - items
+      properties:
+        description:
+          $ref: "#/components/schemas/StringChange"
+        metadata:
+          type: array
+          items:
+            $ref: "#/components/schemas/MetadataChange"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ItemChange"
+
+    DataDiffEntry:
+      type: object
+      description: One entry of a data diff; same shape as the core API diff (§10.2).
+      required:
+        - path
+        - type
+      properties:
+        path:
+          type: string
+        type:
+          type: string
+          enum: [added, removed, changed]
+        size_bytes:
+          type: integer
+          format: int64
+
+    DataDiffList:
+      type: object
+      description: Paginated data diff of the dataset repository (§10.2, §10.3).
+      required:
+        - results
+        - pagination
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/DataDiffEntry"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    Proposal:
+      type: object
+      description: A dataset pull request (§5.6).
+      required:
+        - id
+        - dataset
+        - base_version
+        - title
+        - author
+        - status
+        - created_at
+        - preview_branch
+      properties:
+        id:
+          type: string
+        dataset:
+          type: string
+        base_version:
+          type: integer
+          description: Version the proposal was made against; merging requires it to be latest
+        definition:
+          $ref: "#/components/schemas/DatasetDefinition"
+        title:
+          type: string
+        description:
+          type: string
+        author:
+          type: string
+        status:
+          type: string
+          enum: [open, closed, merged]
+        created_at:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds
+        closed_at:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds; set when closed or merged
+        merged_version:
+          type: integer
+          description: Version produced by the merge
+        preview_branch:
+          type: string
+          description: Hidden branch `_proposal-<id>` holding the materialised definition
+        diff:
+          $ref: "#/components/schemas/DefinitionDiff"
+        data_diff:
+          $ref: "#/components/schemas/DataDiffList"
+
+    ProposalList:
+      type: object
+      required:
+        - results
+        - pagination
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/Proposal"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    MetadataKey:
+      type: object
+      description: A typed metadata key (§5.5).
+      required:
+        - name
+        - type
+        - required
+        - allow_multiple
+        - created_at
+        - created_by
+      properties:
+        name:
+          type: string
+          pattern: "^[a-z][a-z0-9_]{0,62}$"
+        type:
+          type: string
+          enum: [string, enum, number, boolean, date]
+        required:
+          type: boolean
+          description: Enforced on every definition write, not on existing versions
+        allowed_values:
+          type: array
+          description: Non-empty for `enum` keys only
+          items:
+            type: string
+        allow_multiple:
+          type: boolean
+          description: The value is a JSON array
+        description:
+          type: string
+        created_at:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds
+        created_by:
+          type: string
+
+    MetadataKeyList:
+      type: object
+      required:
+        - results
+        - pagination
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/MetadataKey"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    MetadataKeyCreateRequest:
+      type: object
+      required:
+        - name
+        - type
+      properties:
+        name:
+          type: string
+          pattern: "^[a-z][a-z0-9_]{0,62}$"
+        type:
+          type: string
+          enum: [string, enum, number, boolean, date]
+        required:
+          type: boolean
+          default: false
+        allowed_values:
+          type: array
+          items:
+            type: string
+        allow_multiple:
+          type: boolean
+          default: false
+        description:
+          type: string
+
+    MetadataKeyUpdateRequest:
+      type: object
+      description: |
+        Partial update. `type` is immutable (§5.5); changing the name is a delete plus create.
+      properties:
+        required:
+          type: boolean
+        allowed_values:
+          type: array
+          items:
+            type: string
+        allow_multiple:
+          type: boolean
+        description:
+          type: string
+
+    Task:
+      type: object
+      description: An asynchronous dataset task, for example a large publish (§6.5, §10.1).
+      required:
+        - id
+        - status
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+        status:
+          type: string
+          enum: [pending, running, completed, failed]
+        version:
+          type: integer
+          description: Version produced once completed
+        error:
+          type: string
+          description: Failure message
+        created_at:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds
+        updated_at:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds
+
+    AccessGrant:
+      type: object
+      description: A principal holding the managed read policy of a dataset (§9.2).
+      required:
+        - principal_type
+        - principal_id
+      properties:
+        principal_type:
+          type: string
+          enum: [user, group]
+        principal_id:
+          type: string
+        granted_by:
+          type: string
+        granted_at:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds
+
+    AccessGrantList:
+      type: object
+      required:
+        - results
+        - pagination
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/AccessGrant"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    AccessGrantRequest:
+      type: object
+      required:
+        - principal_type
+        - principal_id
+      properties:
+        principal_type:
+          type: string
+          enum: [user, group]
+        principal_id:
+          type: string
+          minLength: 1
+          maxLength: 256
+
+    DatasetsConfig:
+      type: object
+      description: Configuration the UI needs to gate itself (§10.1, §11).
+      required:
+        - enabled
+      properties:
+        enabled:
+          type: boolean
+        storage_id:
+          type: string
+        max_items:
+          type: integer
+        access_model:
+          type: string
+          enum: [open, strict]
+        sync_publish_max_objects:
+          type: integer
+          format: int64
+
+    DatasetCreateRequest:
+      type: object
+      description: |
+        Definition envelope used by create (§5.1, §10.1). Without `publish` the dataset is
+        created empty; with `publish` version `v1` is published right away.
+      required:
+        - name
+        - definition
+      properties:
+        name:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9-]{2,62}$"
+        definition:
+          $ref: "#/components/schemas/DatasetDefinition"
+        publish:
+          $ref: "#/components/schemas/PublishOptions"
+
+    PublishOptions:
+      type: object
+      properties:
+        message:
+          type: string
+
+    VersionPublishRequest:
+      type: object
+      description: Body of `POST /{dataset}/versions` (§10.1).
+      required:
+        - definition
+        - message
+      properties:
+        definition:
+          $ref: "#/components/schemas/DatasetDefinition"
+        message:
+          type: string
+        expected_version:
+          type: integer
+          description: |
+            Optimistic concurrency check, like an ETag: when it does not match `latest_version`
+            the request fails with `409` carrying the current `latest_version` (§5.4).
+
+    DatasetValidateRequest:
+      type: object
+      required:
+        - definition
+      properties:
+        definition:
+          $ref: "#/components/schemas/DatasetDefinition"
+
+    DatasetValidateResponse:
+      type: object
+      description: "Dry-run result: the resolved definition plus a stats estimate (§10.1)."
+      required:
+        - definition
+      properties:
+        definition:
+          $ref: "#/components/schemas/DatasetDefinition"
+        stats:
+          $ref: "#/components/schemas/DatasetStats"
+
+    ProposalCreateRequest:
+      type: object
+      required:
+        - definition
+        - title
+      properties:
+        definition:
+          $ref: "#/components/schemas/DatasetDefinition"
+        title:
+          type: string
+        description:
+          type: string
+
+    ProposalUpdateRequest:
+      type: object
+      description: "Partial update; `status: closed` closes the proposal (§10.1)."
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        definition:
+          $ref: "#/components/schemas/DatasetDefinition"
+        status:
+          type: string
+          enum: [closed]
+
+    ProposalMergeRequest:
+      type: object
+      properties:
+        message:
+          type: string
