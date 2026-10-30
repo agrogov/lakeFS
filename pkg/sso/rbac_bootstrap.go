@@ -26,7 +26,10 @@ const (
 	// Version 2: setup.CreateRBACBasePolicies gained the DatasetsFullAccess and
 	// DatasetsReadAll policies (card C4), so installations that bootstrapped version 1
 	// re-apply the template once to pick them up.
-	RBACBootstrapVersion = 2
+	//
+	// Version 3: SuperUsers gained the PRReadWriteAll attachment, so a Super keeps pull-request
+	// write access after `rbac-migrate` moves it out of the ACL Supers group (GAP-06).
+	RBACBootstrapVersion = 3
 
 	// RBACBootstrapVersionKeyName is the name of the record, inside the "auth" KV partition,
 	// that holds the last successfully applied RBAC template version. It is recorded through

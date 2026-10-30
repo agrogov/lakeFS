@@ -11,6 +11,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/model"
 	"github.com/treeverse/lakefs/pkg/auth/setup"
+	"github.com/treeverse/lakefs/pkg/permissions"
 	"github.com/treeverse/lakefs/pkg/sso"
 )
 
@@ -60,6 +61,23 @@ func requireUserInGroup(t *testing.T, ctx context.Context, svc auth.Service, use
 		}
 	}
 	t.Fatalf("user %s is not a member of group %s", username, group)
+}
+
+// requirePullRequestWrite asserts whether username may create a pull request, which is the right
+// `pr:WritePullRequest` grants (controller.go CreatePullRequest).
+func requirePullRequestWrite(t *testing.T, ctx context.Context, svc *acl.AuthService, username string, want bool) {
+	t.Helper()
+	resp, err := svc.Authorize(ctx, &auth.AuthorizationRequest{
+		Username: username,
+		RequiredPermissions: permissions.Node{
+			Permission: permissions.Permission{
+				Action:   permissions.WritePullRequestAction,
+				Resource: permissions.RepoArn("migration-repo"),
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Equalf(t, want, resp.Allowed, "pr:WritePullRequest for user %s", username)
 }
 
 // setupLegacyMigrationState creates the ACL groups and users a simplified installation
@@ -163,6 +181,48 @@ func TestRBACMigrate_ApplyAndRerun(t *testing.T) {
 	require.Contains(t, out.String(), "no authorization changes")
 	require.Equal(t, adminPolicies, groupPolicyNames(t, ctx, svc, setup.AdminsGroup))
 	requireUserInGroup(t, ctx, svc, migrationSuperUser, setup.SuperUsersGroup)
+}
+
+// TestRBACMigrate_PreservesPullRequestWriteForSupers is the regression test for GAP-06: ACL Super
+// grants pr:WritePullRequest, so a Supers member moved to SuperUsers keeps the ability to create a
+// pull request after the migration - with and without --cleanup, i.e. both while the legacy Supers
+// group still grants it and once it is gone.
+func TestRBACMigrate_PreservesPullRequestWriteForSupers(t *testing.T) {
+	tests := []struct {
+		name    string
+		cleanup bool
+	}{
+		{name: "legacy groups kept", cleanup: false},
+		{name: "legacy groups cleaned up", cleanup: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _, _, svc := newACLService(t)
+			setupLegacyMigrationState(t, ctx, svc)
+
+			// Precondition: a Supers member can open a pull request before the migration, and a Readers
+			// member cannot - so the post-migration assertion is not vacuous.
+			requirePullRequestWrite(t, ctx, svc, migrationSuperUser, true)
+			requirePullRequestWrite(t, ctx, svc, migrationReader, false)
+
+			err := sso.MigrateACLToRBAC(ctx, svc, sso.RBACMigrationOptions{Apply: true, Cleanup: tc.cleanup}, &bytes.Buffer{})
+			require.NoError(t, err)
+			requireUserInGroup(t, ctx, svc, migrationSuperUser, setup.SuperUsersGroup)
+			if tc.cleanup {
+				// After a cleanup only SuperUsers can still grant it; with the legacy groups kept the
+				// assertion is weaker, which is why both cases are run.
+				_, err := svc.GetGroup(ctx, acl.SupersGroup)
+				require.ErrorIs(t, err, auth.ErrNotFound)
+			}
+
+			requirePullRequestWrite(t, ctx, svc, migrationSuperUser, true)
+			requirePullRequestWrite(t, ctx, svc, migrationReader, false)
+
+			// The guarantee comes from the RBAC template itself, not from a migration-only attachment.
+			requireGroupPolicy(t, ctx, svc, setup.SuperUsersGroup, "PRReadWriteAll")
+		})
+	}
 }
 
 func TestRBACMigrate_CleanupDeletesLegacyGroupsAndPolicies(t *testing.T) {

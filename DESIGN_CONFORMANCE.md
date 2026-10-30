@@ -32,10 +32,11 @@ The review itself changed nothing; this section and the design amendments it poi
 | — | R1-F10 (test flake) | `e8c63463f` | `TestListRepositoriesPolicyConditions` compares repository sets (`require.ElementsMatch`) instead of an order the API does not guarantee, so the review's intermittent failure is gone; expectations were not weakened. |
 | — | R1 nit (`UpdateUserProfile`) | `39045669e` (M1 follow-up) | The no-op profile update no longer drops the cached user entry (the invalidation `defer` moved below the early return), plus `TestAuthService_DeleteUserRecreateDropsGroupPermissions`. |
 | R11 | GAP-18 (R1 m6) | `481b59325` (R1-F6) | The §2.5 guard fails closed when ancestry cannot be decided (shallow clone, unborn HEAD, no repository), has a `--self-test`, a `make check-license-base` target wired into `checks-validator` and a `license-base` CI job. R11 and the GAP-18 row were updated by that commit, as its message records. |
+| R15, R44 | GAP-06 | the GAP-06 card (this commit) | `SuperUsers` now gets `PRReadWriteAll`, so the Super/`SuperUsers` pair matches exactly and `rbac-migrate` no longer takes `pr:WritePullRequest` away from a migrated `Supers` member; `RBACBootstrapVersion` is 3, so existing installations re-apply the template once. The parity test lost its `extraPolicyType: PRReadWrite` allow-list; it now enumerates each remaining difference with a reason and prints it on failure, and `TestRBACSuperUsersGrantsPRWrite` plus `TestRBACMigrate_PreservesPullRequestWriteForSupers` pin the fix (both fail if the attachment is removed). §4.5 #1 was rewritten rather than struck: it now states which pair matches and records the one remaining asymmetry (RBAC `Viewers` has no `fs:ReadConfig`). |
 | R05, R31, R66, R74, R98, R101 | GAP-14, GAP-15, GAP-16, GAP-20, GAP-05, GAP-19 | the documentation commit that adds this section | The design's §4.8 ARN/action example, §6 phase contents, §4.9 file list and §8 scope statement now match the code and the commit history; the committer change and the audit-log level requirement are in `CHANGELOG_SSO.md` and the example config. |
 
 Still open from the gap list in §6 of this review at the time of writing: GAP-01, GAP-02 (both MAJOR), GAP-03,
-GAP-04, GAP-06, GAP-07, GAP-08, GAP-10's controller half (R80, R82), GAP-11, GAP-17. Rows that rest on those gaps
+GAP-04, GAP-07, GAP-08, GAP-10's controller half (R80, R82), GAP-11, GAP-17. Rows that rest on those gaps
 are unchanged above.
 
 ## 1. Verdict

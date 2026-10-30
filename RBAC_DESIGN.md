@@ -220,7 +220,7 @@ to apply. It is idempotent.
 | ACL group (permission) | RBAC target | Action |
 |---|---|---|
 | `Admins` (Admin) | `Admins` | Attach `FSFullAccess`, `CatalogReadWriteAll`, `AuthFullAccess`, `RepoManagementFullAccess`, `PRReadWriteAll`; detach `ACL(_-_)Admins` |
-| `Supers` (Super) | `SuperUsers` | Copy members |
+| `Supers` (Super) | `SuperUsers` | Copy members. `SuperUsers` carries `PRReadWriteAll` in the base template, so the copy keeps pull-request write |
 | `Writers` (Write) | `Developers` | Copy members |
 | `Readers` (Read) | `Viewers` | Copy members |
 | Custom group with an ACL | Same group | Keep its `ACL(_-_)<g>` policy. It is a valid policy and shows in the Policies UI. |
@@ -241,7 +241,19 @@ to apply. It is idempotent.
    - ACL `Read` gains `CatalogRead`.
    - Super gains `PRReadWrite` and `CatalogReadWrite`.
 
-   This matches what `Viewers`, `Developers` and `SuperUsers` get in RBAC.
+   The RBAC base groups (§4.3) are the policy-set encoding of the same intent, and the parity is asserted by
+   `TestACLToStatementRBACParity` (`contrib/auth/acl/permission_test.go`), which compares the effective action set of
+   each ACL template with the union of the policies attached to the equivalent RBAC group:
+
+   | ACL template | RBAC group | Difference |
+   |---|---|---|
+   | `Write` | `Developers` | none: `FSReadWriteAll`, `PRReadWriteAll`, `CatalogReadWriteAll`, `AuthManageOwnCredentials`, `RepoManagementReadAll` |
+   | `Super` | `SuperUsers` | none: `FSFullAccess`, `PRReadWriteAll`, `CatalogReadWriteAll`, `AuthManageOwnCredentials`, `RepoManagementReadAll` |
+   | `Read` | `Viewers` | **`fs:ReadConfig`**: the ACL `Read` template grants it (storage-config endpoints), `Viewers` does not. A Reader cannot call `GET /api/v1/config/storage` after migrating. Pre-existing and tracked separately (DESIGN_CONFORMANCE.md GAP-06 records the Super half, which is fixed) |
+
+   `SuperUsers` must keep `PRReadWriteAll`: without it, `rbac-migrate` moved a `Supers` member into a group that can
+   write every branch and object but cannot open, update or merge a pull request, silently downgrading every existing
+   Super. Template change ⇒ bump `RBACBootstrapVersion` (§4.3), which is how existing installations pick it up once.
 2. **`ReconcileACLPolicies` (§3.3 #3):** at startup, for each policy with a non-empty `ACL`, recompute
    `ACLToStatement`. If the result differs, rewrite the policy through `WritePolicy(update=true)` and log it. Run it
    once per template version, using the same version key as §4.3.
