@@ -28,9 +28,10 @@ import (
 // a ref.Manager over the same KV store so the spikes can call the ref-manager entry points that
 // the GC job uses (GCBranchIterator) and inspect branch hidden-ness.
 type spikeFixture struct {
-	ctx    context.Context
-	cat    *catalog.Catalog
-	refMgr *ref.Manager
+	ctx     context.Context
+	cat     *catalog.Catalog
+	refMgr  *ref.Manager
+	kvStore kv.Store
 }
 
 func newSpikeFixture(t *testing.T) *spikeFixture {
@@ -43,6 +44,11 @@ func newSpikeFixture(t *testing.T) *spikeFixture {
 	_, err := config.NewConfig("", cfg)
 	testutil.MustDo(t, "build config", err)
 	cfg.Committed.LocalCache.Dir = t.TempDir()
+	// The catalog caches repository records for ~5s by default, which would hide a repository
+	// deletion from the pin tests (degraded detection, release after the source repository is gone).
+	// Disable that cache, as the branch-protection cache is shortened below; the pin manager reads
+	// repository state through the catalog.
+	cfg.Graveler.RepositoryCache.Size = 0
 
 	store, err := kv.Open(ctx, kvparams.Config{Type: "mem"})
 	require.NoError(t, err, "open mem kv store")
@@ -67,9 +73,10 @@ func newSpikeFixture(t *testing.T) *spikeFixture {
 	}, cfg.StorageConfig())
 
 	return &spikeFixture{
-		ctx:    ctx,
-		cat:    cat,
-		refMgr: refMgr,
+		ctx:     ctx,
+		cat:     cat,
+		refMgr:  refMgr,
+		kvStore: store,
 	}
 }
 
