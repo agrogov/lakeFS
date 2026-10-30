@@ -310,6 +310,80 @@ func (p *Pins) EnsureDatasetPins(ctx context.Context, dataset string) (recreated
 	return p.ensureSources(ctx, sourcesOfPins(records), "" /* references are already recorded */)
 }
 
+// ReleaseVersion drops the pin references of one version of a dataset and deletes every pin
+// branch whose reference set becomes empty. It is the rollback step of §12.3 item 1: a publish
+// that never produced a version must not leave the sources it pinned retained, but a pin that
+// another dataset version still references keeps its branch (§8.2).
+//
+// Releasing a reference that is not there is a no-op, and a source repository that is already
+// gone is tolerated, so the call converges when it is retried (§6.6).
+func (p *Pins) ReleaseVersion(ctx context.Context, dataset string, version int) error {
+	if err := p.available(); err != nil {
+		return err
+	}
+	if err := checkDatasetName(dataset); err != nil {
+		return err
+	}
+	if version < 1 {
+		return fmt.Errorf("%w: version must be positive, got %d", ErrInvalidRecordKey, version)
+	}
+	ref := PinReference(dataset, version)
+	records, err := p.store.ListDatasetPins(ctx, dataset)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, rec := range records {
+		if !containsReference(rec.References, ref) {
+			continue
+		}
+		deleteBranch, err := p.store.RemovePinReferences(ctx, rec.Repository, rec.CommitID, []string{ref})
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if deleteBranch {
+			if err := p.deletePinBranch(ctx, PinnedSource{Repository: rec.Repository, CommitID: rec.CommitID}); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// ClearDatasetDegraded removes the degraded mark of §12.3 item 4 once every pinned source is
+// reachable again. Like markDegraded it compare-and-swaps the dataset record, so it never
+// overwrites a state a concurrent writer set; it reports whether the record was written.
+func (p *Pins) ClearDatasetDegraded(ctx context.Context, dataset string) (bool, error) {
+	if err := p.available(); err != nil {
+		return false, err
+	}
+	for attempt := 0; attempt < pinCASRetries; attempt++ {
+		rec, err := p.store.GetDataset(ctx, dataset)
+		if errors.Is(err, kv.ErrNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if rec.State != DatasetStateDegraded {
+			return false, nil // active already, or a transient state owns the record
+		}
+		next := *rec
+		next.State = DatasetStateActive
+		next.UpdatedAt = time.Now().UTC()
+		err = p.store.PutDatasetIf(ctx, &next, rec)
+		if errors.Is(err, kv.ErrPredicateFailed) {
+			continue // the record changed under us; re-read and retry
+		}
+		if err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, kv.ErrPredicateFailed
+}
+
 // SourceStatus is the reachability of one pinned source, as Status reports it.
 type SourceStatus struct {
 	// PinnedSource is the (repository, commit) pair that was inspected.
