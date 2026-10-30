@@ -287,9 +287,13 @@ this, and recommend `auth.cache.ttl: 5s` for multi-replica deployments.
 
 Concrete outcomes, all expressible with the existing engine:
 
-- Repository- and branch-scoped grants, e.g. allow `fs:*` on `arn:lakefs:fs:::repository/analytics-*`, plus a deny on
-  `…/branch/main` for `fs:WriteObject`.
-- Path-scoped object grants (`…/object/raw/*`).
+- Repository- and branch-scoped grants, e.g. allow `fs:*` on `arn:lakefs:fs:::repository/analytics-*`, plus a deny
+  for `fs:CreateCommit` on `arn:lakefs:fs:::repository/analytics-1/branch/main`. Such a deny blocks `commit`,
+  `merge` into that branch, cherry-pick into it and `import`, and it hides the branch from `list branches`; it
+  does **not** block uploads (see below), and blocking `revert`/`reset` or deleting the branch needs the
+  matching branch actions (`fs:RevertBranch`, `fs:DeleteBranch`).
+- Path-scoped object grants, e.g. a deny for `fs:WriteObject` on
+  `arn:lakefs:fs:::repository/analytics-1/object/raw/*`.
 - IP-restricted access (`IpAddress`/`SourceIp`).
 - Per-user self-service (`${user}`).
 - Repository list filtered to what the user can see (already implemented).
@@ -297,7 +301,43 @@ Concrete outcomes, all expressible with the existing engine:
 - Datasets: the `strict` access model in `DATASETS_DESIGN.md` §9.6 becomes possible by using RBAC base groups
   without global `fs:*` grants.
 
+**An action only decides against the ARN shape it is checked on.** A statement naming a branch ARN cannot
+block an object write, and a statement naming an object path cannot block a commit. The handlers in
+`pkg/api/controller.go` and `pkg/gateway/operations/*` build the resource with the helpers in
+`pkg/permissions/permission.go`:
+
+| ARN | Built by | Actions checked on it | Typical example |
+|---|---|---|---|
+| `…/repository/<repo>/object/<path>` | `permissions.ObjectArn` | `fs:WriteObject`, `fs:ReadObject`, `fs:DeleteObject` (upload, presign, delete, copy source and destination, stat, symlink) | deny `fs:WriteObject` on `…/object/raw/*` |
+| `…/repository/<repo>/branch/<branch>` | `permissions.BranchArn` | `fs:CreateCommit`, `fs:CreateBranch`, `fs:DeleteBranch`, `fs:ReadBranch`, `fs:ListBranches`, `fs:RevertBranch`, `fs:ImportCancel` | deny `fs:CreateCommit` on `…/branch/main` |
+| `…/repository/<repo>` | `permissions.RepoArn` | repository-level actions: `fs:ReadRepository`, `fs:UpdateRepository`, `fs:DeleteRepository`, `fs:ListObjects`, `fs:ListTags`/`fs:ListCommits`/`fs:ListBranches` when not branch-filtered, the `pr:*` actions, GC and branch-protection actions | deny `fs:ListObjects` on `…/repository/analytics-1` |
+
+Consequences worth stating, because the earlier version of this section got the first one wrong:
+
+- `fs:WriteObject` on an object ARN carries no branch segment, so an object-path deny applies to every
+  branch of the repository (an uncommitted write is the same object key on any branch). Branch isolation is
+  not expressible at the object level; what a branch ARN does gate is publishing a change
+  (`fs:CreateCommit`, `fs:CreateBranch`).
+- The exceptions are pre-existing: `import` (`ImportStart`) additionally requires `fs:WriteObject` on the
+  *branch* ARN, and `restore refs` / `create commit record` are checked on the repository ARN.
+- `fs:ListObjects` is checked on the repository ARN, not per object, so a path-prefix grant cannot narrow a
+  listing.
+- A branch-ARN deny is honoured by `ListBranches` (the branch disappears from the listing) and by every
+  branch handler, which is what §5.3 relies on.
+
 ### 4.9 Files touched
+
+The **authoritative** list is the commit range, not this table:
+
+```
+git diff --name-only a25abca09..HEAD
+```
+
+(65 files at the time of writing, tests, test data and the review documents included.) The tables below
+name the files that carry a design decision, so a reader can find the code for each section; anything else
+in the range is test, test data or documentation for the items listed here.
+
+Main changes:
 
 | File | Change |
 |---|---|
@@ -314,6 +354,24 @@ Concrete outcomes, all expressible with the existing engine:
 | `cmd/lakefs/cmd/setup.go`, `superuser.go` | Use `authServiceBuilder` |
 | `webui/src/pages/auth/groups/index.tsx` | "Custom (policies)" display in `simplified` |
 | `cmd/lakefs-sso/config.example.yaml`, SSO changelog | `rbac: internal`, migration steps |
+
+Also touched, for the cross-cutting wiring the sections above require (an earlier version of this table
+omitted them):
+
+| File | Change | Design § |
+|---|---|---|
+| `contrib/auth/acl/permission.go` | ACL statement templates for PRs and catalogs | §4.5 #1 |
+| `pkg/auth/condition.go` | `StringEquals` / `StringNotEquals` operators | §5.1 |
+| `pkg/auth/service.go` | `AuthorizationRequest.Fields` lazy provider, condition context | §5.2 |
+| `pkg/cache/cache.go`, `pkg/cache/no_cache.go` | `Delete` / `Purge`, the primitives behind the policy-cache invalidation | §4.7 |
+| `pkg/config/config.go`, `pkg/config/oss_config.go`, `pkg/config/testdata/*` | `auth.authorization_failure_status`, its startup validation and test fixtures | §5.5 |
+| `pkg/gateway/handler.go`, `pkg/gateway/middleware.go` | Repository-metadata conditions and condition context in the S3 gateway | §5.2 phase 1 |
+| `pkg/gateway/operations/listbuckets.go`, `pkg/catalog/list_repository_options.go` | Condition-aware repository filter (ListBuckets and ListRepositories) | §5.2, §5.3 |
+| `pkg/permissions/actions.go` | `datasets` service set | §5.4 |
+| `webui/src/lib/api/index.js` | 404 `no_acl` body → `NoAclError`, the signal §4.5 #4 depends on | §4.5 #4 |
+| `scripts/check-license-base.sh` (new), `Makefile`, `.github/workflows/test.yaml` | The §2.5 licence-base guard, its make target and its CI job | §2.5 |
+| `REVIEW_R1.md`, `DESIGN_CONFORMANCE.md` | The independent code review and the conformance review of this delivery | — |
+| `RBAC_DESIGN.md` | This document, kept in step with what shipped (§4.8, §4.9, §6, §7, §8) | — |
 
 ### 4.10 Tests
 
@@ -394,28 +452,43 @@ Today a denial returns 401 (`ErrInsufficientPermissions`), or 500 when `Allowed=
 ## 6. Rollout
 
 1. **Phase A (both modes):**
-   - §4.5 template fixes and reconcile;
-   - §4.6 profile API;
-   - §4.7 cache invalidation;
-   - the setup/superuser builder fix.
+   - §4.5 template fixes (commit `adbec67e6`);
+   - §4.6 profile API and §4.7 cache invalidation (`1f8fdd760`, on the cache primitives in `d2cb4521a`);
+   - the setup/superuser builder fix (`40698e6ff`);
+   - the idempotent base-group helpers the others build on (`7d05c21be`).
 
-   Shippable alone. It fixes Writers not being able to open PRs.
+   Shippable alone, and it fixes Writers not being able to open PRs — **on fresh installs**. It does not
+   repair an installation whose KV already holds ACL policies computed from the old templates: the
+   `ReconcileACLPolicies` call that rewrites them lives in the auth builder and ships with Phase B (the
+   reconciler in `20881d6c4`, its startup wiring in `7d5871840`). An earlier version of this section listed
+   "reconcile" under Phase A; it was delivered in Phase B, so a Phase-A-only build leaves stale policies in
+   place.
 2. **Phase B:**
-   - the `internal` mode;
-   - RBAC bootstrap;
-   - the `rbac-migrate` command;
-   - the `SetGroupACL` gate;
-   - docs.
+   - the ACL template reconciler and its startup wiring, including the mode resolution that gates it
+     (`20881d6c4`, `7d5871840`) — this is the part that upgrades existing installations;
+   - the `internal` mode with the `rbacAuthService` wrapper (`7d5871840`);
+   - RBAC bootstrap in `internal` mode, versioned once per template (`da75fd5f2`, on the A2 helpers
+     `7d05c21be`);
+   - the `rbac-migrate` command (`36f68c8a3`);
+   - the `SetGroupACL` gate (`f22e0595c`);
+   - docs (`50bc2bba9`).
 
    Opt-in through `auth.ui_config.rbac: internal`.
 3. **Phase C:** Option 3 items as needed. §5.1 and §5.3 are first; §5.2 phase 1 comes next.
 4. Default stays `simplified`. Reconsider defaulting to `internal` after one release.
 
+Phase independence still holds: the Phase A commits build, vet and pass their package tests on top of the
+base commit without any Phase B code (`DESIGN_CONFORMANCE.md` §4.3). What they cannot do on their own is
+change data that was written before them.
+
 ## 7. Out of scope
 
 - **Tenants** (`auth:*Tenant*`, tenant segment in `fs:` ARNs): OSS has no tenant model.
 - **Audit log as a resource** (`audit:` actions, `arn:lakefs:audit:::log`): Option 2 enables structured audit request
-  logging, which is enough for log shipping.
+  logging, which is enough for log shipping — provided the level is configured. Those lines are written at
+  `logging.audit_log_level`, which defaults to `DEBUG`, and the default `logging.level` is `INFO`, so out of the box
+  they are filtered and produce no output. Set `logging.audit_log_level` at or below `logging.level` (for example
+  `audit_log_level: INFO`) to see them; see `CHANGELOG_SSO.md` and `cmd/lakefs-sso/config.example.yaml`.
 - **External principals / AWS IAM login:** `acl.AuthService` returns `ErrNotImplemented`. It could be added later
   over the KV schema that already exists.
 - **`admin:Login`:** Cloud only.
@@ -423,12 +496,14 @@ Today a denial returns 401 (`ErrInsufficientPermissions`), or 500 when `Allowed=
 
 ## 8. Related, but not part of this design
 
-Security fixes that upstream shipped only under BSL need clean-room equivalents tracked on this branch:
+Security fixes that upstream shipped only under BSL need clean-room equivalents. They are **out of scope for
+this branch and are not tracked here**: nothing in this repository's task board (`tasks.json`), ledger
+(`agent-progress.txt`) or the commit range `a25abca09..HEAD` covers them, so this section is a reminder, not a
+plan. Whoever picks them up should create the cards before starting, and mark each one clean-room (rule 2 in
+§2):
 
 - outbound hook requests to internal addresses (cf. `a6d4f1345`);
 - SigV4 signed-header validation in the S3 gateway (cf. `ffaa219b4`).
-
-Re-implement them from the public advisories (rule 2 in §2).
 
 ## 9. Open questions
 

@@ -14,6 +14,28 @@ database:
   postgres:
     connection_string: "postgres://lakefs:password@localhost/lakefs?sslmode=disable"
 
+# Logging. The REST API and the S3 gateway write one "HTTP call ended" line per request. In
+# rbac: internal mode those lines are audit lines and carry log_audit=true, the client, the
+# response size (sent_bytes) and the request ID; in rbac: simplified they are logged without
+# those fields.
+logging:
+  # Minimum severity that reaches the output: trace, debug, info (default), warn, error.
+  level: "INFO"
+
+  # Severity of the per-request audit lines. They are written at this level and then filtered by
+  # `level` above, so audit_log_level must be at or below level: with the binary defaults
+  # (audit_log_level DEBUG, level INFO) no audit line is emitted at all, which silently defeats
+  # log shipping. INFO gives one audit line per request.
+  audit_log_level: "INFO"
+
+  # "text" (default) or "json". JSON is the usual choice when shipping to a log store.
+  # format: "text"
+
+  # Where to write. Any mix of "-" (stdout, the default), "=" (stderr) and file paths
+  # (rotated by file_max_size_mb / files_keep).
+  # output:
+  #   - "-"
+
 auth:
   # Redirect here after /logout — Azure's end_session_endpoint clears the IdP session.
   # Replace <tenant-id> and the post_logout_redirect_uri with your actual values.
