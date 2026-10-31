@@ -18,7 +18,7 @@ import (
 // action on a dataset repository, and are still allowed on other repositories and for reads.
 func TestImmutabilityAuthServiceDeniesRegardlessOfGroups(t *testing.T) {
 	f := newAuthzFixture(t)
-	full := model.Statements{{Effect: model.StatementEffectAllow, Action: []string{"fs:*", "pr:*"}, Resource: "*"}}
+	full := model.Statements{{Effect: model.StatementEffectAllow, Action: []string{"fs:*", "pr:*", "catalog:*"}, Resource: "*"}}
 	f.policy(t, "FSFullAccess", full)
 	f.group(t, "data-eng")
 	f.attachToGroup(t, "FSFullAccess", "data-eng")
@@ -32,12 +32,15 @@ func TestImmutabilityAuthServiceDeniesRegardlessOfGroups(t *testing.T) {
 	authz := NewAuthorizer(guard)
 
 	writes := map[string]string{
-		permissions.WriteObjectAction:      permissions.ObjectArn("foo", "latest/a"),
-		permissions.CreateTagAction:        permissions.TagArn("foo", "v3"),
-		permissions.DeleteBranchAction:     permissions.BranchArn("foo", "latest"),
-		permissions.UpdateRepositoryAction: permissions.RepoArn("foo"),
-		permissions.ImportCancelAction:     permissions.BranchArn("foo", "latest"),
-		permissions.WritePullRequestAction: permissions.RepoArn("foo"),
+		permissions.WriteObjectAction:            permissions.ObjectArn("foo", "latest/a"),
+		permissions.CreateTagAction:              permissions.TagArn("foo", "v3"),
+		permissions.DeleteBranchAction:           permissions.BranchArn("foo", "latest"),
+		permissions.UpdateRepositoryAction:       permissions.RepoArn("foo"),
+		permissions.ImportCancelAction:           permissions.BranchArn("foo", "latest"),
+		permissions.WritePullRequestAction:       permissions.RepoArn("foo"),
+		permissions.CatalogCreateNamespaceAction: permissions.CatalogNamespaceArn("foo", "ns"),
+		permissions.CatalogUpdateTableAction:     permissions.CatalogTableArn("foo", "ns", "t"),
+		permissions.CatalogDeleteViewAction:      permissions.CatalogViewArn("foo", "ns", "v"),
 	}
 	for _, user := range []string{"grouped", "direct"} {
 		caller := Caller{Username: user}
@@ -70,7 +73,59 @@ func TestImmutabilityAuthServiceDeniesRegardlessOfGroups(t *testing.T) {
 }
 
 func swapRepo(resource, from, to string) string {
-	return strings.Replace(resource, "repository/"+from, "repository/"+to, 1)
+	if strings.Contains(resource, "repository/"+from) {
+		return strings.Replace(resource, "repository/"+from, "repository/"+to, 1)
+	}
+	for _, kind := range []string{"namespace/", "table/", "view/"} {
+		if strings.Contains(resource, kind+from+"/") {
+			return strings.Replace(resource, kind+from+"/", kind+to+"/", 1)
+		}
+	}
+	return resource
+}
+
+// TestRepositoryOfArn pins the resources the immutability guard recognizes: every fs ARN that
+// names a repository, and the catalog ARNs of ICEBERG_CATALOG_PLAN.md §7.2. A resource that does
+// not belong to a repository (or an unknown catalog kind) must not be attributed to one.
+func TestRepositoryOfArn(t *testing.T) {
+	tests := []struct {
+		name     string
+		resource string
+		wantRepo string
+		wantOK   bool
+	}{
+		{"repository", permissions.RepoArn("foo"), "foo", true},
+		{"object", permissions.ObjectArn("foo", "a/b"), "foo", true},
+		{"branch", permissions.BranchArn("foo", "main"), "foo", true},
+		{"tag", permissions.TagArn("foo", "v1"), "foo", true},
+		{"catalog namespace", permissions.CatalogNamespaceArn("foo", "ns"), "foo", true},
+		{"catalog namespace at repository", permissions.CatalogNamespaceArn("foo", ""), "foo", true},
+		{"catalog table", permissions.CatalogTableArn("foo", "ns", "t"), "foo", true},
+		{"catalog view", permissions.CatalogViewArn("foo", "ns", "v"), "foo", true},
+		{"empty fs repository", "arn:lakefs:fs:::repository/", "", false},
+		{"storage namespace", "arn:lakefs:fs:::namespace/ns", "", false},
+		{"catalog unknown kind", "arn:lakefs:catalog:::database/foo/db", "", false},
+		{"catalog missing repository", "arn:lakefs:catalog:::table/", "", false},
+		{"auth resource", "arn:lakefs:auth:::user/bob", "", false},
+		{"wildcard", "*", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, ok := repositoryOfArn(tt.resource)
+			require.Equal(t, tt.wantOK, ok)
+			require.Equal(t, tt.wantRepo, repo)
+		})
+	}
+}
+
+// TestImmutabilityAuthServiceFailsClosedWithoutRepoSet covers a miswired guard: without a name
+// set it must refuse to decide, never allow a write to a dataset repository.
+func TestImmutabilityAuthServiceFailsClosedWithoutRepoSet(t *testing.T) {
+	guard := NewImmutabilityAuthService(&stubAuthService{}, nil)
+	_, err := guard.Authorize(t.Context(), &auth.AuthorizationRequest{RequiredPermissions: permissions.Node{
+		Permission: permissions.Permission{Action: permissions.WriteObjectAction, Resource: permissions.ObjectArn("a", "x")},
+	}})
+	require.ErrorIs(t, err, errNoDatasetRepoSet)
 }
 
 // TestDatasetRepoSetCacheAndFailClosed covers the cached name set: TTL refresh, stale fallback on
