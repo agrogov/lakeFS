@@ -562,10 +562,13 @@ class Datasets {
      * use; the type still covers it for completeness.
      */
     async create(request: DatasetCreateRequest): Promise<Dataset | Task> {
-        return datasetsRequest<Dataset | Task>('', {
+        const created = await datasetsRequest<Dataset | Task>('', {
             method: 'POST',
             body: JSON.stringify(request),
         });
+        // The repository views filter on the cached name set: a new dataset must appear in it.
+        clearDatasetNamesCache();
+        return created;
     }
 
     async get(name: string): Promise<Dataset> {
@@ -586,7 +589,9 @@ class Datasets {
     }
 
     async delete(name: string): Promise<void> {
-        return datasetsRequest<void>(`/${segment(name)}`, { method: 'DELETE' });
+        await datasetsRequest<void>(`/${segment(name)}`, { method: 'DELETE' });
+        // A deleted dataset is no longer a dataset repository; drop the cached name set.
+        clearDatasetNamesCache();
     }
 
     /** Dry run: normalise, resolve, validate and authorise sources without writing (§10.1). */

@@ -183,7 +183,7 @@ const GetStarted = ({
     );
 };
 
-const RepositoryList = ({
+export const RepositoryList = ({
     onPaginate,
     search,
     after,
@@ -223,13 +223,17 @@ const RepositoryList = ({
     }
 
     // Datasets were the only thing on this page: point at where they are listed instead of
-    // rendering an empty list.
+    // rendering an empty list. The paginator stays, because the next page may hold ordinary
+    // repositories: hiding it would strand the reader on an all-dataset page (UI-2).
     if (visibleRepos.length === 0 && datasets.length > 0) {
         return (
-            <Alert variant="secondary">
-                {datasets.length === 1 ? 'This repository is a dataset.' : 'These repositories are datasets.'} Datasets
-                are listed on the <Link href={{ pathname: '/datasets' }}>Datasets</Link> page.
-            </Alert>
+            <div>
+                <Alert variant="secondary">
+                    {datasets.length === 1 ? 'This repository is a dataset.' : 'These repositories are datasets.'}{' '}
+                    Datasets are listed on the <Link href={{ pathname: '/datasets' }}>Datasets</Link> page.
+                </Alert>
+                <Paginator after={after} nextPage={nextPage} onPaginate={onPaginate} />
+            </div>
         );
     }
 

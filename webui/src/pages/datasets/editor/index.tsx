@@ -259,7 +259,7 @@ const EditorForm: FC<EditorFormProps> = ({ mode, datasetId, dataset, metadataKey
                     title: message.trim(),
                     description: description.trim() === '' ? undefined : description.trim(),
                 });
-                navigate(`/datasets/${datasetId}/pulls`);
+                navigate(`/datasets/${encodeURIComponent(datasetId)}/pulls`);
                 return;
             }
             if (mode === 'create') {
@@ -268,7 +268,7 @@ const EditorForm: FC<EditorFormProps> = ({ mode, datasetId, dataset, metadataKey
                     definition: definitionForSubmit,
                     publish: { message: message.trim() },
                 });
-                navigate(`/datasets/${effectiveName}/overview`);
+                navigate(`/datasets/${encodeURIComponent(effectiveName)}/overview`);
                 return;
             }
             await datasets.publishVersion(datasetId, {
@@ -276,7 +276,7 @@ const EditorForm: FC<EditorFormProps> = ({ mode, datasetId, dataset, metadataKey
                 message: message.trim(),
                 expected_version: latestVersion,
             });
-            navigate(`/datasets/${datasetId}/overview`);
+            navigate(`/datasets/${encodeURIComponent(datasetId)}/overview`);
         } catch (error) {
             setSubmitError(error instanceof DatasetsError ? new Error(error.message) : (error as Error));
         } finally {
@@ -487,7 +487,7 @@ const DatasetEditor: FC<{ mode: DatasetEditorMode; datasetId: string }> = ({ mod
             mode={mode}
             datasetId={datasetId}
             dataset={(datasetResponse as Dataset | null) ?? null}
-            metadataKeys={(metadataKeys as MetadataKey[] | undefined) ?? []}
+            metadataKeys={metadataKeys ?? []}
             repositoryIds={repositories}
         />
     );

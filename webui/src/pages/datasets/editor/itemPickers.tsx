@@ -185,10 +185,10 @@ export const PathPicker: FC<{
     }, [show, initialPath, itemType]);
 
     const { response, loading, error } = useAPI(
-        () => (show ? listEntries(repo, refId, prefix) : []),
+        () => (show ? listEntries(repo, refId, prefix) : Promise.resolve<TreeEntry[]>([])),
         [show, repo, refId, prefix],
     );
-    const entries = response ?? [];
+    const entries: TreeEntry[] = response ?? [];
 
     const segments = prefix
         .split('/')

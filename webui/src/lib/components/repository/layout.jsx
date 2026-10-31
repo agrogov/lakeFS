@@ -12,6 +12,7 @@ import { RefContextProvider } from '../../hooks/repo';
 import { ReadOnlyBadge } from '../badges';
 import { DatasetBadge } from '../datasets/datasetBadge';
 import { useDatasetNames } from '../datasets/hooks';
+import { Loading } from '../controls';
 
 const RepoNav = ({ isDataset = false }) => {
     const { repo, reference } = useRefs();
@@ -52,16 +53,19 @@ const RepoNav = ({ isDataset = false }) => {
  * sends the user to the dataset control-plane page instead of the read-only repository view.
  *
  * Repository listings carry no metadata, so the dataset names come from the control plane
- * (`useDatasetNames`); until they arrive the repository renders normally.
+ * (`useDatasetNames`). Both the repository and those names are awaited before anything is
+ * rendered: the index route would otherwise navigate to `/objects` while the names are still
+ * in flight, and the redirect below would never see the repository root again (UI-1).
  */
 const RepositoryOutlet = ({ fluid, activePage, setActivePage }) => {
-    const { repo } = useRefs();
+    const { repo, loading: repoLoading } = useRefs();
     const location = useLocation();
-    const { names } = useDatasetNames();
+    const { names, loading: namesLoading } = useDatasetNames();
     const isDataset = !!repo && names.has(repo.id);
     // Only the repository entry point redirects: the sub-pages stay reachable (and carry the
     // Dataset badge) so links into the read-only repository view keep working.
     const atRepositoryRoot = !!repo && location.pathname === `/repositories/${repo.id}`;
+    if (repoLoading || namesLoading) return <Loading />;
     if (isDataset && atRepositoryRoot) {
         return <Navigate to={`/datasets/${encodeURIComponent(repo.id)}/data`} replace />;
     }

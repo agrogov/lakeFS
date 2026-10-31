@@ -94,7 +94,7 @@ const DatasetOverviewPage: FC = () => {
                         <div className="ms-auto d-flex align-items-center gap-2 dataset-overview-actions">
                             <DatasetVersionPicker
                                 versions={versionNumbers(state.versions)}
-                                latest={dataset.version}
+                                latest={dataset.version ?? 0}
                                 value={selection}
                                 onChange={onSelectVersion}
                                 label="Version"

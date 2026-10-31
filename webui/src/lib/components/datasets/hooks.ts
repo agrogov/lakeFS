@@ -92,15 +92,25 @@ export const METADATA_KEY_RESOURCE = datasetResource('*');
 /** The ARN of one metadata key, kept for display; authorization uses `METADATA_KEY_RESOURCE`. */
 export const metadataKeyResource = (_key: string): string => METADATA_KEY_RESOURCE;
 
+/** Policy condition block, e.g. `{"StringLike": {"lakefs:metadata:owner": ["*"]}}`. */
+type PolicyConditionLike = Record<string, Record<string, string[]>>;
+
 /** Policy shape returned by `GET /auth/users/{id}/policies?effective=true`. */
 interface PolicyStatementLike {
     effect?: string;
     action?: string | string[];
     resource?: string | string[];
+    condition?: PolicyConditionLike;
 }
 
 interface PolicyLike {
     statement?: PolicyStatementLike[];
+}
+
+/** One page of `GET /auth/users/{id}/policies`. */
+interface PolicyListLike {
+    results?: PolicyLike[];
+    pagination?: { has_more?: boolean; next_offset?: string };
 }
 
 /**
@@ -110,10 +120,13 @@ interface PolicyLike {
  */
 const SAMPLE_DATASET_ARN = 'arn:lakefs:dataset:::dataset/sample';
 
-/** Glob matching for ARNs and actions (`*` matches any run of characters), as the server does. */
+/**
+ * Glob matching for ARNs and actions (`*` matches any run of characters), as the server does.
+ * Case-sensitive, like `pkg/auth/arn.go`: a policy action never matches with different case.
+ */
 export const globMatch = (pattern: string, value: string): boolean => {
     const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-    return new RegExp(`^${escaped}$`, 'i').test(value);
+    return new RegExp(`^${escaped}$`).test(value);
 };
 
 const asArray = (value: string | string[] | undefined): string[] => {
@@ -122,13 +135,28 @@ const asArray = (value: string | string[] | undefined): string[] => {
 };
 
 /**
+ * True when a statement carries a condition block. The server evaluates conditions from the
+ * request context (the caller's address, the object's metadata, ...), which the browser does
+ * not have, so such a statement is never counted as a decision here (UI-5).
+ */
+const hasConditions = (statement: PolicyStatementLike): boolean => {
+    const condition = statement.condition;
+    return !!condition && typeof condition === 'object' && Object.keys(condition).length > 0;
+};
+
+/**
  * Whether a set of effective policies allows `action` on `resource`. Deny wins over allow,
  * and both action and resource are glob-matched, mirroring the server's permission model.
+ *
+ * A statement with conditions is skipped: the UI cannot evaluate them, so it never claims their
+ * allow (no control for a user who may be denied) nor their deny (no control withheld from a
+ * user who may be allowed). The control plane answers `403` regardless.
  */
 export const policiesAllow = (policies: PolicyLike[], action: string, resource: string): boolean => {
     let allowed = false;
     for (const policy of policies) {
         for (const statement of policy.statement ?? []) {
+            if (hasConditions(statement)) continue;
             if (!asArray(statement.action).some((pattern) => globMatch(pattern, action))) continue;
             if (!asArray(statement.resource).some((pattern) => globMatch(pattern, resource))) continue;
             if (statement.effect === 'deny') return false;
@@ -176,12 +204,31 @@ export const usePermission = (action: string, resource: string): PermissionState
 /** `usePermission` when only the yes/no answer is needed. */
 export const useCan = (action: string, resource: string): boolean => usePermission(action, resource).allowed;
 
+/** Hard cap so a huge policy set cannot turn one page render into an endless paging loop. */
+const MAX_POLICY_PAGES = 10;
+
+/**
+ * Every effective policy of a user. `GET /auth/users/{id}/policies` is paginated and defaults
+ * to 100 results, so reading only the first page would silently drop the grants of a user with
+ * many policies (UI-5).
+ */
+const listEffectivePolicies = async (userId: string): Promise<PolicyLike[]> => {
+    const policies: PolicyLike[] = [];
+    let after = '';
+    for (let page = 0; page < MAX_POLICY_PAGES; page++) {
+        const response = (await auth.listUserPolicies(userId, true, after, MAX_LISTING_AMOUNT)) as PolicyListLike;
+        policies.push(...(response?.results ?? []));
+        const next = response?.pagination?.has_more ? response.pagination.next_offset : '';
+        if (!next) break;
+        after = next;
+    }
+    return policies;
+};
+
 const fetchCan = async (action: string, resource: string): Promise<boolean> => {
     const user = await auth.getCurrentUserWithCache();
     if (!user?.id) return false;
-    const policies = await auth.listUserPolicies(user.id, true);
-    const results: PolicyLike[] = policies?.results ?? [];
-    return policiesAllow(results, action, resource);
+    return policiesAllow(await listEffectivePolicies(user.id), action, resource);
 };
 
 // ---------------------------------------------------------------------------
@@ -240,6 +287,10 @@ export interface DatasetVersionState {
  *
  * A selection that names a version the dataset does not have (a stale link to `v7` of a `v3`
  * dataset) falls back to `latest` instead of rendering an empty page.
+ *
+ * The version list itself is capped, so an explicit `vN` of a long history can be missing from
+ * it: that version is fetched with `GET .../versions/{version}` instead, and an explicit `vN`
+ * never falls back to the latest definition (UI-6).
  */
 export const useDatasetVersion = (name: string, requested: VersionSelection): DatasetVersionState => {
     const { dataset, loading: datasetLoading, error: datasetError } = useDataset(name);
@@ -248,18 +299,35 @@ export const useDatasetVersion = (name: string, requested: VersionSelection): Da
     const latest = dataset?.version ?? 0;
     const selection = normaliseSelection(requested, latest);
     const wanted = selectionToVersion(selection);
-    const version =
-        wanted === null ? (versions[0] ?? null) : (versions.find((candidate) => versionNumber(candidate) === wanted) ?? null);
+    const wantedVersion = wanted ?? 0;
+    const explicit = wanted !== null;
+    const listed =
+        wanted === null
+            ? (versions[0] ?? null)
+            : (versions.find((candidate) => versionNumber(candidate) === wanted) ?? null);
+
+    const fetchMissing = wanted !== null && !versionsLoading && listed === null;
+    const {
+        response: fetchedResponse,
+        loading: fetchedLoading,
+        error: fetchedError,
+    } = useAPI(
+        // `selection` is the normalised `vN`, the documented version ref (DOC-19).
+        () => (fetchMissing ? datasets.getVersion(name, selection) : Promise.resolve(null)),
+        [name, fetchMissing, selection],
+    );
+    const fetched = (fetchedResponse ?? null) as Version | null;
+    const version = listed ?? fetched;
 
     return {
         dataset,
         versions,
         version,
         selection,
-        versionNumber: version ? versionNumber(version) : latest,
-        definition: version?.definition ?? definitionOf(dataset?.definition),
-        stats: version?.stats ?? dataset?.stats,
-        loading: datasetLoading || versionsLoading,
-        error: datasetError ?? versionsError,
+        versionNumber: version ? versionNumber(version) : explicit ? wantedVersion : latest,
+        definition: explicit ? version?.definition : (version?.definition ?? definitionOf(dataset?.definition)),
+        stats: explicit ? version?.stats : (version?.stats ?? dataset?.stats),
+        loading: datasetLoading || versionsLoading || (fetchMissing && fetchedLoading),
+        error: datasetError ?? versionsError ?? (fetchMissing ? fetchedError : null),
     };
 };

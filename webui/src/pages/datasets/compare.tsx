@@ -93,7 +93,7 @@ const DefinitionTab: FC<{ datasetId: string; left: string; right: string }> = ({
 
     if (loading) return <Loading />;
     if (error) return <AlertError error={error as Error} />;
-    return <DefinitionDiffTable diff={(response as DefinitionDiff | null) ?? { items: [] }} />;
+    return <DefinitionDiffTable diff={(response as DefinitionDiff | null) ?? { data: [] }} />;
 };
 
 /** What `ObjectsDiff` reads from the ref context to resolve the storage configuration. */

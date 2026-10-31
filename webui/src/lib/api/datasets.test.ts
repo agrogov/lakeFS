@@ -5,6 +5,7 @@ import {
     clearDatasetNamesCache,
     DatasetsError,
     datasets,
+    getDatasetNames,
     isDatasetsDisabledError,
     isRebaseRequiredError,
     listDatasetNames,
@@ -150,6 +151,77 @@ describe('isDatasetsDisabledError', () => {
         expect(isDatasetsDisabledError(new DatasetsError('conflict', 409))).toBe(false);
         expect(isDatasetsDisabledError(new Error('boom'))).toBe(false);
         expect(isDatasetsDisabledError(undefined)).toBe(false);
+    });
+});
+
+describe('dataset names cache (UI-3)', () => {
+    let fetchMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+        fetchMock = vi.fn();
+        vi.stubGlobal('fetch', fetchMock);
+        clearDatasetNamesCache();
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        clearDatasetNamesCache();
+    });
+
+    const page = (ids: string[]) =>
+        jsonResponse(200, {
+            results: ids.map((id) => ({ id, creation_date: 1 })),
+            pagination: { has_more: false, next_offset: '', results: ids.length, max_per_page: 1000 },
+        });
+
+    it('reads the names once and then serves them from the cache', async () => {
+        fetchMock.mockResolvedValueOnce(page(['customer-360']));
+
+        expect(await getDatasetNames()).toEqual(new Set(['customer-360']));
+        expect(await getDatasetNames()).toEqual(new Set(['customer-360']));
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('drops the cache after a successful create', async () => {
+        fetchMock.mockResolvedValueOnce(page(['customer-360']));
+        expect(await getDatasetNames()).toEqual(new Set(['customer-360']));
+
+        fetchMock.mockResolvedValueOnce(jsonResponse(201, { id: 'created', creation_date: 2 }));
+        await datasets.create({ name: 'created', definition: { data: [] } });
+
+        fetchMock.mockResolvedValueOnce(page(['customer-360', 'created']));
+        expect(await getDatasetNames()).toEqual(new Set(['customer-360', 'created']));
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+
+    it('drops the cache after a successful delete', async () => {
+        fetchMock.mockResolvedValueOnce(page(['customer-360', 'sales']));
+        expect(await getDatasetNames()).toEqual(new Set(['customer-360', 'sales']));
+
+        fetchMock.mockResolvedValueOnce({
+            status: 204,
+            ok: true,
+            statusText: 'No Content',
+            headers: { get: () => null },
+            json: async () => ({}),
+            text: async () => '',
+        });
+        await datasets.delete('sales');
+
+        fetchMock.mockResolvedValueOnce(page(['customer-360']));
+        expect(await getDatasetNames()).toEqual(new Set(['customer-360']));
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+
+    it('keeps the cache when the create fails', async () => {
+        fetchMock.mockResolvedValueOnce(page(['customer-360']));
+        expect(await getDatasetNames()).toEqual(new Set(['customer-360']));
+
+        fetchMock.mockResolvedValueOnce(jsonResponse(409, { message: 'name unavailable' }));
+        await datasets.create({ name: 'taken', definition: { data: [] } }).catch(() => null);
+
+        expect(await getDatasetNames()).toEqual(new Set(['customer-360']));
+        expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 });
 

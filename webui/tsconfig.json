@@ -13,7 +13,10 @@
         "noImplicitAny": true,
         "strictNullChecks": true,
         "alwaysStrict": true,
-        "types": ["node"]
+        "types": ["node"],
+        "paths": {
+            "@primer/octicons-react": ["./node_modules/@primer/octicons-react/dist/index.d.ts"]
+        }
     },
     "include": ["./src/**/*", "./playwright.config.ts", "./test/e2e/**/*.ts", "./test/integration/**/*.ts"],
 }

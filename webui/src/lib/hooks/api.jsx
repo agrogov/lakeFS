@@ -50,6 +50,18 @@ const initialAPIState = {
     responseHeaders: null,
 };
 
+/**
+ * Runs `promise` on mount and whenever `deps` change, and reports the last answer.
+ *
+ * `response` is the resolved value of the promise (or `null` before it arrives), which is what
+ * the typed dataset pages rely on: without the annotation the state would be inferred as `null`
+ * and every reader of `response` would have to cast through `unknown`.
+ *
+ * @template T
+ * @param {() => Promise<T>} promise
+ * @param {unknown[]} [deps]
+ * @returns {{ loading: boolean, error: any, response: T | null, responseHeaders: any, refetch: () => void }}
+ */
 export const useAPI = (promise, deps = []) => {
     const [request, setRequest] = useState(initialAPIState);
     const { onUnauthenticated } = useAuth();

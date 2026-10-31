@@ -1,6 +1,7 @@
 import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 
 import DatasetAccessPage from './access';
@@ -105,6 +106,49 @@ describe('DatasetAccessPage', () => {
         expect(screen.queryByTestId('dataset-grant-user-alice')).not.toBeInTheDocument();
         // The page does not even ask for the grants it may not see.
         expect(accessCalls()).toHaveLength(0);
+    });
+
+    it('reports only the principals whose grant failed, and refreshes the list (UI-4)', async () => {
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const path = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (path.endsWith('/api/v1/user')) return jsonResponse({ user: { id: 'reviewer' } });
+            if (path.includes('/auth/users/reviewer/policies')) {
+                return jsonResponse(policies(['dataset:ReadDataset', 'dataset:ManageAccess']));
+            }
+            if (path.startsWith('/api/v1/auth/users?')) {
+                return jsonResponse({ results: [{ id: 'bob' }, { id: 'carol' }], pagination: { has_more: false } });
+            }
+            if (path.endsWith('/datasets/customer-360/access')) {
+                if (method === 'POST') {
+                    const body = JSON.parse(String(init?.body));
+                    return body.principal_id === 'carol'
+                        ? jsonResponse({ message: 'forbidden: user carol is not allowed' }, 403)
+                        : jsonResponse({}, 201);
+                }
+                return accessResponse();
+            }
+            return jsonResponse({ message: 'not found' }, 404);
+        });
+        renderPage();
+
+        await screen.findByTestId('dataset-grant-user-alice');
+        await userEvent.click(screen.getByRole('button', { name: 'Add user' }));
+        for (const checkbox of await screen.findAllByRole('checkbox')) {
+            await userEvent.click(checkbox);
+        }
+        await userEvent.click(screen.getByRole('button', { name: 'Add users' }));
+
+        // Only the principal that failed is named: bob's grant went through.
+        expect(await screen.findByText(/Could not grant read access to carol/)).toBeInTheDocument();
+        expect(screen.queryByText(/Could not grant read access to bob/)).not.toBeInTheDocument();
+        // The list is re-read even though the batch failed: bob's grant is already in force.
+        const reads = fetchMock.mock.calls.filter(
+            ([url, init]) =>
+                String(url).endsWith('/datasets/customer-360/access') &&
+                ((init as RequestInit | undefined)?.method ?? 'GET').toUpperCase() === 'GET',
+        );
+        expect(reads).toHaveLength(2);
     });
 
     it('handles a 403 from the grants endpoint the same way as a denied policy check', async () => {
