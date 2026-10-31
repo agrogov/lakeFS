@@ -72,11 +72,20 @@ var (
 // ErrSourceRefNotFound or ErrStorageIDMismatch, and Item is the index of the
 // offending item in the (normalised, target-sorted) definition, so the API can
 // report it as `{"path": "data[2]", ...}` (§10.4).
+//
+// The materialiser reports a denied per-object source read through the same type
+// (SEC-3): Err wraps ErrSourceReadDenied and Path names the first source object
+// the caller may not read, so a failed publish says which path was denied and not
+// only which item it came from.
 type SourceError struct {
 	Item       int
 	Repository string
-	Ref        SourceRef
-	Err        error
+	// Path is the source object path a per-object read check denied (SEC-3). It is
+	// empty for the resolve-time source problems, which are about the repository or
+	// the ref, not about one object.
+	Path string
+	Ref  SourceRef
+	Err  error
 }
 
 // Error implements error.
@@ -86,6 +95,9 @@ func (e *SourceError) Error() string {
 	fmt.Fprintf(&b, ": repository %q", e.Repository)
 	if e.Ref.ID != "" {
 		fmt.Fprintf(&b, " ref %s %q", e.Ref.Type, e.Ref.ID)
+	}
+	if e.Path != "" {
+		fmt.Fprintf(&b, " path %q", e.Path)
 	}
 	fmt.Fprintf(&b, ": %v", e.Err)
 	return b.String()

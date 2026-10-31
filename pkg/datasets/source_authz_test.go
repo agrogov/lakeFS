@@ -91,6 +91,95 @@ func TestSourceReadDenyOnSubPath(t *testing.T) {
 	})
 }
 
+// TestSourceReadDenyOnSecretSubPath is the SEC-3 exploit of the review: a caller with fs:* on
+// everything and a Deny on fs:ReadObject for arn:lakefs:fs:::repository/src/object/secret/* must not
+// be able to publish the denied objects, whatever prefix the item names.
+//
+// A prefix item is normalised to end with "/", so "sec" covers "sec/..." and not "secret/..."; the
+// second case therefore puts the deny under the item's own prefix, which is the shape a prefix item
+// cannot see at attach time (the item's literal ARN .../object/sec/* does not match a Deny on
+// .../object/sec/secret/*). Both cases are caught per object, and both name the item and the first
+// denied path.
+func TestSourceReadDenyOnSecretSubPath(t *testing.T) {
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, "src", map[string]string{
+		"pub/report.csv":          "public",
+		"sec/notes.txt":           "also public",
+		"sec/secret/salaries.csv": "denied below the sec/ prefix",
+		"secret/compensation.csv": "denied",
+	})
+	const user = "exfiltrator"
+	f.addUser(t, user, DatasetAdminsGroup)
+	f.grant(t, user, "allow-fs-all", model.Statements{{
+		Effect:   model.StatementEffectAllow,
+		Action:   []string{"fs:*"},
+		Resource: permissions.All,
+	}})
+	// The review's deny, verbatim.
+	f.grant(t, user, "deny-secret", model.Statements{{
+		Effect:   model.StatementEffectDeny,
+		Action:   []string{permissions.ReadObjectAction},
+		Resource: "arn:lakefs:fs:::repository/src/object/secret/*",
+	}})
+	// The same caller with the deny one level deeper, to show a prefix item cannot hide a deny
+	// that sits below its own literal ARN. It gets the public grant too.
+	const secUser = "exfiltrator-sec"
+	f.addUser(t, secUser, DatasetAdminsGroup)
+	require.NoError(t, f.authService.AttachPolicyToUser(t.Context(), "allow-fs-all", secUser))
+	f.grant(t, secUser, "deny-sec-secret", model.Statements{{
+		Effect:   model.StatementEffectDeny,
+		Action:   []string{permissions.ReadObjectAction},
+		Resource: "arn:lakefs:fs:::repository/src/object/sec/secret/*",
+	}})
+
+	for _, tt := range []struct {
+		name     string
+		dataset  string
+		prefix   string
+		username string
+		// wantPath is the first source object the caller may not read, in key order.
+		wantPath string
+	}{
+		{name: "a prefix over the whole repository", dataset: "exfil-root", prefix: "", username: user, wantPath: "secret/compensation.csv"},
+		{name: "a prefix over sec", dataset: "exfil-sec", prefix: "sec", username: secUser, wantPath: "sec/secret/salaries.csv"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			caller := f.callerFor(tt.username)
+			_, err := f.svc.Create(f.ctx, caller, CreateRequest{
+				Name:       tt.dataset,
+				Definition: prefixDefinition("src", commit.String(), "out", tt.prefix),
+				Publish:    true,
+			})
+			require.ErrorIs(t, err, ErrPermissionDenied)
+			require.ErrorIs(t, err, ErrSourceReadDenied,
+				"the per-object check catches the deny the attach-time check cannot see")
+			var sourceErr *SourceError
+			require.ErrorAs(t, err, &sourceErr)
+			require.Equal(t, tt.wantPath, sourceErr.Path, "the SourceError names the denied path")
+			require.Equal(t, 0, sourceErr.Item)
+			require.Equal(t, "src", sourceErr.Repository)
+
+			status, body := statusOf(t, err)
+			require.Equal(t, http.StatusForbidden, status)
+			require.Contains(t, body, "data[0]", "the 403 names the item")
+			require.Contains(t, body, tt.wantPath, "the 403 names the denied path")
+			_, _, getErr := f.svc.store.GetDataset(f.ctx, tt.dataset)
+			require.Error(t, getErr, "a denied publish creates nothing")
+		})
+	}
+
+	t.Run("a prefix that misses every deny", func(t *testing.T) {
+		// The deny is on a sub-path, not on the item: the same caller publishes "pub" happily.
+		view, err := f.svc.Create(f.ctx, f.callerFor(user), CreateRequest{
+			Name:       "exfil-allowed",
+			Definition: prefixDefinition("src", commit.String(), "out", "pub"),
+			Publish:    true,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, view.Version)
+	})
+}
+
 // TestSourceReadRepositoryUnreadableLooksLikeMissing is SEC-4: before anything is resolved the
 // caller needs fs:ReadRepository, so an unreadable repository and a missing one yield the same 403.
 func TestSourceReadRepositoryUnreadableLooksLikeMissing(t *testing.T) {

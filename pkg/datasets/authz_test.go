@@ -509,6 +509,72 @@ func TestAuthorizerSourceCheckMatrix(t *testing.T) {
 	}
 }
 
+// TestCheckSourcesRespectsSubPathDeny is the unit half of SEC-3. CheckSources matches the caller's
+// policy resources as patterns against the item's own ARN, so a Deny on a sub-path of the source
+// repository denies every item that names a path inside it or below it. It is blind to a Deny that
+// sits below a prefix item - the policy side is the pattern, so .../object/secret/* never matches
+// the requested literal .../object/* - which is why SourceReader.CheckObject re-checks every object
+// the materialiser reads (see TestSourceReadDenyOnSecretSubPath).
+func TestCheckSourcesRespectsSubPathDeny(t *testing.T) {
+	const (
+		creator = "creator"
+		src     = "src"
+	)
+	f := newAuthzFixture(t)
+	ctx := t.Context()
+	f.user(t, creator)
+	// The review's caller: allow everything, deny reading salaries.
+	f.policy(t, "allow-all", model.Statements{{
+		Effect:   model.StatementEffectAllow,
+		Action:   []string{"fs:*"},
+		Resource: permissions.All,
+	}})
+	f.policy(t, "deny-secret", model.Statements{{
+		Effect:   model.StatementEffectDeny,
+		Action:   []string{permissions.ReadObjectAction},
+		Resource: permissions.ObjectArn(src, "secret/*"),
+	}})
+	f.attachToUser(t, "allow-all", creator)
+	f.attachToUser(t, "deny-secret", creator)
+
+	object := func(path string) DataItem {
+		return DataItem{Repository: src, Ref: SourceRef{Type: RefTypeCommit, ID: "aaa"}, Type: ItemTypeObject, Object: &PathSource{Path: path}}
+	}
+	prefix := func(path string) DataItem {
+		return DataItem{Repository: src, Ref: SourceRef{Type: RefTypeCommit, ID: "aaa"}, Type: ItemTypePrefix, Prefix: &PathSource{Path: path}}
+	}
+
+	tests := []struct {
+		name   string
+		items  []DataItem
+		denied bool
+	}{
+		{"an object inside the denied subtree", []DataItem{object("secret/salaries.csv")}, true},
+		{"an object outside it", []DataItem{object("pub/report.csv")}, false},
+		{"a prefix inside the denied subtree", []DataItem{prefix("secret/")}, true},
+		{"a prefix deeper inside it", []DataItem{prefix("secret/salaries/")}, true},
+		{"a second item inside it", []DataItem{object("pub/report.csv"), object("secret/salaries.csv")}, true},
+		{"an item in another repository", []DataItem{{Repository: "other", Ref: SourceRef{Type: RefTypeCommit, ID: "aaa"}, Type: ItemTypeObject, Object: &PathSource{Path: "secret/salaries.csv"}}}, false},
+		// The coarse check cannot see a deny below the item's own prefix: .../object/* does not
+		// match .../object/secret/*. The per-object check is what closes this gap.
+		{"a prefix above it", []DataItem{prefix("")}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := f.authz.CheckSources(ctx, Caller{Username: creator}, tt.items)
+			if !tt.denied {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorIs(t, err, ErrPermissionDenied)
+			var permErr *PermissionError
+			require.ErrorAs(t, err, &permErr)
+			require.Equal(t, http.StatusForbidden, permErr.HTTPStatusCode())
+			require.Contains(t, err.Error(), "data[", "the denial names the offending item (§9.3)")
+		})
+	}
+}
+
 // TestConsumerGrantDoesNotGrantSourceRead is the §9.2/§9.3 boundary: a dataset grant is on the
 // dataset repository, so it never lets its holder attach data from the source repositories.
 func TestConsumerGrantDoesNotGrantSourceRead(t *testing.T) {

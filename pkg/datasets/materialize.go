@@ -669,7 +669,9 @@ func (m *Materializer) openSource(ctx context.Context, stream *itemStream) (grav
 var ErrSourceAuthzMissing = errors.New("datasets: source read without a per-object authorization check")
 
 // checkSourceObject authorizes the read of one source key, mapping a denial to the SourceError
-// that names the item and the first denied path (SEC-3).
+// that names the item and the first denied path (SEC-3). It is the authoritative source-read
+// check: unlike the attach-time SourceReadNode of authz.go it authorizes the exact object, so a
+// Deny on any sub-path of a prefix item is seen here, and the first one fails the publish.
 func checkSourceObject(ctx context.Context, reader *SourceReader, stream *itemStream, key string) error {
 	err := reader.CheckObject(ctx, stream.repository.RepositoryID.String(), key)
 	if err == nil {
@@ -679,6 +681,7 @@ func checkSourceObject(ctx context.Context, reader *SourceReader, stream *itemSt
 		return &SourceError{
 			Item:       stream.index,
 			Repository: stream.repository.RepositoryID.String(),
+			Path:       key,
 			Ref:        SourceRef{Type: RefTypeCommit, ID: stream.commitID.String()},
 			Err:        err,
 		}

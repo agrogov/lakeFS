@@ -175,13 +175,22 @@ type Caller struct {
 // conditions and ${user} interpolation all behave identically to the core API.
 type Authorizer struct {
 	service auth.Authorizer
+
+	// policies is the same auth service seen as a policy lister, when it implements one. The
+	// per-object source-read cache uses it to learn the caller's policy set once per operation
+	// (source_cache.go); nil only costs that optimisation.
+	policies EffectivePoliciesLister
 }
 
 // NewAuthorizer wraps an auth service (auth.Service implements auth.Authorizer) in an
 // Authorizer. A nil service makes every check fail with ErrNoAuthorizer: the control plane must
 // never treat "no auth service" as "allowed" (§4.6).
 func NewAuthorizer(service auth.Authorizer) *Authorizer {
-	return &Authorizer{service: service}
+	authorizer := &Authorizer{service: service}
+	if lister, ok := service.(EffectivePoliciesLister); ok {
+		authorizer.policies = lister
+	}
+	return authorizer
 }
 
 // Check authorizes node for caller and returns nil when the decision is "allow".
@@ -244,6 +253,13 @@ func (a *Authorizer) CheckMetadataKey(ctx context.Context, caller Caller, action
 // this costs one policy evaluation per item plus the per-principal cache hit; the definitions of
 // §5.2 are bounded by datasets.max_items (default 1000).
 //
+// It is the cheap pre-check, not the authoritative one (SEC-3): a policy resource is matched as a
+// pattern, so a Deny below the item's own literal path is not seen here - a prefix item over "data"
+// asks about .../object/data/*, which a Deny on .../object/data/secret/* does not match. It does
+// catch a Deny on the item's own path or on an ancestor of it. The per-object check of
+// SourceReader.CheckObject is what closes the gap; it must keep running for every object the
+// materialiser reads, so this function must never be treated as a replacement for it.
+//
 // The caller must be the principal that is attaching the data:
 //   - create, publish and proposal create/update: the caller of the request;
 //   - proposal merge: the merger, since the merger publishes the data under their authority
@@ -285,33 +301,74 @@ func (a *Authorizer) CheckSourceRepositories(ctx context.Context, caller Caller,
 var ErrSourceReadDenied = fmt.Errorf("%w: source object read denied", ErrPermissionDenied)
 
 // SourceReader authorizes the per-object source reads of the materialiser for one caller (SEC-3).
+// It carries a decision cache scoped to that caller and to the policy set it started with, so a
+// prefix item authorizes its objects once per policy-prefix bucket rather than once per object
+// (source_cache.go).
 type SourceReader struct {
 	authorizer *Authorizer
 	caller     Caller
+	cache      *sourceReadCache
 }
 
-// SourceReader returns the per-object source-read check of caller.
+// SourceReader returns the per-object source-read check of caller. It must be built once per
+// operation and put on the context whose reads it authorizes: the cache it holds is valid for the
+// policy set of that one operation.
 func (a *Authorizer) SourceReader(caller Caller) *SourceReader {
-	return &SourceReader{authorizer: a, caller: caller}
+	var policies EffectivePoliciesLister
+	if a != nil {
+		policies = a.policies
+	}
+	return &SourceReader{
+		authorizer: a,
+		caller:     caller,
+		cache:      newSourceReadCache(policies, caller.Username),
+	}
 }
 
-// CheckObject authorizes fs:ReadObject on one source object. A denial is returned wrapping
-// ErrSourceReadDenied and naming the path; a failure to decide is returned as the
+// CheckObject authorizes fs:ReadObject on one source object for the caller. A denial is returned
+// wrapping ErrSourceReadDenied and naming the path; a failure to decide is returned as the
 // *AuthorizationError (500) and is never turned into a denial or an allow.
+//
+// A decision is cached per (policy set, path prefix up to the deepest policy wildcard) of the
+// caller, so checking a whole prefix item costs one authorization per bucket; a cache hit is only
+// possible where the policy set makes the decision independent of the rest of the path
+// (source_cache.go).
 func (r *SourceReader) CheckObject(ctx context.Context, repository, path string) error {
+	if r == nil || r.cache == nil {
+		// A SourceReader built outside SourceReader() cannot be trusted to authorize anything.
+		return ErrSourceAuthzMissing
+	}
+	arn := permissions.ObjectArn(repository, path)
+	key := r.cache.key(ctx, arn)
+	if decision, ok := r.cache.get(key); ok {
+		if decision == sourceDecisionAllow {
+			return nil
+		}
+		return sourceReadDenied(r.caller.Username, repository, path)
+	}
+
 	node := permissions.Node{Permission: permissions.Permission{
 		Action:   permissions.ReadObjectAction,
-		Resource: permissions.ObjectArn(repository, path),
+		Resource: arn,
 	}}
 	err := r.authorizer.Check(ctx, r.caller, node, "")
 	if err == nil {
+		r.cache.put(key, sourceDecisionAllow)
 		return nil
 	}
 	var denied *PermissionError
 	if errors.As(err, &denied) {
-		return fmt.Errorf("%w: user %s may not read %q in repository %q", ErrSourceReadDenied, r.caller.Username, path, repository)
+		r.cache.put(key, sourceDecisionDeny)
+		return sourceReadDenied(r.caller.Username, repository, path)
 	}
 	return err
+}
+
+// sourceReadDenied builds the SEC-3 denial of one source object. It wraps ErrSourceReadDenied
+// (which matches ErrPermissionDenied, so the control plane answers 403) and names the path the
+// materialiser must report through its *SourceError.
+func sourceReadDenied(user, repository, path string) error {
+	return fmt.Errorf("%w: user %s may not read %q in repository %q", ErrSourceReadDenied, user, path, repository)
 }
 
 type sourceReaderKey struct{}
