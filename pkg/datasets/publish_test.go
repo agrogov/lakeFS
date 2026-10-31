@@ -588,7 +588,7 @@ func TestPublish_PostCommitPutVersionFailureLeavesPublishingForReconciler(t *tes
 	// The reconciler only takes over a transient state once it is stale.
 	stale := *head
 	stale.UpdatedAt = f.svc.now().Add(-f.cfg.PublishTimeout - time.Minute)
-	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &stale, head))
+	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &stale, head, nil))
 
 	f.svc.putVersionFn = f.svc.store.PutVersion
 	report := f.reconcile(t)
@@ -635,7 +635,7 @@ func TestPublish_StalePendingAdoptsCommittedTag(t *testing.T) {
 	current := f.datasetRecord(t, dataset)
 	stale := *current
 	stale.UpdatedAt = f.svc.now().Add(-f.cfg.PublishTimeout - time.Minute)
-	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &stale, current))
+	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &stale, current, nil))
 	f.svc.putVersionFn = f.svc.store.PutVersion
 
 	third := f.commitTo(t, "src-adopt", "main", map[string]string{"data/a.parquet": "c"})

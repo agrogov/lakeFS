@@ -97,7 +97,7 @@ func definitionOf(pairs ...PinnedSource) Definition {
 // pinRefs returns the reference set of the pin of (repo, commit).
 func (f *pinFixture) pinRefs(t *testing.T, repo, commitID string) []string {
 	t.Helper()
-	rec, err := f.store.GetPin(f.ctx, repo, commitID)
+	rec, _, err := f.store.GetPin(f.ctx, repo, commitID)
 	require.NoError(t, err, "pin record %s/%s", repo, commitID)
 	return rec.References
 }
@@ -253,11 +253,11 @@ func TestPinRefcountSharedAcrossDatasets(t *testing.T) {
 
 	// The last reference removes the record and deletes the branch (§8.2).
 	require.NoError(t, f.pins.Release(ctx, def, PinReference("customer-360", 2)))
-	_, err = f.store.GetPin(ctx, src.Repository, src.CommitID)
+	_, _, err = f.store.GetPin(ctx, src.Repository, src.CommitID)
 	require.NoError(t, err, "the pin still has the events@v1 reference")
 	require.NoError(t, f.pins.Release(ctx, def, PinReference("events", 1)))
 
-	_, err = f.store.GetPin(ctx, src.Repository, src.CommitID)
+	_, _, err = f.store.GetPin(ctx, src.Repository, src.CommitID)
 	require.ErrorIs(t, err, kv.ErrNotFound, "the pin record must be gone at refcount zero")
 	_, ok := f.pinBranchAt(t, src.Repository, src.CommitID)
 	require.False(t, ok, "the pin branch must be deleted at refcount zero")
@@ -284,7 +284,7 @@ func TestReleaseDatasetDeletesOrphanPins(t *testing.T) {
 
 	// Deleting customer-360 releases both of its versions at once.
 	require.NoError(t, f.pins.ReleaseDataset(ctx, "customer-360"))
-	_, err = f.store.GetPin(ctx, src.Repository, src.CommitID)
+	_, _, err = f.store.GetPin(ctx, src.Repository, src.CommitID)
 	require.ErrorIs(t, err, kv.ErrNotFound)
 	_, ok := f.pinBranchAt(t, src.Repository, src.CommitID)
 	require.False(t, ok)
@@ -447,7 +447,7 @@ func TestDegradedDetection(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, missing)
 	require.False(t, marked)
-	rec, err := f.store.GetDataset(ctx, dataset)
+	rec, _, err := f.store.GetDataset(ctx, dataset)
 	require.NoError(t, err)
 	require.Equal(t, DatasetStateActive, rec.State)
 
@@ -476,7 +476,7 @@ func TestDegradedDetection(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []PinnedSource{src}, missing)
 	require.True(t, marked, "the dataset must be marked degraded")
-	rec, err = f.store.GetDataset(ctx, dataset)
+	rec, _, err = f.store.GetDataset(ctx, dataset)
 	require.NoError(t, err)
 	require.Equal(t, DatasetStateDegraded, rec.State)
 
@@ -494,7 +494,7 @@ func TestDegradedDetection(t *testing.T) {
 	// Releasing after the source repository is gone still succeeds: the pin records go away and the
 	// branch delete is tolerated (§6.6 "every step tolerates not found").
 	require.NoError(t, f.pins.ReleaseDataset(ctx, dataset))
-	_, err = f.store.GetPin(ctx, src.Repository, src.CommitID)
+	_, _, err = f.store.GetPin(ctx, src.Repository, src.CommitID)
 	require.ErrorIs(t, err, kv.ErrNotFound)
 }
 
@@ -521,7 +521,7 @@ func TestDegradedDoesNotTouchTransientStates(t *testing.T) {
 	require.Equal(t, []PinnedSource{src}, missing)
 	require.False(t, marked, "a transient state belongs to the reconciler's rollback step")
 
-	rec, err := f.store.GetDataset(ctx, dataset)
+	rec, _, err := f.store.GetDataset(ctx, dataset)
 	require.NoError(t, err)
 	require.Equal(t, DatasetStatePublishing, rec.State)
 	require.Equal(t, 2, rec.PendingVersion)
@@ -592,7 +592,7 @@ func TestAcquireRollsBackOnlyWhatItAdded(t *testing.T) {
 	// First attempt: the first source is pinned, the second fails, and the first is released again.
 	_, err := broken.Acquire(ctx, def, ref)
 	require.ErrorIs(t, err, errPinSourceUnavailable)
-	_, err = f.store.GetPin(ctx, goodSource.Repository, goodSource.CommitID)
+	_, _, err = f.store.GetPin(ctx, goodSource.Repository, goodSource.CommitID)
 	require.ErrorIs(t, err, kv.ErrNotFound, "the reference added by this call must be rolled back")
 	_, ok := f.pinBranchAt(t, goodSource.Repository, goodSource.CommitID)
 	require.False(t, ok, "the branch goes with the only reference that was ever taken")

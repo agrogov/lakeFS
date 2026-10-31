@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -55,8 +56,7 @@ func (e *etagStore) SetIf(ctx context.Context, partitionKey, key, value []byte, 
 
 func newETagStore(t *testing.T) (*Store, context.Context) {
 	t.Helper()
-	store, kvs, ctx := newTestStore(t)
-	_ = store
+	_, kvs, ctx := newTestStore(t)
 	return NewStore(&etagStore{Store: kvs}), ctx
 }
 
@@ -66,27 +66,147 @@ func TestStoreCASWithOpaquePredicate(t *testing.T) {
 	store, ctx := newETagStore(t)
 
 	require.NoError(t, store.CreateDataset(ctx, newDatasetRecord()))
-	current, err := store.GetDataset(ctx, "customer-360")
+	current, predicate, err := store.GetDataset(ctx, "customer-360")
 	require.NoError(t, err)
+	require.NotNil(t, predicate)
 
 	next := *current
 	next.State = DatasetStatePublishing
 	next.PendingVersion = current.LatestVersion + 1
-	require.NoError(t, store.PutDatasetIf(ctx, &next, current), "PutDatasetIf after GetDataset")
+	require.NoError(t, store.PutDatasetIf(ctx, &next, current, predicate), "PutDatasetIf after GetDataset")
 
+	// The predicate now guards the record as it was before the write: a second write
+	// conditioned on it is a stale read and must lose.
 	stale := *current
 	stale.State = DatasetStateDeleting
-	require.ErrorIs(t, store.PutDatasetIf(ctx, &stale, current), kv.ErrPredicateFailed)
+	require.ErrorIs(t, store.PutDatasetIf(ctx, &stale, current, predicate), kv.ErrPredicateFailed)
 
-	require.ErrorIs(t, store.DeleteDataset(ctx, "customer-360", current), kv.ErrPredicateFailed)
-	require.NoError(t, store.DeleteDataset(ctx, "customer-360", &next))
+	fresh, freshPredicate, err := store.GetDataset(ctx, "customer-360")
+	require.NoError(t, err)
+	require.Equal(t, DatasetStatePublishing, fresh.State)
 
-	_, err = store.AddPinReference(ctx, "lakehouse-repo", "30f9eb1c", PinReference("customer-360", 2))
+	require.ErrorIs(t, store.DeleteDataset(ctx, "customer-360", current, predicate), kv.ErrPredicateFailed)
+	require.NoError(t, store.DeleteDataset(ctx, "customer-360", fresh, freshPredicate))
+	_, _, err = store.GetDataset(ctx, "customer-360")
+	require.ErrorIs(t, err, kv.ErrNotFound)
+}
+
+// TestStorePinCASWithOpaquePredicate is the pin half of BUG-1: acquiring and releasing
+// references must apply the predicate of the pin record as read, not a re-encoding of it.
+func TestStorePinCASWithOpaquePredicate(t *testing.T) {
+	store, ctx := newETagStore(t)
+
+	pin, err := store.AddPinReference(ctx, "lakehouse-repo", "30f9eb1c", PinReference("customer-360", 2))
+	require.NoError(t, err, "creating a pin needs a nil predicate")
+	require.Equal(t, []string{PinReference("customer-360", 2)}, pin.References)
+
+	read, predicate, err := store.GetPin(ctx, "lakehouse-repo", "30f9eb1c")
 	require.NoError(t, err)
-	_, err = store.AddPinReference(ctx, "lakehouse-repo", "30f9eb1c", PinReference("customer-360", 3))
+	require.Equal(t, pin, read)
+
+	added, err := store.AddPinReference(ctx, "lakehouse-repo", "30f9eb1c", PinReference("customer-360", 3))
 	require.NoError(t, err)
-	_, err = store.RemovePinReference(ctx, "lakehouse-repo", "30f9eb1c", PinReference("customer-360", 2))
+	require.Equal(t, 2, len(added.References))
+
+	// The predicate guards the pin as it was before the second reference: the store
+	// rejects it, and the stale write does not drop a reference.
+	mutated := *read
+	mutated.References = []string{PinReference("customer-360", 9)}
+	mutatedValue, err := json.Marshal(mutated)
 	require.NoError(t, err)
+	key, err := pinKey("lakehouse-repo", "30f9eb1c")
+	require.NoError(t, err)
+	require.ErrorIs(t, store.store.SetIf(ctx, []byte(PartitionKey), key, mutatedValue, predicate), kv.ErrPredicateFailed)
+
+	deleted, err := store.RemovePinReference(ctx, "lakehouse-repo", "30f9eb1c", PinReference("customer-360", 2))
+	require.NoError(t, err)
+	require.False(t, deleted)
+	deleted, err = store.RemovePinReference(ctx, "lakehouse-repo", "30f9eb1c", PinReference("customer-360", 3))
+	require.NoError(t, err)
+	require.True(t, deleted, "the empty set deletes the pin")
+	_, _, err = store.GetPin(ctx, "lakehouse-repo", "30f9eb1c")
+	require.ErrorIs(t, err, kv.ErrNotFound)
+}
+
+// TestStoreLeaseCASWithOpaquePredicate is the lease half of BUG-1: taking and renewing the
+// reconcile lease must use the predicate of the lease record as read.
+func TestStoreLeaseCASWithOpaquePredicate(t *testing.T) {
+	store, ctx := newETagStore(t)
+
+	acquired, err := store.AcquireLease(ctx, "node-a", time.Minute)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	before, stalePredicate, err := store.GetLease(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "node-a", before.Owner)
+	require.NotNil(t, stalePredicate)
+
+	// Renewal by the same owner is a CAS on the record it already holds.
+	acquired, err = store.AcquireLease(ctx, "node-a", 2*time.Minute)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	lease, _, err := store.GetLease(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "node-a", lease.Owner)
+	require.True(t, lease.ExpiresAt.After(before.ExpiresAt), "the renewal extended the lease")
+
+	acquired, err = store.AcquireLease(ctx, "node-b", time.Minute)
+	require.NoError(t, err)
+	require.False(t, acquired, "a live lease owned by another node is not taken")
+
+	// The predicate from before the renewal no longer matches: the lease is not overwritten.
+	leaseValue, err := json.Marshal(leaseRecord{Owner: "node-b", ExpiresAt: lease.ExpiresAt})
+	require.NoError(t, err)
+	require.ErrorIs(t, store.store.SetIf(ctx, []byte(PartitionKey), []byte(ReconcileLeaseKey),
+		leaseValue, stalePredicate), kv.ErrPredicateFailed)
+
+	// Releasing with a stale predicate leaves the lease in place.
+	require.ErrorIs(t, store.deleteIf(ctx, []byte(ReconcileLeaseKey), stalePredicate), kv.ErrPredicateFailed)
+	still, _, err := store.GetLease(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "node-a", still.Owner)
+
+	require.NoError(t, store.ReleaseLease(ctx, "node-a"))
+	_, _, err = store.GetLease(ctx)
+	require.ErrorIs(t, err, kv.ErrNotFound)
+	require.NoError(t, store.ReleaseLease(ctx, "node-a"), "releasing a lease that is gone is a no-op")
+}
+
+// TestPinsAcquireReleaseWithOpaquePredicate drives the pin manager end to end on a store
+// whose predicate is opaque: acquiring a second reference and releasing them again are
+// compare-and-swaps on the predicate of the pin record as read.
+func TestPinsAcquireReleaseWithOpaquePredicate(t *testing.T) {
+	f := newPinFixture(t)
+	store := NewStore(&etagStore{Store: f.kvStore})
+	pins := NewPins(store, f.cat)
+
+	commit := f.sourceRepo(t, "source-opaque", "data/a/customers.parquet")
+	src := PinnedSource{Repository: "source-opaque", CommitID: commit.String()}
+	def := definitionOf(src)
+
+	_, err := pins.Acquire(f.ctx, def, PinReference("customer-360", 1))
+	require.NoError(t, err)
+	rec, _, err := store.GetPin(f.ctx, src.Repository, src.CommitID)
+	require.NoError(t, err)
+	require.Equal(t, []string{PinReference("customer-360", 1)}, rec.References)
+
+	// A second dataset version shares the pin: the CAS is on the predicate just read.
+	_, err = pins.Acquire(f.ctx, def, PinReference("events", 1))
+	require.NoError(t, err)
+	rec, _, err = store.GetPin(f.ctx, src.Repository, src.CommitID)
+	require.NoError(t, err)
+	require.Equal(t, []string{PinReference("customer-360", 1), PinReference("events", 1)}, rec.References)
+
+	// Releasing one reference keeps the pin; releasing the last removes it.
+	require.NoError(t, pins.Release(f.ctx, def, PinReference("customer-360", 1)))
+	rec, _, err = store.GetPin(f.ctx, src.Repository, src.CommitID)
+	require.NoError(t, err)
+	require.Equal(t, []string{PinReference("events", 1)}, rec.References)
+	require.NoError(t, pins.Release(f.ctx, def, PinReference("events", 1)))
+	_, _, err = store.GetPin(f.ctx, src.Repository, src.CommitID)
+	require.ErrorIs(t, err, kv.ErrNotFound)
 }
 
 // TestStoreProposalCAS is BUG-8 (proposal half): a write based on a stale read must not
@@ -165,7 +285,7 @@ func TestStoreCASCanonicalizesExpected(t *testing.T) {
 	next := *rec
 	next.State = DatasetStatePublishing
 	next.PendingVersion = rec.LatestVersion + 1
-	require.NoError(t, store.PutDatasetIf(ctx, &next, rec), "previous holds a monotonic time.Now()")
+	require.NoError(t, store.PutDatasetIf(ctx, &next, rec, nil), "previous holds a monotonic time.Now()")
 
 	key := &MetadataKey{Name: "owner", Type: "string", AllowedValues: []string{}, CreatedAt: time.Now(), CreatedBy: "alice"}
 	require.NoError(t, store.PutMetadataKey(ctx, *key, nil))

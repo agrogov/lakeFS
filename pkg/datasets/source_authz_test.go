@@ -53,7 +53,7 @@ func TestSourceReadDenyOnSubPath(t *testing.T) {
 			require.Equal(t, http.StatusForbidden, status)
 			require.Contains(t, body, "data[0]", "the response names the item")
 			require.Regexp(t, `sec(ret)?/`, body, "the response names the first denied path")
-			_, getErr := f.svc.store.GetDataset(f.ctx, name)
+			_, _, getErr := f.svc.store.GetDataset(f.ctx, name)
 			require.Error(t, getErr, "nothing was created")
 		})
 	}

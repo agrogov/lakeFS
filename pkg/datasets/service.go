@@ -341,7 +341,7 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 
 	// §6.1: the dataset repository is read-only and defaults to the "latest" branch.
 	if _, err := s.catalog.CreateRepository(ctx, req.Name, s.cfg.StorageID, ns, DefaultBranch, true); err != nil {
-		_ = s.store.DeleteDataset(ctx, req.Name, rec)
+		_ = s.store.DeleteDataset(ctx, req.Name, rec, nil)
 		if errors.Is(err, graveler.ErrNotUnique) || errors.Is(err, kv.ErrPredicateFailed) {
 			return nil, fmt.Errorf("%w: repository %q already exists", ErrNameTaken, req.Name)
 		}
@@ -393,7 +393,7 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 		next.State = DatasetStateActive
 		next.PendingVersion = 0
 		next.UpdatedAt = s.now()
-		if err := s.store.PutDatasetIf(ctx, &next, current); err != nil {
+		if err := s.store.PutDatasetIf(ctx, &next, current, nil); err != nil {
 			s.rollbackCreate(ctx, rec)
 			if errors.Is(err, kv.ErrPredicateFailed) {
 				return nil, fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, req.Name)
@@ -426,8 +426,8 @@ func (s *Service) rollbackCreate(ctx context.Context, rec *DatasetRecord) {
 	errs = append(errs, s.dropImmutabilityGuard(ctx, rec.Name)...)
 	// The record may have been modified since it was created (e.g. by a concurrent writer);
 	// CAS against the fresh record so a stale predicate does not orphan it.
-	if fresh, err := s.store.GetDataset(ctx, rec.Name); err == nil {
-		if err := s.store.DeleteDataset(ctx, rec.Name, fresh); err != nil && !isNotFound(err) {
+	if fresh, predicate, err := s.store.GetDataset(ctx, rec.Name); err == nil {
+		if err := s.store.DeleteDataset(ctx, rec.Name, fresh, predicate); err != nil && !isNotFound(err) {
 			errs = append(errs, err)
 		}
 	} else if !errors.Is(err, kv.ErrNotFound) {
@@ -446,7 +446,7 @@ func (s *Service) leavePending(ctx context.Context, dataset string, version int)
 	ctx, cancel := detachedWriteContext(ctx)
 	defer cancel()
 	for attempt := 0; attempt < publishWriteRetries; attempt++ {
-		current, err := s.store.GetDataset(ctx, dataset)
+		current, predicate, err := s.store.GetDataset(ctx, dataset)
 		if errors.Is(err, kv.ErrNotFound) {
 			return
 		}
@@ -463,7 +463,7 @@ func (s *Service) leavePending(ctx context.Context, dataset string, version int)
 		next.State = DatasetStatePublishing
 		next.PendingVersion = version
 		next.UpdatedAt = s.now()
-		err = s.store.PutDatasetIf(ctx, &next, current)
+		err = s.store.PutDatasetIf(ctx, &next, current, predicate)
 		if err == nil {
 			return
 		}
@@ -479,7 +479,7 @@ func (s *Service) Get(ctx context.Context, caller Caller, name string) (*Dataset
 	if err := s.authorizer.CheckDataset(ctx, caller, ActionReadDataset, name); err != nil {
 		return nil, err
 	}
-	rec, err := s.store.GetDataset(ctx, name)
+	rec, _, err := s.store.GetDataset(ctx, name)
 	if errors.Is(err, kv.ErrNotFound) {
 		return nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, name)
 	}
@@ -606,7 +606,7 @@ func (s *Service) Delete(ctx context.Context, caller Caller, name string) error 
 	if err := s.authorizer.CheckDataset(ctx, caller, ActionDeleteDataset, name); err != nil {
 		return err
 	}
-	rec, err := s.store.GetDataset(ctx, name)
+	rec, predicate, err := s.store.GetDataset(ctx, name)
 	if errors.Is(err, kv.ErrNotFound) {
 		return fmt.Errorf("%w: %q", ErrDatasetNotFound, name)
 	}
@@ -630,7 +630,7 @@ func (s *Service) Delete(ctx context.Context, caller Caller, name string) error 
 	deleting := *rec
 	deleting.State = DatasetStateDeleting
 	deleting.UpdatedAt = s.now()
-	if err := s.store.PutDatasetIf(ctx, &deleting, rec); err != nil {
+	if err := s.store.PutDatasetIf(ctx, &deleting, rec, predicate); err != nil {
 		if errors.Is(err, kv.ErrPredicateFailed) {
 			return fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, name)
 		}
@@ -669,7 +669,7 @@ func (s *Service) Delete(ctx context.Context, caller Caller, name string) error 
 			errs = append(errs, err)
 		}
 	}
-	if err := s.store.DeleteDataset(ctx, name, current); err != nil && !isNotFound(err) {
+	if err := s.store.DeleteDataset(ctx, name, current, nil); err != nil && !isNotFound(err) {
 		if errors.Is(err, kv.ErrPredicateFailed) {
 			errs = append(errs, fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, name))
 		} else {
@@ -832,7 +832,7 @@ func (s *Service) PublishVersion(ctx context.Context, caller Caller, name string
 // (§12.3). A non-stale publish in flight is a 409 (ErrPublishInProgress).
 func (s *Service) beginPublish(ctx context.Context, name string, expected *int) (*DatasetRecord, error) {
 	for attempt := 0; attempt < publishWriteRetries; attempt++ {
-		rec, err := s.store.GetDataset(ctx, name)
+		rec, predicate, err := s.store.GetDataset(ctx, name)
 		if errors.Is(err, kv.ErrNotFound) {
 			return nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, name)
 		}
@@ -882,7 +882,7 @@ func (s *Service) beginPublish(ctx context.Context, name string, expected *int) 
 		next.State = DatasetStatePublishing
 		next.PendingVersion = version
 		next.UpdatedAt = s.now()
-		err = s.store.PutDatasetIf(ctx, &next, rec)
+		err = s.store.PutDatasetIf(ctx, &next, rec, predicate)
 		if errors.Is(err, kv.ErrPredicateFailed) {
 			continue // somebody moved the record; re-read and retry the state machine
 		}
@@ -1002,12 +1002,12 @@ func (s *Service) advanceDataset(ctx context.Context, base *DatasetRecord, versi
 		next.PendingVersion = 0
 		next.LatestVersion = version
 		next.UpdatedAt = s.now()
-		err := s.store.PutDatasetIf(ctx, &next, current)
+		err := s.store.PutDatasetIf(ctx, &next, current, nil)
 		if err == nil {
 			return &next, nil
 		}
 		if errors.Is(err, kv.ErrPredicateFailed) {
-			latest, getErr := s.store.GetDataset(ctx, current.Name)
+			latest, _, getErr := s.store.GetDataset(ctx, current.Name)
 			if getErr != nil {
 				return nil, err
 			}
@@ -1049,7 +1049,7 @@ func (s *Service) rollbackPublish(ctx context.Context, publishing *DatasetRecord
 	next.State = DatasetStateActive
 	next.PendingVersion = 0
 	next.UpdatedAt = s.now()
-	if err := s.store.PutDatasetIf(ctx, &next, publishing); err != nil {
+	if err := s.store.PutDatasetIf(ctx, &next, publishing, nil); err != nil {
 		logging.FromContext(ctx).WithError(err).WithFields(logging.Fields{
 			"dataset":         publishing.Name,
 			"pending_version": publishing.PendingVersion,
@@ -1237,7 +1237,7 @@ func (s *Service) GetVersion(ctx context.Context, caller Caller, name, ref strin
 	if err := s.authorizer.CheckDataset(ctx, caller, ActionReadDataset, name); err != nil {
 		return nil, err
 	}
-	rec, err := s.store.GetDataset(ctx, name)
+	rec, _, err := s.store.GetDataset(ctx, name)
 	if errors.Is(err, kv.ErrNotFound) {
 		return nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, name)
 	}
@@ -1367,7 +1367,7 @@ func (s *Service) ListAccess(ctx context.Context, caller Caller, dataset string)
 	if err := s.authorizer.CheckDataset(ctx, caller, ActionManageAccess, dataset); err != nil {
 		return nil, err
 	}
-	if _, err := s.store.GetDataset(ctx, dataset); err != nil {
+	if _, _, err := s.store.GetDataset(ctx, dataset); err != nil {
 		if errors.Is(err, kv.ErrNotFound) {
 			return nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, dataset)
 		}
@@ -1641,7 +1641,7 @@ func (s *Service) storageNamespace(name string, now time.Time) (string, error) {
 
 // checkNameAvailable rejects a name used by a dataset or by any repository (§10.4 409).
 func (s *Service) checkNameAvailable(ctx context.Context, name string) error {
-	if _, err := s.store.GetDataset(ctx, name); err == nil {
+	if _, _, err := s.store.GetDataset(ctx, name); err == nil {
 		return fmt.Errorf("%w: dataset %q already exists", ErrNameTaken, name)
 	} else if !errors.Is(err, kv.ErrNotFound) {
 		return err
@@ -1763,7 +1763,7 @@ func (s *Service) publish(ctx context.Context, rec *DatasetRecord, def Definitio
 // publishing record: a concurrent delete has moved it to "deleting", or a stale takeover is
 // publishing another version (BUG-9).
 func (s *Service) ensurePublishOwnership(ctx context.Context, rec *DatasetRecord, version int) error {
-	current, err := s.store.GetDataset(ctx, rec.Name)
+	current, _, err := s.store.GetDataset(ctx, rec.Name)
 	if errors.Is(err, kv.ErrNotFound) {
 		return fmt.Errorf("%w: dataset %q was deleted", ErrPublishInProgress, rec.Name)
 	}
@@ -2032,7 +2032,7 @@ func (s *Service) ensureConsumerPolicy(ctx context.Context, dataset string) erro
 
 // requireDataset returns 404 (ErrDatasetNotFound) for an unknown dataset.
 func (s *Service) requireDataset(ctx context.Context, dataset string) error {
-	if _, err := s.store.GetDataset(ctx, dataset); err != nil {
+	if _, _, err := s.store.GetDataset(ctx, dataset); err != nil {
 		if errors.Is(err, kv.ErrNotFound) {
 			return fmt.Errorf("%w: %q", ErrDatasetNotFound, dataset)
 		}

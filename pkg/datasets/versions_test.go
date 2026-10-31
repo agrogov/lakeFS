@@ -63,7 +63,7 @@ func (f *serviceFixture) commitTo(t *testing.T, repo, branch string, objects map
 // datasetRecord reads the current head record of a dataset.
 func (f *serviceFixture) datasetRecord(t *testing.T, name string) *DatasetRecord {
 	t.Helper()
-	rec, err := f.svc.store.GetDataset(f.ctx, name)
+	rec, _, err := f.svc.store.GetDataset(f.ctx, name)
 	require.NoError(t, err, "get dataset record %s", name)
 	return rec
 }
@@ -326,7 +326,7 @@ func TestPublishVersion_TakesOverStalePublishingState(t *testing.T) {
 		crashed.State = DatasetStatePublishing
 		crashed.PendingVersion = 2
 		crashed.UpdatedAt = f.svc.now().Add(-age)
-		require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &crashed, current))
+		require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &crashed, current, nil))
 	}
 
 	// A recent "publishing" record is not stale: the publish is refused.

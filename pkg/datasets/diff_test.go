@@ -355,7 +355,7 @@ func newDiffFixture(t *testing.T) *diffFixture {
 func (f *serviceFixture) publishNextVersion(t *testing.T, name string, def Definition, message string) *VersionRecord {
 	t.Helper()
 	ctx := f.ctx
-	previous, err := f.svc.store.GetDataset(ctx, name)
+	previous, predicate, err := f.svc.store.GetDataset(ctx, name)
 	require.NoError(t, err)
 	require.NoError(t, f.svc.validateDefinition(ctx, &def))
 	resolved, err := f.svc.resolver.Resolve(ctx, &def)
@@ -370,7 +370,7 @@ func (f *serviceFixture) publishNextVersion(t *testing.T, name string, def Defin
 	next := *previous
 	next.LatestVersion = version.Version
 	next.UpdatedAt = f.svc.now()
-	require.NoError(t, f.svc.store.PutDatasetIf(ctx, &next, previous))
+	require.NoError(t, f.svc.store.PutDatasetIf(ctx, &next, previous, predicate))
 	return version
 }
 

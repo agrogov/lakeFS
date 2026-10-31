@@ -64,12 +64,31 @@ type leaseRecord struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
+// GetLease reads the reconcile lease record and the kv.Predicate that AcquireLease and
+// ReleaseLease condition their writes on. It returns kv.ErrNotFound unchanged when no node
+// holds (or has held) the lease. A record that does not decode returns the predicate with
+// the decode error: its holder is unknown, but the record can still be replaced or left to
+// expire under that predicate.
+func (s *Store) GetLease(ctx context.Context) (*leaseRecord, kv.Predicate, error) {
+	res, err := s.store.Get(ctx, []byte(PartitionKey), []byte(ReconcileLeaseKey))
+	if err != nil {
+		return nil, nil, err
+	}
+	var rec leaseRecord
+	if err := json.Unmarshal(res.Value, &rec); err != nil {
+		return nil, res.Predicate, fmt.Errorf("datasets: decode reconcile lease: %w", err)
+	}
+	return &rec, res.Predicate, nil
+}
+
 // AcquireLease tries to take the reconcile lease for owner for ttl. It reports whether this
 // caller now holds it.
 //
 // A missing or expired lease is written with SetIf, so two nodes racing for it cannot both
 // win: the loser gets kv.ErrPredicateFailed, re-reads the record and finds a live owner. A
-// live lease held by another owner is left alone.
+// live lease held by another owner is left alone. The SetIf predicate is the one GetLease
+// returned, never a re-encoding of the record: some stores compare it opaquely (CosmosDB
+// uses an ETag, pkg/kv/cosmosdb/store.go).
 func (s *Store) AcquireLease(ctx context.Context, owner string, ttl time.Duration) (bool, error) {
 	if owner == "" {
 		return false, fmt.Errorf("%w: reconcile lease owner is required", ErrInvalidRecordKey)
@@ -81,20 +100,22 @@ func (s *Store) AcquireLease(ctx context.Context, owner string, ttl time.Duratio
 	for attempt := 0; attempt < pinCASRetries; attempt++ {
 		now := s.clock().UTC()
 		var predicate kv.Predicate
-		res, err := s.store.Get(ctx, []byte(PartitionKey), key)
+		current, stored, err := s.GetLease(ctx)
 		switch {
 		case errors.Is(err, kv.ErrNotFound):
 			// No lease record yet: SetIf with a nil predicate creates it only if it is
 			// still absent.
-		case err != nil:
+		case err != nil && stored == nil:
 			return false, err
+		case err != nil:
+			// A corrupted lease is treated as expired - no owner can be identified - but it
+			// is only replaced under the predicate it was read with.
+			predicate = stored
 		default:
-			var current leaseRecord
-			if decodeErr := json.Unmarshal(res.Value, &current); decodeErr == nil &&
-				current.ExpiresAt.After(now) && current.Owner != owner {
+			if current.ExpiresAt.After(now) && current.Owner != owner {
 				return false, nil // a live lease owned by somebody else
 			}
-			predicate = res.Predicate
+			predicate = stored
 		}
 		value, err := json.Marshal(leaseRecord{Owner: owner, ExpiresAt: now.Add(ttl)})
 		if err != nil {
@@ -116,25 +137,25 @@ func (s *Store) AcquireLease(ctx context.Context, owner string, ttl time.Duratio
 // immediately instead of waiting for the expiry. It is a no-op when the lease is already gone
 // or owned by someone else (a crashed node's lease expired and was taken over): releasing
 // another owner's lease would let two nodes run concurrently.
+//
+// The delete is conditioned on the predicate of the record that was read, so a lease renewed
+// by another owner in between is not deleted.
 func (s *Store) ReleaseLease(ctx context.Context, owner string) error {
-	key := []byte(ReconcileLeaseKey)
-	res, err := s.store.Get(ctx, []byte(PartitionKey), key)
+	current, predicate, err := s.GetLease(ctx)
 	switch {
 	case errors.Is(err, kv.ErrNotFound):
+		return nil
+	case err != nil && predicate != nil:
+		// A corrupted lease is left to expire rather than deleted: it may belong to an
+		// owner this node cannot identify.
 		return nil
 	case err != nil:
 		return err
 	}
-	var current leaseRecord
-	if err := json.Unmarshal(res.Value, &current); err != nil {
-		// A corrupted lease is left to expire rather than deleted: it may belong to an
-		// owner this node cannot identify.
-		return nil
-	}
 	if current.Owner != owner {
 		return nil
 	}
-	return s.store.Delete(ctx, []byte(PartitionKey), key)
+	return s.deleteIf(ctx, []byte(ReconcileLeaseKey), predicate)
 }
 
 // Reconciler runs the §12.3 repair pass. One instance per process; it holds no per-pass
@@ -378,7 +399,7 @@ func (r *Reconciler) repairDataset(ctx context.Context, rec *DatasetRecord, repo
 			return err
 		}
 		// Re-read: the repair advanced the record to active (or removed it).
-		repaired, err := r.store.GetDataset(ctx, rec.Name)
+		repaired, _, err := r.store.GetDataset(ctx, rec.Name)
 		if errors.Is(err, kv.ErrNotFound) {
 			return nil
 		}
@@ -480,7 +501,9 @@ func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, 
 	// removed instead of being promoted to a dataset with no repository.
 	if rec.State == DatasetStateCreating {
 		if _, err := r.catalog.GetRepository(ctx, dataset); isNotFound(err) {
-			if err := r.store.DeleteDataset(ctx, dataset, rec); err != nil && !errors.Is(err, kv.ErrPredicateFailed) {
+			// rec came from ListDatasets, which returns values without their predicate: a
+			// nil predicate makes DeleteDataset compare against a fresh read.
+			if err := r.store.DeleteDataset(ctx, dataset, rec, nil); err != nil && !errors.Is(err, kv.ErrPredicateFailed) {
 				return err
 			}
 			report.StatesRepaired++
@@ -495,7 +518,7 @@ func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, 
 	next.State = DatasetStateActive
 	next.PendingVersion = 0
 	next.UpdatedAt = r.now()
-	if err := r.store.PutDatasetIf(ctx, &next, rec); err != nil {
+	if err := r.store.PutDatasetIf(ctx, &next, rec, nil); err != nil {
 		return fmt.Errorf("datasets: roll %q back to active: %w", dataset, err)
 	}
 	report.StatesRepaired++
@@ -560,7 +583,7 @@ func (r *Reconciler) completeVersion(ctx context.Context, rec *DatasetRecord, ve
 		next.LatestVersion = version
 	}
 	next.UpdatedAt = r.now()
-	if err := r.store.PutDatasetIf(ctx, &next, rec); err != nil {
+	if err := r.store.PutDatasetIf(ctx, &next, rec, nil); err != nil {
 		if errors.Is(err, kv.ErrPredicateFailed) {
 			// Somebody else moved the record; the next pass converges on the new value.
 			return nil
@@ -594,7 +617,7 @@ func (r *Reconciler) finishDelete(ctx context.Context, rec *DatasetRecord, repor
 	// §6.6 step 4: policies and grants, then the control-plane records.
 	errs = append(errs, r.svc.dropAccessGrants(ctx, dataset)...)
 	errs = append(errs, r.svc.dropImmutabilityGuard(ctx, dataset)...)
-	if err := r.store.DeleteDataset(ctx, dataset, rec); err != nil && !isNotFound(err) {
+	if err := r.store.DeleteDataset(ctx, dataset, rec, nil); err != nil && !isNotFound(err) {
 		errs = append(errs, fmt.Errorf("datasets: delete record of %q: %w", dataset, err))
 	}
 	for _, version := range versions {

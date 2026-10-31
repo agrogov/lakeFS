@@ -325,7 +325,7 @@ func TestGCPinSharedPinKeepsBothDatasetsReadable(t *testing.T) {
 
 	// Deleting the second dataset releases the last reference and removes the branch.
 	require.NoError(t, f.pins.ReleaseDataset(ctx, "events"))
-	_, err = f.store.GetPin(ctx, srcRepo, pinned.String())
+	_, _, err = f.store.GetPin(ctx, srcRepo, pinned.String())
 	require.ErrorIs(t, err, kv.ErrNotFound)
 	_, ok := f.pinBranchAt(t, srcRepo, pinned.String())
 	require.False(t, ok)

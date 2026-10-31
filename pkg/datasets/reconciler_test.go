@@ -38,7 +38,7 @@ func (f *serviceFixture) leaveInTransientState(t *testing.T, dataset, state stri
 	crashed.State = state
 	crashed.PendingVersion = pendingVersion
 	crashed.UpdatedAt = f.svc.now().Add(-f.cfg.PublishTimeout - time.Minute)
-	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &crashed, current))
+	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &crashed, current, nil))
 }
 
 // reconcile runs one repair pass and requires that this node got the lease and the pass succeeded.
@@ -183,7 +183,7 @@ func TestReconcile_RollsBackPublishWithoutWork(t *testing.T) {
 
 	// The pins acquired for v2 were released, and their branch is gone because nothing else
 	// referenced that commit.
-	_, err = f.svc.store.GetPin(f.ctx, source, second.String())
+	_, _, err = f.svc.store.GetPin(f.ctx, source, second.String())
 	require.ErrorIs(t, err, kv.ErrNotFound)
 	_, err = f.cat.GetBranchReference(f.ctx, source, PinBranch(second.String()))
 	require.ErrorIs(t, err, graveler.ErrBranchNotFound)
@@ -208,14 +208,14 @@ func TestReconcile_FinishesCrashedDelete(t *testing.T) {
 	require.Equal(t, 1, report.StatesRepaired)
 	require.Zero(t, report.Errors)
 
-	_, err := f.svc.store.GetDataset(f.ctx, dataset)
+	_, _, err := f.svc.store.GetDataset(f.ctx, dataset)
 	require.ErrorIs(t, err, kv.ErrNotFound, "the crashed delete was finished")
 
 	versions, err := f.svc.store.ListVersions(f.ctx, dataset)
 	require.NoError(t, err)
 	require.Empty(t, versions)
 
-	_, err = f.svc.store.GetPin(f.ctx, source, sourceCommit.String())
+	_, _, err = f.svc.store.GetPin(f.ctx, source, sourceCommit.String())
 	require.ErrorIs(t, err, kv.ErrNotFound, "the pins of the deleted dataset were released")
 }
 
@@ -242,7 +242,7 @@ func TestReconcile_RecreatesMissingPinBranch(t *testing.T) {
 	require.Equal(t, sourceCommit.String(), repaired)
 
 	// The reference count is untouched: recreating a branch is not a new reference.
-	pin, err := f.svc.store.GetPin(f.ctx, source, sourceCommit.String())
+	pin, _, err := f.svc.store.GetPin(f.ctx, source, sourceCommit.String())
 	require.NoError(t, err)
 	require.Equal(t, []string{PinReference(dataset, 1)}, pin.References)
 }
@@ -263,7 +263,7 @@ func TestReconcile_RemovesOrphanPin(t *testing.T) {
 	report := f.reconcile(t)
 	require.Equal(t, 1, report.PinsRemoved)
 
-	_, err = f.svc.store.GetPin(f.ctx, source, commit.String())
+	_, _, err = f.svc.store.GetPin(f.ctx, source, commit.String())
 	require.ErrorIs(t, err, kv.ErrNotFound, "the orphan pin record was removed")
 	_, err = f.cat.GetBranchReference(f.ctx, source, PinBranch(commit.String()))
 	require.ErrorIs(t, err, graveler.ErrBranchNotFound, "the orphan pin branch was removed")
@@ -327,7 +327,7 @@ func TestReconcile_DegradedFollowsSourceReachability(t *testing.T) {
 	marked := *current
 	marked.State = DatasetStateDegraded
 	marked.UpdatedAt = f.svc.now().Add(-time.Hour)
-	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &marked, current))
+	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &marked, current, nil))
 
 	report := f.reconcile(t)
 	require.Equal(t, 1, report.Degraded)

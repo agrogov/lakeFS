@@ -223,7 +223,7 @@ func TestStoreRoundTrip(t *testing.T) {
 	t.Run("dataset", func(t *testing.T) {
 		want := newDatasetRecord()
 		require.NoError(t, store.CreateDataset(ctx, want))
-		got, err := store.GetDataset(ctx, want.Name)
+		got, _, err := store.GetDataset(ctx, want.Name)
 		require.NoError(t, err)
 		requireJSONEq(t, want, got)
 	})
@@ -291,7 +291,7 @@ func TestStoreRoundTrip(t *testing.T) {
 			},
 		}
 		require.NoError(t, store.PutPin(ctx, want))
-		got, err := store.GetPin(ctx, want.Repository, want.CommitID)
+		got, _, err := store.GetPin(ctx, want.Repository, want.CommitID)
 		require.NoError(t, err)
 		require.Equal(t, []string{
 			"customer-360@v1",
@@ -380,7 +380,7 @@ func TestStoreListings(t *testing.T) {
 func TestStoreNotFound(t *testing.T) {
 	store, _, ctx := newTestStore(t)
 
-	_, err := store.GetDataset(ctx, "customer-360")
+	_, _, err := store.GetDataset(ctx, "customer-360")
 	require.ErrorIs(t, err, kv.ErrNotFound)
 
 	_, err = store.GetVersion(ctx, "customer-360", 1)
@@ -392,14 +392,14 @@ func TestStoreNotFound(t *testing.T) {
 	_, err = store.GetMetadataKey(ctx, "tier")
 	require.ErrorIs(t, err, kv.ErrNotFound)
 
-	_, err = store.GetPin(ctx, "lakehouse-repo", "30f9eb1c")
+	_, _, err = store.GetPin(ctx, "lakehouse-repo", "30f9eb1c")
 	require.ErrorIs(t, err, kv.ErrNotFound)
 
 	_, err = store.GetGrant(ctx, "customer-360", PrincipalTypeUser, "alice")
 	require.ErrorIs(t, err, kv.ErrNotFound)
 
 	// Deleting a missing record is not an error.
-	require.NoError(t, store.DeleteDataset(ctx, "customer-360", nil))
+	require.NoError(t, store.DeleteDataset(ctx, "customer-360", nil, nil))
 	require.NoError(t, store.DeleteProposal(ctx, "customer-360", "01J9Z6Q0K8"))
 	require.NoError(t, store.DeleteMetadataKey(ctx, "tier", nil))
 	require.NoError(t, store.DeletePin(ctx, "lakehouse-repo", "30f9eb1c"))
@@ -414,7 +414,7 @@ func TestStoreDatasetCAS(t *testing.T) {
 	require.NoError(t, store.CreateDataset(ctx, record))
 	err := store.CreateDataset(ctx, newDatasetRecord())
 	require.ErrorIs(t, err, kv.ErrPredicateFailed, "two creates cannot both win")
-	current, err := store.GetDataset(ctx, "customer-360")
+	current, predicate, err := store.GetDataset(ctx, "customer-360")
 	require.NoError(t, err)
 	require.Equal(t, DatasetStateActive, current.State, "the losing create left the record untouched")
 
@@ -422,12 +422,12 @@ func TestStoreDatasetCAS(t *testing.T) {
 	publishing := *current
 	publishing.State = DatasetStatePublishing
 	publishing.PendingVersion = current.LatestVersion + 1
-	require.NoError(t, store.PutDatasetIf(ctx, &publishing, current))
+	require.NoError(t, store.PutDatasetIf(ctx, &publishing, current, predicate))
 
 	// Re-using the stale record as the predicate fails and keeps the stored value.
 	stale := *current
 	stale.State = DatasetStatePublishing
-	err = store.PutDatasetIf(ctx, &stale, current)
+	err = store.PutDatasetIf(ctx, &stale, current, predicate)
 	require.ErrorIs(t, err, kv.ErrPredicateFailed)
 
 	// The record written by the winning CAS is the predicate that works.
@@ -435,9 +435,9 @@ func TestStoreDatasetCAS(t *testing.T) {
 	active.State = DatasetStateActive
 	active.LatestVersion = publishing.PendingVersion
 	active.PendingVersion = 0
-	require.NoError(t, store.PutDatasetIf(ctx, &active, &publishing))
+	require.NoError(t, store.PutDatasetIf(ctx, &active, &publishing, nil))
 
-	got, err := store.GetDataset(ctx, "customer-360")
+	got, _, err := store.GetDataset(ctx, "customer-360")
 	require.NoError(t, err)
 	require.Equal(t, DatasetStateActive, got.State)
 	require.Equal(t, 3, got.LatestVersion)
@@ -446,18 +446,18 @@ func TestStoreDatasetCAS(t *testing.T) {
 	// different dataset is a programming error, not a lost race.
 	other := newDatasetRecord()
 	other.Name = "other-dataset"
-	err = store.PutDatasetIf(ctx, other, current)
+	err = store.PutDatasetIf(ctx, other, current, nil)
 	require.ErrorIs(t, err, ErrRecordMismatch)
 
 	// A conditional delete with a stale record fails and leaves the record.
-	err = store.DeleteDataset(ctx, "customer-360", current)
+	err = store.DeleteDataset(ctx, "customer-360", current, nil)
 	require.ErrorIs(t, err, kv.ErrPredicateFailed)
-	_, err = store.GetDataset(ctx, "customer-360")
+	_, _, err = store.GetDataset(ctx, "customer-360")
 	require.NoError(t, err)
 
 	// A conditional delete with the current record succeeds.
-	require.NoError(t, store.DeleteDataset(ctx, "customer-360", got))
-	_, err = store.GetDataset(ctx, "customer-360")
+	require.NoError(t, store.DeleteDataset(ctx, "customer-360", got, nil))
+	_, _, err = store.GetDataset(ctx, "customer-360")
 	require.ErrorIs(t, err, kv.ErrNotFound)
 }
 
@@ -469,7 +469,7 @@ func TestStoreConcurrentPublishCAS(t *testing.T) {
 	store, _, ctx := newTestStore(t)
 	require.NoError(t, store.CreateDataset(ctx, newDatasetRecord()))
 
-	previous, err := store.GetDataset(ctx, "customer-360")
+	previous, predicate, err := store.GetDataset(ctx, "customer-360")
 	require.NoError(t, err)
 
 	const publishers = 8
@@ -484,7 +484,7 @@ func TestStoreConcurrentPublishCAS(t *testing.T) {
 			next.State = DatasetStatePublishing
 			next.PendingVersion = previous.LatestVersion + 1
 			<-start
-			results[i] = store.PutDatasetIf(ctx, &next, previous)
+			results[i] = store.PutDatasetIf(ctx, &next, previous, predicate)
 		}(i)
 	}
 	close(start)
@@ -503,7 +503,7 @@ func TestStoreConcurrentPublishCAS(t *testing.T) {
 	}
 	require.Equal(t, 1, winners, "exactly one concurrent publish CAS may win")
 
-	after, err := store.GetDataset(ctx, "customer-360")
+	after, _, err := store.GetDataset(ctx, "customer-360")
 	require.NoError(t, err)
 	require.Equal(t, DatasetStatePublishing, after.State)
 	require.Equal(t, previous.LatestVersion+1, after.PendingVersion)
@@ -659,7 +659,7 @@ func TestStorePins(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{ref, otherRef}, pin.References)
 
-	stored, err := store.GetPin(ctx, repository, commitID)
+	stored, _, err := store.GetPin(ctx, repository, commitID)
 	require.NoError(t, err)
 	require.Equal(t, []string{ref, otherRef}, stored.References)
 
@@ -667,7 +667,7 @@ func TestStorePins(t *testing.T) {
 	deleted, err := store.RemovePinReference(ctx, repository, commitID, ref)
 	require.NoError(t, err)
 	require.False(t, deleted)
-	stored, err = store.GetPin(ctx, repository, commitID)
+	stored, _, err = store.GetPin(ctx, repository, commitID)
 	require.NoError(t, err)
 	require.Equal(t, []string{otherRef}, stored.References)
 
@@ -675,7 +675,7 @@ func TestStorePins(t *testing.T) {
 	deleted, err = store.RemovePinReference(ctx, repository, commitID, ref)
 	require.NoError(t, err)
 	require.False(t, deleted)
-	stored, err = store.GetPin(ctx, repository, commitID)
+	stored, _, err = store.GetPin(ctx, repository, commitID)
 	require.NoError(t, err)
 	require.Equal(t, []string{otherRef}, stored.References)
 
@@ -688,7 +688,7 @@ func TestStorePins(t *testing.T) {
 	deleted, err = store.RemovePinReference(ctx, repository, commitID, otherRef)
 	require.NoError(t, err)
 	require.True(t, deleted, "the caller must be told to delete the hidden pin branch")
-	_, err = store.GetPin(ctx, repository, commitID)
+	_, _, err = store.GetPin(ctx, repository, commitID)
 	require.ErrorIs(t, err, kv.ErrNotFound)
 
 	// The pin can be recreated afterwards, e.g. by the reconciler (§12.3).
@@ -734,7 +734,7 @@ func TestStorePinReferencesConcurrent(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	pin, err := store.GetPin(ctx, repository, commitID)
+	pin, _, err := store.GetPin(ctx, repository, commitID)
 	require.NoError(t, err)
 	require.Len(t, pin.References, writers, "no reference may be lost")
 }

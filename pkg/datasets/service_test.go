@@ -242,7 +242,7 @@ func TestServiceCreateWithPublish(t *testing.T) {
 	require.NoError(t, err, "pin branch exists in the source repository")
 	require.True(t, pinBranch.Hidden)
 	require.Equal(t, commit, pinBranch.CommitID)
-	pin, err := f.svc.store.GetPin(f.ctx, "src", commit.String())
+	pin, _, err := f.svc.store.GetPin(f.ctx, "src", commit.String())
 	require.NoError(t, err)
 	require.Equal(t, []string{PinReference("customer-360", 1)}, pin.References)
 }
@@ -428,7 +428,7 @@ func TestServiceDeleteReleasesPinsAndPolicies(t *testing.T) {
 	require.NoError(t, err)
 
 	// Preconditions: the pin, the repository, the policies and the version exist.
-	_, err = f.svc.store.GetPin(f.ctx, "src", commit.String())
+	_, _, err = f.svc.store.GetPin(f.ctx, "src", commit.String())
 	require.NoError(t, err)
 	_, err = f.cat.GetRepository(f.ctx, "gone-set")
 	require.NoError(t, err)
@@ -443,7 +443,7 @@ func TestServiceDeleteReleasesPinsAndPolicies(t *testing.T) {
 	require.NoError(t, f.svc.Delete(f.ctx, f.caller(), "gone-set"))
 
 	t.Run("pins released", func(t *testing.T) {
-		_, err := f.svc.store.GetPin(f.ctx, "src", commit.String())
+		_, _, err := f.svc.store.GetPin(f.ctx, "src", commit.String())
 		require.ErrorIs(t, err, kv.ErrNotFound)
 		_, err = f.refMgr.GetBranch(f.ctx, f.repositoryRecord(t, "src"), graveler.BranchID(PinBranch(commit.String())))
 		require.Error(t, err, "the hidden pin branch is gone")
@@ -467,7 +467,7 @@ func TestServiceDeleteReleasesPinsAndPolicies(t *testing.T) {
 	})
 
 	t.Run("records deleted", func(t *testing.T) {
-		_, err := f.svc.store.GetDataset(f.ctx, "gone-set")
+		_, _, err := f.svc.store.GetDataset(f.ctx, "gone-set")
 		require.ErrorIs(t, err, kv.ErrNotFound)
 		versions, err := f.svc.store.ListVersions(f.ctx, "gone-set")
 		require.NoError(t, err)
@@ -519,7 +519,7 @@ func TestServiceDeleteRejectsLivePublish(t *testing.T) {
 	live.State = DatasetStatePublishing
 	live.PendingVersion = 2
 	live.UpdatedAt = f.svc.now()
-	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &live, current))
+	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &live, current, nil))
 
 	err = f.svc.Delete(f.ctx, f.caller(), dataset)
 	require.ErrorIs(t, err, ErrPublishInProgress)
@@ -530,7 +530,7 @@ func TestServiceDeleteRejectsLivePublish(t *testing.T) {
 
 	stale := live
 	stale.UpdatedAt = f.svc.now().Add(-f.cfg.PublishTimeout - time.Minute)
-	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &stale, &live))
+	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &stale, &live, nil))
 	require.NoError(t, f.svc.Delete(f.ctx, f.caller(), dataset))
 	_, err = f.cat.GetRepository(f.ctx, dataset)
 	require.True(t, isNotFound(err), "a stale publishing record is deleted")
@@ -551,7 +551,7 @@ func TestServiceCreateFailureRollsBackInline(t *testing.T) {
 	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def, Publish: true})
 	require.Error(t, err)
 
-	_, err = f.svc.store.GetDataset(f.ctx, dataset)
+	_, _, err = f.svc.store.GetDataset(f.ctx, dataset)
 	require.ErrorIs(t, err, kv.ErrNotFound)
 	_, err = f.cat.GetRepository(f.ctx, dataset)
 	require.True(t, isNotFound(err), "the repository of a failed create is removed")
@@ -581,7 +581,7 @@ func TestServiceInjectedClock(t *testing.T) {
 	degraded := *current
 	degraded.State = DatasetStateDegraded
 	degraded.UpdatedAt = fixed.Add(-time.Hour)
-	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &degraded, current))
+	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &degraded, current, nil))
 	cleared, err := f.svc.pins.ClearDatasetDegraded(f.ctx, dataset)
 	require.NoError(t, err)
 	require.True(t, cleared)
@@ -891,11 +891,11 @@ func TestRollbackCreate_ModifiedRecordIsStillRemoved(t *testing.T) {
 
 	changed := *stale
 	changed.UpdatedAt = stale.UpdatedAt.Add(time.Minute)
-	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &changed, stale))
+	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &changed, stale, nil))
 
 	f.svc.rollbackCreate(f.ctx, stale)
 
-	_, err = f.svc.store.GetDataset(f.ctx, dataset)
+	_, _, err = f.svc.store.GetDataset(f.ctx, dataset)
 	require.ErrorIs(t, err, kv.ErrNotFound)
 }
 
