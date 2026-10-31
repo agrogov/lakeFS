@@ -24,6 +24,7 @@ package datasets
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/treeverse/lakefs/pkg/auth"
@@ -429,8 +430,8 @@ func (s *server) ListVersions(w http.ResponseWriter, r *http.Request, dataset ap
 		writeServiceError(w, r, err)
 		return
 	}
-	body := apigen.VersionList{
-		Results: make([]apigen.Version, 0, len(result.Versions)),
+	body := apigen.DatasetVersionList{
+		Results: make([]apigen.DatasetVersion, 0, len(result.Versions)),
 		Pagination: apigen.Pagination{
 			HasMore:    result.HasMore,
 			NextOffset: result.NextOffset,
@@ -535,36 +536,86 @@ func (s *server) DiffRefs(w http.ResponseWriter, r *http.Request, dataset apigen
 	httputil.WriteAPIResponse(w, r, http.StatusOK, definitionDiffToAPI(result.Definition))
 }
 
-func (s *server) ListProposals(w http.ResponseWriter, r *http.Request, dataset apigen.DatasetName, params apigen.ListProposalsParams) {
+func (s *server) UpdateDataset(w http.ResponseWriter, r *http.Request, body apigen.UpdateDatasetJSONRequestBody, dataset apigen.DatasetName) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	view, err := s.svc.UpdateDataset(r.Context(), caller, string(dataset), PublishVersionRequest{
+		Definition: definitionFromAPI(body.Definition),
+		Message:    body.Publish.Message,
+	})
+	if err != nil {
+		if writeVersionConflict(w, r, err) {
+			return
+		}
+		writeServiceError(w, r, err)
+		return
+	}
+	logAction(r, "UpdateDataset", string(dataset), view.Record.LatestVersion)
+	httputil.WriteAPIResponse(w, r, http.StatusOK, datasetToAPI(view))
+}
+
+func (s *server) GetDatasetByRef(w http.ResponseWriter, r *http.Request, dataset apigen.DatasetName, ref apigen.Ref) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	view, err := s.svc.GetByRef(r.Context(), caller, string(dataset), string(ref))
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	httputil.WriteAPIResponse(w, r, http.StatusOK, datasetToAPI(view))
+}
+
+// ListPullRequests answers GET /datasets/pulls, the global pull-request listing (§10.1).
+func (s *server) ListPullRequests(w http.ResponseWriter, r *http.Request, params apigen.ListPullRequestsParams) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	result, err := s.svc.ListAllPullRequests(r.Context(), caller, PullRequestFilter{
+		Dataset: string(valueOrZero(params.Dataset)),
+		Status:  string(valueOrZero(params.Status)),
+		After:   string(valueOrZero(params.After)),
+		Amount:  int(valueOrZero(params.Amount)),
+	})
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	httputil.WriteAPIResponse(w, r, http.StatusOK, pullRequestListToAPI(result.PullRequests, result.HasMore, result.NextOffset, result.MaxPerPage))
+}
+
+func (s *server) ListDatasetPullRequests(w http.ResponseWriter, r *http.Request, dataset apigen.DatasetName, params apigen.ListDatasetPullRequestsParams) {
 	caller, err := s.caller(r)
 	if err != nil {
 		writeUnauthenticated(w, r)
 		return
 	}
 	result, err := s.svc.ListProposals(r.Context(), caller, string(dataset),
-		valueOrZero(params.Status), string(valueOrZero(params.After)), int(valueOrZero(params.Amount)))
+		string(valueOrZero(params.Status)), string(valueOrZero(params.After)), int(valueOrZero(params.Amount)))
 	if err != nil {
 		writeServiceError(w, r, err)
 		return
 	}
-	body := apigen.ProposalList{
-		Results: make([]apigen.Proposal, 0, len(result.Proposals)),
-		Pagination: apigen.Pagination{
-			HasMore:    result.HasMore,
-			NextOffset: result.NextOffset,
-			Results:    len(result.Proposals),
-			MaxPerPage: result.MaxPerPage,
-		},
+	views := make([]*ProposalView, 0, len(result.Proposals))
+	for _, record := range result.Proposals {
+		views = append(views, &ProposalView{
+			Record:        record,
+			LatestVersion: result.LatestVersion,
+			Stale:         record.Status == ProposalStatusOpen && result.LatestVersion != record.BaseVersion,
+			Conflicted:    record.Status == ProposalStatusOpen && result.Conflicted,
+		})
 	}
-	for _, proposal := range result.Proposals {
-		// The list endpoint returns the records without diffs: §10.1 puts the diff summary
-		// on the detail read, and a data diff per row would be a diff per row of the page.
-		body.Results = append(body.Results, proposalToAPI(&ProposalView{Record: proposal}))
-	}
-	httputil.WriteAPIResponse(w, r, http.StatusOK, body)
+	httputil.WriteAPIResponse(w, r, http.StatusOK, pullRequestListToAPI(views, result.HasMore, result.NextOffset, result.MaxPerPage))
 }
 
-func (s *server) CreateProposal(w http.ResponseWriter, r *http.Request, body apigen.CreateProposalJSONRequestBody, dataset apigen.DatasetName) {
+func (s *server) CreatePullRequest(w http.ResponseWriter, r *http.Request, body apigen.CreatePullRequestJSONRequestBody, dataset apigen.DatasetName) {
 	caller, err := s.caller(r)
 	if err != nil {
 		writeUnauthenticated(w, r)
@@ -582,24 +633,25 @@ func (s *server) CreateProposal(w http.ResponseWriter, r *http.Request, body api
 		writeServiceError(w, r, err)
 		return
 	}
-	httputil.WriteAPIResponse(w, r, http.StatusCreated, proposalToAPI(view))
+	logAction(r, "CreatePullRequest", string(dataset), 0)
+	httputil.WriteAPIResponse(w, r, http.StatusCreated, pullRequestToAPI(view))
 }
 
-func (s *server) GetProposal(w http.ResponseWriter, r *http.Request, dataset apigen.DatasetName, id apigen.ProposalID) {
+func (s *server) GetPullRequest(w http.ResponseWriter, r *http.Request, dataset apigen.DatasetName, pullRequest apigen.PullRequestID) {
 	caller, err := s.caller(r)
 	if err != nil {
 		writeUnauthenticated(w, r)
 		return
 	}
-	view, err := s.svc.GetProposal(r.Context(), caller, string(dataset), string(id))
+	view, err := s.svc.GetProposal(r.Context(), caller, string(dataset), string(pullRequest))
 	if err != nil {
 		writeServiceError(w, r, err)
 		return
 	}
-	httputil.WriteAPIResponse(w, r, http.StatusOK, proposalToAPI(view))
+	httputil.WriteAPIResponse(w, r, http.StatusOK, pullRequestToAPI(view))
 }
 
-func (s *server) UpdateProposal(w http.ResponseWriter, r *http.Request, body apigen.UpdateProposalJSONRequestBody, dataset apigen.DatasetName, id apigen.ProposalID) {
+func (s *server) UpdatePullRequest(w http.ResponseWriter, r *http.Request, body apigen.UpdatePullRequestJSONRequestBody, dataset apigen.DatasetName, pullRequest apigen.PullRequestID) {
 	caller, err := s.caller(r)
 	if err != nil {
 		writeUnauthenticated(w, r)
@@ -613,56 +665,124 @@ func (s *server) UpdateProposal(w http.ResponseWriter, r *http.Request, body api
 	if body.Status != nil {
 		req.Status = *body.Status
 	}
-	view, err := s.svc.UpdateProposal(r.Context(), caller, string(dataset), string(id), req)
+	view, err := s.svc.UpdateProposal(r.Context(), caller, string(dataset), string(pullRequest), req)
 	if err != nil {
 		writeServiceError(w, r, err)
 		return
 	}
-	httputil.WriteAPIResponse(w, r, http.StatusOK, proposalToAPI(view))
+	httputil.WriteAPIResponse(w, r, http.StatusOK, pullRequestToAPI(view))
 }
 
-func (s *server) MergeProposal(w http.ResponseWriter, r *http.Request, body apigen.MergeProposalJSONRequestBody, dataset apigen.DatasetName, id apigen.ProposalID) {
+func (s *server) ClosePullRequest(w http.ResponseWriter, r *http.Request, dataset apigen.DatasetName, pullRequest apigen.PullRequestID) {
 	caller, err := s.caller(r)
 	if err != nil {
 		writeUnauthenticated(w, r)
 		return
 	}
-	version, err := s.svc.MergeProposal(r.Context(), caller, string(dataset), string(id), MergeProposalRequest{
-		Message: valueOrZero(body.Message),
-	})
+	if _, err := s.svc.CloseProposal(r.Context(), caller, string(dataset), string(pullRequest)); err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	logAction(r, "ClosePullRequest", string(dataset), 0)
+	httputil.WriteAPIResponse(w, r, http.StatusNoContent, nil)
+}
+
+func (s *server) GetPullRequestDiff(w http.ResponseWriter, r *http.Request, dataset apigen.DatasetName, pullRequest apigen.PullRequestID) {
+	caller, err := s.caller(r)
 	if err != nil {
-		// §5.6: a stale proposal base is the 409 whose body carries latest_version, the same
-		// shape as a lost expected_version check (§5.4).
+		writeUnauthenticated(w, r)
+		return
+	}
+	view, err := s.svc.GetProposal(r.Context(), caller, string(dataset), string(pullRequest))
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	httputil.WriteAPIResponse(w, r, http.StatusOK, definitionDiffToAPI(view.Diff))
+}
+
+func (s *server) MergePullRequest(w http.ResponseWriter, r *http.Request, dataset apigen.DatasetName, pullRequest apigen.PullRequestID) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	version, err := s.svc.MergeProposal(r.Context(), caller, string(dataset), string(pullRequest), MergeProposalRequest{})
+	if err != nil {
+		// §5.6: a stale pull-request base is the 409 whose body carries latest_version, the
+		// same shape as a lost expected_version check (§5.4).
 		if writeVersionConflict(w, r, err) {
 			return
 		}
 		writeServiceError(w, r, err)
 		return
 	}
-	httputil.WriteAPIResponse(w, r, http.StatusCreated, versionToAPI(version))
+	logAction(r, "MergePullRequest", string(dataset), version.Version)
+	httputil.WriteAPIResponse(w, r, http.StatusOK, apigen.DatasetPullRequestMerge{
+		Version:   version.Version,
+		Reference: fmt.Sprintf("v%d", version.Version),
+	})
 }
 
 // --- API type conversions (§10.2) ---
 
 // datasetToAPI renders a dataset view as the §10.2 Dataset schema.
 func datasetToAPI(view *DatasetView) apigen.Dataset {
+	version := view.Record.LatestVersion
+	createdBy := view.Record.CreatedBy
+	state := view.Record.State
 	out := apigen.Dataset{
-		Name:          view.Record.Name,
-		CreatedAt:     view.Record.CreatedAt.UnixMilli(),
-		CreatedBy:     view.Record.CreatedBy,
-		LatestVersion: view.Record.LatestVersion,
-		State:         view.Record.State,
+		Id:           view.Record.Name,
+		CreationDate: view.Record.CreatedAt.Unix(),
+		CreatedBy:    &createdBy,
+		Version:      &version,
+		State:        &state,
 	}
 	if view.Record.Description != "" {
 		description := view.Record.Description
 		out.Description = &description
 	}
 	if view.Version != nil {
-		definition := definitionToAPI(view.Version.Definition)
+		definition := definitionStateToAPI(view.Version.Definition, view.ItemStatuses)
 		stats := statsToAPI(view.Version.Stats)
 		out.Definition = &definition
 		out.Stats = &stats
 	}
+	return out
+}
+
+// definitionStateToAPI renders a definition with the per-item source-resolution status of
+// §10.2 DatasetDefinitionState. statuses is indexed like the definition's data items; a
+// missing entry is reported as ok, because the definition itself resolved.
+func definitionStateToAPI(in Definition, statuses []ItemStatus) apigen.DatasetDefinitionState {
+	formatVersion := in.FormatVersion
+	if formatVersion == 0 {
+		formatVersion = FormatVersion
+	}
+	data := make([]apigen.DataItemState, 0, len(in.Data))
+	out := apigen.DatasetDefinitionState{
+		FormatVersion: &formatVersion,
+		Data:          &data,
+	}
+	if in.Description != "" {
+		description := in.Description
+		out.Description = &description
+	}
+	if in.Metadata != nil {
+		metadata := apigen.DatasetMetadata(in.Metadata)
+		out.Metadata = &metadata
+	}
+	for i, item := range in.Data {
+		status := string(ItemStatusOK)
+		if i < len(statuses) && statuses[i] != "" {
+			status = string(statuses[i])
+		}
+		data = append(data, apigen.DataItemState{
+			DataItem: dataItemToAPI(item),
+			Status:   &status,
+		})
+	}
+	out.Data = &data
 	return out
 }
 
@@ -740,40 +860,60 @@ func dataItemToAPI(in DataItem) apigen.DataItem {
 	return out
 }
 
-// definitionDiffToAPI converts a definition diff into the DefinitionDiff schema (§10.2).
-func definitionDiffToAPI(in *DefinitionDiff) apigen.DefinitionDiff {
-	out := apigen.DefinitionDiff{Items: []apigen.ItemChange{}}
+// definitionDiffToAPI converts a definition diff into the §10.2 DatasetDiff schema.
+func definitionDiffToAPI(in *DefinitionDiff) apigen.DatasetDiff {
+	out := apigen.DatasetDiff{Data: []apigen.ItemChange{}}
 	if in == nil {
 		return out
 	}
 	if in.Description != nil {
-		out.Description = &apigen.StringChange{From: in.Description.From, To: in.Description.To}
+		out.Description = &apigen.StringChange{Left: in.Description.From, Right: in.Description.To}
 	}
 	if len(in.Metadata) > 0 {
 		metadata := make([]apigen.MetadataChange, 0, len(in.Metadata))
 		for _, change := range in.Metadata {
 			metadata = append(metadata, apigen.MetadataChange{
-				Key:    change.Key,
-				Change: string(change.Change),
-				From:   change.From,
-				To:     change.To,
+				Type:  string(change.Change),
+				Key:   change.Key,
+				Left:  metadataValues(change.From),
+				Right: metadataValues(change.To),
 			})
 		}
 		out.Metadata = &metadata
 	}
 	for _, change := range in.Items {
-		item := apigen.ItemChange{Target: change.Target, Change: string(change.Change)}
+		item := apigen.ItemChange{Type: string(change.Change), Target: change.Target}
 		if change.From != nil {
-			from := dataItemToAPI(*change.From)
-			item.From = &from
+			left := dataItemToAPI(*change.From)
+			item.Left = &left
 		}
 		if change.To != nil {
-			to := dataItemToAPI(*change.To)
-			item.To = &to
+			right := dataItemToAPI(*change.To)
+			item.Right = &right
 		}
-		out.Items = append(out.Items, item)
+		out.Data = append(out.Data, item)
 	}
 	return out
+}
+
+// metadataValues renders one side of a metadata change as the string list the §10.2
+// MetadataChange schema uses. A nil side (added/removed) stays nil.
+func metadataValues(value *any) *[]string {
+	if value == nil {
+		return nil
+	}
+	values := make([]string, 0, 1)
+	switch typed := (*value).(type) {
+	case []any:
+		for _, element := range typed {
+			values = append(values, fmt.Sprint(element))
+		}
+	case []string:
+		values = append(values, typed...)
+	default:
+		values = append(values, fmt.Sprint(typed))
+	}
+	return &values
 }
 
 // dataDiffToAPI converts one page of a data diff into the DataDiffList schema (§10.2).
@@ -818,13 +958,14 @@ func statsToAPI(in ItemStats) apigen.DatasetStats {
 	return out
 }
 
-// versionToAPI renders a VersionRecord as the §10.2 Version schema.
-func versionToAPI(rec *VersionRecord) apigen.Version {
-	out := apigen.Version{
-		Version:     rec.Version,
-		CommitId:    rec.CommitID,
-		PublishedAt: rec.PublishedAt.UnixMilli(),
-		Publisher:   rec.Publisher,
+// versionToAPI renders a VersionRecord as the §10.2 DatasetVersion schema.
+func versionToAPI(rec *VersionRecord) apigen.DatasetVersion {
+	commitID := rec.CommitID
+	out := apigen.DatasetVersion{
+		Id:           fmt.Sprintf("v%d", rec.Version),
+		CommitId:     &commitID,
+		CreationDate: rec.PublishedAt.Unix(),
+		Author:       rec.Publisher,
 	}
 	if rec.Message != "" {
 		message := rec.Message
@@ -963,28 +1104,33 @@ func metadataKeyFromUpdateAPI(name string, in apigen.MetadataKeyUpdateRequest) M
 	return out
 }
 
-// proposalToAPI renders a proposal view as the §10.2 Proposal schema. The diffs of the
-// detail read are optional: a list row has none, and a diff the service could not compute
-// is left out rather than failing the read (see Service.proposalView).
-func proposalToAPI(view *ProposalView) apigen.Proposal {
+// pullRequestToAPI renders a pull-request view as the §10.2 DatasetPullRequest schema. The
+// diffs of the detail read are optional: a list row has none, and a diff the service could
+// not compute is left out rather than failing the read (see Service.proposalView).
+func pullRequestToAPI(view *ProposalView) apigen.DatasetPullRequest {
 	rec := view.Record
-	out := apigen.Proposal{
+	previewBranch := previewBranchOf(rec)
+	out := apigen.DatasetPullRequest{
 		Id:            rec.ID,
 		Dataset:       rec.Dataset,
 		BaseVersion:   rec.BaseVersion,
+		LatestVersion: view.LatestVersion,
+		Stale:         view.Stale,
+		Conflicted:    view.Conflicted,
+		SourceRef:     PullRequestRef(rec.ID),
 		Title:         rec.Title,
 		Author:        rec.Author,
 		Status:        rec.Status,
-		CreatedAt:     rec.CreatedAt.UnixMilli(),
-		PreviewBranch: rec.PreviewBranch,
+		CreationDate:  rec.CreatedAt.Unix(),
+		PreviewBranch: &previewBranch,
 	}
 	if rec.Description != "" {
 		description := rec.Description
 		out.Description = &description
 	}
 	if rec.ClosedAt != nil {
-		closedAt := rec.ClosedAt.UnixMilli()
-		out.ClosedAt = &closedAt
+		closedDate := rec.ClosedAt.Unix()
+		out.ClosedDate = &closedDate
 	}
 	if rec.MergedVersion > 0 {
 		mergedVersion := rec.MergedVersion
@@ -1003,6 +1149,23 @@ func proposalToAPI(view *ProposalView) apigen.Proposal {
 		out.DataDiff = &dataDiff
 	}
 	return out
+}
+
+// pullRequestListToAPI renders one page of pull requests.
+func pullRequestListToAPI(views []*ProposalView, hasMore bool, nextOffset string, maxPerPage int) apigen.DatasetPullRequestList {
+	body := apigen.DatasetPullRequestList{
+		Results: make([]apigen.DatasetPullRequest, 0, len(views)),
+		Pagination: apigen.Pagination{
+			HasMore:    hasMore,
+			NextOffset: nextOffset,
+			Results:    len(views),
+			MaxPerPage: maxPerPage,
+		},
+	}
+	for _, view := range views {
+		body.Results = append(body.Results, pullRequestToAPI(view))
+	}
+	return body
 }
 
 // metadataFilters extracts the dynamic metadata.<key>=<value> query parameters of §10.1.

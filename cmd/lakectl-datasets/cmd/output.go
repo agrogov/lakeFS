@@ -81,6 +81,15 @@ func formatMillis(millis int64) string {
 	return time.UnixMilli(millis).String()
 }
 
+// formatSeconds renders a Unix epoch seconds timestamp, the unit the Dataset and
+// DatasetVersion schemas use.
+func formatSeconds(seconds int64) string {
+	if seconds == 0 {
+		return ""
+	}
+	return time.Unix(seconds, 0).String()
+}
+
 // formatVersion renders a version number as the ref datasets use, `vN`. Version 0 means the
 // dataset has no published version yet (§10.2).
 func formatVersion(version int) string {
@@ -170,33 +179,63 @@ func printDefinition(cmd *cobra.Command, definition apigen.DatasetDefinition) {
 // printDataset prints a dataset record with the definition of its latest version.
 func printDataset(cmd *cobra.Command, dataset apigen.Dataset) {
 	out := cmd.OutOrStdout()
-	printField(out, "Dataset", dataset.Name)
+	printField(out, "Dataset", dataset.Id)
 	if description := derefString(dataset.Description); description != "" {
 		printField(out, "Description", description)
 	}
-	printField(out, "Created At", formatMillis(dataset.CreatedAt))
-	printField(out, "Created By", dataset.CreatedBy)
-	printField(out, "Latest Version", formatVersion(dataset.LatestVersion))
-	printField(out, "State", dataset.State)
+	printField(out, "Created At", formatSeconds(dataset.CreationDate))
+	printField(out, "Created By", derefString(dataset.CreatedBy))
+	printField(out, "Latest Version", formatVersion(derefInt(dataset.Version)))
+	if dataset.State != nil {
+		printField(out, "State", *dataset.State)
+	}
 	printField(out, "Data", formatStats(dataset.Stats))
 	if dataset.Definition != nil {
 		fmt.Fprintln(out)
-		printDefinition(cmd, *dataset.Definition)
+		printDefinitionState(cmd, *dataset.Definition)
 	}
 }
 
-// printVersion prints one dataset version.
-func printVersion(cmd *cobra.Command, version apigen.Version) {
+// printDefinitionState prints a definition together with the per-item source-resolution
+// status of §10.2 DataItemState.
+func printDefinitionState(cmd *cobra.Command, definition apigen.DatasetDefinitionState) {
 	out := cmd.OutOrStdout()
-	printField(out, "Version", formatVersion(version.Version))
+	if definition.FormatVersion != nil {
+		printField(out, "Format Version", *definition.FormatVersion)
+	}
+	if description := derefString(definition.Description); description != "" {
+		printField(out, "Description", description)
+	}
+	if metadata := formatMetadata(definition.Metadata); metadata != "" {
+		printField(out, "Metadata", metadata)
+	}
+	if definition.Data == nil || len(*definition.Data) == 0 {
+		fmt.Fprintln(out, "Items: none")
+		return
+	}
+	items := *definition.Data
+	fmt.Fprintf(out, "Items: %d\n", len(items))
+	rows := make([][]any, len(items))
+	for i, item := range items {
+		rows[i] = append(formatDataItem(item.DataItem), derefString(item.Status))
+	}
+	printTable(cmd, []any{"Target", "Type", "Repository", "Ref", "Path", "Status"}, rows, apigen.Pagination{}, 0)
+}
+
+// printVersion prints one dataset version.
+func printVersion(cmd *cobra.Command, version apigen.DatasetVersion) {
+	out := cmd.OutOrStdout()
+	printField(out, "Version", version.Id)
 	if message := derefString(version.Message); message != "" {
 		printField(out, "Message", message)
 	}
-	printField(out, "Publisher", version.Publisher)
-	printField(out, "Published At", formatMillis(version.PublishedAt))
-	printField(out, "Commit ID", version.CommitId)
+	printField(out, "Author", version.Author)
+	printField(out, "Created At", formatSeconds(version.CreationDate))
+	if commit := derefString(version.CommitId); commit != "" {
+		printField(out, "Commit ID", commit)
+	}
 	if proposal := derefString(version.ProposalId); proposal != "" {
-		printField(out, "Proposal", proposal)
+		printField(out, "Pull Request", proposal)
 	}
 	printField(out, "Data", formatStats(version.Stats))
 	if version.Definition != nil {
@@ -221,29 +260,29 @@ func printTask(cmd *cobra.Command, dataset string, task apigen.Task) {
 }
 
 // printDefinitionDiff prints the structural diff of two definitions (§10.3).
-func printDefinitionDiff(cmd *cobra.Command, diff apigen.DefinitionDiff) {
+func printDefinitionDiff(cmd *cobra.Command, diff apigen.DatasetDiff) {
 	out := cmd.OutOrStdout()
 	if diff.Description != nil {
-		printField(out, "Description", fmt.Sprintf("%q -> %q", diff.Description.From, diff.Description.To))
+		printField(out, "Description", fmt.Sprintf("%q -> %q", diff.Description.Left, diff.Description.Right))
 	}
 	if diff.Metadata != nil && len(*diff.Metadata) > 0 {
 		fmt.Fprintln(out, "\nMetadata:")
 		rows := make([][]any, len(*diff.Metadata))
 		for i, change := range *diff.Metadata {
-			rows[i] = []any{change.Key, change.Change, formatMetadataValue(change.From), formatMetadataValue(change.To)}
+			rows[i] = []any{change.Key, change.Type, formatMetadataValues(change.Left), formatMetadataValues(change.Right)}
 		}
-		printTable(cmd, []any{"Key", "Change", "From", "To"}, rows, apigen.Pagination{}, 0)
+		printTable(cmd, []any{"Key", "Change", "Left", "Right"}, rows, apigen.Pagination{}, 0)
 	}
-	if len(diff.Items) == 0 {
+	if len(diff.Data) == 0 {
 		fmt.Fprintln(out, "\nNo definition changes.")
 		return
 	}
-	fmt.Fprintf(out, "\nItems: %d changed\n", len(diff.Items))
-	rows := make([][]any, len(diff.Items))
-	for i, change := range diff.Items {
-		rows[i] = []any{change.Target, change.Change, formatItemPtr(change.From), formatItemPtr(change.To)}
+	fmt.Fprintf(out, "\nItems: %d changed\n", len(diff.Data))
+	rows := make([][]any, len(diff.Data))
+	for i, change := range diff.Data {
+		rows[i] = []any{change.Target, change.Type, formatItemPtr(change.Left), formatItemPtr(change.Right)}
 	}
-	printTable(cmd, []any{"Target", "Change", "From", "To"}, rows, apigen.Pagination{}, 0)
+	printTable(cmd, []any{"Target", "Change", "Left", "Right"}, rows, apigen.Pagination{}, 0)
 }
 
 // formatItemPtr renders an item that may be absent (an added or removed item).
@@ -254,12 +293,12 @@ func formatItemPtr(item *apigen.DataItem) string {
 	return formatItem(*item)
 }
 
-// formatMetadataValue renders a metadata diff value.
-func formatMetadataValue(value *interface{}) string {
-	if value == nil {
+// formatMetadataValues renders one side of a metadata diff.
+func formatMetadataValues(values *[]string) string {
+	if values == nil {
 		return ""
 	}
-	return fmt.Sprintf("%v", *value)
+	return strings.Join(*values, ", ")
 }
 
 // printDataDiff prints the paginated data diff of two dataset refs (§10.3).
@@ -280,33 +319,39 @@ func printDataDiff(cmd *cobra.Command, diff apigen.DataDiffList, amount int) {
 	printTable(cmd, []any{"Path", "Change", "Size (bytes)"}, rows, diff.Pagination, amount)
 }
 
-// printProposal prints one dataset proposal (§5.6).
-func printProposal(cmd *cobra.Command, proposal apigen.Proposal) {
+// printPullRequest prints one dataset pull request (§5.6).
+func printPullRequest(cmd *cobra.Command, pull apigen.DatasetPullRequest) {
 	out := cmd.OutOrStdout()
-	printField(out, "Proposal", proposal.Id)
-	printField(out, "Dataset", proposal.Dataset)
-	printField(out, "Title", proposal.Title)
-	if description := derefString(proposal.Description); description != "" {
+	printField(out, "Pull Request", pull.Id)
+	printField(out, "Dataset", pull.Dataset)
+	printField(out, "Title", pull.Title)
+	if description := derefString(pull.Description); description != "" {
 		printField(out, "Description", description)
 	}
-	printField(out, "Status", proposal.Status)
-	printField(out, "Author", proposal.Author)
-	printField(out, "Base Version", formatVersion(proposal.BaseVersion))
-	printField(out, "Created At", formatMillis(proposal.CreatedAt))
-	if proposal.ClosedAt != nil {
-		printField(out, "Closed At", formatMillis(*proposal.ClosedAt))
+	printField(out, "Status", pull.Status)
+	printField(out, "Author", pull.Author)
+	printField(out, "Base Version", formatVersion(pull.BaseVersion))
+	printField(out, "Latest Version", formatVersion(pull.LatestVersion))
+	printField(out, "Stale", pull.Stale)
+	printField(out, "Conflicted", pull.Conflicted)
+	printField(out, "Source Ref", pull.SourceRef)
+	printField(out, "Created At", formatSeconds(pull.CreationDate))
+	if pull.ClosedDate != nil {
+		printField(out, "Closed At", formatSeconds(*pull.ClosedDate))
 	}
-	if proposal.MergedVersion != nil {
-		printField(out, "Merged Version", formatVersion(*proposal.MergedVersion))
+	if pull.MergedVersion != nil {
+		printField(out, "Merged Version", formatVersion(*pull.MergedVersion))
 	}
-	printField(out, "Preview Branch", proposal.PreviewBranch)
-	if proposal.Definition != nil {
+	if pull.PreviewBranch != nil {
+		printField(out, "Preview Branch", *pull.PreviewBranch)
+	}
+	if pull.Definition != nil {
 		fmt.Fprintln(out)
-		printDefinition(cmd, *proposal.Definition)
+		printDefinition(cmd, *pull.Definition)
 	}
-	if proposal.Diff != nil {
+	if pull.Diff != nil {
 		fmt.Fprintln(out)
-		printDefinitionDiff(cmd, *proposal.Diff)
+		printDefinitionDiff(cmd, *pull.Diff)
 	}
 }
 

@@ -6,7 +6,7 @@ import dayjs from 'dayjs';
 import relativeTime from 'dayjs/plugin/relativeTime';
 import { DiffIcon, HistoryIcon } from '@primer/octicons-react';
 
-import { DatasetDefinition, Version } from '../../lib/api/datasets';
+import { DatasetDefinition, Version, versionNumber } from '../../lib/api/datasets';
 import { AlertError, Loading } from '../../lib/components/controls';
 import { useDatasetVersion } from '../../lib/components/datasets/hooks';
 import { DefinitionDiffCounts, versionChangeCounts } from '../../lib/components/datasets/definitionDiff';
@@ -32,11 +32,11 @@ export interface VersionTimelineEntry {
  */
 export const versionTimeline = (versions: Version[]): VersionTimelineEntry[] => {
     const byNumber = new Map<number, Version>();
-    for (const version of versions) byNumber.set(version.version, version);
+    for (const version of versions) byNumber.set(versionNumber(version), version);
     return [...versions]
-        .sort((left, right) => right.version - left.version)
+        .sort((left, right) => versionNumber(right) - versionNumber(left))
         .map((version) => {
-            const previous = byNumber.get(version.version - 1);
+            const previous = byNumber.get(versionNumber(version) - 1);
             return {
                 version,
                 previous: previous?.definition,
@@ -77,12 +77,12 @@ const VersionEntry: FC<{ entry: VersionTimelineEntry; datasetId: string; latest:
     latest,
 }) => {
     const { version, counts } = entry;
-    const ref = versionTag(version.version);
-    const previousRef = previousVersionRef(version.version);
+    const ref = versionTag(versionNumber(version));
+    const previousRef = previousVersionRef(versionNumber(version));
     return (
         <div className="dataset-version-entry" data-testid={`dataset-version-${ref}`}>
             <div className="dataset-version-marker">
-                <Badge bg={version.version === latest ? 'primary' : 'secondary'} className="dataset-version-badge">
+                <Badge bg={versionNumber(version) === latest ? 'primary' : 'secondary'} className="dataset-version-badge">
                     {ref}
                 </Badge>
             </div>
@@ -92,22 +92,22 @@ const VersionEntry: FC<{ entry: VersionTimelineEntry; datasetId: string; latest:
                         <span className="dataset-version-message-title fw-semibold">
                             {version.message || <em className="text-muted">No message</em>}
                         </span>
-                        {version.version === latest && (
+                        {versionNumber(version) === latest && (
                             <Badge bg="light" text="dark" className="border">
                                 latest
                             </Badge>
                         )}
                         <span className="text-muted small ms-auto">
-                            <strong>{version.publisher}</strong>{' '}
-                            <span title={dayjs(version.published_at).toISOString()}>
-                                {dayjs(version.published_at).fromNow()}
+                            <strong>{version.author}</strong>{' '}
+                            <span title={dayjs.unix(version.creation_date).toISOString()}>
+                                {dayjs.unix(version.creation_date).fromNow()}
                             </span>
                         </span>
                     </div>
                     <div className="d-flex flex-wrap align-items-center gap-2 mt-2">
                         <CountsBadges counts={counts} />
                         <span className="text-muted small">
-                            {version.commit_id.substring(0, 12)} · {version.stats?.objects.toLocaleString() ?? 0}{' '}
+                            {(version.commit_id ?? '').substring(0, 12)} · {version.stats?.objects.toLocaleString() ?? 0}{' '}
                             objects
                         </span>
                         <div className="ms-auto d-flex gap-2">
@@ -165,7 +165,7 @@ const DatasetVersionsPage: FC = () => {
         );
     }
 
-    const latest = state.dataset.latest_version ?? 0;
+    const latest = state.dataset.version ?? 0;
     return (
         <div className="dataset-versions-page">
             <div className="d-flex align-items-center mb-3">
@@ -176,7 +176,7 @@ const DatasetVersionsPage: FC = () => {
             </div>
             <div className="dataset-versions-timeline">
                 {entries.map((entry) => (
-                    <VersionEntry key={entry.version.version} entry={entry} datasetId={datasetId} latest={latest} />
+                    <VersionEntry key={versionNumber(entry.version)} entry={entry} datasetId={datasetId} latest={latest} />
                 ))}
             </div>
         </div>

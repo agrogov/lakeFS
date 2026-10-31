@@ -47,13 +47,13 @@ describe('diffDefinitionItems', () => {
         expect(diffDefinitionItems(left, right)).toEqual([
             {
                 target: 'orders',
-                change: 'removed',
-                from: item({ target: 'orders', prefix: { path: 'data/orders/' } }),
+                type: 'removed',
+                left: item({ target: 'orders', prefix: { path: 'data/orders/' } }),
             },
             {
                 target: 'refunds',
-                change: 'added',
-                to: item({ target: 'refunds', prefix: { path: 'data/refunds/' } }),
+                type: 'added',
+                right: item({ target: 'refunds', prefix: { path: 'data/refunds/' } }),
             },
         ]);
     });
@@ -67,8 +67,8 @@ describe('diffDefinitionItems', () => {
         const changes = diffDefinitionItems(definition(), definition({ data: [changed] }));
 
         expect(changes).toHaveLength(1);
-        expect(changes[0].change).toBe('changed');
-        expect(changes[0].to).toEqual(changed);
+        expect(changes[0].type).toBe('changed');
+        expect(changes[0].right).toEqual(changed);
     });
 
     it('reports nothing for identical definitions', () => {
@@ -77,10 +77,10 @@ describe('diffDefinitionItems', () => {
 
     it('treats a missing definition as empty', () => {
         expect(diffDefinitionItems(undefined, definition())).toEqual([
-            { target: 'customers', change: 'added', to: item() },
+            { target: 'customers', type: 'added', right: item() },
         ]);
         expect(diffDefinitionItems(definition(), undefined)).toEqual([
-            { target: 'customers', change: 'removed', from: item() },
+            { target: 'customers', type: 'removed', left: item() },
         ]);
     });
 });
@@ -91,9 +91,9 @@ describe('diffDefinitionMetadata', () => {
         const right = definition({ metadata: { tier: 'platinum', owner: 'data-platform', added: 'yes' } });
 
         expect(diffDefinitionMetadata(left, right)).toEqual([
-            { key: 'added', change: 'added', to: 'yes' },
-            { key: 'drop', change: 'removed', from: 'me' },
-            { key: 'tier', change: 'changed', from: 'gold', to: 'platinum' },
+            { key: 'added', type: 'added', right: ['yes'] },
+            { key: 'drop', type: 'removed', left: ['me'] },
+            { key: 'tier', type: 'changed', left: ['gold'], right: ['platinum'] },
         ]);
     });
 
@@ -102,7 +102,7 @@ describe('diffDefinitionMetadata', () => {
         const right = definition({ metadata: { regions: ['emea', 'us'] } });
 
         expect(diffDefinitionMetadata(left, right)).toEqual([
-            { key: 'regions', change: 'changed', from: ['emea'], to: ['emea', 'us'] },
+            { key: 'regions', type: 'changed', left: ['emea'], right: ['emea', 'us'] },
         ]);
     });
 });
@@ -111,7 +111,7 @@ describe('definitionDiff', () => {
     it('omits the sections that did not change', () => {
         const diff = definitionDiff(definition(), definition());
 
-        expect(diff).toEqual({ items: [] });
+        expect(diff).toEqual({ data: [] });
         expect(diff.description).toBeUndefined();
         expect(diff.metadata).toBeUndefined();
     });
@@ -120,8 +120,8 @@ describe('definitionDiff', () => {
         const diff = definitionDiff(definition(), definition({ description: 'Something else' }));
 
         expect(diff).toEqual({
-            items: [],
-            description: { from: 'Curated customer view', to: 'Something else' },
+            data: [],
+            description: { left: 'Curated customer view', right: 'Something else' },
         });
     });
 

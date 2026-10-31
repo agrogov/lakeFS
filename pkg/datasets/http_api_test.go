@@ -150,14 +150,17 @@ func TestDatasetsSpecLoadsAndValidates(t *testing.T) {
 			"/config":                       {http.MethodGet},
 			"/metadata":                     {http.MethodGet, http.MethodPost},
 			"/metadata/{key}":               {http.MethodGet, http.MethodPut, http.MethodDelete},
-			"/{dataset}":                    {http.MethodGet, http.MethodDelete},
+			"/{dataset}":                    {http.MethodGet, http.MethodPut, http.MethodDelete},
 			"/{dataset}/validate":           {http.MethodPost},
 			"/{dataset}/versions":           {http.MethodGet, http.MethodPost},
 			"/{dataset}/versions/{version}": {http.MethodGet},
-			"/{dataset}/refs/{leftRef}/diff/{rightRef}":         {http.MethodGet},
-			"/{dataset}/proposals":                              {http.MethodGet, http.MethodPost},
-			"/{dataset}/proposals/{id}":                         {http.MethodGet, http.MethodPatch},
-			"/{dataset}/proposals/{id}/merge":                   {http.MethodPost},
+			"/{dataset}/refs/{ref}":         {http.MethodGet},
+			"/{dataset}/refs/{leftRef}/diff/{rightRef}": {http.MethodGet},
+			"/pulls":                                            {http.MethodGet},
+			"/{dataset}/pulls":                                  {http.MethodGet, http.MethodPost},
+			"/{dataset}/pulls/{pullRequest}":                    {http.MethodGet, http.MethodPatch, http.MethodDelete},
+			"/{dataset}/pulls/{pullRequest}/diff":               {http.MethodGet},
+			"/{dataset}/pulls/{pullRequest}/merge":              {http.MethodPost},
 			"/{dataset}/access":                                 {http.MethodGet, http.MethodPost},
 			"/{dataset}/access/{principal_type}/{principal_id}": {http.MethodDelete},
 			"/{dataset}/tasks/{task_id}":                        {http.MethodGet},
@@ -173,8 +176,8 @@ func TestDatasetsSpecLoadsAndValidates(t *testing.T) {
 
 	t.Run("core schemas of §10.2 are declared", func(t *testing.T) {
 		for _, name := range []string{
-			"Dataset", "DatasetDefinition", "DataItem", "Version", "DatasetStats",
-			"DefinitionDiff", "DataDiffList", "Proposal", "MetadataKey", "Task", "Error",
+			"Dataset", "DatasetDefinition", "DataItem", "DatasetVersion", "DatasetStats",
+			"DatasetDiff", "DataDiffList", "DatasetPullRequest", "MetadataKey", "Task", "Error",
 		} {
 			require.Contains(t, swagger.Components.Schemas, name, "schema %q is missing", name)
 		}

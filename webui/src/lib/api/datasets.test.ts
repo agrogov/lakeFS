@@ -93,7 +93,7 @@ describe('datasets client error mapping', () => {
             }),
         );
 
-        const error = await datasets.mergeProposal('d', 'p1').catch((e) => e);
+        const error = await datasets.mergePullRequest('d', 'p1').catch((e) => e);
 
         expect(error).toBeInstanceOf(DatasetsError);
         expect(error.status).toBe(409);
@@ -104,7 +104,7 @@ describe('datasets client error mapping', () => {
     it('does not treat a 409 without a rebase indication as a rebase', async () => {
         fetchMock.mockResolvedValue(jsonResponse(409, { message: 'proposal is not open' }));
 
-        const error = await datasets.mergeProposal('d', 'p1').catch((e) => e);
+        const error = await datasets.mergePullRequest('d', 'p1').catch((e) => e);
 
         expect(error.status).toBe(409);
         expect(isRebaseRequiredError(error)).toBe(false);
@@ -192,13 +192,13 @@ describe('datasets client requests', () => {
         fetchMock
             .mockResolvedValueOnce(
                 jsonResponse(200, {
-                    results: [{ name: 'customer-360' }],
+                    results: [{ id: 'customer-360' }],
                     pagination: { has_more: true, next_offset: 'customer-360', results: 1, max_per_page: 1000 },
                 }),
             )
             .mockResolvedValueOnce(
                 jsonResponse(200, {
-                    results: [{ name: 'sales' }],
+                    results: [{ id: 'sales' }],
                     pagination: { has_more: false, next_offset: '', results: 1, max_per_page: 1000 },
                 }),
             );

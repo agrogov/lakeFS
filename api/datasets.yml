@@ -37,7 +37,7 @@ security:
 
 tags:
   - name: datasets
-    description: Dataset lifecycle, versions, diffs and proposals
+    description: Dataset lifecycle, versions, diffs and pull requests
   - name: metadata
     description: Metadata key definitions used to type dataset metadata
   - name: access
@@ -53,7 +53,7 @@ paths:
       summary: List datasets
       description: |
         Paginated list of datasets with the latest version summary (§10.1). Results are
-        filtered by `datasets:ReadDataset` in addition to requiring `datasets:ListDatasets`.
+        filtered by `dataset:ReadDataset` in addition to requiring `dataset:ListDatasets`.
 
         Metadata filters use dynamic query parameters of the form `metadata.<key>=<value>` and
         match against the latest version's metadata. OpenAPI 3.0 cannot declare dynamic query
@@ -299,6 +299,43 @@ paths:
           $ref: "#/components/responses/NotFound"
         "501":
           $ref: "#/components/responses/NotImplemented"
+    put:
+      operationId: updateDataset
+      tags: [datasets]
+      summary: Update a dataset
+      description: |
+        Publishes `definition` as version `version + 1` (§5.4, §6.2): materialises the
+        definition into the dataset repository, commits `latest`, tags `vN` and records the
+        version. The publish is synchronous and the updated dataset is returned. This is the
+        documented "Update Dataset" operation; `POST /{dataset}/versions` remains available as
+        an extension for asynchronous publishes. Requires `dataset:UpdateDataset`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DatasetUpdate"
+      responses:
+        "200":
+          description: Dataset updated; the new version was published
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Dataset"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
     delete:
       operationId: deleteDataset
       tags: [datasets]
@@ -373,7 +410,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/VersionList"
+                $ref: "#/components/schemas/DatasetVersionList"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -406,7 +443,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Version"
+                $ref: "#/components/schemas/DatasetVersion"
         "202":
           description: Publish accepted; runs asynchronously
           content:
@@ -444,7 +481,36 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Version"
+                $ref: "#/components/schemas/DatasetVersion"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /{dataset}/refs/{ref}:
+    parameters:
+      - $ref: "#/components/parameters/DatasetName"
+      - $ref: "#/components/parameters/Ref"
+    get:
+      operationId: getDatasetByRef
+      tags: [datasets]
+      summary: Get a dataset at a ref
+      description: |
+        The dataset as it is at `ref`: `latest` or `v<N>`. This is the documented read of one
+        dataset revision; the definition and stats are those of the named version.
+      responses:
+        "200":
+          description: Dataset at the ref
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Dataset"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -466,12 +532,12 @@ paths:
       tags: [datasets]
       summary: Diff two dataset refs
       description: |
-        `leftRef` and `rightRef` accept `vN`, `latest` or `proposal-<id>` (§10.3).
+        `leftRef` and `rightRef` accept `vN`, `latest` or `pr/<id>` (§10.3).
 
         `type=definition` (the default) returns a structural diff of the two resolved
         definitions matched by `target`; an item is `changed` when repository, commit, type or
-        source path differs. `type=data` returns a native graveler diff of the dataset
-        repository, paginated, with `_dataset/` entries filtered out.
+        source path differs. `type=data` is an extension that returns a native graveler diff of
+        the dataset repository, paginated, with `_dataset/` entries filtered out.
       parameters:
         - name: type
           in: query
@@ -492,7 +558,7 @@ paths:
             application/json:
               schema:
                 oneOf:
-                  - $ref: "#/components/schemas/DefinitionDiff"
+                  - $ref: "#/components/schemas/DatasetDiff"
                   - $ref: "#/components/schemas/DataDiffList"
         "400":
           $ref: "#/components/responses/BadRequest"
@@ -505,19 +571,61 @@ paths:
         "501":
           $ref: "#/components/responses/NotImplemented"
 
-  /{dataset}/proposals:
+  /pulls:
+    get:
+      operationId: listPullRequests
+      tags: [datasets]
+      summary: List dataset pull requests
+      description: |
+        Every dataset pull request (§5.6, §10.1), optionally filtered by `status` and
+        `dataset`. Results are filtered by `dataset:ReadDataset` in addition to requiring
+        `dataset:ListDatasets`.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: Only return pull requests in this state (`all` is the default)
+          schema:
+            type: string
+            enum: [open, closed, all]
+            default: all
+        - name: dataset
+          in: query
+          required: false
+          description: Only return pull requests of this dataset
+          schema:
+            type: string
+        - $ref: "#/components/parameters/After"
+        - $ref: "#/components/parameters/Amount"
+      responses:
+        "200":
+          description: Pull request list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatasetPullRequestList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /{dataset}/pulls:
     parameters:
       - $ref: "#/components/parameters/DatasetName"
     get:
-      operationId: listProposals
+      operationId: listDatasetPullRequests
       tags: [datasets]
-      summary: List dataset proposals
+      summary: List the pull requests of a dataset
       description: Dataset pull requests, optionally filtered by status (§5.6, §10.1).
       parameters:
         - name: status
           in: query
-          description: Only return proposals in this state
           required: false
+          description: Only return pull requests in this state
           schema:
             type: string
             enum: [open, closed, merged]
@@ -525,11 +633,11 @@ paths:
         - $ref: "#/components/parameters/Amount"
       responses:
         "200":
-          description: Proposal list
+          description: Pull request list
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProposalList"
+                $ref: "#/components/schemas/DatasetPullRequestList"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -541,26 +649,28 @@ paths:
         "501":
           $ref: "#/components/responses/NotImplemented"
     post:
-      operationId: createProposal
+      operationId: createPullRequest
       tags: [datasets]
-      summary: Open a dataset proposal
+      summary: Open a dataset pull request
       description: |
         Materialises the definition on the hidden preview branch `_proposal-<id>` so reviewers
-        can browse the actual data, and records the proposal (§5.6). Base version is the current
-        `latest_version`.
+        can browse the actual data, and records the pull request (§5.6). Base version is the
+        current `latest_version`; for a dataset that does not exist yet it is 0 and the
+        dataset is created when the pull request is merged. Requires
+        `dataset:UpdateDataset`.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/ProposalCreateRequest"
+              $ref: "#/components/schemas/DatasetPullRequestCreate"
       responses:
         "201":
-          description: Proposal created
+          description: Pull request created
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Proposal"
+                $ref: "#/components/schemas/DatasetPullRequest"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -576,22 +686,22 @@ paths:
         "501":
           $ref: "#/components/responses/NotImplemented"
 
-  /{dataset}/proposals/{id}:
+  /{dataset}/pulls/{pullRequest}:
     parameters:
       - $ref: "#/components/parameters/DatasetName"
-      - $ref: "#/components/parameters/ProposalID"
+      - $ref: "#/components/parameters/PullRequestID"
     get:
-      operationId: getProposal
+      operationId: getPullRequest
       tags: [datasets]
-      summary: Get a dataset proposal
+      summary: Get a dataset pull request
       description: Includes the definition and data diff summaries against `latest`.
       responses:
         "200":
-          description: Proposal
+          description: Pull request
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Proposal"
+                $ref: "#/components/schemas/DatasetPullRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -601,26 +711,26 @@ paths:
         "501":
           $ref: "#/components/responses/NotImplemented"
     patch:
-      operationId: updateProposal
+      operationId: updatePullRequest
       tags: [datasets]
-      summary: Update or close a proposal
+      summary: Update a dataset pull request
       description: |
-        Updates title, description or definition, or closes the proposal with `status: closed`.
-        The author needs `datasets:CreateProposal`; another principal publishing on the author's
-        behalf needs `datasets:PublishVersion` (§10.1).
+        Updates the title, description or definition. `status: closed` still closes the pull
+        request, exactly like `DELETE`; the documented way to close is `DELETE`. Requires
+        `dataset:UpdateDataset`.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/ProposalUpdateRequest"
+              $ref: "#/components/schemas/DatasetPullRequestUpdate"
       responses:
         "200":
-          description: Updated proposal
+          description: Updated pull request
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Proposal"
+                $ref: "#/components/schemas/DatasetPullRequest"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -633,32 +743,76 @@ paths:
           $ref: "#/components/responses/Conflict"
         "501":
           $ref: "#/components/responses/NotImplemented"
+    delete:
+      operationId: closePullRequest
+      tags: [datasets]
+      summary: Close a dataset pull request
+      description: |
+        Closes the pull request and deletes its preview branch without publishing anything
+        (§5.6). A pull request that is already closed or merged answers `409`.
+      responses:
+        "204":
+          description: Pull request closed
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
 
-  /{dataset}/proposals/{id}/merge:
+  /{dataset}/pulls/{pullRequest}/diff:
     parameters:
       - $ref: "#/components/parameters/DatasetName"
-      - $ref: "#/components/parameters/ProposalID"
-    post:
-      operationId: mergeProposal
+      - $ref: "#/components/parameters/PullRequestID"
+    get:
+      operationId: getPullRequestDiff
       tags: [datasets]
-      summary: Merge a proposal
+      summary: Diff a dataset pull request against latest
       description: |
-        Publishing the proposal's definition deletes the preview branch and closes the proposal
-        (§5.6). Requires `base_version == latest_version`; otherwise `409` ("rebase required").
-        The source-read check runs again for the merging principal (§9.3).
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/ProposalMergeRequest"
+        The structural diff (§10.3) between the dataset's `latest` and the definition the pull
+        request proposes.
       responses:
-        "201":
-          description: Proposal merged; new version published
+        "200":
+          description: Pull request definition diff
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Version"
+                $ref: "#/components/schemas/DatasetDiff"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /{dataset}/pulls/{pullRequest}/merge:
+    parameters:
+      - $ref: "#/components/parameters/DatasetName"
+      - $ref: "#/components/parameters/PullRequestID"
+    post:
+      operationId: mergePullRequest
+      tags: [datasets]
+      summary: Merge a dataset pull request
+      description: |
+        Publishing the pull request's definition deletes the preview branch and closes the
+        pull request (§5.6). Requires `base_version == latest_version`; otherwise `409`
+        ("rebase required"). A pull request opened before its dataset existed creates the
+        dataset on merge; if the name is taken by then the merge answers `409` and the pull
+        request reports `conflicted: true`. The source-read check runs again for the merging
+        principal (§9.3). The request has no body.
+      responses:
+        "200":
+          description: Pull request merged; the new version was published
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatasetPullRequestMerge"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -814,7 +968,16 @@ components:
       name: version
       in: path
       required: true
-      description: "`vN`, `N` or `latest`"
+      description: "`vN` or `latest`"
+      schema:
+        type: string
+        pattern: "^(latest|[vV]?[0-9]{1,9})$"
+
+    Ref:
+      name: ref
+      in: path
+      required: true
+      description: "`vN` or `latest`"
       schema:
         type: string
         pattern: "^(latest|[vV]?[0-9]{1,9})$"
@@ -823,25 +986,25 @@ components:
       name: leftRef
       in: path
       required: true
-      description: "`vN`, `latest` or `proposal-<id>`"
+      description: "`vN`, `latest` or `pr/<id>`"
       schema:
         type: string
-        pattern: "^(latest|[vV]?[0-9]{1,9}|proposal-[0-9A-Za-z]+)$"
+        pattern: "^(latest|[vV]?[0-9]{1,9}|pr/[0-9A-Za-z]+|proposal-[0-9A-Za-z]+)$"
 
     RightRef:
       name: rightRef
       in: path
       required: true
-      description: "`vN`, `latest` or `proposal-<id>`"
+      description: "`vN`, `latest` or `pr/<id>`"
       schema:
         type: string
-        pattern: "^(latest|[vV]?[0-9]{1,9}|proposal-[0-9A-Za-z]+)$"
+        pattern: "^(latest|[vV]?[0-9]{1,9}|pr/[0-9A-Za-z]+|proposal-[0-9A-Za-z]+)$"
 
-    ProposalID:
-      name: id
+    PullRequestID:
+      name: pullRequest
       in: path
       required: true
-      description: Proposal identifier (ULID)
+      description: Pull request identifier (ULID)
       schema:
         type: string
         pattern: "^[0-9A-Za-z]{1,64}$"
@@ -951,7 +1114,7 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     NotFound:
-      description: The dataset, version, proposal, task, metadata key or source repository was not found.
+      description: The dataset, version, pull request, task, metadata key or source repository was not found.
       content:
         application/json:
           schema:
@@ -959,7 +1122,7 @@ components:
     Conflict:
       description: |
         The name is unavailable, the version conflicts (`expected_version`, concurrent publish,
-        no changes), the proposal base is stale, or a required metadata key change is invalid
+        no changes), the pull request base is stale, or a required metadata key change is invalid
         (`type` change). A name clash never says whether the name is held by a dataset or by a
         plain repository (SEC-7).
       content:
@@ -1163,37 +1326,68 @@ components:
 
     Dataset:
       type: object
+      description: |
+        One dataset (§10.1). `id` is the dataset name and `creation_date` is Unix epoch
+        seconds. `version` is the latest published version, absent (or 0) when nothing was
+        published yet. `definition` carries the per-item source-resolution status.
       required:
-        - name
-        - created_at
-        - created_by
-        - latest_version
-        - state
+        - id
+        - creation_date
       properties:
-        name:
+        id:
           type: string
           pattern: "^[a-z0-9][a-z0-9-]{2,62}$"
           maxLength: 63
         description:
           type: string
           maxLength: 4096
-        created_at:
+        creation_date:
           type: integer
           format: int64
-          description: Unix epoch milliseconds
+          description: Unix epoch seconds
+        version:
+          type: integer
+          description: Latest published version; 0 when no version was published yet
+        definition:
+          $ref: "#/components/schemas/DatasetDefinitionState"
+        # --- extensions of this implementation ---
         created_by:
           type: string
-        latest_version:
-          type: integer
-          description: 0 when no version was published yet
         state:
           type: string
           enum: [creating, active, publishing, deleting, degraded]
-        definition:
-          $ref: "#/components/schemas/DatasetDefinition"
         stats:
           $ref: "#/components/schemas/DatasetStats"
 
+    DatasetDefinitionState:
+      type: object
+      description: |
+        The definition of a dataset version plus the per-item source-resolution status. The
+        status tells a consumer which items it cannot read and why, without failing the read.
+      properties:
+        format_version:
+          type: integer
+        description:
+          type: string
+        metadata:
+          $ref: "#/components/schemas/DatasetMetadata"
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/DataItemState"
+
+    DataItemState:
+      description: |
+        A data item plus its source-resolution status: `ok`, `source_repo_unavailable` (the
+        source repository is gone), `source_ref_unavailable` (the pinned ref is gone) or
+        `caller_unauthorized` (the caller cannot read the source).
+      allOf:
+        - $ref: "#/components/schemas/DataItem"
+        - type: object
+          properties:
+            status:
+              type: string
+              enum: [ok, source_repo_unavailable, source_ref_unavailable, caller_unauthorized]
     DatasetList:
       type: object
       required:
@@ -1241,38 +1435,39 @@ components:
           type: integer
           format: int64
 
-    Version:
+    DatasetVersion:
       type: object
       description: One immutable dataset version (§5.3).
       required:
-        - version
-        - commit_id
-        - published_at
-        - publisher
+        - id
+        - author
+        - creation_date
       properties:
-        version:
-          type: integer
-          minimum: 1
+        id:
+          type: string
+          description: Version id, `v<N>`
+          pattern: "^v[0-9]{1,9}$"
         message:
           type: string
-        publisher:
+        author:
           type: string
-        published_at:
+        creation_date:
           type: integer
           format: int64
-          description: Unix epoch milliseconds
+          description: Unix epoch seconds
+        # --- extensions of this implementation ---
         commit_id:
           type: string
           description: Commit in the dataset repository
         proposal_id:
           type: string
-          description: Set when the version was published by merging a proposal
+          description: Set when the version was published by merging a pull request
         definition:
           $ref: "#/components/schemas/DatasetDefinition"
         stats:
           $ref: "#/components/schemas/DatasetStats"
 
-    VersionList:
+    DatasetVersionList:
       type: object
       required:
         - results
@@ -1281,70 +1476,76 @@ components:
         results:
           type: array
           items:
-            $ref: "#/components/schemas/Version"
+            $ref: "#/components/schemas/DatasetVersion"
         pagination:
           $ref: "#/components/schemas/Pagination"
-
     StringChange:
       type: object
       required:
-        - from
-        - to
+        - left
+        - right
       properties:
-        from:
+        left:
           type: string
-        to:
+        right:
           type: string
 
     MetadataChange:
       type: object
       required:
+        - type
         - key
-        - change
       properties:
-        key:
-          type: string
-        change:
+        type:
           type: string
           enum: [added, removed, changed]
-        from:
-          description: Previous value (absent when added)
-        to:
-          description: New value (absent when removed)
+        key:
+          type: string
+        left:
+          type: array
+          items:
+            type: string
+          description: Values on the left side (absent when added)
+        right:
+          type: array
+          items:
+            type: string
+          description: Values on the right side (absent when removed)
 
     ItemChange:
       type: object
       required:
+        - type
         - target
-        - change
       properties:
-        target:
-          type: string
-        change:
+        type:
           type: string
           enum: [added, removed, changed]
-        from:
+        target:
+          type: string
+        left:
           $ref: "#/components/schemas/DataItem"
-        to:
+        right:
           $ref: "#/components/schemas/DataItem"
 
-    DefinitionDiff:
+    DatasetDiff:
       type: object
       description: Structural diff of two resolved definitions, matched by `target` (§10.3).
       required:
-        - items
+        - data
       properties:
+        format_version:
+          type: integer
         description:
           $ref: "#/components/schemas/StringChange"
         metadata:
           type: array
           items:
             $ref: "#/components/schemas/MetadataChange"
-        items:
+        data:
           type: array
           items:
             $ref: "#/components/schemas/ItemChange"
-
     DataDiffEntry:
       type: object
       description: One entry of a data diff; same shape as the core API diff (§10.2).
@@ -1375,28 +1576,26 @@ components:
         pagination:
           $ref: "#/components/schemas/Pagination"
 
-    Proposal:
+    DatasetPullRequest:
       type: object
       description: A dataset pull request (§5.6).
       required:
         - id
         - dataset
-        - base_version
         - title
         - author
         - status
-        - created_at
-        - preview_branch
+        - base_version
+        - latest_version
+        - stale
+        - conflicted
+        - source_ref
+        - creation_date
       properties:
         id:
           type: string
         dataset:
           type: string
-        base_version:
-          type: integer
-          description: Version the proposal was made against; merging requires it to be latest
-        definition:
-          $ref: "#/components/schemas/DatasetDefinition"
         title:
           type: string
           maxLength: 256
@@ -1408,14 +1607,34 @@ components:
         status:
           type: string
           enum: [open, closed, merged]
-        created_at:
+        base_version:
+          type: integer
+          description: Version the pull request was made against; merging requires it to be latest
+        latest_version:
+          type: integer
+          description: Latest version of the dataset at read time (0 when it does not exist)
+        stale:
+          type: boolean
+          description: base_version differs from latest_version, so the pull request must be updated first
+        conflicted:
+          type: boolean
+          description: |
+            The dataset's name is unavailable (a pull request opened before the dataset
+            existed, and the name has since been taken). Merging it answers 409.
+        source_ref:
+          type: string
+          description: The ref the pull request is materialised on, `pr/<id>`
+        creation_date:
           type: integer
           format: int64
-          description: Unix epoch milliseconds
-        closed_at:
+          description: Unix epoch seconds
+        closed_date:
           type: integer
           format: int64
-          description: Unix epoch milliseconds; set when closed or merged
+          description: Unix epoch seconds; set when closed or merged
+        # --- extensions of this implementation ---
+        definition:
+          $ref: "#/components/schemas/DatasetDefinition"
         merged_version:
           type: integer
           description: Version produced by the merge
@@ -1423,11 +1642,11 @@ components:
           type: string
           description: Hidden branch `_proposal-<id>` holding the materialised definition
         diff:
-          $ref: "#/components/schemas/DefinitionDiff"
+          $ref: "#/components/schemas/DatasetDiff"
         data_diff:
           $ref: "#/components/schemas/DataDiffList"
 
-    ProposalList:
+    DatasetPullRequestList:
       type: object
       required:
         - results
@@ -1436,10 +1655,23 @@ components:
         results:
           type: array
           items:
-            $ref: "#/components/schemas/Proposal"
+            $ref: "#/components/schemas/DatasetPullRequest"
         pagination:
           $ref: "#/components/schemas/Pagination"
 
+    DatasetPullRequestMerge:
+      type: object
+      description: The result of merging a pull request (§5.6).
+      required:
+        - version
+        - reference
+      properties:
+        version:
+          type: integer
+          description: Version produced by the merge
+        reference:
+          type: string
+          description: The dataset ref the merge produced, `v<N>`
     MetadataKey:
       type: object
       description: A typed metadata key (§5.5).
@@ -1684,6 +1916,23 @@ components:
         publish:
           $ref: "#/components/schemas/PublishOptions"
 
+    DatasetUpdate:
+      type: object
+      description: "Body of `PUT /datasets/{dataset}` (§10.1): a new definition and its publish message."
+      required:
+        - definition
+        - publish
+      properties:
+        definition:
+          $ref: "#/components/schemas/DatasetDefinition"
+        publish:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
+              maxLength: 4096
     PublishOptions:
       type: object
       properties:
@@ -1728,7 +1977,7 @@ components:
         stats:
           $ref: "#/components/schemas/DatasetStats"
 
-    ProposalCreateRequest:
+    DatasetPullRequestCreate:
       type: object
       required:
         - definition
@@ -1743,9 +1992,9 @@ components:
           type: string
           maxLength: 4096
 
-    ProposalUpdateRequest:
+    DatasetPullRequestUpdate:
       type: object
-      description: "Partial update; `status: closed` closes the proposal (§10.1)."
+      description: "Partial update; `status: closed` closes the pull request (§10.1)."
       properties:
         title:
           type: string
@@ -1758,10 +2007,3 @@ components:
         status:
           type: string
           enum: [closed]
-
-    ProposalMergeRequest:
-      type: object
-      properties:
-        message:
-          type: string
-          maxLength: 4096

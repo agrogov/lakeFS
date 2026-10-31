@@ -43,7 +43,7 @@ const DatasetNamePattern = `^[a-z0-9][a-z0-9-]{2,62}$`
 var datasetNameRegexp = regexp.MustCompile(DatasetNamePattern)
 
 // reservedNames are names that pass DatasetNamePattern but may not be used as
-// dataset names (§5.2 rule 1). "config" and "metadata" collide with the
+// dataset names (§5.2 rule 1). "config", "metadata" and "pulls" collide with the
 // control-plane routes of §10.1, which are siblings of /datasets/{ds}; "_datasets"
 // is the KV partition of §5.3 and "_dataset" the reserved in-repository directory
 // of §6.4. The two underscore names can never match DatasetNamePattern today;
@@ -52,6 +52,7 @@ var datasetNameRegexp = regexp.MustCompile(DatasetNamePattern)
 var reservedNames = map[string]struct{}{
 	"config":    {},
 	"metadata":  {},
+	"pulls":     {},
 	"_datasets": {},
 	"_dataset":  {},
 }

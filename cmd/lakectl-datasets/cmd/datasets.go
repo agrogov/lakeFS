@@ -104,12 +104,12 @@ func runList(cmd *cobra.Command, options listOptions) error {
 			stats = formatStats(dataset.Stats)
 		}
 		rows[i] = []any{
-			dataset.Name,
+			dataset.Id,
 			derefString(dataset.Description),
-			formatVersion(dataset.LatestVersion),
-			dataset.State,
+			formatVersion(derefInt(dataset.Version)),
+			derefString(dataset.State),
 			stats,
-			formatMillis(dataset.CreatedAt),
+			formatSeconds(dataset.CreationDate),
 		}
 	}
 	printTable(cmd,
@@ -125,7 +125,7 @@ func runList(cmd *cobra.Command, options listOptions) error {
 // showOptions is the parsed command line of `datasets show`.
 type showOptions struct {
 	Dataset string
-	// Version is empty when the dataset record itself is shown, `latest`/`vN`/`N`/`proposal-<id>`
+	// Version is empty when the dataset record itself is shown, `latest`/`vN`/`N`/`pr/<id>`
 	// when one version is shown.
 	Version string
 	Output  outputFormat
@@ -647,16 +647,16 @@ func runVersions(cmd *cobra.Command, options versionsOptions) error {
 	rows := make([][]any, len(versions))
 	for i, version := range versions {
 		rows[i] = []any{
-			formatVersion(version.Version),
+			version.Id,
 			derefString(version.Message),
-			version.Publisher,
-			formatMillis(version.PublishedAt),
-			version.CommitId,
+			version.Author,
+			formatSeconds(version.CreationDate),
+			derefString(version.CommitId),
 			formatStats(version.Stats),
 		}
 	}
 	printTable(cmd,
-		[]any{"Version", "Message", "Publisher", "Published At", "Commit ID", "Data"},
+		[]any{"Version", "Message", "Author", "Creation Date", "Commit ID", "Data"},
 		rows, resp.JSON200.Pagination, options.Amount)
 	return nil
 }
@@ -783,7 +783,7 @@ func runDiff(cmd *cobra.Command, options diffOptions) error {
 		printDataDiff(cmd, diff, options.Amount)
 		return nil
 	}
-	var diff apigen.DefinitionDiff
+	var diff apigen.DatasetDiff
 	if err := json.Unmarshal(resp.Body, &diff); err != nil {
 		return fmt.Errorf("invalid definition diff response: %w", err)
 	}

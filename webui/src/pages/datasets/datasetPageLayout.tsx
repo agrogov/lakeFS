@@ -21,11 +21,11 @@ export const DATASET_PAGES = [
     { key: 'data', label: 'Data', icon: FileDirectoryIcon },
     { key: 'versions', label: 'Versions', icon: HistoryIcon },
     { key: 'compare', label: 'Compare', icon: DiffIcon },
-    { key: 'proposals', label: 'Pull Requests', icon: GitPullRequestIcon },
+    { key: 'pulls', label: 'Pull Requests', icon: GitPullRequestIcon },
     { key: 'access', label: 'Access', icon: ShieldIcon },
 ] as const;
 
-/** The dataset page a pathname points at; nested proposal routes belong to `proposals`. */
+/** The dataset page a pathname points at; nested pull-request routes belong to `pulls`. */
 export const datasetPageForPath = (pathname: string): string => {
     const match = /^\/datasets\/[^/]+\/([^/]+)/.exec(pathname);
     return match ? match[1] : 'overview';

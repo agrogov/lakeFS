@@ -35,7 +35,7 @@ const resolveGroupName = (group: { id: string; name?: string }) => group.name ||
  * Access of one dataset (DATASETS_DESIGN.md §11.2, §9.2): the users and groups that were granted
  * consumer read access, and the controls to grant and revoke it.
  *
- * The page is rendered only for a caller holding `datasets:ManageAccess`; a `403` from the list
+ * The page is rendered only for a caller holding `dataset:ManageAccess`; a `403` from the list
  * is treated exactly like the policy check saying no, so both paths show the same explanation
  * rather than an error.
  */

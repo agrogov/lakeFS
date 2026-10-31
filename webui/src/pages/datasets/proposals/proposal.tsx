@@ -9,11 +9,11 @@ import dayjs from 'dayjs';
 import relativeTime from 'dayjs/plugin/relativeTime';
 import { AlertIcon, GitMergeIcon, SyncIcon, XCircleIcon } from '@primer/octicons-react';
 
-import { Dataset, DefinitionDiff, Proposal, Version, datasets, isRebaseRequiredError } from '../../../lib/api/datasets';
+import { Dataset, DefinitionDiff, Proposal, datasets, isRebaseRequiredError } from '../../../lib/api/datasets';
 import { AlertError, Loading } from '../../../lib/components/controls';
 import { DefinitionDiffTable } from '../../../lib/components/datasets/definitionDiffTable';
 import { DataDiffTable } from '../../../lib/components/datasets/dataDiffTable';
-import { DATASETS_PUBLISH_ACTION, datasetResource, useCan } from '../../../lib/components/datasets/hooks';
+import { DATASETS_UPDATE_ACTION, datasetResource, useCan } from '../../../lib/components/datasets/hooks';
 import { ProposalStatusBadge } from '../../../lib/components/datasets/proposals';
 import { Link } from '../../../lib/components/nav';
 import { useAPI } from '../../../lib/hooks/api';
@@ -77,7 +77,7 @@ export const ProposalConflictBanner: FC<{
                     disabled={updating}
                 >
                     <SyncIcon className="me-1" />
-                    {updating ? 'Updating…' : 'Update proposal'}
+                    {updating ? 'Updating…' : 'Update pull request'}
                 </Button>
             </div>
         </div>
@@ -101,7 +101,7 @@ const ProposalHeader: FC<{ datasetId: string; proposal: Proposal }> = ({ dataset
             {proposal.description && <p className="text-muted mt-2 mb-0">{proposal.description}</p>}
             <div className="text-muted small mt-2 dataset-proposal-origin">
                 Opened by <strong>{proposal.author}</strong>{' '}
-                <span title={dayjs(proposal.created_at).toISOString()}>{dayjs(proposal.created_at).fromNow()}</span>
+                <span title={dayjs.unix(proposal.creation_date).toISOString()}>{dayjs.unix(proposal.creation_date).fromNow()}</span>
                 <span className="mx-2">&middot;</span>
                 Based on <code>v{proposal.base_version}</code>
                 {proposal.status === 'merged' && proposal.merged_version !== undefined && (
@@ -110,12 +110,12 @@ const ProposalHeader: FC<{ datasetId: string; proposal: Proposal }> = ({ dataset
                         Merged as <code>v{proposal.merged_version}</code>
                     </>
                 )}
-                {proposal.closed_at !== undefined && (
+                {proposal.closed_date !== undefined && (
                     <>
                         <span className="mx-2">&middot;</span>
                         Closed{' '}
-                        <span title={dayjs(proposal.closed_at).toISOString()}>
-                            {dayjs(proposal.closed_at).fromNow()}
+                        <span title={dayjs.unix(proposal.closed_date).toISOString()}>
+                            {dayjs.unix(proposal.closed_date).fromNow()}
                         </span>
                     </>
                 )}
@@ -128,7 +128,7 @@ const ProposalHeader: FC<{ datasetId: string; proposal: Proposal }> = ({ dataset
  * One pull request of a dataset (DATASETS_DESIGN.md §11.2, §5.6): the definition diff, the data
  * diff, a link to the preview branch (`data?ref=_proposal-<id>`) and the merge / close actions.
  *
- * Merge is offered only to a caller holding `datasets:PublishVersion`, because merging is a
+ * Merge is offered only to a caller holding `dataset:UpdateDataset`, because merging is a
  * publish (§5.6). The refusal case is surfaced as the rebase banner rather than as a generic
  * failure, and the banner is also shown up front when `base_version` is already behind
  * `latest_version` - the button would only produce that same `409`.
@@ -153,11 +153,11 @@ const DatasetProposalPage: FC = () => {
         loading: proposalLoading,
         error: proposalError,
         refetch: refetchProposal,
-    } = useAPI(() => datasets.getProposal(datasetId, proposalId), [datasetId, proposalId]);
+    } = useAPI(() => datasets.getPullRequest(datasetId, proposalId), [datasetId, proposalId]);
 
     const dataset = datasetResponse as Dataset | null;
     const proposal = proposalResponse as Proposal | null;
-    const canPublish = useCan(DATASETS_PUBLISH_ACTION, datasetResource(datasetId));
+    const canPublish = useCan(DATASETS_UPDATE_ACTION, datasetResource(datasetId));
 
     if (datasetLoading || proposalLoading) return <Loading />;
     if (datasetError || proposalError) {
@@ -165,7 +165,7 @@ const DatasetProposalPage: FC = () => {
     }
     if (!proposal) return <AlertError error={new Error(`Pull request "${proposalId}" was not found`)} />;
 
-    const latestVersion = dataset?.latest_version ?? proposal.base_version;
+    const latestVersion = dataset?.version ?? proposal.latest_version;
     // The record's own staleness, or the latest_version the refused merge reported (which may be
     // newer than what this page loaded, if a publish happened meanwhile).
     const recordConflict: ProposalConflict | null =
@@ -180,9 +180,9 @@ const DatasetProposalPage: FC = () => {
         setActionError(null);
         setNotice(null);
         try {
-            const version = (await datasets.mergeProposal(datasetId, proposalId)) as Version;
+            const merged = await datasets.mergePullRequest(datasetId, proposalId);
             setConflict(null);
-            setNotice(`Merged as v${version.version}`);
+            setNotice(`Merged as ${merged.reference}`);
             refetchProposal();
             refetchDataset();
         } catch (error) {
@@ -204,7 +204,7 @@ const DatasetProposalPage: FC = () => {
         setActionError(null);
         setNotice(null);
         try {
-            await datasets.updateProposal(datasetId, proposalId, { status: 'closed' });
+            await datasets.closePullRequest(datasetId, proposalId);
             setConflict(null);
             refetchProposal();
             refetchDataset();
@@ -221,7 +221,7 @@ const DatasetProposalPage: FC = () => {
         setBusy('update');
         setActionError(null);
         try {
-            await datasets.updateProposal(datasetId, proposalId, {});
+            await datasets.updatePullRequest(datasetId, proposalId, {});
             setConflict(null);
             setNotice('Pull request updated against the latest version');
             refetchProposal();
@@ -276,7 +276,7 @@ const DatasetProposalPage: FC = () => {
                                 disabled={busy !== null || !canPublish || shownConflict !== null}
                                 title={
                                     !canPublish
-                                        ? 'Merging a pull request publishes a version (datasets:PublishVersion)'
+                                        ? 'Merging a pull request publishes a version (dataset:UpdateDataset)'
                                         : shownConflict
                                           ? 'Rebase the pull request before merging'
                                           : undefined

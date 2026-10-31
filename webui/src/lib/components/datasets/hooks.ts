@@ -7,8 +7,10 @@ import {
     Version,
     VersionList,
     datasets,
+    definitionOf,
     getDatasetNames,
     isDatasetsDisabledError,
+    versionNumber,
 } from '../../api/datasets';
 import { useAPI } from '../../hooks/api';
 import { VersionSelection, normaliseSelection, selectionToVersion } from './versions';
@@ -68,16 +70,27 @@ const fetchDatasetNames = async (): Promise<Set<string>> => getDatasetNames();
 // Permissions
 // ---------------------------------------------------------------------------
 
-export const DATASETS_CREATE_ACTION = 'datasets:CreateDataset';
-export const DATASETS_PUBLISH_ACTION = 'datasets:PublishVersion';
-export const DATASETS_MANAGE_ACCESS_ACTION = 'datasets:ManageAccess';
-export const DATASETS_MANAGE_METADATA_KEYS_ACTION = 'datasets:ManageMetadataKeys';
+// The `dataset:*` actions of the public RBAC table (DOC-1, DOC-2). Metadata-key operations are
+// authorized on the datasets namespace, `arn:lakefs:dataset:::dataset/*`, not on a key ARN.
+export const DATASETS_CREATE_ACTION = 'dataset:CreateDataset';
+export const DATASETS_UPDATE_ACTION = 'dataset:UpdateDataset';
+export const DATASETS_MANAGE_ACCESS_ACTION = 'dataset:ManageAccess';
+export const DATASETS_LIST_METADATA_KEYS_ACTION = 'dataset:ListMetadataKeys';
+export const DATASETS_READ_METADATA_KEY_ACTION = 'dataset:ReadMetadataKey';
+export const DATASETS_CREATE_METADATA_KEY_ACTION = 'dataset:CreateMetadataKey';
+export const DATASETS_UPDATE_METADATA_KEY_ACTION = 'dataset:UpdateMetadataKey';
+export const DATASETS_DELETE_METADATA_KEY_ACTION = 'dataset:DeleteMetadataKey';
+/** Kept for callers that gate the whole metadata-key screen. */
+export const DATASETS_MANAGE_METADATA_KEYS_ACTION = DATASETS_CREATE_METADATA_KEY_ACTION;
 
-/** The `§9.1` ARN of one dataset: `arn:lakefs:datasets:::dataset/<name>`. */
-export const datasetResource = (name: string): string => `arn:lakefs:datasets:::dataset/${name}`;
+/** The `§9.1` ARN of one dataset: `arn:lakefs:dataset:::dataset/<name>`. */
+export const datasetResource = (name: string): string => `arn:lakefs:dataset:::dataset/${name}`;
 
-/** The `§9.1` ARN of one metadata key: `arn:lakefs:datasets:::metadata-key/<key>`. */
-export const metadataKeyResource = (key: string): string => `arn:lakefs:datasets:::metadata-key/${key}`;
+/** The `§9.1` ARN metadata-key operations are authorized on: `arn:lakefs:dataset:::dataset/*`. */
+export const METADATA_KEY_RESOURCE = datasetResource('*');
+
+/** The ARN of one metadata key, kept for display; authorization uses `METADATA_KEY_RESOURCE`. */
+export const metadataKeyResource = (_key: string): string => METADATA_KEY_RESOURCE;
 
 /** Policy shape returned by `GET /auth/users/{id}/policies?effective=true`. */
 interface PolicyStatementLike {
@@ -92,10 +105,10 @@ interface PolicyLike {
 
 /**
  * A concrete dataset ARN used to resolve wildcard resources such as `*` or
- * `arn:lakefs:datasets:::dataset/*` when the question is "may this user create *a* dataset".
+ * `arn:lakefs:dataset:::dataset/*` when the question is "may this user create *a* dataset".
  * Names are validated by the server; the placeholder is only ever matched, never created.
  */
-const SAMPLE_DATASET_ARN = 'arn:lakefs:datasets:::dataset/sample';
+const SAMPLE_DATASET_ARN = 'arn:lakefs:dataset:::dataset/sample';
 
 /** Glob matching for ARNs and actions (`*` matches any run of characters), as the server does. */
 export const globMatch = (pattern: string, value: string): boolean => {
@@ -145,7 +158,7 @@ export interface PermissionState {
 }
 
 /**
- * `datasets:<action>` on one resource, from the user's effective policies.
+ * `dataset:<action>` on one resource, from the user's effective policies.
  *
  * This only decides what the UI *offers*; the control plane re-checks every permission and
  * answers `403` regardless. A failure to read the policies counts as "allowed" for the same
@@ -200,7 +213,7 @@ export const useDatasetVersions = (name: string) => {
 };
 
 /** The version numbers of `useDatasetVersions`, newest first, for the version pickers. */
-export const versionNumbers = (versions: Version[]): number[] => versions.map((version) => version.version);
+export const versionNumbers = (versions: Version[]): number[] => versions.map((version) => versionNumber(version));
 
 export interface DatasetVersionState {
     dataset: Dataset | null;
@@ -232,19 +245,19 @@ export const useDatasetVersion = (name: string, requested: VersionSelection): Da
     const { dataset, loading: datasetLoading, error: datasetError } = useDataset(name);
     const { versions, loading: versionsLoading, error: versionsError } = useDatasetVersions(name);
 
-    const latest = dataset?.latest_version ?? 0;
+    const latest = dataset?.version ?? 0;
     const selection = normaliseSelection(requested, latest);
     const wanted = selectionToVersion(selection);
     const version =
-        wanted === null ? (versions[0] ?? null) : (versions.find((candidate) => candidate.version === wanted) ?? null);
+        wanted === null ? (versions[0] ?? null) : (versions.find((candidate) => versionNumber(candidate) === wanted) ?? null);
 
     return {
         dataset,
         versions,
         version,
         selection,
-        versionNumber: version?.version ?? latest,
-        definition: version?.definition ?? dataset?.definition,
+        versionNumber: version ? versionNumber(version) : latest,
+        definition: version?.definition ?? definitionOf(dataset?.definition),
         stats: version?.stats ?? dataset?.stats,
         loading: datasetLoading || versionsLoading,
         error: datasetError ?? versionsError,

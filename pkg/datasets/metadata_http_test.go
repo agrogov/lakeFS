@@ -143,6 +143,7 @@ func TestDatasetsHTTPConfig(t *testing.T) {
 // TestMetadataIsReservedDatasetName: "metadata" collides with the /metadata routes.
 func TestMetadataIsReservedDatasetName(t *testing.T) {
 	require.True(t, IsReservedName("metadata"))
+	require.True(t, IsReservedName("pulls"))
 	require.False(t, IsReservedName("metadata-keys"))
 	handler, deps, accessKey, secret := newControlPlaneWithDeps(t)
 	commit := seedHandlerSource(t, deps.Catalog)

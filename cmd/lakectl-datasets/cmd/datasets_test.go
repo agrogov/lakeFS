@@ -48,7 +48,7 @@ func TestListCommand(t *testing.T) {
 	t.Run("json output", func(t *testing.T) {
 		newFakeControlPlane(t, fakeResponse{Status: http.StatusOK, Body: listBody})
 		out := mustExecute(t, "list", "-o", "json")
-		require.Contains(t, out, `"name": "customer-360"`)
+		require.Contains(t, out, `"id": "customer-360"`)
 		require.Contains(t, out, "\n  \"results\"")
 	})
 
@@ -165,7 +165,7 @@ func TestShowCommand(t *testing.T) {
 	t.Run("json output", func(t *testing.T) {
 		newFakeControlPlane(t, fakeResponse{Status: http.StatusOK, Body: testDatasetBody})
 		out := mustExecute(t, "show", "customer-360", "-o", "json")
-		require.Contains(t, out, `"latest_version": 3`)
+		require.Contains(t, out, `"version": 3`)
 	})
 
 	t.Run("invalid version", func(t *testing.T) {
@@ -389,11 +389,11 @@ func TestVersionsCommand(t *testing.T) {
 // TestDiffCommand pins both diff modes of §10.3.
 func TestDiffCommand(t *testing.T) {
 	definitionDiffBody := `{
-	  "description": {"from": "old", "to": "new"},
-	  "metadata": [{"key": "tier", "change": "added", "to": "gold"}],
-	  "items": [
-	    {"target": "customers", "change": "added", "to": {"target": "customers", "repository": "lakehouse-repo", "ref": {"type": "commit", "id": "30f9eb1c"}, "type": "prefix", "prefix": {"path": "data/customers/"}}},
-	    {"target": "reference/countries.csv", "change": "removed", "from": {"target": "reference/countries.csv", "repository": "ref-data", "ref": {"type": "commit", "id": "a1b2c3"}, "type": "object", "object": {"path": "geo/countries.csv"}}}
+	  "description": {"left": "old", "right": "new"},
+	  "metadata": [{"type": "added", "key": "tier", "right": ["gold"]}],
+	  "data": [
+	    {"type": "added", "target": "customers", "right": {"target": "customers", "repository": "lakehouse-repo", "ref": {"type": "commit", "id": "30f9eb1c"}, "type": "prefix", "prefix": {"path": "data/customers/"}}},
+	    {"type": "removed", "target": "reference/countries.csv", "left": {"target": "reference/countries.csv", "repository": "ref-data", "ref": {"type": "commit", "id": "a1b2c3"}, "type": "object", "object": {"path": "geo/countries.csv"}}}
 	  ]
 	}`
 
@@ -428,7 +428,7 @@ func TestDiffCommand(t *testing.T) {
 	t.Run("json output", func(t *testing.T) {
 		newFakeControlPlane(t, fakeResponse{Status: http.StatusOK, Body: definitionDiffBody})
 		out := mustExecute(t, "diff", "customer-360", "v1", "v2", "-o", "json")
-		require.Contains(t, out, `"change": "added"`)
+		require.Contains(t, out, `"type": "added"`)
 	})
 
 	t.Run("invalid ref", func(t *testing.T) {

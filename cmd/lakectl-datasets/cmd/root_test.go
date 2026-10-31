@@ -16,8 +16,8 @@ func TestRootCommandTree(t *testing.T) {
 
 	// commandPaths maps each command tree of §12.1 to the subcommands it must provide.
 	commandPaths := map[string][]string{
-		"datasets":               {"list", "show", "create", "publish", "validate", "versions", "diff", "delete", "proposals", "access", "metadata-keys"},
-		"datasets proposals":     {"list", "show", "create", "merge", "close"},
+		"datasets":               {"list", "show", "create", "publish", "validate", "versions", "diff", "delete", "pulls", "access", "metadata-keys"},
+		"datasets pulls":         {"list", "show", "create", "diff", "merge", "close"},
 		"datasets access":        {"list", "grant", "revoke"},
 		"datasets metadata-keys": {"list", "create", "delete"},
 	}

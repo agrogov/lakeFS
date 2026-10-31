@@ -91,23 +91,31 @@ type DataItem struct {
 	Type   string `json:"type"`
 }
 
+// DataItemState defines model for DataItemState.
+type DataItemState struct {
+	// Embedded struct due to allOf(#/components/schemas/DataItem)
+	DataItem `yaml:",inline"`
+	// Embedded fields due to inline allOf schema
+	Status *string `json:"status,omitempty"`
+}
+
 // Dataset defines model for Dataset.
 type Dataset struct {
+	CreatedBy *string `json:"created_by,omitempty"`
 
-	// Unix epoch milliseconds
-	CreatedAt int64  `json:"created_at"`
-	CreatedBy string `json:"created_by"`
+	// Unix epoch seconds
+	CreationDate int64 `json:"creation_date"`
 
-	// The Enterprise-compatible definition format, `format_version: 1` (§5.1). Stored
-	// definitions only contain commit refs; branch and tag refs are resolved on input.
-	Definition  *DatasetDefinition `json:"definition,omitempty"`
-	Description *string            `json:"description,omitempty"`
+	// The definition of a dataset version plus the per-item source-resolution status. The
+	// status tells a consumer which items it cannot read and why, without failing the read.
+	Definition  *DatasetDefinitionState `json:"definition,omitempty"`
+	Description *string                 `json:"description,omitempty"`
+	Id          string                  `json:"id"`
+	State       *string                 `json:"state,omitempty"`
+	Stats       *DatasetStats           `json:"stats,omitempty"`
 
-	// 0 when no version was published yet
-	LatestVersion int           `json:"latest_version"`
-	Name          string        `json:"name"`
-	State         string        `json:"state"`
-	Stats         *DatasetStats `json:"stats,omitempty"`
+	// Latest published version; 0 when no version was published yet
+	Version *int `json:"version,omitempty"`
 }
 
 // DatasetCreateRequest defines model for DatasetCreateRequest.
@@ -133,6 +141,25 @@ type DatasetDefinition struct {
 	Metadata *DatasetMetadata `json:"metadata,omitempty"`
 }
 
+// DatasetDefinitionState defines model for DatasetDefinitionState.
+type DatasetDefinitionState struct {
+	Data          *[]DataItemState `json:"data,omitempty"`
+	Description   *string          `json:"description,omitempty"`
+	FormatVersion *int             `json:"format_version,omitempty"`
+
+	// Free-form dataset metadata (§5.1): string, number, boolean or array of strings.
+	// Values of defined metadata keys are validated against their type (§5.5).
+	Metadata *DatasetMetadata `json:"metadata,omitempty"`
+}
+
+// DatasetDiff defines model for DatasetDiff.
+type DatasetDiff struct {
+	Data          []ItemChange      `json:"data"`
+	Description   *StringChange     `json:"description,omitempty"`
+	FormatVersion *int              `json:"format_version,omitempty"`
+	Metadata      *[]MetadataChange `json:"metadata,omitempty"`
+}
+
 // DatasetList defines model for DatasetList.
 type DatasetList struct {
 	Pagination Pagination `json:"pagination"`
@@ -142,11 +169,107 @@ type DatasetList struct {
 // DatasetMetadata defines model for DatasetMetadata.
 type DatasetMetadata map[string]interface{}
 
+// DatasetPullRequest defines model for DatasetPullRequest.
+type DatasetPullRequest struct {
+	Author string `json:"author"`
+
+	// Version the pull request was made against; merging requires it to be latest
+	BaseVersion int `json:"base_version"`
+
+	// Unix epoch seconds; set when closed or merged
+	ClosedDate *int64 `json:"closed_date,omitempty"`
+
+	// The dataset's name is unavailable (a pull request opened before the dataset
+	// existed, and the name has since been taken). Merging it answers 409.
+	Conflicted bool `json:"conflicted"`
+
+	// Unix epoch seconds
+	CreationDate int64 `json:"creation_date"`
+
+	// Paginated data diff of the dataset repository (§10.2, §10.3).
+	DataDiff *DataDiffList `json:"data_diff,omitempty"`
+	Dataset  string        `json:"dataset"`
+
+	// The Enterprise-compatible definition format, `format_version: 1` (§5.1). Stored
+	// definitions only contain commit refs; branch and tag refs are resolved on input.
+	Definition  *DatasetDefinition `json:"definition,omitempty"`
+	Description *string            `json:"description,omitempty"`
+
+	// Structural diff of two resolved definitions, matched by `target` (§10.3).
+	Diff *DatasetDiff `json:"diff,omitempty"`
+	Id   string       `json:"id"`
+
+	// Latest version of the dataset at read time (0 when it does not exist)
+	LatestVersion int `json:"latest_version"`
+
+	// Version produced by the merge
+	MergedVersion *int `json:"merged_version,omitempty"`
+
+	// Hidden branch `_proposal-<id>` holding the materialised definition
+	PreviewBranch *string `json:"preview_branch,omitempty"`
+
+	// The ref the pull request is materialised on, `pr/<id>`
+	SourceRef string `json:"source_ref"`
+
+	// base_version differs from latest_version, so the pull request must be updated first
+	Stale  bool   `json:"stale"`
+	Status string `json:"status"`
+	Title  string `json:"title"`
+}
+
+// DatasetPullRequestCreate defines model for DatasetPullRequestCreate.
+type DatasetPullRequestCreate struct {
+
+	// The Enterprise-compatible definition format, `format_version: 1` (§5.1). Stored
+	// definitions only contain commit refs; branch and tag refs are resolved on input.
+	Definition  DatasetDefinition `json:"definition"`
+	Description *string           `json:"description,omitempty"`
+	Title       string            `json:"title"`
+}
+
+// DatasetPullRequestList defines model for DatasetPullRequestList.
+type DatasetPullRequestList struct {
+	Pagination Pagination           `json:"pagination"`
+	Results    []DatasetPullRequest `json:"results"`
+}
+
+// DatasetPullRequestMerge defines model for DatasetPullRequestMerge.
+type DatasetPullRequestMerge struct {
+
+	// The dataset ref the merge produced, `v<N>`
+	Reference string `json:"reference"`
+
+	// Version produced by the merge
+	Version int `json:"version"`
+}
+
+// DatasetPullRequestUpdate defines model for DatasetPullRequestUpdate.
+type DatasetPullRequestUpdate struct {
+
+	// The Enterprise-compatible definition format, `format_version: 1` (§5.1). Stored
+	// definitions only contain commit refs; branch and tag refs are resolved on input.
+	Definition  *DatasetDefinition `json:"definition,omitempty"`
+	Description *string            `json:"description,omitempty"`
+	Status      *string            `json:"status,omitempty"`
+	Title       *string            `json:"title,omitempty"`
+}
+
 // DatasetStats defines model for DatasetStats.
 type DatasetStats struct {
 	Bytes   int64       `json:"bytes"`
 	Items   []ItemStats `json:"items"`
 	Objects int64       `json:"objects"`
+}
+
+// DatasetUpdate defines model for DatasetUpdate.
+type DatasetUpdate struct {
+
+	// The Enterprise-compatible definition format, `format_version: 1` (§5.1). Stored
+	// definitions only contain commit refs; branch and tag refs are resolved on input.
+	Definition DatasetDefinition `json:"definition"`
+	Publish    struct {
+		Message string `json:"message"`
+	} `json:"publish"`
 }
 
 // DatasetValidateRequest defines model for DatasetValidateRequest.
@@ -166,6 +289,35 @@ type DatasetValidateResponse struct {
 	Stats      *DatasetStats     `json:"stats,omitempty"`
 }
 
+// DatasetVersion defines model for DatasetVersion.
+type DatasetVersion struct {
+	Author string `json:"author"`
+
+	// Commit in the dataset repository
+	CommitId *string `json:"commit_id,omitempty"`
+
+	// Unix epoch seconds
+	CreationDate int64 `json:"creation_date"`
+
+	// The Enterprise-compatible definition format, `format_version: 1` (§5.1). Stored
+	// definitions only contain commit refs; branch and tag refs are resolved on input.
+	Definition *DatasetDefinition `json:"definition,omitempty"`
+
+	// Version id, `v<N>`
+	Id      string  `json:"id"`
+	Message *string `json:"message,omitempty"`
+
+	// Set when the version was published by merging a pull request
+	ProposalId *string       `json:"proposal_id,omitempty"`
+	Stats      *DatasetStats `json:"stats,omitempty"`
+}
+
+// DatasetVersionList defines model for DatasetVersionList.
+type DatasetVersionList struct {
+	Pagination Pagination       `json:"pagination"`
+	Results    []DatasetVersion `json:"results"`
+}
+
 // DatasetsConfig defines model for DatasetsConfig.
 type DatasetsConfig struct {
 	AccessModel           *string `json:"access_model,omitempty"`
@@ -173,13 +325,6 @@ type DatasetsConfig struct {
 	MaxItems              *int    `json:"max_items,omitempty"`
 	StorageId             *string `json:"storage_id,omitempty"`
 	SyncPublishMaxObjects *int64  `json:"sync_publish_max_objects,omitempty"`
-}
-
-// DefinitionDiff defines model for DefinitionDiff.
-type DefinitionDiff struct {
-	Description *StringChange     `json:"description,omitempty"`
-	Items       []ItemChange      `json:"items"`
-	Metadata    *[]MetadataChange `json:"metadata,omitempty"`
 }
 
 // Error defines model for Error.
@@ -200,7 +345,6 @@ type ErrorDetail struct {
 
 // ItemChange defines model for ItemChange.
 type ItemChange struct {
-	Change string `json:"change"`
 
 	// One source of dataset data, materialised at `target` in the dataset repository (§5.2).
 	//
@@ -218,26 +362,27 @@ type ItemChange struct {
 	// go.sum) encodes `oneOf` as `interface{}`, which would leave the generated server and
 	// client for the whole definition tree untyped. `pkg/datasets` validation enforces the
 	// union (§5.2, validate.go); the spec keeps the per-type shape documented and typed.
-	From   *DataItem `json:"from,omitempty"`
+	Left *DataItem `json:"left,omitempty"`
+
+	// One source of dataset data, materialised at `target` in the dataset repository (§5.2).
+	//
+	// DataItem is a discriminated union on `type` (oneOf semantics):
+	//
+	//   * `type: object`  requires `object` and forbids `prefix`/`table`/`namespace`;
+	//     the source key lands exactly at `target`.
+	//   * `type: prefix`  requires `prefix` and forbids `object`/`table`/`namespace`;
+	//     `prefix/<rel>` lands at `target/<rel>`.
+	//   * `type: table` or `type: namespace` are reserved for the Iceberg phase and answered
+	//     with `501` (§1.2, §10.4).
+	//
+	// The union is modelled as one object with optional per-type members rather than a literal
+	// OpenAPI `oneOf` because the oapi-codegen release pinned by this repository (v1.5.6, see
+	// go.sum) encodes `oneOf` as `interface{}`, which would leave the generated server and
+	// client for the whole definition tree untyped. `pkg/datasets` validation enforces the
+	// union (§5.2, validate.go); the spec keeps the per-type shape documented and typed.
+	Right  *DataItem `json:"right,omitempty"`
 	Target string    `json:"target"`
-
-	// One source of dataset data, materialised at `target` in the dataset repository (§5.2).
-	//
-	// DataItem is a discriminated union on `type` (oneOf semantics):
-	//
-	//   * `type: object`  requires `object` and forbids `prefix`/`table`/`namespace`;
-	//     the source key lands exactly at `target`.
-	//   * `type: prefix`  requires `prefix` and forbids `object`/`table`/`namespace`;
-	//     `prefix/<rel>` lands at `target/<rel>`.
-	//   * `type: table` or `type: namespace` are reserved for the Iceberg phase and answered
-	//     with `501` (§1.2, §10.4).
-	//
-	// The union is modelled as one object with optional per-type members rather than a literal
-	// OpenAPI `oneOf` because the oapi-codegen release pinned by this repository (v1.5.6, see
-	// go.sum) encodes `oneOf` as `interface{}`, which would leave the generated server and
-	// client for the whole definition tree untyped. `pkg/datasets` validation enforces the
-	// union (§5.2, validate.go); the spec keeps the per-type shape documented and typed.
-	To *DataItem `json:"to,omitempty"`
+	Type   string    `json:"type"`
 }
 
 // ItemStats defines model for ItemStats.
@@ -249,14 +394,14 @@ type ItemStats struct {
 
 // MetadataChange defines model for MetadataChange.
 type MetadataChange struct {
-	Change string `json:"change"`
+	Key string `json:"key"`
 
-	// Previous value (absent when added)
-	From *interface{} `json:"from,omitempty"`
-	Key  string       `json:"key"`
+	// Values on the left side (absent when added)
+	Left *[]string `json:"left,omitempty"`
 
-	// New value (absent when removed)
-	To *interface{} `json:"to,omitempty"`
+	// Values on the right side (absent when removed)
+	Right *[]string `json:"right,omitempty"`
+	Type  string    `json:"type"`
 }
 
 // MetadataKey defines model for MetadataKey.
@@ -333,73 +478,6 @@ type PathSource struct {
 	Path string `json:"path"`
 }
 
-// Proposal defines model for Proposal.
-type Proposal struct {
-	Author string `json:"author"`
-
-	// Version the proposal was made against; merging requires it to be latest
-	BaseVersion int `json:"base_version"`
-
-	// Unix epoch milliseconds; set when closed or merged
-	ClosedAt *int64 `json:"closed_at,omitempty"`
-
-	// Unix epoch milliseconds
-	CreatedAt int64 `json:"created_at"`
-
-	// Paginated data diff of the dataset repository (§10.2, §10.3).
-	DataDiff *DataDiffList `json:"data_diff,omitempty"`
-	Dataset  string        `json:"dataset"`
-
-	// The Enterprise-compatible definition format, `format_version: 1` (§5.1). Stored
-	// definitions only contain commit refs; branch and tag refs are resolved on input.
-	Definition  *DatasetDefinition `json:"definition,omitempty"`
-	Description *string            `json:"description,omitempty"`
-
-	// Structural diff of two resolved definitions, matched by `target` (§10.3).
-	Diff *DefinitionDiff `json:"diff,omitempty"`
-	Id   string          `json:"id"`
-
-	// Version produced by the merge
-	MergedVersion *int `json:"merged_version,omitempty"`
-
-	// Hidden branch `_proposal-<id>` holding the materialised definition
-	PreviewBranch string `json:"preview_branch"`
-	Status        string `json:"status"`
-	Title         string `json:"title"`
-}
-
-// ProposalCreateRequest defines model for ProposalCreateRequest.
-type ProposalCreateRequest struct {
-
-	// The Enterprise-compatible definition format, `format_version: 1` (§5.1). Stored
-	// definitions only contain commit refs; branch and tag refs are resolved on input.
-	Definition  DatasetDefinition `json:"definition"`
-	Description *string           `json:"description,omitempty"`
-	Title       string            `json:"title"`
-}
-
-// ProposalList defines model for ProposalList.
-type ProposalList struct {
-	Pagination Pagination `json:"pagination"`
-	Results    []Proposal `json:"results"`
-}
-
-// ProposalMergeRequest defines model for ProposalMergeRequest.
-type ProposalMergeRequest struct {
-	Message *string `json:"message,omitempty"`
-}
-
-// ProposalUpdateRequest defines model for ProposalUpdateRequest.
-type ProposalUpdateRequest struct {
-
-	// The Enterprise-compatible definition format, `format_version: 1` (§5.1). Stored
-	// definitions only contain commit refs; branch and tag refs are resolved on input.
-	Definition  *DatasetDefinition `json:"definition,omitempty"`
-	Description *string            `json:"description,omitempty"`
-	Status      *string            `json:"status,omitempty"`
-	Title       *string            `json:"title,omitempty"`
-}
-
 // PublishOptions defines model for PublishOptions.
 type PublishOptions struct {
 	Message *string `json:"message,omitempty"`
@@ -413,8 +491,8 @@ type SourceRef struct {
 
 // StringChange defines model for StringChange.
 type StringChange struct {
-	From string `json:"from"`
-	To   string `json:"to"`
+	Left  string `json:"left"`
+	Right string `json:"right"`
 }
 
 // TableSource defines model for TableSource.
@@ -446,33 +524,6 @@ type Task struct {
 type TaskError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
-}
-
-// Version defines model for Version.
-type Version struct {
-
-	// Commit in the dataset repository
-	CommitId string `json:"commit_id"`
-
-	// The Enterprise-compatible definition format, `format_version: 1` (§5.1). Stored
-	// definitions only contain commit refs; branch and tag refs are resolved on input.
-	Definition *DatasetDefinition `json:"definition,omitempty"`
-	Message    *string            `json:"message,omitempty"`
-
-	// Set when the version was published by merging a proposal
-	ProposalId *string `json:"proposal_id,omitempty"`
-
-	// Unix epoch milliseconds
-	PublishedAt int64         `json:"published_at"`
-	Publisher   string        `json:"publisher"`
-	Stats       *DatasetStats `json:"stats,omitempty"`
-	Version     int           `json:"version"`
-}
-
-// VersionList defines model for VersionList.
-type VersionList struct {
-	Pagination Pagination `json:"pagination"`
-	Results    []Version  `json:"results"`
 }
 
 // VersionPublishRequest defines model for VersionPublishRequest.
@@ -518,8 +569,11 @@ const (
 	PrincipalType_user  PrincipalType = "user"
 )
 
-// ProposalID defines model for ProposalID.
-type ProposalID string
+// PullRequestID defines model for PullRequestID.
+type PullRequestID string
+
+// Ref defines model for Ref.
+type Ref string
 
 // RightRef defines model for RightRef.
 type RightRef string
@@ -596,13 +650,34 @@ type CreateMetadataKeyJSONBody MetadataKeyCreateRequest
 // UpdateMetadataKeyJSONBody defines parameters for UpdateMetadataKey.
 type UpdateMetadataKeyJSONBody MetadataKeyUpdateRequest
 
+// ListPullRequestsParams defines parameters for ListPullRequests.
+type ListPullRequestsParams struct {
+
+	// Only return pull requests in this state (`all` is the default)
+	Status *string `json:"status,omitempty"`
+
+	// Only return pull requests of this dataset
+	Dataset *string `json:"dataset,omitempty"`
+
+	// Return items after this value (pagination token)
+	After *After `json:"after,omitempty"`
+
+	// How many items to return. A value <= 0 means the default page size and a value above
+	// 1000 is clamped to 1000: there is no way to ask for every item at once, so a client
+	// always follows `pagination.has_more` / `pagination.next_offset` (SEC-5).
+	Amount *Amount `json:"amount,omitempty"`
+}
+
+// UpdateDatasetJSONBody defines parameters for UpdateDataset.
+type UpdateDatasetJSONBody DatasetUpdate
+
 // GrantAccessJSONBody defines parameters for GrantAccess.
 type GrantAccessJSONBody AccessGrantRequest
 
-// ListProposalsParams defines parameters for ListProposals.
-type ListProposalsParams struct {
+// ListDatasetPullRequestsParams defines parameters for ListDatasetPullRequests.
+type ListDatasetPullRequestsParams struct {
 
-	// Only return proposals in this state
+	// Only return pull requests in this state
 	Status *string `json:"status,omitempty"`
 
 	// Return items after this value (pagination token)
@@ -614,14 +689,11 @@ type ListProposalsParams struct {
 	Amount *Amount `json:"amount,omitempty"`
 }
 
-// CreateProposalJSONBody defines parameters for CreateProposal.
-type CreateProposalJSONBody ProposalCreateRequest
+// CreatePullRequestJSONBody defines parameters for CreatePullRequest.
+type CreatePullRequestJSONBody DatasetPullRequestCreate
 
-// UpdateProposalJSONBody defines parameters for UpdateProposal.
-type UpdateProposalJSONBody ProposalUpdateRequest
-
-// MergeProposalJSONBody defines parameters for MergeProposal.
-type MergeProposalJSONBody ProposalMergeRequest
+// UpdatePullRequestJSONBody defines parameters for UpdatePullRequest.
+type UpdatePullRequestJSONBody DatasetPullRequestUpdate
 
 // DiffRefsParams defines parameters for DiffRefs.
 type DiffRefsParams struct {
@@ -668,17 +740,17 @@ type CreateMetadataKeyJSONRequestBody CreateMetadataKeyJSONBody
 // UpdateMetadataKeyJSONRequestBody defines body for UpdateMetadataKey for application/json ContentType.
 type UpdateMetadataKeyJSONRequestBody UpdateMetadataKeyJSONBody
 
+// UpdateDatasetJSONRequestBody defines body for UpdateDataset for application/json ContentType.
+type UpdateDatasetJSONRequestBody UpdateDatasetJSONBody
+
 // GrantAccessJSONRequestBody defines body for GrantAccess for application/json ContentType.
 type GrantAccessJSONRequestBody GrantAccessJSONBody
 
-// CreateProposalJSONRequestBody defines body for CreateProposal for application/json ContentType.
-type CreateProposalJSONRequestBody CreateProposalJSONBody
+// CreatePullRequestJSONRequestBody defines body for CreatePullRequest for application/json ContentType.
+type CreatePullRequestJSONRequestBody CreatePullRequestJSONBody
 
-// UpdateProposalJSONRequestBody defines body for UpdateProposal for application/json ContentType.
-type UpdateProposalJSONRequestBody UpdateProposalJSONBody
-
-// MergeProposalJSONRequestBody defines body for MergeProposal for application/json ContentType.
-type MergeProposalJSONRequestBody MergeProposalJSONBody
+// UpdatePullRequestJSONRequestBody defines body for UpdatePullRequest for application/json ContentType.
+type UpdatePullRequestJSONRequestBody UpdatePullRequestJSONBody
 
 // ValidateDatasetJSONRequestBody defines body for ValidateDataset for application/json ContentType.
 type ValidateDatasetJSONRequestBody ValidateDatasetJSONBody
@@ -895,11 +967,19 @@ type ClientInterface interface {
 
 	UpdateMetadataKey(ctx context.Context, key MetadataKeyName, body UpdateMetadataKeyJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// ListPullRequests request
+	ListPullRequests(ctx context.Context, params *ListPullRequestsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// DeleteDataset request
 	DeleteDataset(ctx context.Context, dataset DatasetName, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// GetDataset request
 	GetDataset(ctx context.Context, dataset DatasetName, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// UpdateDataset request  with any body
+	UpdateDatasetWithBody(ctx context.Context, dataset DatasetName, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	UpdateDataset(ctx context.Context, dataset DatasetName, body UpdateDatasetJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// ListAccess request
 	ListAccess(ctx context.Context, dataset DatasetName, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -912,29 +992,36 @@ type ClientInterface interface {
 	// RevokeAccess request
 	RevokeAccess(ctx context.Context, dataset DatasetName, principalType PrincipalType, principalId PrincipalID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-	// ListProposals request
-	ListProposals(ctx context.Context, dataset DatasetName, params *ListProposalsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+	// ListDatasetPullRequests request
+	ListDatasetPullRequests(ctx context.Context, dataset DatasetName, params *ListDatasetPullRequestsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-	// CreateProposal request  with any body
-	CreateProposalWithBody(ctx context.Context, dataset DatasetName, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+	// CreatePullRequest request  with any body
+	CreatePullRequestWithBody(ctx context.Context, dataset DatasetName, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-	CreateProposal(ctx context.Context, dataset DatasetName, body CreateProposalJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+	CreatePullRequest(ctx context.Context, dataset DatasetName, body CreatePullRequestJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-	// GetProposal request
-	GetProposal(ctx context.Context, dataset DatasetName, id ProposalID, reqEditors ...RequestEditorFn) (*http.Response, error)
+	// ClosePullRequest request
+	ClosePullRequest(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-	// UpdateProposal request  with any body
-	UpdateProposalWithBody(ctx context.Context, dataset DatasetName, id ProposalID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+	// GetPullRequest request
+	GetPullRequest(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-	UpdateProposal(ctx context.Context, dataset DatasetName, id ProposalID, body UpdateProposalJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+	// UpdatePullRequest request  with any body
+	UpdatePullRequestWithBody(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-	// MergeProposal request  with any body
-	MergeProposalWithBody(ctx context.Context, dataset DatasetName, id ProposalID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+	UpdatePullRequest(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, body UpdatePullRequestJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-	MergeProposal(ctx context.Context, dataset DatasetName, id ProposalID, body MergeProposalJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+	// GetPullRequestDiff request
+	GetPullRequestDiff(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// MergePullRequest request
+	MergePullRequest(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// DiffRefs request
 	DiffRefs(ctx context.Context, dataset DatasetName, leftRef LeftRef, rightRef RightRef, params *DiffRefsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetDatasetByRef request
+	GetDatasetByRef(ctx context.Context, dataset DatasetName, ref Ref, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// GetTask request
 	GetTask(ctx context.Context, dataset DatasetName, taskId TaskID, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -1088,6 +1175,18 @@ func (c *Client) UpdateMetadataKey(ctx context.Context, key MetadataKeyName, bod
 	return c.Client.Do(req)
 }
 
+func (c *Client) ListPullRequests(ctx context.Context, params *ListPullRequestsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewListPullRequestsRequest(c.Server, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 func (c *Client) DeleteDataset(ctx context.Context, dataset DatasetName, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewDeleteDatasetRequest(c.Server, dataset)
 	if err != nil {
@@ -1102,6 +1201,30 @@ func (c *Client) DeleteDataset(ctx context.Context, dataset DatasetName, reqEdit
 
 func (c *Client) GetDataset(ctx context.Context, dataset DatasetName, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewGetDatasetRequest(c.Server, dataset)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) UpdateDatasetWithBody(ctx context.Context, dataset DatasetName, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewUpdateDatasetRequestWithBody(c.Server, dataset, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) UpdateDataset(ctx context.Context, dataset DatasetName, body UpdateDatasetJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewUpdateDatasetRequest(c.Server, dataset, body)
 	if err != nil {
 		return nil, err
 	}
@@ -1160,8 +1283,8 @@ func (c *Client) RevokeAccess(ctx context.Context, dataset DatasetName, principa
 	return c.Client.Do(req)
 }
 
-func (c *Client) ListProposals(ctx context.Context, dataset DatasetName, params *ListProposalsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewListProposalsRequest(c.Server, dataset, params)
+func (c *Client) ListDatasetPullRequests(ctx context.Context, dataset DatasetName, params *ListDatasetPullRequestsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewListDatasetPullRequestsRequest(c.Server, dataset, params)
 	if err != nil {
 		return nil, err
 	}
@@ -1172,8 +1295,8 @@ func (c *Client) ListProposals(ctx context.Context, dataset DatasetName, params 
 	return c.Client.Do(req)
 }
 
-func (c *Client) CreateProposalWithBody(ctx context.Context, dataset DatasetName, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewCreateProposalRequestWithBody(c.Server, dataset, contentType, body)
+func (c *Client) CreatePullRequestWithBody(ctx context.Context, dataset DatasetName, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCreatePullRequestRequestWithBody(c.Server, dataset, contentType, body)
 	if err != nil {
 		return nil, err
 	}
@@ -1184,8 +1307,8 @@ func (c *Client) CreateProposalWithBody(ctx context.Context, dataset DatasetName
 	return c.Client.Do(req)
 }
 
-func (c *Client) CreateProposal(ctx context.Context, dataset DatasetName, body CreateProposalJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewCreateProposalRequest(c.Server, dataset, body)
+func (c *Client) CreatePullRequest(ctx context.Context, dataset DatasetName, body CreatePullRequestJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCreatePullRequestRequest(c.Server, dataset, body)
 	if err != nil {
 		return nil, err
 	}
@@ -1196,8 +1319,8 @@ func (c *Client) CreateProposal(ctx context.Context, dataset DatasetName, body C
 	return c.Client.Do(req)
 }
 
-func (c *Client) GetProposal(ctx context.Context, dataset DatasetName, id ProposalID, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewGetProposalRequest(c.Server, dataset, id)
+func (c *Client) ClosePullRequest(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewClosePullRequestRequest(c.Server, dataset, pullRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -1208,8 +1331,8 @@ func (c *Client) GetProposal(ctx context.Context, dataset DatasetName, id Propos
 	return c.Client.Do(req)
 }
 
-func (c *Client) UpdateProposalWithBody(ctx context.Context, dataset DatasetName, id ProposalID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewUpdateProposalRequestWithBody(c.Server, dataset, id, contentType, body)
+func (c *Client) GetPullRequest(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetPullRequestRequest(c.Server, dataset, pullRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -1220,8 +1343,8 @@ func (c *Client) UpdateProposalWithBody(ctx context.Context, dataset DatasetName
 	return c.Client.Do(req)
 }
 
-func (c *Client) UpdateProposal(ctx context.Context, dataset DatasetName, id ProposalID, body UpdateProposalJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewUpdateProposalRequest(c.Server, dataset, id, body)
+func (c *Client) UpdatePullRequestWithBody(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewUpdatePullRequestRequestWithBody(c.Server, dataset, pullRequest, contentType, body)
 	if err != nil {
 		return nil, err
 	}
@@ -1232,8 +1355,8 @@ func (c *Client) UpdateProposal(ctx context.Context, dataset DatasetName, id Pro
 	return c.Client.Do(req)
 }
 
-func (c *Client) MergeProposalWithBody(ctx context.Context, dataset DatasetName, id ProposalID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewMergeProposalRequestWithBody(c.Server, dataset, id, contentType, body)
+func (c *Client) UpdatePullRequest(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, body UpdatePullRequestJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewUpdatePullRequestRequest(c.Server, dataset, pullRequest, body)
 	if err != nil {
 		return nil, err
 	}
@@ -1244,8 +1367,20 @@ func (c *Client) MergeProposalWithBody(ctx context.Context, dataset DatasetName,
 	return c.Client.Do(req)
 }
 
-func (c *Client) MergeProposal(ctx context.Context, dataset DatasetName, id ProposalID, body MergeProposalJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewMergeProposalRequest(c.Server, dataset, id, body)
+func (c *Client) GetPullRequestDiff(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetPullRequestDiffRequest(c.Server, dataset, pullRequest)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) MergePullRequest(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewMergePullRequestRequest(c.Server, dataset, pullRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -1258,6 +1393,18 @@ func (c *Client) MergeProposal(ctx context.Context, dataset DatasetName, id Prop
 
 func (c *Client) DiffRefs(ctx context.Context, dataset DatasetName, leftRef LeftRef, rightRef RightRef, params *DiffRefsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewDiffRefsRequest(c.Server, dataset, leftRef, rightRef, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) GetDatasetByRef(ctx context.Context, dataset DatasetName, ref Ref, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetDatasetByRefRequest(c.Server, dataset, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -1748,6 +1895,101 @@ func NewUpdateMetadataKeyRequestWithBody(server string, key MetadataKeyName, con
 	return req, nil
 }
 
+// NewListPullRequestsRequest generates requests for ListPullRequests
+func NewListPullRequestsRequest(server string, params *ListPullRequestsParams) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/pulls")
+	if operationPath[0] == '/' {
+		operationPath = operationPath[1:]
+	}
+	operationURL := url.URL{
+		Path: operationPath,
+	}
+
+	queryURL := serverURL.ResolveReference(&operationURL)
+
+	queryValues := queryURL.Query()
+
+	if params.Status != nil {
+
+		if queryFrag, err := runtime.StyleParamWithLocation("form", true, "status", runtime.ParamLocationQuery, *params.Status); err != nil {
+			return nil, err
+		} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+			return nil, err
+		} else {
+			for k, v := range parsed {
+				for _, v2 := range v {
+					queryValues.Add(k, v2)
+				}
+			}
+		}
+
+	}
+
+	if params.Dataset != nil {
+
+		if queryFrag, err := runtime.StyleParamWithLocation("form", true, "dataset", runtime.ParamLocationQuery, *params.Dataset); err != nil {
+			return nil, err
+		} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+			return nil, err
+		} else {
+			for k, v := range parsed {
+				for _, v2 := range v {
+					queryValues.Add(k, v2)
+				}
+			}
+		}
+
+	}
+
+	if params.After != nil {
+
+		if queryFrag, err := runtime.StyleParamWithLocation("form", true, "after", runtime.ParamLocationQuery, *params.After); err != nil {
+			return nil, err
+		} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+			return nil, err
+		} else {
+			for k, v := range parsed {
+				for _, v2 := range v {
+					queryValues.Add(k, v2)
+				}
+			}
+		}
+
+	}
+
+	if params.Amount != nil {
+
+		if queryFrag, err := runtime.StyleParamWithLocation("form", true, "amount", runtime.ParamLocationQuery, *params.Amount); err != nil {
+			return nil, err
+		} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+			return nil, err
+		} else {
+			for k, v := range parsed {
+				for _, v2 := range v {
+					queryValues.Add(k, v2)
+				}
+			}
+		}
+
+	}
+
+	queryURL.RawQuery = queryValues.Encode()
+
+	req, err := http.NewRequest("GET", queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
 // NewDeleteDatasetRequest generates requests for DeleteDataset
 func NewDeleteDatasetRequest(server string, dataset DatasetName) (*http.Request, error) {
 	var err error
@@ -1812,6 +2054,53 @@ func NewGetDatasetRequest(server string, dataset DatasetName) (*http.Request, er
 	if err != nil {
 		return nil, err
 	}
+
+	return req, nil
+}
+
+// NewUpdateDatasetRequest calls the generic UpdateDataset builder with application/json body
+func NewUpdateDatasetRequest(server string, dataset DatasetName, body UpdateDatasetJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewUpdateDatasetRequestWithBody(server, dataset, "application/json", bodyReader)
+}
+
+// NewUpdateDatasetRequestWithBody generates requests for UpdateDataset with any type of body
+func NewUpdateDatasetRequestWithBody(server string, dataset DatasetName, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithLocation("simple", false, "dataset", runtime.ParamLocationPath, dataset)
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/%s", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = operationPath[1:]
+	}
+	operationURL := url.URL{
+		Path: operationPath,
+	}
+
+	queryURL := serverURL.ResolveReference(&operationURL)
+
+	req, err := http.NewRequest("PUT", queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
 
 	return req, nil
 }
@@ -1945,8 +2234,8 @@ func NewRevokeAccessRequest(server string, dataset DatasetName, principalType Pr
 	return req, nil
 }
 
-// NewListProposalsRequest generates requests for ListProposals
-func NewListProposalsRequest(server string, dataset DatasetName, params *ListProposalsParams) (*http.Request, error) {
+// NewListDatasetPullRequestsRequest generates requests for ListDatasetPullRequests
+func NewListDatasetPullRequestsRequest(server string, dataset DatasetName, params *ListDatasetPullRequestsParams) (*http.Request, error) {
 	var err error
 
 	var pathParam0 string
@@ -1961,7 +2250,7 @@ func NewListProposalsRequest(server string, dataset DatasetName, params *ListPro
 		return nil, err
 	}
 
-	operationPath := fmt.Sprintf("/%s/proposals", pathParam0)
+	operationPath := fmt.Sprintf("/%s/pulls", pathParam0)
 	if operationPath[0] == '/' {
 		operationPath = operationPath[1:]
 	}
@@ -2031,19 +2320,19 @@ func NewListProposalsRequest(server string, dataset DatasetName, params *ListPro
 	return req, nil
 }
 
-// NewCreateProposalRequest calls the generic CreateProposal builder with application/json body
-func NewCreateProposalRequest(server string, dataset DatasetName, body CreateProposalJSONRequestBody) (*http.Request, error) {
+// NewCreatePullRequestRequest calls the generic CreatePullRequest builder with application/json body
+func NewCreatePullRequestRequest(server string, dataset DatasetName, body CreatePullRequestJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
 	bodyReader = bytes.NewReader(buf)
-	return NewCreateProposalRequestWithBody(server, dataset, "application/json", bodyReader)
+	return NewCreatePullRequestRequestWithBody(server, dataset, "application/json", bodyReader)
 }
 
-// NewCreateProposalRequestWithBody generates requests for CreateProposal with any type of body
-func NewCreateProposalRequestWithBody(server string, dataset DatasetName, contentType string, body io.Reader) (*http.Request, error) {
+// NewCreatePullRequestRequestWithBody generates requests for CreatePullRequest with any type of body
+func NewCreatePullRequestRequestWithBody(server string, dataset DatasetName, contentType string, body io.Reader) (*http.Request, error) {
 	var err error
 
 	var pathParam0 string
@@ -2058,7 +2347,7 @@ func NewCreateProposalRequestWithBody(server string, dataset DatasetName, conten
 		return nil, err
 	}
 
-	operationPath := fmt.Sprintf("/%s/proposals", pathParam0)
+	operationPath := fmt.Sprintf("/%s/pulls", pathParam0)
 	if operationPath[0] == '/' {
 		operationPath = operationPath[1:]
 	}
@@ -2078,8 +2367,8 @@ func NewCreateProposalRequestWithBody(server string, dataset DatasetName, conten
 	return req, nil
 }
 
-// NewGetProposalRequest generates requests for GetProposal
-func NewGetProposalRequest(server string, dataset DatasetName, id ProposalID) (*http.Request, error) {
+// NewClosePullRequestRequest generates requests for ClosePullRequest
+func NewClosePullRequestRequest(server string, dataset DatasetName, pullRequest PullRequestID) (*http.Request, error) {
 	var err error
 
 	var pathParam0 string
@@ -2091,7 +2380,7 @@ func NewGetProposalRequest(server string, dataset DatasetName, id ProposalID) (*
 
 	var pathParam1 string
 
-	pathParam1, err = runtime.StyleParamWithLocation("simple", false, "id", runtime.ParamLocationPath, id)
+	pathParam1, err = runtime.StyleParamWithLocation("simple", false, "pullRequest", runtime.ParamLocationPath, pullRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -2101,7 +2390,48 @@ func NewGetProposalRequest(server string, dataset DatasetName, id ProposalID) (*
 		return nil, err
 	}
 
-	operationPath := fmt.Sprintf("/%s/proposals/%s", pathParam0, pathParam1)
+	operationPath := fmt.Sprintf("/%s/pulls/%s", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = operationPath[1:]
+	}
+	operationURL := url.URL{
+		Path: operationPath,
+	}
+
+	queryURL := serverURL.ResolveReference(&operationURL)
+
+	req, err := http.NewRequest("DELETE", queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetPullRequestRequest generates requests for GetPullRequest
+func NewGetPullRequestRequest(server string, dataset DatasetName, pullRequest PullRequestID) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithLocation("simple", false, "dataset", runtime.ParamLocationPath, dataset)
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithLocation("simple", false, "pullRequest", runtime.ParamLocationPath, pullRequest)
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/%s/pulls/%s", pathParam0, pathParam1)
 	if operationPath[0] == '/' {
 		operationPath = operationPath[1:]
 	}
@@ -2119,19 +2449,19 @@ func NewGetProposalRequest(server string, dataset DatasetName, id ProposalID) (*
 	return req, nil
 }
 
-// NewUpdateProposalRequest calls the generic UpdateProposal builder with application/json body
-func NewUpdateProposalRequest(server string, dataset DatasetName, id ProposalID, body UpdateProposalJSONRequestBody) (*http.Request, error) {
+// NewUpdatePullRequestRequest calls the generic UpdatePullRequest builder with application/json body
+func NewUpdatePullRequestRequest(server string, dataset DatasetName, pullRequest PullRequestID, body UpdatePullRequestJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
 	bodyReader = bytes.NewReader(buf)
-	return NewUpdateProposalRequestWithBody(server, dataset, id, "application/json", bodyReader)
+	return NewUpdatePullRequestRequestWithBody(server, dataset, pullRequest, "application/json", bodyReader)
 }
 
-// NewUpdateProposalRequestWithBody generates requests for UpdateProposal with any type of body
-func NewUpdateProposalRequestWithBody(server string, dataset DatasetName, id ProposalID, contentType string, body io.Reader) (*http.Request, error) {
+// NewUpdatePullRequestRequestWithBody generates requests for UpdatePullRequest with any type of body
+func NewUpdatePullRequestRequestWithBody(server string, dataset DatasetName, pullRequest PullRequestID, contentType string, body io.Reader) (*http.Request, error) {
 	var err error
 
 	var pathParam0 string
@@ -2143,7 +2473,7 @@ func NewUpdateProposalRequestWithBody(server string, dataset DatasetName, id Pro
 
 	var pathParam1 string
 
-	pathParam1, err = runtime.StyleParamWithLocation("simple", false, "id", runtime.ParamLocationPath, id)
+	pathParam1, err = runtime.StyleParamWithLocation("simple", false, "pullRequest", runtime.ParamLocationPath, pullRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -2153,7 +2483,7 @@ func NewUpdateProposalRequestWithBody(server string, dataset DatasetName, id Pro
 		return nil, err
 	}
 
-	operationPath := fmt.Sprintf("/%s/proposals/%s", pathParam0, pathParam1)
+	operationPath := fmt.Sprintf("/%s/pulls/%s", pathParam0, pathParam1)
 	if operationPath[0] == '/' {
 		operationPath = operationPath[1:]
 	}
@@ -2173,19 +2503,8 @@ func NewUpdateProposalRequestWithBody(server string, dataset DatasetName, id Pro
 	return req, nil
 }
 
-// NewMergeProposalRequest calls the generic MergeProposal builder with application/json body
-func NewMergeProposalRequest(server string, dataset DatasetName, id ProposalID, body MergeProposalJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	bodyReader = bytes.NewReader(buf)
-	return NewMergeProposalRequestWithBody(server, dataset, id, "application/json", bodyReader)
-}
-
-// NewMergeProposalRequestWithBody generates requests for MergeProposal with any type of body
-func NewMergeProposalRequestWithBody(server string, dataset DatasetName, id ProposalID, contentType string, body io.Reader) (*http.Request, error) {
+// NewGetPullRequestDiffRequest generates requests for GetPullRequestDiff
+func NewGetPullRequestDiffRequest(server string, dataset DatasetName, pullRequest PullRequestID) (*http.Request, error) {
 	var err error
 
 	var pathParam0 string
@@ -2197,7 +2516,7 @@ func NewMergeProposalRequestWithBody(server string, dataset DatasetName, id Prop
 
 	var pathParam1 string
 
-	pathParam1, err = runtime.StyleParamWithLocation("simple", false, "id", runtime.ParamLocationPath, id)
+	pathParam1, err = runtime.StyleParamWithLocation("simple", false, "pullRequest", runtime.ParamLocationPath, pullRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -2207,7 +2526,7 @@ func NewMergeProposalRequestWithBody(server string, dataset DatasetName, id Prop
 		return nil, err
 	}
 
-	operationPath := fmt.Sprintf("/%s/proposals/%s/merge", pathParam0, pathParam1)
+	operationPath := fmt.Sprintf("/%s/pulls/%s/diff", pathParam0, pathParam1)
 	if operationPath[0] == '/' {
 		operationPath = operationPath[1:]
 	}
@@ -2217,12 +2536,51 @@ func NewMergeProposalRequestWithBody(server string, dataset DatasetName, id Prop
 
 	queryURL := serverURL.ResolveReference(&operationURL)
 
-	req, err := http.NewRequest("POST", queryURL.String(), body)
+	req, err := http.NewRequest("GET", queryURL.String(), nil)
 	if err != nil {
 		return nil, err
 	}
 
-	req.Header.Add("Content-Type", contentType)
+	return req, nil
+}
+
+// NewMergePullRequestRequest generates requests for MergePullRequest
+func NewMergePullRequestRequest(server string, dataset DatasetName, pullRequest PullRequestID) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithLocation("simple", false, "dataset", runtime.ParamLocationPath, dataset)
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithLocation("simple", false, "pullRequest", runtime.ParamLocationPath, pullRequest)
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/%s/pulls/%s/merge", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = operationPath[1:]
+	}
+	operationURL := url.URL{
+		Path: operationPath,
+	}
+
+	queryURL := serverURL.ResolveReference(&operationURL)
+
+	req, err := http.NewRequest("POST", queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
 
 	return req, nil
 }
@@ -2334,6 +2692,47 @@ func NewDiffRefsRequest(server string, dataset DatasetName, leftRef LeftRef, rig
 	}
 
 	queryURL.RawQuery = queryValues.Encode()
+
+	req, err := http.NewRequest("GET", queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetDatasetByRefRequest generates requests for GetDatasetByRef
+func NewGetDatasetByRefRequest(server string, dataset DatasetName, ref Ref) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithLocation("simple", false, "dataset", runtime.ParamLocationPath, dataset)
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithLocation("simple", false, "ref", runtime.ParamLocationPath, ref)
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/%s/refs/%s", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = operationPath[1:]
+	}
+	operationURL := url.URL{
+		Path: operationPath,
+	}
+
+	queryURL := serverURL.ResolveReference(&operationURL)
 
 	req, err := http.NewRequest("GET", queryURL.String(), nil)
 	if err != nil {
@@ -2662,11 +3061,19 @@ type ClientWithResponsesInterface interface {
 
 	UpdateMetadataKeyWithResponse(ctx context.Context, key MetadataKeyName, body UpdateMetadataKeyJSONRequestBody, reqEditors ...RequestEditorFn) (*UpdateMetadataKeyResponse, error)
 
+	// ListPullRequests request
+	ListPullRequestsWithResponse(ctx context.Context, params *ListPullRequestsParams, reqEditors ...RequestEditorFn) (*ListPullRequestsResponse, error)
+
 	// DeleteDataset request
 	DeleteDatasetWithResponse(ctx context.Context, dataset DatasetName, reqEditors ...RequestEditorFn) (*DeleteDatasetResponse, error)
 
 	// GetDataset request
 	GetDatasetWithResponse(ctx context.Context, dataset DatasetName, reqEditors ...RequestEditorFn) (*GetDatasetResponse, error)
+
+	// UpdateDataset request  with any body
+	UpdateDatasetWithBodyWithResponse(ctx context.Context, dataset DatasetName, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*UpdateDatasetResponse, error)
+
+	UpdateDatasetWithResponse(ctx context.Context, dataset DatasetName, body UpdateDatasetJSONRequestBody, reqEditors ...RequestEditorFn) (*UpdateDatasetResponse, error)
 
 	// ListAccess request
 	ListAccessWithResponse(ctx context.Context, dataset DatasetName, reqEditors ...RequestEditorFn) (*ListAccessResponse, error)
@@ -2679,29 +3086,36 @@ type ClientWithResponsesInterface interface {
 	// RevokeAccess request
 	RevokeAccessWithResponse(ctx context.Context, dataset DatasetName, principalType PrincipalType, principalId PrincipalID, reqEditors ...RequestEditorFn) (*RevokeAccessResponse, error)
 
-	// ListProposals request
-	ListProposalsWithResponse(ctx context.Context, dataset DatasetName, params *ListProposalsParams, reqEditors ...RequestEditorFn) (*ListProposalsResponse, error)
+	// ListDatasetPullRequests request
+	ListDatasetPullRequestsWithResponse(ctx context.Context, dataset DatasetName, params *ListDatasetPullRequestsParams, reqEditors ...RequestEditorFn) (*ListDatasetPullRequestsResponse, error)
 
-	// CreateProposal request  with any body
-	CreateProposalWithBodyWithResponse(ctx context.Context, dataset DatasetName, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateProposalResponse, error)
+	// CreatePullRequest request  with any body
+	CreatePullRequestWithBodyWithResponse(ctx context.Context, dataset DatasetName, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreatePullRequestResponse, error)
 
-	CreateProposalWithResponse(ctx context.Context, dataset DatasetName, body CreateProposalJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateProposalResponse, error)
+	CreatePullRequestWithResponse(ctx context.Context, dataset DatasetName, body CreatePullRequestJSONRequestBody, reqEditors ...RequestEditorFn) (*CreatePullRequestResponse, error)
 
-	// GetProposal request
-	GetProposalWithResponse(ctx context.Context, dataset DatasetName, id ProposalID, reqEditors ...RequestEditorFn) (*GetProposalResponse, error)
+	// ClosePullRequest request
+	ClosePullRequestWithResponse(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, reqEditors ...RequestEditorFn) (*ClosePullRequestResponse, error)
 
-	// UpdateProposal request  with any body
-	UpdateProposalWithBodyWithResponse(ctx context.Context, dataset DatasetName, id ProposalID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*UpdateProposalResponse, error)
+	// GetPullRequest request
+	GetPullRequestWithResponse(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, reqEditors ...RequestEditorFn) (*GetPullRequestResponse, error)
 
-	UpdateProposalWithResponse(ctx context.Context, dataset DatasetName, id ProposalID, body UpdateProposalJSONRequestBody, reqEditors ...RequestEditorFn) (*UpdateProposalResponse, error)
+	// UpdatePullRequest request  with any body
+	UpdatePullRequestWithBodyWithResponse(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*UpdatePullRequestResponse, error)
 
-	// MergeProposal request  with any body
-	MergeProposalWithBodyWithResponse(ctx context.Context, dataset DatasetName, id ProposalID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*MergeProposalResponse, error)
+	UpdatePullRequestWithResponse(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, body UpdatePullRequestJSONRequestBody, reqEditors ...RequestEditorFn) (*UpdatePullRequestResponse, error)
 
-	MergeProposalWithResponse(ctx context.Context, dataset DatasetName, id ProposalID, body MergeProposalJSONRequestBody, reqEditors ...RequestEditorFn) (*MergeProposalResponse, error)
+	// GetPullRequestDiff request
+	GetPullRequestDiffWithResponse(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, reqEditors ...RequestEditorFn) (*GetPullRequestDiffResponse, error)
+
+	// MergePullRequest request
+	MergePullRequestWithResponse(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, reqEditors ...RequestEditorFn) (*MergePullRequestResponse, error)
 
 	// DiffRefs request
 	DiffRefsWithResponse(ctx context.Context, dataset DatasetName, leftRef LeftRef, rightRef RightRef, params *DiffRefsParams, reqEditors ...RequestEditorFn) (*DiffRefsResponse, error)
+
+	// GetDatasetByRef request
+	GetDatasetByRefWithResponse(ctx context.Context, dataset DatasetName, ref Ref, reqEditors ...RequestEditorFn) (*GetDatasetByRefResponse, error)
 
 	// GetTask request
 	GetTaskWithResponse(ctx context.Context, dataset DatasetName, taskId TaskID, reqEditors ...RequestEditorFn) (*GetTaskResponse, error)
@@ -2935,6 +3349,32 @@ func (r UpdateMetadataKeyResponse) StatusCode() int {
 	return 0
 }
 
+type ListPullRequestsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON200      *DatasetPullRequestList
+	JSON400      *Error
+	JSON401      *Error
+	JSON403      *Error
+	JSON501      *Error
+}
+
+// Status returns HTTPResponse.Status
+func (r ListPullRequestsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ListPullRequestsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
 type DeleteDatasetResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -2981,6 +3421,35 @@ func (r GetDatasetResponse) Status() string {
 
 // StatusCode returns HTTPResponse.StatusCode
 func (r GetDatasetResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type UpdateDatasetResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON200      *Dataset
+	JSON400      *Error
+	JSON401      *Error
+	JSON403      *Error
+	JSON404      *Error
+	JSON409      *Error
+	JSON422      *Error
+	JSON501      *Error
+}
+
+// Status returns HTTPResponse.Status
+func (r UpdateDatasetResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r UpdateDatasetResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -3066,10 +3535,10 @@ func (r RevokeAccessResponse) StatusCode() int {
 	return 0
 }
 
-type ListProposalsResponse struct {
+type ListDatasetPullRequestsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
-	JSON200      *ProposalList
+	JSON200      *DatasetPullRequestList
 	JSON400      *Error
 	JSON401      *Error
 	JSON403      *Error
@@ -3078,7 +3547,7 @@ type ListProposalsResponse struct {
 }
 
 // Status returns HTTPResponse.Status
-func (r ListProposalsResponse) Status() string {
+func (r ListDatasetPullRequestsResponse) Status() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Status
 	}
@@ -3086,100 +3555,17 @@ func (r ListProposalsResponse) Status() string {
 }
 
 // StatusCode returns HTTPResponse.StatusCode
-func (r ListProposalsResponse) StatusCode() int {
+func (r ListDatasetPullRequestsResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
 	return 0
 }
 
-type CreateProposalResponse struct {
+type CreatePullRequestResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
-	JSON201      *Proposal
-	JSON400      *Error
-	JSON401      *Error
-	JSON403      *Error
-	JSON404      *Error
-	JSON409      *Error
-	JSON422      *Error
-	JSON501      *Error
-}
-
-// Status returns HTTPResponse.Status
-func (r CreateProposalResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r CreateProposalResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-type GetProposalResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	JSON200      *Proposal
-	JSON401      *Error
-	JSON403      *Error
-	JSON404      *Error
-	JSON501      *Error
-}
-
-// Status returns HTTPResponse.Status
-func (r GetProposalResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r GetProposalResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-type UpdateProposalResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	JSON200      *Proposal
-	JSON400      *Error
-	JSON401      *Error
-	JSON403      *Error
-	JSON404      *Error
-	JSON409      *Error
-	JSON501      *Error
-}
-
-// Status returns HTTPResponse.Status
-func (r UpdateProposalResponse) Status() string {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.Status
-	}
-	return http.StatusText(0)
-}
-
-// StatusCode returns HTTPResponse.StatusCode
-func (r UpdateProposalResponse) StatusCode() int {
-	if r.HTTPResponse != nil {
-		return r.HTTPResponse.StatusCode
-	}
-	return 0
-}
-
-type MergeProposalResponse struct {
-	Body         []byte
-	HTTPResponse *http.Response
-	JSON201      *Version
+	JSON201      *DatasetPullRequest
 	JSON400      *Error
 	JSON401      *Error
 	JSON403      *Error
@@ -3190,7 +3576,7 @@ type MergeProposalResponse struct {
 }
 
 // Status returns HTTPResponse.Status
-func (r MergeProposalResponse) Status() string {
+func (r CreatePullRequestResponse) Status() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Status
 	}
@@ -3198,7 +3584,142 @@ func (r MergeProposalResponse) Status() string {
 }
 
 // StatusCode returns HTTPResponse.StatusCode
-func (r MergeProposalResponse) StatusCode() int {
+func (r CreatePullRequestResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type ClosePullRequestResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON401      *Error
+	JSON403      *Error
+	JSON404      *Error
+	JSON409      *Error
+	JSON501      *Error
+}
+
+// Status returns HTTPResponse.Status
+func (r ClosePullRequestResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ClosePullRequestResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type GetPullRequestResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON200      *DatasetPullRequest
+	JSON401      *Error
+	JSON403      *Error
+	JSON404      *Error
+	JSON501      *Error
+}
+
+// Status returns HTTPResponse.Status
+func (r GetPullRequestResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetPullRequestResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type UpdatePullRequestResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON200      *DatasetPullRequest
+	JSON400      *Error
+	JSON401      *Error
+	JSON403      *Error
+	JSON404      *Error
+	JSON409      *Error
+	JSON501      *Error
+}
+
+// Status returns HTTPResponse.Status
+func (r UpdatePullRequestResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r UpdatePullRequestResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type GetPullRequestDiffResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON200      *DatasetDiff
+	JSON401      *Error
+	JSON403      *Error
+	JSON404      *Error
+	JSON501      *Error
+}
+
+// Status returns HTTPResponse.Status
+func (r GetPullRequestDiffResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetPullRequestDiffResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type MergePullRequestResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON200      *DatasetPullRequestMerge
+	JSON400      *Error
+	JSON401      *Error
+	JSON403      *Error
+	JSON404      *Error
+	JSON409      *Error
+	JSON422      *Error
+	JSON501      *Error
+}
+
+// Status returns HTTPResponse.Status
+func (r MergePullRequestResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r MergePullRequestResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -3226,6 +3747,33 @@ func (r DiffRefsResponse) Status() string {
 
 // StatusCode returns HTTPResponse.StatusCode
 func (r DiffRefsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type GetDatasetByRefResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	JSON200      *Dataset
+	JSON400      *Error
+	JSON401      *Error
+	JSON403      *Error
+	JSON404      *Error
+	JSON501      *Error
+}
+
+// Status returns HTTPResponse.Status
+func (r GetDatasetByRefResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetDatasetByRefResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -3289,7 +3837,7 @@ func (r ValidateDatasetResponse) StatusCode() int {
 type ListVersionsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
-	JSON200      *VersionList
+	JSON200      *DatasetVersionList
 	JSON400      *Error
 	JSON401      *Error
 	JSON403      *Error
@@ -3316,7 +3864,7 @@ func (r ListVersionsResponse) StatusCode() int {
 type PublishVersionResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
-	JSON201      *Version
+	JSON201      *DatasetVersion
 	JSON202      *Task
 	JSON400      *Error
 	JSON401      *Error
@@ -3346,7 +3894,7 @@ func (r PublishVersionResponse) StatusCode() int {
 type GetVersionResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
-	JSON200      *Version
+	JSON200      *DatasetVersion
 	JSON400      *Error
 	JSON401      *Error
 	JSON403      *Error
@@ -3466,6 +4014,15 @@ func (c *ClientWithResponses) UpdateMetadataKeyWithResponse(ctx context.Context,
 	return ParseUpdateMetadataKeyResponse(rsp)
 }
 
+// ListPullRequestsWithResponse request returning *ListPullRequestsResponse
+func (c *ClientWithResponses) ListPullRequestsWithResponse(ctx context.Context, params *ListPullRequestsParams, reqEditors ...RequestEditorFn) (*ListPullRequestsResponse, error) {
+	rsp, err := c.ListPullRequests(ctx, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseListPullRequestsResponse(rsp)
+}
+
 // DeleteDatasetWithResponse request returning *DeleteDatasetResponse
 func (c *ClientWithResponses) DeleteDatasetWithResponse(ctx context.Context, dataset DatasetName, reqEditors ...RequestEditorFn) (*DeleteDatasetResponse, error) {
 	rsp, err := c.DeleteDataset(ctx, dataset, reqEditors...)
@@ -3482,6 +4039,23 @@ func (c *ClientWithResponses) GetDatasetWithResponse(ctx context.Context, datase
 		return nil, err
 	}
 	return ParseGetDatasetResponse(rsp)
+}
+
+// UpdateDatasetWithBodyWithResponse request with arbitrary body returning *UpdateDatasetResponse
+func (c *ClientWithResponses) UpdateDatasetWithBodyWithResponse(ctx context.Context, dataset DatasetName, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*UpdateDatasetResponse, error) {
+	rsp, err := c.UpdateDatasetWithBody(ctx, dataset, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseUpdateDatasetResponse(rsp)
+}
+
+func (c *ClientWithResponses) UpdateDatasetWithResponse(ctx context.Context, dataset DatasetName, body UpdateDatasetJSONRequestBody, reqEditors ...RequestEditorFn) (*UpdateDatasetResponse, error) {
+	rsp, err := c.UpdateDataset(ctx, dataset, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseUpdateDatasetResponse(rsp)
 }
 
 // ListAccessWithResponse request returning *ListAccessResponse
@@ -3519,73 +4093,83 @@ func (c *ClientWithResponses) RevokeAccessWithResponse(ctx context.Context, data
 	return ParseRevokeAccessResponse(rsp)
 }
 
-// ListProposalsWithResponse request returning *ListProposalsResponse
-func (c *ClientWithResponses) ListProposalsWithResponse(ctx context.Context, dataset DatasetName, params *ListProposalsParams, reqEditors ...RequestEditorFn) (*ListProposalsResponse, error) {
-	rsp, err := c.ListProposals(ctx, dataset, params, reqEditors...)
+// ListDatasetPullRequestsWithResponse request returning *ListDatasetPullRequestsResponse
+func (c *ClientWithResponses) ListDatasetPullRequestsWithResponse(ctx context.Context, dataset DatasetName, params *ListDatasetPullRequestsParams, reqEditors ...RequestEditorFn) (*ListDatasetPullRequestsResponse, error) {
+	rsp, err := c.ListDatasetPullRequests(ctx, dataset, params, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-	return ParseListProposalsResponse(rsp)
+	return ParseListDatasetPullRequestsResponse(rsp)
 }
 
-// CreateProposalWithBodyWithResponse request with arbitrary body returning *CreateProposalResponse
-func (c *ClientWithResponses) CreateProposalWithBodyWithResponse(ctx context.Context, dataset DatasetName, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateProposalResponse, error) {
-	rsp, err := c.CreateProposalWithBody(ctx, dataset, contentType, body, reqEditors...)
+// CreatePullRequestWithBodyWithResponse request with arbitrary body returning *CreatePullRequestResponse
+func (c *ClientWithResponses) CreatePullRequestWithBodyWithResponse(ctx context.Context, dataset DatasetName, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreatePullRequestResponse, error) {
+	rsp, err := c.CreatePullRequestWithBody(ctx, dataset, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-	return ParseCreateProposalResponse(rsp)
+	return ParseCreatePullRequestResponse(rsp)
 }
 
-func (c *ClientWithResponses) CreateProposalWithResponse(ctx context.Context, dataset DatasetName, body CreateProposalJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateProposalResponse, error) {
-	rsp, err := c.CreateProposal(ctx, dataset, body, reqEditors...)
+func (c *ClientWithResponses) CreatePullRequestWithResponse(ctx context.Context, dataset DatasetName, body CreatePullRequestJSONRequestBody, reqEditors ...RequestEditorFn) (*CreatePullRequestResponse, error) {
+	rsp, err := c.CreatePullRequest(ctx, dataset, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-	return ParseCreateProposalResponse(rsp)
+	return ParseCreatePullRequestResponse(rsp)
 }
 
-// GetProposalWithResponse request returning *GetProposalResponse
-func (c *ClientWithResponses) GetProposalWithResponse(ctx context.Context, dataset DatasetName, id ProposalID, reqEditors ...RequestEditorFn) (*GetProposalResponse, error) {
-	rsp, err := c.GetProposal(ctx, dataset, id, reqEditors...)
+// ClosePullRequestWithResponse request returning *ClosePullRequestResponse
+func (c *ClientWithResponses) ClosePullRequestWithResponse(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, reqEditors ...RequestEditorFn) (*ClosePullRequestResponse, error) {
+	rsp, err := c.ClosePullRequest(ctx, dataset, pullRequest, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-	return ParseGetProposalResponse(rsp)
+	return ParseClosePullRequestResponse(rsp)
 }
 
-// UpdateProposalWithBodyWithResponse request with arbitrary body returning *UpdateProposalResponse
-func (c *ClientWithResponses) UpdateProposalWithBodyWithResponse(ctx context.Context, dataset DatasetName, id ProposalID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*UpdateProposalResponse, error) {
-	rsp, err := c.UpdateProposalWithBody(ctx, dataset, id, contentType, body, reqEditors...)
+// GetPullRequestWithResponse request returning *GetPullRequestResponse
+func (c *ClientWithResponses) GetPullRequestWithResponse(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, reqEditors ...RequestEditorFn) (*GetPullRequestResponse, error) {
+	rsp, err := c.GetPullRequest(ctx, dataset, pullRequest, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-	return ParseUpdateProposalResponse(rsp)
+	return ParseGetPullRequestResponse(rsp)
 }
 
-func (c *ClientWithResponses) UpdateProposalWithResponse(ctx context.Context, dataset DatasetName, id ProposalID, body UpdateProposalJSONRequestBody, reqEditors ...RequestEditorFn) (*UpdateProposalResponse, error) {
-	rsp, err := c.UpdateProposal(ctx, dataset, id, body, reqEditors...)
+// UpdatePullRequestWithBodyWithResponse request with arbitrary body returning *UpdatePullRequestResponse
+func (c *ClientWithResponses) UpdatePullRequestWithBodyWithResponse(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*UpdatePullRequestResponse, error) {
+	rsp, err := c.UpdatePullRequestWithBody(ctx, dataset, pullRequest, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-	return ParseUpdateProposalResponse(rsp)
+	return ParseUpdatePullRequestResponse(rsp)
 }
 
-// MergeProposalWithBodyWithResponse request with arbitrary body returning *MergeProposalResponse
-func (c *ClientWithResponses) MergeProposalWithBodyWithResponse(ctx context.Context, dataset DatasetName, id ProposalID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*MergeProposalResponse, error) {
-	rsp, err := c.MergeProposalWithBody(ctx, dataset, id, contentType, body, reqEditors...)
+func (c *ClientWithResponses) UpdatePullRequestWithResponse(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, body UpdatePullRequestJSONRequestBody, reqEditors ...RequestEditorFn) (*UpdatePullRequestResponse, error) {
+	rsp, err := c.UpdatePullRequest(ctx, dataset, pullRequest, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-	return ParseMergeProposalResponse(rsp)
+	return ParseUpdatePullRequestResponse(rsp)
 }
 
-func (c *ClientWithResponses) MergeProposalWithResponse(ctx context.Context, dataset DatasetName, id ProposalID, body MergeProposalJSONRequestBody, reqEditors ...RequestEditorFn) (*MergeProposalResponse, error) {
-	rsp, err := c.MergeProposal(ctx, dataset, id, body, reqEditors...)
+// GetPullRequestDiffWithResponse request returning *GetPullRequestDiffResponse
+func (c *ClientWithResponses) GetPullRequestDiffWithResponse(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, reqEditors ...RequestEditorFn) (*GetPullRequestDiffResponse, error) {
+	rsp, err := c.GetPullRequestDiff(ctx, dataset, pullRequest, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-	return ParseMergeProposalResponse(rsp)
+	return ParseGetPullRequestDiffResponse(rsp)
+}
+
+// MergePullRequestWithResponse request returning *MergePullRequestResponse
+func (c *ClientWithResponses) MergePullRequestWithResponse(ctx context.Context, dataset DatasetName, pullRequest PullRequestID, reqEditors ...RequestEditorFn) (*MergePullRequestResponse, error) {
+	rsp, err := c.MergePullRequest(ctx, dataset, pullRequest, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseMergePullRequestResponse(rsp)
 }
 
 // DiffRefsWithResponse request returning *DiffRefsResponse
@@ -3595,6 +4179,15 @@ func (c *ClientWithResponses) DiffRefsWithResponse(ctx context.Context, dataset 
 		return nil, err
 	}
 	return ParseDiffRefsResponse(rsp)
+}
+
+// GetDatasetByRefWithResponse request returning *GetDatasetByRefResponse
+func (c *ClientWithResponses) GetDatasetByRefWithResponse(ctx context.Context, dataset DatasetName, ref Ref, reqEditors ...RequestEditorFn) (*GetDatasetByRefResponse, error) {
+	rsp, err := c.GetDatasetByRef(ctx, dataset, ref, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetDatasetByRefResponse(rsp)
 }
 
 // GetTaskWithResponse request returning *GetTaskResponse
@@ -4118,6 +4711,60 @@ func ParseUpdateMetadataKeyResponse(rsp *http.Response) (*UpdateMetadataKeyRespo
 	return response, nil
 }
 
+// ParseListPullRequestsResponse parses an HTTP response from a ListPullRequestsWithResponse call
+func ParseListPullRequestsResponse(rsp *http.Response) (*ListPullRequestsResponse, error) {
+	bodyBytes, err := ioutil.ReadAll(rsp.Body)
+	defer rsp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ListPullRequestsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest DatasetPullRequestList
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 501:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON501 = &dest
+
+	}
+
+	return response, nil
+}
+
 // ParseDeleteDatasetResponse parses an HTTP response from a DeleteDatasetWithResponse call
 func ParseDeleteDatasetResponse(rsp *http.Response) (*DeleteDatasetResponse, error) {
 	bodyBytes, err := ioutil.ReadAll(rsp.Body)
@@ -4213,6 +4860,81 @@ func ParseGetDatasetResponse(rsp *http.Response) (*GetDatasetResponse, error) {
 			return nil, err
 		}
 		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 501:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON501 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseUpdateDatasetResponse parses an HTTP response from a UpdateDatasetWithResponse call
+func ParseUpdateDatasetResponse(rsp *http.Response) (*UpdateDatasetResponse, error) {
+	bodyBytes, err := ioutil.ReadAll(rsp.Body)
+	defer rsp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &UpdateDatasetResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest Dataset
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON422 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 501:
 		var dest Error
@@ -4395,22 +5117,22 @@ func ParseRevokeAccessResponse(rsp *http.Response) (*RevokeAccessResponse, error
 	return response, nil
 }
 
-// ParseListProposalsResponse parses an HTTP response from a ListProposalsWithResponse call
-func ParseListProposalsResponse(rsp *http.Response) (*ListProposalsResponse, error) {
+// ParseListDatasetPullRequestsResponse parses an HTTP response from a ListDatasetPullRequestsWithResponse call
+func ParseListDatasetPullRequestsResponse(rsp *http.Response) (*ListDatasetPullRequestsResponse, error) {
 	bodyBytes, err := ioutil.ReadAll(rsp.Body)
 	defer rsp.Body.Close()
 	if err != nil {
 		return nil, err
 	}
 
-	response := &ListProposalsResponse{
+	response := &ListDatasetPullRequestsResponse{
 		Body:         bodyBytes,
 		HTTPResponse: rsp,
 	}
 
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest ProposalList
+		var dest DatasetPullRequestList
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -4456,22 +5178,22 @@ func ParseListProposalsResponse(rsp *http.Response) (*ListProposalsResponse, err
 	return response, nil
 }
 
-// ParseCreateProposalResponse parses an HTTP response from a CreateProposalWithResponse call
-func ParseCreateProposalResponse(rsp *http.Response) (*CreateProposalResponse, error) {
+// ParseCreatePullRequestResponse parses an HTTP response from a CreatePullRequestWithResponse call
+func ParseCreatePullRequestResponse(rsp *http.Response) (*CreatePullRequestResponse, error) {
 	bodyBytes, err := ioutil.ReadAll(rsp.Body)
 	defer rsp.Body.Close()
 	if err != nil {
 		return nil, err
 	}
 
-	response := &CreateProposalResponse{
+	response := &CreatePullRequestResponse{
 		Body:         bodyBytes,
 		HTTPResponse: rsp,
 	}
 
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
-		var dest Proposal
+		var dest DatasetPullRequest
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -4531,22 +5253,76 @@ func ParseCreateProposalResponse(rsp *http.Response) (*CreateProposalResponse, e
 	return response, nil
 }
 
-// ParseGetProposalResponse parses an HTTP response from a GetProposalWithResponse call
-func ParseGetProposalResponse(rsp *http.Response) (*GetProposalResponse, error) {
+// ParseClosePullRequestResponse parses an HTTP response from a ClosePullRequestWithResponse call
+func ParseClosePullRequestResponse(rsp *http.Response) (*ClosePullRequestResponse, error) {
 	bodyBytes, err := ioutil.ReadAll(rsp.Body)
 	defer rsp.Body.Close()
 	if err != nil {
 		return nil, err
 	}
 
-	response := &GetProposalResponse{
+	response := &ClosePullRequestResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 501:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON501 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetPullRequestResponse parses an HTTP response from a GetPullRequestWithResponse call
+func ParseGetPullRequestResponse(rsp *http.Response) (*GetPullRequestResponse, error) {
+	bodyBytes, err := ioutil.ReadAll(rsp.Body)
+	defer rsp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetPullRequestResponse{
 		Body:         bodyBytes,
 		HTTPResponse: rsp,
 	}
 
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest Proposal
+		var dest DatasetPullRequest
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -4585,22 +5361,22 @@ func ParseGetProposalResponse(rsp *http.Response) (*GetProposalResponse, error) 
 	return response, nil
 }
 
-// ParseUpdateProposalResponse parses an HTTP response from a UpdateProposalWithResponse call
-func ParseUpdateProposalResponse(rsp *http.Response) (*UpdateProposalResponse, error) {
+// ParseUpdatePullRequestResponse parses an HTTP response from a UpdatePullRequestWithResponse call
+func ParseUpdatePullRequestResponse(rsp *http.Response) (*UpdatePullRequestResponse, error) {
 	bodyBytes, err := ioutil.ReadAll(rsp.Body)
 	defer rsp.Body.Close()
 	if err != nil {
 		return nil, err
 	}
 
-	response := &UpdateProposalResponse{
+	response := &UpdatePullRequestResponse{
 		Body:         bodyBytes,
 		HTTPResponse: rsp,
 	}
 
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest Proposal
+		var dest DatasetPullRequest
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -4653,26 +5429,80 @@ func ParseUpdateProposalResponse(rsp *http.Response) (*UpdateProposalResponse, e
 	return response, nil
 }
 
-// ParseMergeProposalResponse parses an HTTP response from a MergeProposalWithResponse call
-func ParseMergeProposalResponse(rsp *http.Response) (*MergeProposalResponse, error) {
+// ParseGetPullRequestDiffResponse parses an HTTP response from a GetPullRequestDiffWithResponse call
+func ParseGetPullRequestDiffResponse(rsp *http.Response) (*GetPullRequestDiffResponse, error) {
 	bodyBytes, err := ioutil.ReadAll(rsp.Body)
 	defer rsp.Body.Close()
 	if err != nil {
 		return nil, err
 	}
 
-	response := &MergeProposalResponse{
+	response := &GetPullRequestDiffResponse{
 		Body:         bodyBytes,
 		HTTPResponse: rsp,
 	}
 
 	switch {
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
-		var dest Version
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest DatasetDiff
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
-		response.JSON201 = &dest
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 501:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON501 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseMergePullRequestResponse parses an HTTP response from a MergePullRequestWithResponse call
+func ParseMergePullRequestResponse(rsp *http.Response) (*MergePullRequestResponse, error) {
+	bodyBytes, err := ioutil.ReadAll(rsp.Body)
+	defer rsp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &MergePullRequestResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest DatasetPullRequestMerge
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
 		var dest Error
@@ -4744,6 +5574,67 @@ func ParseDiffRefsResponse(rsp *http.Response) (*DiffRefsResponse, error) {
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
 		var dest interface{}
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON401 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 501:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON501 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetDatasetByRefResponse parses an HTTP response from a GetDatasetByRefWithResponse call
+func ParseGetDatasetByRefResponse(rsp *http.Response) (*GetDatasetByRefResponse, error) {
+	bodyBytes, err := ioutil.ReadAll(rsp.Body)
+	defer rsp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetDatasetByRefResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest Dataset
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -4926,7 +5817,7 @@ func ParseListVersionsResponse(rsp *http.Response) (*ListVersionsResponse, error
 
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest VersionList
+		var dest DatasetVersionList
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -4987,7 +5878,7 @@ func ParsePublishVersionResponse(rsp *http.Response) (*PublishVersionResponse, e
 
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
-		var dest Version
+		var dest DatasetVersion
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -5069,7 +5960,7 @@ func ParseGetVersionResponse(rsp *http.Response) (*GetVersionResponse, error) {
 
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest Version
+		var dest DatasetVersion
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -5143,12 +6034,18 @@ type ServerInterface interface {
 	// Replace a metadata key
 	// (PUT /metadata/{key})
 	UpdateMetadataKey(w http.ResponseWriter, r *http.Request, body UpdateMetadataKeyJSONRequestBody, key MetadataKeyName)
+	// List dataset pull requests
+	// (GET /pulls)
+	ListPullRequests(w http.ResponseWriter, r *http.Request, params ListPullRequestsParams)
 	// Delete a dataset
 	// (DELETE /{dataset})
 	DeleteDataset(w http.ResponseWriter, r *http.Request, dataset DatasetName)
 	// Get a dataset
 	// (GET /{dataset})
 	GetDataset(w http.ResponseWriter, r *http.Request, dataset DatasetName)
+	// Update a dataset
+	// (PUT /{dataset})
+	UpdateDataset(w http.ResponseWriter, r *http.Request, body UpdateDatasetJSONRequestBody, dataset DatasetName)
 	// List dataset access grants
 	// (GET /{dataset}/access)
 	ListAccess(w http.ResponseWriter, r *http.Request, dataset DatasetName)
@@ -5158,24 +6055,33 @@ type ServerInterface interface {
 	// Revoke dataset access
 	// (DELETE /{dataset}/access/{principal_type}/{principal_id})
 	RevokeAccess(w http.ResponseWriter, r *http.Request, dataset DatasetName, principalType PrincipalType, principalId PrincipalID)
-	// List dataset proposals
-	// (GET /{dataset}/proposals)
-	ListProposals(w http.ResponseWriter, r *http.Request, dataset DatasetName, params ListProposalsParams)
-	// Open a dataset proposal
-	// (POST /{dataset}/proposals)
-	CreateProposal(w http.ResponseWriter, r *http.Request, body CreateProposalJSONRequestBody, dataset DatasetName)
-	// Get a dataset proposal
-	// (GET /{dataset}/proposals/{id})
-	GetProposal(w http.ResponseWriter, r *http.Request, dataset DatasetName, id ProposalID)
-	// Update or close a proposal
-	// (PATCH /{dataset}/proposals/{id})
-	UpdateProposal(w http.ResponseWriter, r *http.Request, body UpdateProposalJSONRequestBody, dataset DatasetName, id ProposalID)
-	// Merge a proposal
-	// (POST /{dataset}/proposals/{id}/merge)
-	MergeProposal(w http.ResponseWriter, r *http.Request, body MergeProposalJSONRequestBody, dataset DatasetName, id ProposalID)
+	// List the pull requests of a dataset
+	// (GET /{dataset}/pulls)
+	ListDatasetPullRequests(w http.ResponseWriter, r *http.Request, dataset DatasetName, params ListDatasetPullRequestsParams)
+	// Open a dataset pull request
+	// (POST /{dataset}/pulls)
+	CreatePullRequest(w http.ResponseWriter, r *http.Request, body CreatePullRequestJSONRequestBody, dataset DatasetName)
+	// Close a dataset pull request
+	// (DELETE /{dataset}/pulls/{pullRequest})
+	ClosePullRequest(w http.ResponseWriter, r *http.Request, dataset DatasetName, pullRequest PullRequestID)
+	// Get a dataset pull request
+	// (GET /{dataset}/pulls/{pullRequest})
+	GetPullRequest(w http.ResponseWriter, r *http.Request, dataset DatasetName, pullRequest PullRequestID)
+	// Update a dataset pull request
+	// (PATCH /{dataset}/pulls/{pullRequest})
+	UpdatePullRequest(w http.ResponseWriter, r *http.Request, body UpdatePullRequestJSONRequestBody, dataset DatasetName, pullRequest PullRequestID)
+	// Diff a dataset pull request against latest
+	// (GET /{dataset}/pulls/{pullRequest}/diff)
+	GetPullRequestDiff(w http.ResponseWriter, r *http.Request, dataset DatasetName, pullRequest PullRequestID)
+	// Merge a dataset pull request
+	// (POST /{dataset}/pulls/{pullRequest}/merge)
+	MergePullRequest(w http.ResponseWriter, r *http.Request, dataset DatasetName, pullRequest PullRequestID)
 	// Diff two dataset refs
 	// (GET /{dataset}/refs/{leftRef}/diff/{rightRef})
 	DiffRefs(w http.ResponseWriter, r *http.Request, dataset DatasetName, leftRef LeftRef, rightRef RightRef, params DiffRefsParams)
+	// Get a dataset at a ref
+	// (GET /{dataset}/refs/{ref})
+	GetDatasetByRef(w http.ResponseWriter, r *http.Request, dataset DatasetName, ref Ref)
 	// Get an asynchronous dataset task
 	// (GET /{dataset}/tasks/{task_id})
 	GetTask(w http.ResponseWriter, r *http.Request, dataset DatasetName, taskId TaskID)
@@ -5561,6 +6467,81 @@ func (siw *ServerInterfaceWrapper) UpdateMetadataKey(w http.ResponseWriter, r *h
 	handler(w, r.WithContext(ctx))
 }
 
+// ListPullRequests operation middleware
+func (siw *ServerInterfaceWrapper) ListPullRequests(w http.ResponseWriter, r *http.Request) {
+	ctx, task := trace.NewTask(r.Context(), "api:ListPullRequests")
+	defer task.End()
+
+	var err error
+
+	ctx = context.WithValue(ctx, Jwt_tokenScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Basic_authScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Cookie_authScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Oidc_authScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Saml_authScopes, []string{""})
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListPullRequestsParams
+
+	// ------------- Optional query parameter "status" -------------
+	if paramValue := r.URL.Query().Get("status"); paramValue != "" {
+
+	}
+
+	err = runtime.BindQueryParameter("form", true, false, "status", r.URL.Query(), &params.Status)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid format for parameter status: %s", err), http.StatusBadRequest)
+		return
+	}
+
+	// ------------- Optional query parameter "dataset" -------------
+	if paramValue := r.URL.Query().Get("dataset"); paramValue != "" {
+
+	}
+
+	err = runtime.BindQueryParameter("form", true, false, "dataset", r.URL.Query(), &params.Dataset)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid format for parameter dataset: %s", err), http.StatusBadRequest)
+		return
+	}
+
+	// ------------- Optional query parameter "after" -------------
+	if paramValue := r.URL.Query().Get("after"); paramValue != "" {
+
+	}
+
+	err = runtime.BindQueryParameter("form", true, false, "after", r.URL.Query(), &params.After)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid format for parameter after: %s", err), http.StatusBadRequest)
+		return
+	}
+
+	// ------------- Optional query parameter "amount" -------------
+	if paramValue := r.URL.Query().Get("amount"); paramValue != "" {
+
+	}
+
+	err = runtime.BindQueryParameter("form", true, false, "amount", r.URL.Query(), &params.Amount)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid format for parameter amount: %s", err), http.StatusBadRequest)
+		return
+	}
+
+	var handler = func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListPullRequests(w, r, params)
+	}
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler(w, r.WithContext(ctx))
+}
+
 // DeleteDataset operation middleware
 func (siw *ServerInterfaceWrapper) DeleteDataset(w http.ResponseWriter, r *http.Request) {
 	ctx, task := trace.NewTask(r.Context(), "api:DeleteDataset")
@@ -5626,6 +6607,53 @@ func (siw *ServerInterfaceWrapper) GetDataset(w http.ResponseWriter, r *http.Req
 
 	var handler = func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetDataset(w, r, dataset)
+	}
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler(w, r.WithContext(ctx))
+}
+
+// UpdateDataset operation middleware
+func (siw *ServerInterfaceWrapper) UpdateDataset(w http.ResponseWriter, r *http.Request) {
+	ctx, task := trace.NewTask(r.Context(), "api:UpdateDataset")
+	defer task.End()
+
+	var err error
+
+	// ------------- Body parse -------------
+	var body UpdateDatasetJSONRequestBody
+	parseBody := true
+	if parseBody {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "Error unmarshalling body 'UpdateDataset' as JSON", http.StatusBadRequest)
+			return
+		}
+	}
+
+	// ------------- Path parameter "dataset" -------------
+	var dataset DatasetName
+
+	err = runtime.BindStyledParameter("simple", false, "dataset", chi.URLParam(r, "dataset"), &dataset)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid format for parameter dataset: %s", err), http.StatusBadRequest)
+		return
+	}
+
+	ctx = context.WithValue(ctx, Jwt_tokenScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Basic_authScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Cookie_authScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Oidc_authScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Saml_authScopes, []string{""})
+
+	var handler = func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.UpdateDataset(w, r, body, dataset)
 	}
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -5774,9 +6802,9 @@ func (siw *ServerInterfaceWrapper) RevokeAccess(w http.ResponseWriter, r *http.R
 	handler(w, r.WithContext(ctx))
 }
 
-// ListProposals operation middleware
-func (siw *ServerInterfaceWrapper) ListProposals(w http.ResponseWriter, r *http.Request) {
-	ctx, task := trace.NewTask(r.Context(), "api:ListProposals")
+// ListDatasetPullRequests operation middleware
+func (siw *ServerInterfaceWrapper) ListDatasetPullRequests(w http.ResponseWriter, r *http.Request) {
+	ctx, task := trace.NewTask(r.Context(), "api:ListDatasetPullRequests")
 	defer task.End()
 
 	var err error
@@ -5801,7 +6829,7 @@ func (siw *ServerInterfaceWrapper) ListProposals(w http.ResponseWriter, r *http.
 	ctx = context.WithValue(ctx, Saml_authScopes, []string{""})
 
 	// Parameter object where we will unmarshal all parameters from the context
-	var params ListProposalsParams
+	var params ListDatasetPullRequestsParams
 
 	// ------------- Optional query parameter "status" -------------
 	if paramValue := r.URL.Query().Get("status"); paramValue != "" {
@@ -5837,7 +6865,7 @@ func (siw *ServerInterfaceWrapper) ListProposals(w http.ResponseWriter, r *http.
 	}
 
 	var handler = func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.ListProposals(w, r, dataset, params)
+		siw.Handler.ListDatasetPullRequests(w, r, dataset, params)
 	}
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -5847,19 +6875,19 @@ func (siw *ServerInterfaceWrapper) ListProposals(w http.ResponseWriter, r *http.
 	handler(w, r.WithContext(ctx))
 }
 
-// CreateProposal operation middleware
-func (siw *ServerInterfaceWrapper) CreateProposal(w http.ResponseWriter, r *http.Request) {
-	ctx, task := trace.NewTask(r.Context(), "api:CreateProposal")
+// CreatePullRequest operation middleware
+func (siw *ServerInterfaceWrapper) CreatePullRequest(w http.ResponseWriter, r *http.Request) {
+	ctx, task := trace.NewTask(r.Context(), "api:CreatePullRequest")
 	defer task.End()
 
 	var err error
 
 	// ------------- Body parse -------------
-	var body CreateProposalJSONRequestBody
+	var body CreatePullRequestJSONRequestBody
 	parseBody := true
 	if parseBody {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "Error unmarshalling body 'CreateProposal' as JSON", http.StatusBadRequest)
+			http.Error(w, "Error unmarshalling body 'CreatePullRequest' as JSON", http.StatusBadRequest)
 			return
 		}
 	}
@@ -5884,7 +6912,7 @@ func (siw *ServerInterfaceWrapper) CreateProposal(w http.ResponseWriter, r *http
 	ctx = context.WithValue(ctx, Saml_authScopes, []string{""})
 
 	var handler = func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.CreateProposal(w, r, body, dataset)
+		siw.Handler.CreatePullRequest(w, r, body, dataset)
 	}
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -5894,9 +6922,9 @@ func (siw *ServerInterfaceWrapper) CreateProposal(w http.ResponseWriter, r *http
 	handler(w, r.WithContext(ctx))
 }
 
-// GetProposal operation middleware
-func (siw *ServerInterfaceWrapper) GetProposal(w http.ResponseWriter, r *http.Request) {
-	ctx, task := trace.NewTask(r.Context(), "api:GetProposal")
+// ClosePullRequest operation middleware
+func (siw *ServerInterfaceWrapper) ClosePullRequest(w http.ResponseWriter, r *http.Request) {
+	ctx, task := trace.NewTask(r.Context(), "api:ClosePullRequest")
 	defer task.End()
 
 	var err error
@@ -5910,12 +6938,12 @@ func (siw *ServerInterfaceWrapper) GetProposal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// ------------- Path parameter "id" -------------
-	var id ProposalID
+	// ------------- Path parameter "pullRequest" -------------
+	var pullRequest PullRequestID
 
-	err = runtime.BindStyledParameter("simple", false, "id", chi.URLParam(r, "id"), &id)
+	err = runtime.BindStyledParameter("simple", false, "pullRequest", chi.URLParam(r, "pullRequest"), &pullRequest)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Invalid format for parameter id: %s", err), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("Invalid format for parameter pullRequest: %s", err), http.StatusBadRequest)
 		return
 	}
 
@@ -5930,7 +6958,7 @@ func (siw *ServerInterfaceWrapper) GetProposal(w http.ResponseWriter, r *http.Re
 	ctx = context.WithValue(ctx, Saml_authScopes, []string{""})
 
 	var handler = func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.GetProposal(w, r, dataset, id)
+		siw.Handler.ClosePullRequest(w, r, dataset, pullRequest)
 	}
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -5940,19 +6968,65 @@ func (siw *ServerInterfaceWrapper) GetProposal(w http.ResponseWriter, r *http.Re
 	handler(w, r.WithContext(ctx))
 }
 
-// UpdateProposal operation middleware
-func (siw *ServerInterfaceWrapper) UpdateProposal(w http.ResponseWriter, r *http.Request) {
-	ctx, task := trace.NewTask(r.Context(), "api:UpdateProposal")
+// GetPullRequest operation middleware
+func (siw *ServerInterfaceWrapper) GetPullRequest(w http.ResponseWriter, r *http.Request) {
+	ctx, task := trace.NewTask(r.Context(), "api:GetPullRequest")
+	defer task.End()
+
+	var err error
+
+	// ------------- Path parameter "dataset" -------------
+	var dataset DatasetName
+
+	err = runtime.BindStyledParameter("simple", false, "dataset", chi.URLParam(r, "dataset"), &dataset)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid format for parameter dataset: %s", err), http.StatusBadRequest)
+		return
+	}
+
+	// ------------- Path parameter "pullRequest" -------------
+	var pullRequest PullRequestID
+
+	err = runtime.BindStyledParameter("simple", false, "pullRequest", chi.URLParam(r, "pullRequest"), &pullRequest)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid format for parameter pullRequest: %s", err), http.StatusBadRequest)
+		return
+	}
+
+	ctx = context.WithValue(ctx, Jwt_tokenScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Basic_authScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Cookie_authScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Oidc_authScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Saml_authScopes, []string{""})
+
+	var handler = func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetPullRequest(w, r, dataset, pullRequest)
+	}
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler(w, r.WithContext(ctx))
+}
+
+// UpdatePullRequest operation middleware
+func (siw *ServerInterfaceWrapper) UpdatePullRequest(w http.ResponseWriter, r *http.Request) {
+	ctx, task := trace.NewTask(r.Context(), "api:UpdatePullRequest")
 	defer task.End()
 
 	var err error
 
 	// ------------- Body parse -------------
-	var body UpdateProposalJSONRequestBody
+	var body UpdatePullRequestJSONRequestBody
 	parseBody := true
 	if parseBody {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "Error unmarshalling body 'UpdateProposal' as JSON", http.StatusBadRequest)
+			http.Error(w, "Error unmarshalling body 'UpdatePullRequest' as JSON", http.StatusBadRequest)
 			return
 		}
 	}
@@ -5966,12 +7040,12 @@ func (siw *ServerInterfaceWrapper) UpdateProposal(w http.ResponseWriter, r *http
 		return
 	}
 
-	// ------------- Path parameter "id" -------------
-	var id ProposalID
+	// ------------- Path parameter "pullRequest" -------------
+	var pullRequest PullRequestID
 
-	err = runtime.BindStyledParameter("simple", false, "id", chi.URLParam(r, "id"), &id)
+	err = runtime.BindStyledParameter("simple", false, "pullRequest", chi.URLParam(r, "pullRequest"), &pullRequest)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Invalid format for parameter id: %s", err), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("Invalid format for parameter pullRequest: %s", err), http.StatusBadRequest)
 		return
 	}
 
@@ -5986,7 +7060,7 @@ func (siw *ServerInterfaceWrapper) UpdateProposal(w http.ResponseWriter, r *http
 	ctx = context.WithValue(ctx, Saml_authScopes, []string{""})
 
 	var handler = func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.UpdateProposal(w, r, body, dataset, id)
+		siw.Handler.UpdatePullRequest(w, r, body, dataset, pullRequest)
 	}
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -5996,22 +7070,12 @@ func (siw *ServerInterfaceWrapper) UpdateProposal(w http.ResponseWriter, r *http
 	handler(w, r.WithContext(ctx))
 }
 
-// MergeProposal operation middleware
-func (siw *ServerInterfaceWrapper) MergeProposal(w http.ResponseWriter, r *http.Request) {
-	ctx, task := trace.NewTask(r.Context(), "api:MergeProposal")
+// GetPullRequestDiff operation middleware
+func (siw *ServerInterfaceWrapper) GetPullRequestDiff(w http.ResponseWriter, r *http.Request) {
+	ctx, task := trace.NewTask(r.Context(), "api:GetPullRequestDiff")
 	defer task.End()
 
 	var err error
-
-	// ------------- Body parse -------------
-	var body MergeProposalJSONRequestBody
-	parseBody := r.ContentLength != 0
-	if parseBody {
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "Error unmarshalling body 'MergeProposal' as JSON", http.StatusBadRequest)
-			return
-		}
-	}
 
 	// ------------- Path parameter "dataset" -------------
 	var dataset DatasetName
@@ -6022,12 +7086,12 @@ func (siw *ServerInterfaceWrapper) MergeProposal(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// ------------- Path parameter "id" -------------
-	var id ProposalID
+	// ------------- Path parameter "pullRequest" -------------
+	var pullRequest PullRequestID
 
-	err = runtime.BindStyledParameter("simple", false, "id", chi.URLParam(r, "id"), &id)
+	err = runtime.BindStyledParameter("simple", false, "pullRequest", chi.URLParam(r, "pullRequest"), &pullRequest)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Invalid format for parameter id: %s", err), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("Invalid format for parameter pullRequest: %s", err), http.StatusBadRequest)
 		return
 	}
 
@@ -6042,7 +7106,53 @@ func (siw *ServerInterfaceWrapper) MergeProposal(w http.ResponseWriter, r *http.
 	ctx = context.WithValue(ctx, Saml_authScopes, []string{""})
 
 	var handler = func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.MergeProposal(w, r, body, dataset, id)
+		siw.Handler.GetPullRequestDiff(w, r, dataset, pullRequest)
+	}
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler(w, r.WithContext(ctx))
+}
+
+// MergePullRequest operation middleware
+func (siw *ServerInterfaceWrapper) MergePullRequest(w http.ResponseWriter, r *http.Request) {
+	ctx, task := trace.NewTask(r.Context(), "api:MergePullRequest")
+	defer task.End()
+
+	var err error
+
+	// ------------- Path parameter "dataset" -------------
+	var dataset DatasetName
+
+	err = runtime.BindStyledParameter("simple", false, "dataset", chi.URLParam(r, "dataset"), &dataset)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid format for parameter dataset: %s", err), http.StatusBadRequest)
+		return
+	}
+
+	// ------------- Path parameter "pullRequest" -------------
+	var pullRequest PullRequestID
+
+	err = runtime.BindStyledParameter("simple", false, "pullRequest", chi.URLParam(r, "pullRequest"), &pullRequest)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid format for parameter pullRequest: %s", err), http.StatusBadRequest)
+		return
+	}
+
+	ctx = context.WithValue(ctx, Jwt_tokenScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Basic_authScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Cookie_authScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Oidc_authScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Saml_authScopes, []string{""})
+
+	var handler = func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.MergePullRequest(w, r, dataset, pullRequest)
 	}
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -6145,6 +7255,52 @@ func (siw *ServerInterfaceWrapper) DiffRefs(w http.ResponseWriter, r *http.Reque
 
 	var handler = func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.DiffRefs(w, r, dataset, leftRef, rightRef, params)
+	}
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler(w, r.WithContext(ctx))
+}
+
+// GetDatasetByRef operation middleware
+func (siw *ServerInterfaceWrapper) GetDatasetByRef(w http.ResponseWriter, r *http.Request) {
+	ctx, task := trace.NewTask(r.Context(), "api:GetDatasetByRef")
+	defer task.End()
+
+	var err error
+
+	// ------------- Path parameter "dataset" -------------
+	var dataset DatasetName
+
+	err = runtime.BindStyledParameter("simple", false, "dataset", chi.URLParam(r, "dataset"), &dataset)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid format for parameter dataset: %s", err), http.StatusBadRequest)
+		return
+	}
+
+	// ------------- Path parameter "ref" -------------
+	var ref Ref
+
+	err = runtime.BindStyledParameter("simple", false, "ref", chi.URLParam(r, "ref"), &ref)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid format for parameter ref: %s", err), http.StatusBadRequest)
+		return
+	}
+
+	ctx = context.WithValue(ctx, Jwt_tokenScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Basic_authScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Cookie_authScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Oidc_authScopes, []string{""})
+
+	ctx = context.WithValue(ctx, Saml_authScopes, []string{""})
+
+	var handler = func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetDatasetByRef(w, r, dataset, ref)
 	}
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -6464,10 +7620,16 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 		r.Put(options.BaseURL+"/metadata/{key}", wrapper.UpdateMetadataKey)
 	})
 	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/pulls", wrapper.ListPullRequests)
+	})
+	r.Group(func(r chi.Router) {
 		r.Delete(options.BaseURL+"/{dataset}", wrapper.DeleteDataset)
 	})
 	r.Group(func(r chi.Router) {
 		r.Get(options.BaseURL+"/{dataset}", wrapper.GetDataset)
+	})
+	r.Group(func(r chi.Router) {
+		r.Put(options.BaseURL+"/{dataset}", wrapper.UpdateDataset)
 	})
 	r.Group(func(r chi.Router) {
 		r.Get(options.BaseURL+"/{dataset}/access", wrapper.ListAccess)
@@ -6479,22 +7641,31 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 		r.Delete(options.BaseURL+"/{dataset}/access/{principal_type}/{principal_id}", wrapper.RevokeAccess)
 	})
 	r.Group(func(r chi.Router) {
-		r.Get(options.BaseURL+"/{dataset}/proposals", wrapper.ListProposals)
+		r.Get(options.BaseURL+"/{dataset}/pulls", wrapper.ListDatasetPullRequests)
 	})
 	r.Group(func(r chi.Router) {
-		r.Post(options.BaseURL+"/{dataset}/proposals", wrapper.CreateProposal)
+		r.Post(options.BaseURL+"/{dataset}/pulls", wrapper.CreatePullRequest)
 	})
 	r.Group(func(r chi.Router) {
-		r.Get(options.BaseURL+"/{dataset}/proposals/{id}", wrapper.GetProposal)
+		r.Delete(options.BaseURL+"/{dataset}/pulls/{pullRequest}", wrapper.ClosePullRequest)
 	})
 	r.Group(func(r chi.Router) {
-		r.Patch(options.BaseURL+"/{dataset}/proposals/{id}", wrapper.UpdateProposal)
+		r.Get(options.BaseURL+"/{dataset}/pulls/{pullRequest}", wrapper.GetPullRequest)
 	})
 	r.Group(func(r chi.Router) {
-		r.Post(options.BaseURL+"/{dataset}/proposals/{id}/merge", wrapper.MergeProposal)
+		r.Patch(options.BaseURL+"/{dataset}/pulls/{pullRequest}", wrapper.UpdatePullRequest)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/{dataset}/pulls/{pullRequest}/diff", wrapper.GetPullRequestDiff)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/{dataset}/pulls/{pullRequest}/merge", wrapper.MergePullRequest)
 	})
 	r.Group(func(r chi.Router) {
 		r.Get(options.BaseURL+"/{dataset}/refs/{leftRef}/diff/{rightRef}", wrapper.DiffRefs)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/{dataset}/refs/{ref}", wrapper.GetDatasetByRef)
 	})
 	r.Group(func(r chi.Router) {
 		r.Get(options.BaseURL+"/{dataset}/tasks/{task_id}", wrapper.GetTask)
@@ -6520,145 +7691,164 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
+	"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",
+	"oLGgGSpztYvPrv//ADIiwABBxQAA",
 }
 
 // GetSwaggerSpecReader returns a reader to the Swagger specification corresponding to the generated code in this file.

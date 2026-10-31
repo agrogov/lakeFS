@@ -38,10 +38,10 @@ const definition = (targets: string[], overrides: Partial<DatasetDefinition> = {
 });
 
 const version = (number: number, targets: string[], overrides: Partial<Version> = {}): Version => ({
-    version: number,
+    id: `v${number}`,
     message: `message for v${number}`,
-    publisher: `publisher-${number}`,
-    published_at: Date.UTC(2026, 0, number),
+    author: `publisher-${number}`,
+    creation_date: Date.UTC(2026, 0, number) / 1000,
     commit_id: `${number}`.repeat(40),
     definition: definition(targets),
     stats: { objects: 10 * number, bytes: 1024 * number, items: [] },
@@ -51,11 +51,11 @@ const version = (number: number, targets: string[], overrides: Partial<Version> 
 const versions = [version(3, ['customers', 'orders']), version(2, ['customers']), version(1, ['customers'])];
 
 const dataset = {
-    name: 'customer-360',
+    id: 'customer-360',
     description: 'Curated customer view',
-    created_at: Date.UTC(2026, 0, 1),
+    creation_date: Date.UTC(2026, 0, 1) / 1000,
     created_by: 'creator',
-    latest_version: 3,
+    version: 3,
     state: 'active',
     definition: versions[0].definition,
     stats: versions[0].stats,
@@ -65,7 +65,7 @@ describe('versionTimeline', () => {
     it('counts what each version changed against the version before it', () => {
         const entries = versionTimeline(versions);
 
-        expect(entries.map((entry) => entry.version.version)).toEqual([3, 2, 1]);
+        expect(entries.map((entry) => entry.version.id)).toEqual(['v3', 'v2', 'v1']);
         // v3 adds "orders" to the item v2 already had.
         expect(entries[0].counts).toEqual({ added: 1, removed: 0, changed: 0, total: 1 });
         // v2 and v3 declare the same single item, so nothing changed.
@@ -76,7 +76,7 @@ describe('versionTimeline', () => {
 
     it('sorts newest first whatever order it is given', () => {
         const entries = versionTimeline([...versions].reverse());
-        expect(entries.map((entry) => entry.version.version)).toEqual([3, 2, 1]);
+        expect(entries.map((entry) => entry.version.id)).toEqual(['v3', 'v2', 'v1']);
     });
 });
 
@@ -165,7 +165,7 @@ describe('DatasetVersionsPage', () => {
     });
 
     it('says so when the dataset has no versions', async () => {
-        fetchMock.mockResolvedValueOnce(jsonResponse({ ...dataset, latest_version: 0, definition: undefined }));
+        fetchMock.mockResolvedValueOnce(jsonResponse({ ...dataset, version: 0, definition: undefined }));
         fetchMock.mockResolvedValueOnce(jsonResponse({ results: [], pagination: {} }));
         renderPage();
 

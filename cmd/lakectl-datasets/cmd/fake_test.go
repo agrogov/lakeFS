@@ -158,10 +158,10 @@ const testDefinition = `{
 
 // testVersionBody is a version response (§10.2).
 const testVersionBody = `{
-  "version": 3,
+  "id": "v3",
   "message": "add churn column",
-  "publisher": "admin",
-  "published_at": 1767225600000,
+  "author": "admin",
+  "creation_date": 1767225600,
   "commit_id": "abc123",
   "definition": ` + testDefinition + `,
   "stats": {"objects": 12, "bytes": 4096, "items": [{"target": "customers", "objects": 12, "bytes": 4096}]}
@@ -169,14 +169,31 @@ const testVersionBody = `{
 
 // testDatasetBody is a dataset response (§10.2).
 const testDatasetBody = `{
-  "name": "customer-360",
+  "id": "customer-360",
   "description": "Curated customer view for analytics",
-  "created_at": 1767225600000,
+  "creation_date": 1767225600,
   "created_by": "admin",
-  "latest_version": 3,
+  "version": 3,
   "state": "active",
   "definition": ` + testDefinition + `,
   "stats": {"objects": 12, "bytes": 4096, "items": []}
+}`
+
+// testPullRequestBody is a DatasetPullRequest response (§10.2).
+const testPullRequestBody = `{
+  "id": "01J8Z3Q4X5",
+  "dataset": "customer-360",
+  "title": "add churn column",
+  "author": "admin",
+  "status": "open",
+  "base_version": 3,
+  "latest_version": 3,
+  "stale": false,
+  "conflicted": false,
+  "source_ref": "pr/01J8Z3Q4X5",
+  "creation_date": 1767225600,
+  "preview_branch": "_proposal-01J8Z3Q4X5",
+  "definition": ` + testDefinition + `
 }`
 
 // emptyPagination is the pagination object of every list response (§10.2).

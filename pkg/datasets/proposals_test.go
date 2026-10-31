@@ -626,15 +626,50 @@ func TestProposalListAndNotFound(t *testing.T) {
 		require.ErrorIs(t, err, ErrProposalNotFound)
 	})
 
-	t.Run("unknown dataset is 404", func(t *testing.T) {
+	t.Run("unknown dataset with no pull requests is 404", func(t *testing.T) {
 		_, err := f.svc.ListProposals(f.ctx, f.caller(), "not-a-dataset", "", "", 0)
 		require.ErrorIs(t, err, ErrDatasetNotFound)
+	})
 
-		_, err = f.svc.CreateProposal(f.ctx, f.caller(), "not-a-dataset", CreateProposalRequest{
+	t.Run("pull request for a dataset that does not exist yet", func(t *testing.T) {
+		opened, err := f.svc.CreateProposal(f.ctx, f.caller(), "not-a-dataset", CreateProposalRequest{
 			Definition: prefixDefinition(source, commit.String(), "data", "data/"),
-			Title:      "nope",
+			Title:      "create it through review",
 		})
-		require.ErrorIs(t, err, ErrDatasetNotFound)
+		require.NoError(t, err)
+		require.Equal(t, 0, opened.Record.BaseVersion)
+		require.False(t, opened.Stale)
+		require.False(t, opened.Conflicted)
+		require.Empty(t, opened.Record.PreviewBranch)
+
+		// The name is still free, so the merge creates the dataset and publishes v1.
+		version, err := f.svc.MergeProposal(f.ctx, f.caller(), "not-a-dataset", opened.Record.ID, MergeProposalRequest{})
+		require.NoError(t, err)
+		require.Equal(t, 1, version.Version)
+		created, err := f.svc.Get(f.ctx, f.caller(), "not-a-dataset")
+		require.NoError(t, err)
+		require.Equal(t, 1, created.Record.LatestVersion)
+	})
+
+	t.Run("pull request for a name taken later is conflicted", func(t *testing.T) {
+		const name = "later-taken"
+		opened, err := f.svc.CreateProposal(f.ctx, f.caller(), name, CreateProposalRequest{
+			Definition: prefixDefinition(source, commit.String(), "data", "data/"),
+			Title:      "create it through review",
+		})
+		require.NoError(t, err)
+		require.False(t, opened.Conflicted)
+
+		// Somebody takes the name after the pull request was opened.
+		_, err = f.svc.catalog.CreateRepository(f.ctx, name, f.svc.cfg.StorageID, "mem://"+name+"-ns", DefaultBranch, false)
+		require.NoError(t, err)
+
+		view, err := f.svc.GetProposal(f.ctx, f.caller(), name, opened.Record.ID)
+		require.NoError(t, err)
+		require.True(t, view.Conflicted, "the dataset name is unavailable")
+
+		_, err = f.svc.MergeProposal(f.ctx, f.caller(), name, opened.Record.ID, MergeProposalRequest{})
+		require.ErrorIs(t, err, ErrDatasetConflict, "merging a conflicted pull request answers 409")
 	})
 }
 

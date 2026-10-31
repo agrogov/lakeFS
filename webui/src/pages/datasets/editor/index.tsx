@@ -213,7 +213,7 @@ const EditorForm: FC<EditorFormProps> = ({ mode, datasetId, dataset, metadataKey
         });
     }, [currentResolution, rawMode, items]);
 
-    const latestVersion = dataset?.latest_version ?? 0;
+    const latestVersion = dataset?.version ?? 0;
     const publishLabel = `Publish as v${latestVersion + 1}`;
 
     const serverBlocked = validation.errors.length > 0;
@@ -250,12 +250,12 @@ const EditorForm: FC<EditorFormProps> = ({ mode, datasetId, dataset, metadataKey
         setSubmitError(null);
         try {
             if (action === 'proposal') {
-                await datasets.createProposal(datasetId, {
+                await datasets.createPullRequest(datasetId, {
                     definition: definitionForSubmit,
                     title: message.trim(),
                     description: description.trim() === '' ? undefined : description.trim(),
                 });
-                navigate(`/datasets/${datasetId}/proposals`);
+                navigate(`/datasets/${datasetId}/pulls`);
                 return;
             }
             if (mode === 'create') {
@@ -445,7 +445,7 @@ const EditorForm: FC<EditorFormProps> = ({ mode, datasetId, dataset, metadataKey
                     {mode === 'edit' && (
                         <Button variant="outline-primary" disabled={!canSubmit} onClick={() => void submit('proposal')}>
                             <GitPullRequestIcon className="me-2" />
-                            Open proposal
+                            Open Pull Request
                         </Button>
                     )}
                     <span className="ms-auto small">{status}</span>

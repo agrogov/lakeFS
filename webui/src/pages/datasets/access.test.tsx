@@ -88,7 +88,7 @@ describe('DatasetAccessPage', () => {
     });
 
     it('renders the grants when the caller holds datasets:ManageAccess', async () => {
-        mockWith(['datasets:ReadDataset', 'datasets:ManageAccess']);
+        mockWith(['dataset:ReadDataset', 'dataset:ManageAccess']);
         renderPage();
 
         expect(await screen.findByTestId('dataset-grant-user-alice')).toBeInTheDocument();
@@ -97,11 +97,11 @@ describe('DatasetAccessPage', () => {
     });
 
     it('does not render the grants without datasets:ManageAccess', async () => {
-        mockWith(['datasets:ReadDataset']);
+        mockWith(['dataset:ReadDataset']);
         renderPage();
 
         expect(await screen.findByText('Permission required')).toBeInTheDocument();
-        expect(screen.getAllByText(/datasets:ManageAccess/).length).toBeGreaterThan(0);
+        expect(screen.getAllByText(/dataset:ManageAccess/).length).toBeGreaterThan(0);
         expect(screen.queryByTestId('dataset-grant-user-alice')).not.toBeInTheDocument();
         // The page does not even ask for the grants it may not see.
         expect(accessCalls()).toHaveLength(0);
@@ -109,7 +109,7 @@ describe('DatasetAccessPage', () => {
 
     it('handles a 403 from the grants endpoint the same way as a denied policy check', async () => {
         accessResponse = () => jsonResponse({ message: 'forbidden: user reviewer is not allowed' }, 403);
-        mockWith(['datasets:ReadDataset', 'datasets:ManageAccess']);
+        mockWith(['dataset:ReadDataset', 'dataset:ManageAccess']);
         renderPage();
 
         expect(await screen.findByText('Permission required')).toBeInTheDocument();

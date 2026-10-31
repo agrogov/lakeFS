@@ -82,25 +82,25 @@ const DatasetOverviewPage: FC = () => {
     const items = definition?.data ?? [];
     const sources = new Set(items.map((item) => item.repository)).size;
     const ref = selectionToRef(selection);
-    const hasVersions = (dataset.latest_version ?? 0) > 0;
+    const hasVersions = (dataset.version ?? 0) > 0;
 
     return (
         <div className="dataset-overview-page">
             <Card className="mb-4 dataset-overview-header">
                 <Card.Body>
                     <div className="d-flex flex-wrap align-items-center gap-2">
-                        <h4 className="mb-0 dataset-overview-name">{dataset.name}</h4>
+                        <h4 className="mb-0 dataset-overview-name">{dataset.id}</h4>
                         <StateBadge state={dataset.state} />
                         <div className="ms-auto d-flex align-items-center gap-2 dataset-overview-actions">
                             <DatasetVersionPicker
                                 versions={versionNumbers(state.versions)}
-                                latest={dataset.latest_version}
+                                latest={dataset.version}
                                 value={selection}
                                 onChange={onSelectVersion}
                                 label="Version"
                                 id="dataset-overview-version"
                             />
-                            <DatasetUriCopyButtons dataset={dataset.name} versionRef={ref} />
+                            <DatasetUriCopyButtons dataset={dataset.id} versionRef={ref} />
                         </div>
                     </div>
 
@@ -108,16 +108,16 @@ const DatasetOverviewPage: FC = () => {
 
                     <div className="text-muted small mt-2 dataset-overview-origin">
                         Created by <strong>{dataset.created_by}</strong>{' '}
-                        <span title={dayjs(dataset.created_at).toISOString()}>
-                            {dayjs(dataset.created_at).fromNow()}
+                        <span title={dayjs.unix(dataset.creation_date).toISOString()}>
+                            {dayjs.unix(dataset.creation_date).fromNow()}
                         </span>
                         {version && (
                             <>
                                 <span className="mx-2">&middot;</span>
-                                <span className="dataset-version-ref">{`v${version.version}`}</span> published by{' '}
-                                <strong>{version.publisher}</strong>{' '}
-                                <span title={dayjs(version.published_at).toISOString()}>
-                                    {dayjs(version.published_at).fromNow()}
+                                <span className="dataset-version-ref">{version.id}</span> published by{' '}
+                                <strong>{version.author}</strong>{' '}
+                                <span title={dayjs.unix(version.creation_date).toISOString()}>
+                                    {dayjs.unix(version.creation_date).fromNow()}
                                 </span>
                             </>
                         )}

@@ -89,8 +89,27 @@ older than the current `latest_version` is rejected with a conflict.
 
 Versions are dense integers: `v1`, `v2`, … Each publish writes one commit on the branch
 `latest` of the dataset repository and tag `vN` for the same commit. `latest` always points at
-the newest version. Version diffs are available for the definition (`items`, `metadata`,
-`description`) and for the data:
+the newest version.
+
+Every create or update produces the next version. The documented update is a synchronous
+publish that answers the updated dataset:
+
+```
+PUT /api/v1/datasets/customer-360
+{ "definition": { ... }, "publish": { "message": "v3" } }
+```
+
+`POST /api/v1/datasets/{dataset}/versions` remains available as an extension: it takes an
+optional `expected_version` (an ETag-like check) and answers `202` with a task when the publish
+is large. `GET /api/v1/datasets/{dataset}/refs/{ref}` returns the dataset at `latest` or `vN`.
+
+A `Dataset` is `{"id": ..., "creation_date": <Unix seconds>, "version": N, ...}` and a
+`DatasetVersion` is `{"id": "v3", "author": ..., "creation_date": <Unix seconds>, ...}`; the
+`definition` of a dataset reports a per-item `status` (`ok`, `source_repo_unavailable`,
+`source_ref_unavailable`, `caller_unauthorized`).
+
+Version diffs are available for the definition (`data`, `metadata`, `description`) and for the
+data:
 
 ```
 GET /api/v1/datasets/customer-360/refs/v1/diff/v2
@@ -165,23 +184,36 @@ Practical consequences:
 - The dataset repository's own GC is not a risk: it only lists the dataset's storage
   namespace, and dataset entries point outside it.
 
-## Proposals
+## Pull requests
 
-A dataset version can be published directly, or reviewed first through a dataset proposal
-(pull request):
+A dataset version can be published directly, or reviewed first through a dataset pull request:
 
-1. `POST /api/v1/datasets/{dataset}/proposals` materialises the proposed definition on the
-   hidden branch `_proposal-<id>` in the dataset repository, so reviewers can browse the
-   actual data at `lakefs://<dataset>/_proposal-<id>/…`, and records a diff against `latest`.
-2. `POST /api/v1/datasets/{dataset}/proposals/{id}/merge` publishes the definition as the
-   next version, records the proposal ID on that version and deletes the preview branch.
-3. `PATCH /api/v1/datasets/{dataset}/proposals/{id}` with `{"status": "closed"}` closes a
-   proposal without publishing and deletes the preview branch.
+1. `POST /api/v1/datasets/{dataset}/pulls` materialises the proposed definition on the hidden
+   branch `_proposal-<id>` in the dataset repository, so reviewers can browse the actual data at
+   `lakefs://<dataset>/_proposal-<id>/…`, and records a diff against `latest`. The pull request
+   is also addressable through its ref, `pr/<id>`.
+2. `GET /api/v1/datasets/{dataset}/pulls/{pullRequest}/diff` returns the structural diff
+   against `latest`.
+3. `POST /api/v1/datasets/{dataset}/pulls/{pullRequest}/merge` publishes the definition as the
+   next version, records the pull-request ID on that version and deletes the preview branch.
+   It takes no body and answers `200 {"version": N, "reference": "vN"}`.
+4. `DELETE /api/v1/datasets/{dataset}/pulls/{pullRequest}` closes a pull request without
+   publishing and deletes the preview branch (`204`). `PATCH` with `{"status": "closed"}`
+   still closes one as well.
 
-A proposal merges only on top of the version it was opened against. If `latest` moved in the
-meantime the merge is rejected with a conflict ("rebase required"); update the proposal
-against the current version and merge again. Rebasing is deliberately not automatic: the
-conflicts are semantic, so the author decides.
+`GET /api/v1/datasets/pulls` lists every pull request of the installation (`status` is `open`,
+`closed`, `merged` or `all`; `dataset` filters by dataset). The fields are `id`, `dataset`,
+`title`, `description`, `author`, `status`, `base_version`, `latest_version`, `stale`,
+`conflicted`, `source_ref`, `creation_date` and `closed_date`.
+
+A pull request merges only on top of the version it was opened against. If `latest` moved in
+the meantime `stale` is true and the merge is rejected with a conflict ("rebase required");
+update the pull request against the current version and merge again. Rebasing is deliberately
+not automatic: the conflicts are semantic, so the author decides.
+
+A pull request may be opened before its dataset exists: merging it then creates the dataset and
+publishes `v1`. If the name is taken by the time of the merge, `conflicted` is true and the
+merge is rejected with `409`.
 
 ## Access
 
@@ -203,16 +235,38 @@ managed `dataset-<name>-immutable` deny policy keeps every non-service principal
 
 Control-plane actions are authorised on `arn:lakefs:dataset:::dataset/<name>`:
 `dataset:ListDatasets`, `dataset:ReadDataset`, `dataset:CreateDataset`, `dataset:UpdateDataset`
-(publishing a version, opening or merging a proposal) and `dataset:DeleteDataset`; the metadata-key
-actions `dataset:ListMetadataKeys`, `dataset:ReadMetadataKey`, `dataset:CreateMetadataKey`,
-`dataset:UpdateMetadataKey` and `dataset:DeleteMetadataKey` are authorised on
-`arn:lakefs:dataset:::dataset/*`. `dataset:ManageAccess` (grant and revoke consumer access) is an
-extension of this implementation. The legacy `datasets:` namespace is still accepted when policies
-are validated and managed policies are migrated automatically. Whoever creates or publishes a
-dataset must be able to read every source it attaches (`fs:ReadCommit`, `fs:ReadObject`,
-`fs:ListObjects` on the source repository); a failure names the item that could not be read.
-On a merge the source check runs for the merging principal, because the merge publishes the
-data under their authority.
+(publishing a version, opening, updating or merging a pull request) and `dataset:DeleteDataset`;
+the metadata-key actions `dataset:ListMetadataKeys`, `dataset:ReadMetadataKey`,
+`dataset:CreateMetadataKey`, `dataset:UpdateMetadataKey` and `dataset:DeleteMetadataKey` are
+authorised on `arn:lakefs:dataset:::dataset/*`. `dataset:ManageAccess` (grant and revoke consumer
+access) is an extension of this implementation. The legacy plural `datasets:` namespace is still
+accepted when policies are validated, and the managed policies are migrated automatically.
+Whoever creates or publishes a dataset must be able to read every source it attaches
+(`fs:ReadObject` and `fs:ListObjects` on the source repository, per object); a failure names the
+item that could not be read. On a merge the source check runs for the merging principal, because
+the merge publishes the data under their authority.
+
+When datasets are configured, the RBAC bootstrap creates the four documented policies on
+`arn:lakefs:dataset:::dataset/*`: `DatasetsFullAccess` (`dataset:*`), `DatasetsReadWriteAll`,
+`DatasetsReadAll` and `DatasetsManageMetadataKeys`, and maps `Admins` to `DatasetsFullAccess`,
+`SuperUsers` and `Developers` to `DatasetsReadWriteAll`, and `Viewers` to `DatasetsReadAll`.
+
+## Metadata keys
+
+Metadata keys are the typed schema of dataset metadata. They are global (they apply to every
+dataset) and are managed through:
+
+```
+GET    /api/v1/datasets/metadata          # ?prefix= filter
+POST   /api/v1/datasets/metadata
+GET    /api/v1/datasets/metadata/{key}
+PUT    /api/v1/datasets/metadata/{key}
+DELETE /api/v1/datasets/metadata/{key}
+```
+
+A `PUT` is a full replacement and requires `type`; changing `type` is rejected (`409`). Required
+keys are enforced on every definition write (create, update, publish and pull requests), never
+on existing versions. `GET /api/v1/datasets/config` reports the feature configuration.
 
 ### Access model note
 
@@ -274,17 +328,16 @@ span storage IDs are rejected.
 - **No copy-on-publish ("snapshot") mode.** A dataset is always zero-copy, so it depends on
   the source objects being retained (which is what pins are for).
 - **Single storage only.** A dataset cannot span blockstores with different storage IDs.
-- **API compatibility is limited to the definition format and path shapes.** Definitions use
-  `format_version: 1` and dataset refs use `vN`/`latest`, so they are portable, but this build
-  makes no promise about matching any other implementation's wire behaviour field by field.
-- **Typed metadata keys are enforced but not manageable over the API yet.** Metadata values
-  are validated against the metadata key rules the installation has, and
-  `datasets.metadata.strict` rejects undeclared keys; the metadata-key CRUD endpoints and
-  `GET /datasets/config` are not implemented in this build and answer `501`.
-- **Built-in datasets policies are not created by default.** The RBAC bootstrap can create the
-  datasets policies, but it ships with the feature switched off, so a stock installation has
-  no principal with `dataset:*`. Grant the control-plane actions explicitly (see
-  [Access](#access)) or run the bootstrap with the datasets policies enabled before relying on
-  the built-in `DatasetsFullAccess` / `DatasetsReadAll` policies.
+- **The compatibility target is the public Enterprise OpenAPI**
+  (`docs.lakefs.io/reference/api/enterprise/v1.108/swagger.yml`): the document format, the
+  control-plane paths of this revision, the field names and the `dataset:*` RBAC actions follow
+  it. The deliberate extensions are `GET /datasets/config`, `POST /{dataset}/validate`,
+  `POST /{dataset}/versions` and its asynchronous `202`, `GET /datasets/{dataset}/tasks/{id}`,
+  the `?type=data` diff, and the `dataset:ManageAccess` action.
+- **Typed metadata keys are enforced, and manageable over the API** (see
+  [Metadata keys](#metadata-keys)); `datasets.metadata.strict` rejects undeclared keys.
+- **Built-in datasets policies are created when datasets are configured.** The RBAC bootstrap
+  creates `DatasetsFullAccess`, `DatasetsReadWriteAll`, `DatasetsReadAll` and
+  `DatasetsManageMetadataKeys` and attaches them to the base groups (see [Access](#access)).
 - **No dataset-level Python helper.** Reads work through the lakeFS SDK, `lakectl`,
   Spark and the S3 gateway; the CLI helper is the `lakectl-datasets` plugin.

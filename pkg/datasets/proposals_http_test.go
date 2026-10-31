@@ -25,29 +25,29 @@ import (
 	"github.com/treeverse/lakefs/pkg/graveler"
 )
 
-// proposalCreateBody renders a POST /{dataset}/proposals body.
+// proposalCreateBody renders a POST /{dataset}/pulls body.
 func proposalCreateBody(t *testing.T, title string, def Definition, description string) string {
 	t.Helper()
-	body := apigen.ProposalCreateRequest{Title: title, Definition: definitionToAPI(def)}
+	body := apigen.DatasetPullRequestCreate{Title: title, Definition: definitionToAPI(def)}
 	if description != "" {
 		body.Description = &description
 	}
 	return marshalBody(t, body)
 }
 
-// proposalUpdateBody renders a PATCH /{dataset}/proposals/{id} body.
-func proposalUpdateBody(t *testing.T, body apigen.ProposalUpdateRequest) string {
+// proposalUpdateBody renders a PATCH /{dataset}/pulls/{id} body.
+func proposalUpdateBody(t *testing.T, body apigen.DatasetPullRequestUpdate) string {
 	t.Helper()
 	return marshalBody(t, body)
 }
 
 // createHTTPProposal opens a proposal over HTTP and returns the record.
-func createHTTPProposal(t *testing.T, handler http.Handler, accessKey, secret, dataset, title string, def Definition) apigen.Proposal {
+func createHTTPProposal(t *testing.T, handler http.Handler, accessKey, secret, dataset, title string, def Definition) apigen.DatasetPullRequest {
 	t.Helper()
-	rec := doRequest(t, handler, http.MethodPost, "/"+dataset+"/proposals",
+	rec := doRequest(t, handler, http.MethodPost, "/"+dataset+"/pulls",
 		proposalCreateBody(t, title, def, ""), accessKey, secret)
 	require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
-	var proposal apigen.Proposal
+	var proposal apigen.DatasetPullRequest
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &proposal))
 	return proposal
 }
@@ -130,45 +130,45 @@ func TestDatasetsHTTPProposalLifecycle(t *testing.T) {
 	require.Equal(t, ProposalStatusOpen, proposal.Status)
 	require.Equal(t, testUsername, proposal.Author)
 	require.Equal(t, "add cities", proposal.Title)
-	require.Equal(t, ProposalPreviewBranch(proposal.Id), proposal.PreviewBranch)
+	require.Equal(t, ProposalPreviewBranch(proposal.Id), deref(proposal.PreviewBranch))
 	require.NotNil(t, proposal.Definition)
 	require.Equal(t, second.String(), proposal.Definition.Data[0].Ref.Id, "the response carries the resolved definition")
 	require.Equal(t, "commit", proposal.Definition.Data[0].Ref.Type)
 	require.NotNil(t, proposal.Diff, "§10.1: the response carries the definition diff")
-	require.Len(t, proposal.Diff.Items, 2, "the proposal adds cities and drops countries")
+	require.Len(t, proposal.Diff.Data, 2, "the proposal adds cities and drops countries")
 	require.Equal(t, []string{"reference/cities.csv", "reference/countries.csv"},
-		[]string{proposal.Diff.Items[0].Target, proposal.Diff.Items[1].Target})
-	require.Equal(t, string(ChangeAdded), proposal.Diff.Items[0].Change)
-	require.Equal(t, string(ChangeRemoved), proposal.Diff.Items[1].Change)
+		[]string{proposal.Diff.Data[0].Target, proposal.Diff.Data[1].Target})
+	require.Equal(t, string(ChangeAdded), proposal.Diff.Data[0].Type)
+	require.Equal(t, string(ChangeRemoved), proposal.Diff.Data[1].Type)
 	require.NotNil(t, proposal.DataDiff, "§10.1: the response carries the data diff")
 	require.Contains(t, dataPaths(proposal.DataDiff), "reference/cities.csv")
 
 	// A reviewer can browse the materialised preview through the data plane (§5.6, §7.1).
-	require.Equal(t, []byte("cities-9\n"), readDatasetObjectHTTP(t, deps, "http-proposals", proposal.PreviewBranch, "reference/cities.csv"))
+	require.Equal(t, []byte("cities-9\n"), readDatasetObjectHTTP(t, deps, "http-proposals", deref(proposal.PreviewBranch), "reference/cities.csv"))
 
 	t.Run("list and filters", func(t *testing.T) {
-		rec := doRequest(t, handler, http.MethodGet, "/http-proposals/proposals", "", accessKey, secret)
+		rec := doRequest(t, handler, http.MethodGet, "/http-proposals/pulls", "", accessKey, secret)
 		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
-		var list apigen.ProposalList
+		var list apigen.DatasetPullRequestList
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &list))
 		require.Len(t, list.Results, 1)
 		require.Equal(t, proposal.Id, list.Results[0].Id)
 		require.Equal(t, 1, list.Pagination.Results)
 
-		rec = doRequest(t, handler, http.MethodGet, "/http-proposals/proposals?status=merged", "", accessKey, secret)
+		rec = doRequest(t, handler, http.MethodGet, "/http-proposals/pulls?status=merged", "", accessKey, secret)
 		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &list))
 		require.Empty(t, list.Results)
 
 		// The status enum is validated before the handler runs (§10.4 400).
-		rec = doRequest(t, handler, http.MethodGet, "/http-proposals/proposals?status=bogus", "", accessKey, secret)
+		rec = doRequest(t, handler, http.MethodGet, "/http-proposals/pulls?status=bogus", "", accessKey, secret)
 		require.Equal(t, http.StatusBadRequest, rec.Code, "body: %s", rec.Body.String())
 	})
 
 	t.Run("get", func(t *testing.T) {
-		rec := doRequest(t, handler, http.MethodGet, "/http-proposals/proposals/"+proposal.Id, "", accessKey, secret)
+		rec := doRequest(t, handler, http.MethodGet, "/http-proposals/pulls/"+proposal.Id, "", accessKey, secret)
 		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
-		var got apigen.Proposal
+		var got apigen.DatasetPullRequest
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
 		require.Equal(t, proposal.Id, got.Id)
 		require.NotNil(t, got.Diff)
@@ -177,10 +177,10 @@ func TestDatasetsHTTPProposalLifecycle(t *testing.T) {
 
 	t.Run("patch title and description", func(t *testing.T) {
 		title, description := "add cities (v2)", "reviewed by the platform team"
-		rec := doRequest(t, handler, http.MethodPatch, "/http-proposals/proposals/"+proposal.Id,
-			proposalUpdateBody(t, apigen.ProposalUpdateRequest{Title: &title, Description: &description}), accessKey, secret)
+		rec := doRequest(t, handler, http.MethodPatch, "/http-proposals/pulls/"+proposal.Id,
+			proposalUpdateBody(t, apigen.DatasetPullRequestUpdate{Title: &title, Description: &description}), accessKey, secret)
 		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
-		var updated apigen.Proposal
+		var updated apigen.DatasetPullRequest
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &updated))
 		require.Equal(t, title, updated.Title)
 		require.NotNil(t, updated.Description)
@@ -189,63 +189,67 @@ func TestDatasetsHTTPProposalLifecycle(t *testing.T) {
 	})
 
 	t.Run("merge", func(t *testing.T) {
-		message := "merge the cities proposal"
-		rec := doRequest(t, handler, http.MethodPost, "/http-proposals/proposals/"+proposal.Id+"/merge",
-			marshalBody(t, apigen.ProposalMergeRequest{Message: &message}), accessKey, secret)
-		require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
-		var version apigen.Version
-		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &version))
-		require.Equal(t, 2, version.Version)
-		require.Equal(t, testUsername, version.Publisher)
+		rec := doRequest(t, handler, http.MethodPost, "/http-proposals/pulls/"+proposal.Id+"/merge", "", accessKey, secret)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		var merged apigen.DatasetPullRequestMerge
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &merged))
+		require.Equal(t, 2, merged.Version)
+		require.Equal(t, "v2", merged.Reference)
+
+		// The published version carries the author and the pull request it came from.
+		versionRec := doRequest(t, handler, http.MethodGet, "/http-proposals/versions/v2", "", accessKey, secret)
+		require.Equal(t, http.StatusOK, versionRec.Code, "body: %s", versionRec.Body.String())
+		var version apigen.DatasetVersion
+		require.NoError(t, json.Unmarshal(versionRec.Body.Bytes(), &version))
+		require.Equal(t, "v2", version.Id)
+		require.Equal(t, testUsername, version.Author)
 		require.NotNil(t, version.ProposalId)
 		require.Equal(t, proposal.Id, *version.ProposalId)
-		require.NotNil(t, version.Message)
-		require.Equal(t, message, *version.Message)
 
 		// The dataset moved to v2 and the data plane serves it (§7.1).
 		datasetRec := doRequest(t, handler, http.MethodGet, "/http-proposals", "", accessKey, secret)
 		require.Equal(t, http.StatusOK, datasetRec.Code)
 		var dataset apigen.Dataset
 		require.NoError(t, json.Unmarshal(datasetRec.Body.Bytes(), &dataset))
-		require.Equal(t, 2, dataset.LatestVersion)
+		require.Equal(t, 2, derefInt(dataset.Version))
 		require.Equal(t, []byte("cities-9\n"), readDatasetObjectHTTP(t, deps, "http-proposals", "v2", "reference/cities.csv"))
 
 		// §5.6: the proposal is merged, carries the version, and its preview branch is gone.
-		proposalRec := doRequest(t, handler, http.MethodGet, "/http-proposals/proposals/"+proposal.Id, "", accessKey, secret)
+		proposalRec := doRequest(t, handler, http.MethodGet, "/http-proposals/pulls/"+proposal.Id, "", accessKey, secret)
 		require.Equal(t, http.StatusOK, proposalRec.Code, "body: %s", proposalRec.Body.String())
-		var merged apigen.Proposal
-		require.NoError(t, json.Unmarshal(proposalRec.Body.Bytes(), &merged))
-		require.Equal(t, ProposalStatusMerged, merged.Status)
-		require.NotNil(t, merged.MergedVersion)
-		require.Equal(t, 2, *merged.MergedVersion)
-		require.NotNil(t, merged.ClosedAt)
+		var mergedPR apigen.DatasetPullRequest
+		require.NoError(t, json.Unmarshal(proposalRec.Body.Bytes(), &mergedPR))
+		require.Equal(t, ProposalStatusMerged, mergedPR.Status)
+		require.NotNil(t, mergedPR.MergedVersion)
+		require.Equal(t, 2, *mergedPR.MergedVersion)
+		require.NotNil(t, mergedPR.ClosedDate)
 
-		_, err := deps.Catalog.GetBranchReference(t.Context(), "http-proposals", proposal.PreviewBranch)
+		_, err := deps.Catalog.GetBranchReference(t.Context(), "http-proposals", deref(proposal.PreviewBranch))
 		require.Error(t, err, "the preview branch is deleted by the merge")
 		require.True(t, isNotFound(err))
 	})
 
 	t.Run("a merged proposal cannot be merged or updated again", func(t *testing.T) {
-		rec := doRequest(t, handler, http.MethodPost, "/http-proposals/proposals/"+proposal.Id+"/merge", "", accessKey, secret)
+		rec := doRequest(t, handler, http.MethodPost, "/http-proposals/pulls/"+proposal.Id+"/merge", "", accessKey, secret)
 		require.Equal(t, http.StatusConflict, rec.Code, "body: %s", rec.Body.String())
 
 		title := "too late"
-		rec = doRequest(t, handler, http.MethodPatch, "/http-proposals/proposals/"+proposal.Id,
-			proposalUpdateBody(t, apigen.ProposalUpdateRequest{Title: &title}), accessKey, secret)
+		rec = doRequest(t, handler, http.MethodPatch, "/http-proposals/pulls/"+proposal.Id,
+			proposalUpdateBody(t, apigen.DatasetPullRequestUpdate{Title: &title}), accessKey, secret)
 		require.Equal(t, http.StatusConflict, rec.Code, "body: %s", rec.Body.String())
 	})
 
 	t.Run("unknown proposal is 404", func(t *testing.T) {
-		rec := doRequest(t, handler, http.MethodGet, "/http-proposals/proposals/01J8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8", "", accessKey, secret)
+		rec := doRequest(t, handler, http.MethodGet, "/http-proposals/pulls/01J8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8", "", accessKey, secret)
 		require.Equal(t, http.StatusNotFound, rec.Code, "body: %s", rec.Body.String())
 		require.Contains(t, decodeError(t, rec).Message, "proposal")
 
-		rec = doRequest(t, handler, http.MethodPost, "/http-proposals/proposals/01J8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8/merge", "", accessKey, secret)
+		rec = doRequest(t, handler, http.MethodPost, "/http-proposals/pulls/01J8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8/merge", "", accessKey, secret)
 		require.Equal(t, http.StatusNotFound, rec.Code, "body: %s", rec.Body.String())
 	})
 
 	t.Run("unknown dataset is 404", func(t *testing.T) {
-		rec := doRequest(t, handler, http.MethodGet, "/no-such-dataset/proposals", "", accessKey, secret)
+		rec := doRequest(t, handler, http.MethodGet, "/no-such-dataset/pulls", "", accessKey, secret)
 		require.Equal(t, http.StatusNotFound, rec.Code, "body: %s", rec.Body.String())
 	})
 }
@@ -272,7 +276,7 @@ func TestDatasetsHTTPProposalRebaseConflict(t *testing.T) {
 		accessKey, secret)
 	require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
 
-	rec = doRequest(t, handler, http.MethodPost, "/http-rebase/proposals/"+proposal.Id+"/merge", "", accessKey, secret)
+	rec = doRequest(t, handler, http.MethodPost, "/http-rebase/pulls/"+proposal.Id+"/merge", "", accessKey, secret)
 	require.Equal(t, http.StatusConflict, rec.Code, "body: %s", rec.Body.String())
 	var conflict versionConflictBody
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &conflict))
@@ -280,13 +284,13 @@ func TestDatasetsHTTPProposalRebaseConflict(t *testing.T) {
 	require.Contains(t, conflict.Message, "rebase required")
 
 	// The proposal is untouched: still open, base still 1, preview branch still there.
-	got := doRequest(t, handler, http.MethodGet, "/http-rebase/proposals/"+proposal.Id, "", accessKey, secret)
+	got := doRequest(t, handler, http.MethodGet, "/http-rebase/pulls/"+proposal.Id, "", accessKey, secret)
 	require.Equal(t, http.StatusOK, got.Code, "body: %s", got.Body.String())
-	var proposalAgain apigen.Proposal
+	var proposalAgain apigen.DatasetPullRequest
 	require.NoError(t, json.Unmarshal(got.Body.Bytes(), &proposalAgain))
 	require.Equal(t, ProposalStatusOpen, proposalAgain.Status)
 	require.Equal(t, 1, proposalAgain.BaseVersion)
-	_, err := deps.Catalog.GetBranchReference(t.Context(), "http-rebase", proposal.PreviewBranch)
+	_, err := deps.Catalog.GetBranchReference(t.Context(), "http-rebase", deref(proposal.PreviewBranch))
 	require.NoError(t, err, "the preview branch survives a refused merge")
 }
 
@@ -310,7 +314,7 @@ func TestDatasetsHTTPProposalSourceDenied(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, deps.AuthService.AddUserToGroup(t.Context(), weak, DatasetAdminsGroup))
 
-	rec = doRequest(t, handler, http.MethodPost, "/http-authz/proposals",
+	rec = doRequest(t, handler, http.MethodPost, "/http-authz/pulls",
 		proposalCreateBody(t, "denied", def, ""), weakCred.AccessKeyID, weakCred.SecretAccessKey)
 	require.Equal(t, http.StatusForbidden, rec.Code, "body: %s", rec.Body.String())
 	message := decodeError(t, rec).Message
@@ -322,27 +326,32 @@ func TestDatasetsHTTPProposalSourceDenied(t *testing.T) {
 	// refuses them.
 	proposal := createHTTPProposal(t, handler, accessKey, secret, "http-authz", "allowed",
 		objectDefinition("handler-src", commit.String(), "reference/countries-2.csv", "geo/countries.csv"))
-	rec = doRequest(t, handler, http.MethodPost, "/http-authz/proposals/"+proposal.Id+"/merge", "",
+	rec = doRequest(t, handler, http.MethodPost, "/http-authz/pulls/"+proposal.Id+"/merge", "",
 		weakCred.AccessKeyID, weakCred.SecretAccessKey)
 	require.Equal(t, http.StatusForbidden, rec.Code, "body: %s", rec.Body.String())
 	require.Contains(t, decodeError(t, rec).Message, "handler-src")
 
 	// The proposal is still open, so it was not merged by the refusal.
-	got := doRequest(t, handler, http.MethodGet, "/http-authz/proposals/"+proposal.Id, "", accessKey, secret)
+	got := doRequest(t, handler, http.MethodGet, "/http-authz/pulls/"+proposal.Id, "", accessKey, secret)
 	require.Equal(t, http.StatusOK, got.Code)
-	var proposalAgain apigen.Proposal
+	var proposalAgain apigen.DatasetPullRequest
 	require.NoError(t, json.Unmarshal(got.Body.Bytes(), &proposalAgain))
 	require.Equal(t, ProposalStatusOpen, proposalAgain.Status)
 
 	// With source read (the ACL base groups) the same principal may merge it (§9.3).
 	require.NoError(t, deps.AuthService.AddUserToGroup(t.Context(), weak, acl.AdminsGroup))
-	rec = doRequest(t, handler, http.MethodPost, "/http-authz/proposals/"+proposal.Id+"/merge", "",
+	rec = doRequest(t, handler, http.MethodPost, "/http-authz/pulls/"+proposal.Id+"/merge", "",
 		weakCred.AccessKeyID, weakCred.SecretAccessKey)
-	require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
-	var version apigen.Version
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &version))
-	require.Equal(t, 2, version.Version)
-	require.Equal(t, weak, version.Publisher, "the merger publishes under their own authority")
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	var merged apigen.DatasetPullRequestMerge
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &merged))
+	require.Equal(t, 2, merged.Version)
+
+	versionRec := doRequest(t, handler, http.MethodGet, "/http-authz/versions/v2", "", accessKey, secret)
+	require.Equal(t, http.StatusOK, versionRec.Code)
+	var version apigen.DatasetVersion
+	require.NoError(t, json.Unmarshal(versionRec.Body.Bytes(), &version))
+	require.Equal(t, weak, version.Author, "the merger publishes under their own authority")
 }
 
 // TestDatasetsHTTPProposalBadRequest pins the 400s of §10.4 on the proposal path, including the
@@ -363,17 +372,17 @@ func TestDatasetsHTTPProposalBadRequest(t *testing.T) {
 	}{
 		{
 			name: "missing title",
-			path: "/http-bad-proposal/proposals",
+			path: "/http-bad-proposal/pulls",
 			body: `{"definition": ` + definitionJSON(t, def) + `}`,
 		},
 		{
 			name: "missing definition",
-			path: "/http-bad-proposal/proposals",
+			path: "/http-bad-proposal/pulls",
 			body: `{"title": "no definition"}`,
 		},
 		{
 			name: "patch status outside the enum",
-			path: "/http-bad-proposal/proposals/" + proposal.Id,
+			path: "/http-bad-proposal/pulls/" + proposal.Id,
 			body: `{"status": "merged"}`,
 		},
 	}
@@ -390,15 +399,16 @@ func TestDatasetsHTTPProposalBadRequest(t *testing.T) {
 	}
 
 	t.Run("close", func(t *testing.T) {
-		rec := doRequest(t, handler, http.MethodPatch, "/http-bad-proposal/proposals/"+proposal.Id,
-			proposalUpdateBody(t, apigen.ProposalUpdateRequest{Status: ptr(ProposalStatusClosed)}), accessKey, secret)
-		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
-		var closed apigen.Proposal
-		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &closed))
+		rec := doRequest(t, handler, http.MethodDelete, "/http-bad-proposal/pulls/"+proposal.Id, "", accessKey, secret)
+		require.Equal(t, http.StatusNoContent, rec.Code, "body: %s", rec.Body.String())
+		got := doRequest(t, handler, http.MethodGet, "/http-bad-proposal/pulls/"+proposal.Id, "", accessKey, secret)
+		require.Equal(t, http.StatusOK, got.Code, "body: %s", got.Body.String())
+		var closed apigen.DatasetPullRequest
+		require.NoError(t, json.Unmarshal(got.Body.Bytes(), &closed))
 		require.Equal(t, ProposalStatusClosed, closed.Status)
-		require.NotNil(t, closed.ClosedAt)
+		require.NotNil(t, closed.ClosedDate)
 
-		_, err := deps.Catalog.GetBranchReference(t.Context(), "http-bad-proposal", proposal.PreviewBranch)
+		_, err := deps.Catalog.GetBranchReference(t.Context(), "http-bad-proposal", deref(proposal.PreviewBranch))
 		require.Error(t, err, "closing deletes the preview branch")
 		require.True(t, isNotFound(err))
 	})

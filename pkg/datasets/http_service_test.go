@@ -72,9 +72,9 @@ func TestDatasetsHTTPCreateGetDelete(t *testing.T) {
 
 	var created apigen.Dataset
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &created))
-	require.Equal(t, "handler-set", created.Name)
-	require.Equal(t, 1, created.LatestVersion)
-	require.Equal(t, DatasetStateActive, created.State)
+	require.Equal(t, "handler-set", created.Id)
+	require.Equal(t, 1, derefInt(created.Version))
+	require.Equal(t, DatasetStateActive, deref(created.State))
 	require.NotNil(t, created.Definition)
 	require.NotNil(t, created.Stats)
 	require.Equal(t, int64(1), created.Stats.Objects)
@@ -85,8 +85,8 @@ func TestDatasetsHTTPCreateGetDelete(t *testing.T) {
 		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
 		var got apigen.Dataset
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
-		require.Equal(t, created.Name, got.Name)
-		require.Equal(t, created.LatestVersion, got.LatestVersion)
+		require.Equal(t, created.Id, got.Id)
+		require.Equal(t, derefInt(created.Version), derefInt(got.Version))
 	})
 
 	t.Run("missing dataset is 404", func(t *testing.T) {
@@ -129,7 +129,7 @@ func TestDatasetsHTTPCreateGetDelete(t *testing.T) {
 		var list apigen.DatasetList
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &list))
 		require.Len(t, list.Results, 1)
-		require.Equal(t, "handler-set", list.Results[0].Name)
+		require.Equal(t, "handler-set", list.Results[0].Id)
 		require.False(t, list.Pagination.HasMore)
 
 		rec = doRequest(t, handler, http.MethodGet, "?metadata.tier=bronze", "", accessKey, secret)
@@ -280,5 +280,58 @@ func TestDatasetsHTTPAccessGrants(t *testing.T) {
 
 		rec = doRequest(t, handler, http.MethodDelete, "/access-set/access/user/bob", "", accessKey, secret)
 		require.Equal(t, http.StatusNotFound, rec.Code)
+	})
+}
+
+// TestDatasetsHTTPDocumentedRoutes pins the routes this API revision adds or renames: the
+// documented `PUT /{dataset}` update (DOC-4), `GET /{dataset}/refs/{ref}` (DOC-6), the global
+// `GET /pulls` listing (DOC-8) and the `/metadata` schema paths (DOC-9). They are registered on
+// the real router, which is where a static route can shadow a `{dataset}` one.
+func TestDatasetsHTTPDocumentedRoutes(t *testing.T) {
+	handler, deps, accessKey, secret := newControlPlaneWithDeps(t)
+	commit := seedHandlerSource(t, deps.Catalog)
+	def := objectDefinition("handler-src", commit.String(), "reference/countries.csv", "geo/countries.csv")
+
+	rec := doRequest(t, handler, http.MethodPost, "", createDatasetBody(t, "http-routes", def, true), accessKey, secret)
+	require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
+
+	t.Run("get dataset by ref", func(t *testing.T) {
+		for _, ref := range []string{"latest", "v1"} {
+			rec := doRequest(t, handler, http.MethodGet, "/http-routes/refs/"+ref, "", accessKey, secret)
+			require.Equal(t, http.StatusOK, rec.Code, "ref %q: %s", ref, rec.Body.String())
+			var got apigen.Dataset
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+			require.Equal(t, "http-routes", got.Id)
+			require.Equal(t, 1, derefInt(got.Version))
+		}
+	})
+
+	t.Run("update dataset publishes synchronously", func(t *testing.T) {
+		updatedDef := def
+		updatedDef.Description = "updated through PUT"
+		// The update definition must differ from v1, or the no-op check answers 409.
+		body := marshalBody(t, map[string]any{
+			"definition": definitionToAPI(updatedDef),
+			"publish":    map[string]string{"message": "v2 through PUT"},
+		})
+		rec := doRequest(t, handler, http.MethodPut, "/http-routes", body, accessKey, secret)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		var dataset apigen.Dataset
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &dataset))
+		require.Equal(t, 2, derefInt(dataset.Version))
+		require.NotNil(t, dataset.Definition)
+	})
+
+	t.Run("global pull request listing", func(t *testing.T) {
+		rec := doRequest(t, handler, http.MethodGet, "/pulls", "", accessKey, secret)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		var list apigen.DatasetPullRequestList
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &list))
+		require.Empty(t, list.Results)
+	})
+
+	t.Run("metadata paths", func(t *testing.T) {
+		rec := doRequest(t, handler, http.MethodGet, "/metadata", "", accessKey, secret)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
 	})
 }

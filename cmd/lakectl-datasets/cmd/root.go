@@ -132,7 +132,7 @@ dataset access and metadata keys.`,
 		diffCmd(),
 		deleteCmd(),
 		// Dataset pull requests.
-		proposalsCmd(),
+		pullsCmd(),
 		// Dataset-level access grants.
 		accessCmd(),
 		// Global metadata key definitions.

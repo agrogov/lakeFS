@@ -27,10 +27,14 @@ const proposal = (id: string, dataset: string, status: 'open' | 'merged', create
     id,
     dataset,
     base_version: 1,
+    latest_version: 1,
+    stale: false,
+    conflicted: false,
+    source_ref: `pr/${id}`,
     title: `${dataset} ${status}`,
     author: 'alice',
     status,
-    created_at: createdAt,
+    creation_date: createdAt / 1000,
     preview_branch: `_proposal-${id}`,
 });
 
@@ -53,21 +57,16 @@ describe('DatasetProposalsAllPage', () => {
         clearDatasetNamesCache();
         fetchMock = vi.fn(async (url: unknown) => {
             const path = String(url);
-            if (path.includes('/proposals?')) {
+            // The global listing (§10.1 GET /datasets/pulls): one request for every dataset,
+            // already filtered by status and ordered newest first by the server.
+            if (path.includes('/pulls?')) {
                 const status = new URLSearchParams(path.split('?')[1] ?? '').get('status') ?? 'open';
-                if (path.includes('/datasets/alpha/')) {
-                    return jsonResponse(
-                        status === 'merged'
-                            ? page([proposal('a-merged', 'alpha', 'merged', 1000)])
-                            : page([proposal('a-open', 'alpha', 'open', 3000)]),
-                    );
+                if (status === 'merged') {
+                    return jsonResponse(page([proposal('a-merged', 'alpha', 'merged', 1000)]));
                 }
-                if (path.includes('/datasets/beta/')) {
-                    return jsonResponse(page([proposal('b-open', 'beta', 'open', 2000)]));
-                }
-            }
-            if (path.endsWith('/api/v1/datasets?amount=1000')) {
-                return jsonResponse(page([{ name: 'alpha' }, { name: 'beta' }]));
+                return jsonResponse(
+                    page([proposal('a-open', 'alpha', 'open', 3000), proposal('b-open', 'beta', 'open', 2000)]),
+                );
             }
             return jsonResponse({ message: 'not found' }, 404);
         });
@@ -95,7 +94,7 @@ describe('DatasetProposalsAllPage', () => {
         await screen.findByTestId('dataset-proposal-row-b-open');
         expect(screen.getByRole('link', { name: 'beta open' })).toHaveAttribute(
             'href',
-            '/datasets/beta/proposals/b-open',
+            '/datasets/beta/pulls/b-open',
         );
     });
 

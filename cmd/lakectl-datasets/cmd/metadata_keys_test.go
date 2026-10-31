@@ -27,7 +27,7 @@ func TestMetadataKeysListCommand(t *testing.T) {
 	out := mustExecute(t, "metadata-keys", "list", "--amount", "50")
 	request := fake.OnlyRequest()
 	require.Equal(t, http.MethodGet, request.Method)
-	require.Equal(t, controlPlanePath+"/metadata-keys", request.Path)
+	require.Equal(t, controlPlanePath+"/metadata", request.Path)
 	require.Equal(t, []string{"50"}, request.Query["amount"])
 	require.Contains(t, out, "tier")
 	require.Contains(t, out, "enum")
@@ -44,7 +44,7 @@ func TestMetadataKeysCreateCommand(t *testing.T) {
 
 		request := fake.OnlyRequest()
 		require.Equal(t, http.MethodPost, request.Method)
-		require.Equal(t, controlPlanePath+"/metadata-keys", request.Path)
+		require.Equal(t, controlPlanePath+"/metadata", request.Path)
 		requireJSONBody(t, request.Body, `{
 		  "name": "tier",
 		  "type": "enum",
@@ -115,6 +115,6 @@ func TestMetadataKeysDeleteCommand(t *testing.T) {
 
 	request := fake.OnlyRequest()
 	require.Equal(t, http.MethodDelete, request.Method)
-	require.Equal(t, controlPlanePath+"/metadata-keys/tier", request.Path)
+	require.Equal(t, controlPlanePath+"/metadata/tier", request.Path)
 	require.Contains(t, out, `Metadata key "tier" deleted`)
 }

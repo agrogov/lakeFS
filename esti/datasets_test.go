@@ -23,7 +23,7 @@
 //  3. GC safety: delete the source branch, run the local GC flow (rules + commit preparation,
 //     the artifact the GC job consumes) and confirm the pinned commit is retained and the
 //     dataset still readable;
-//  4. proposals: create with a preview branch, browse the preview, merge, and close;
+//  4. pull requests: create with a preview branch, browse the preview, merge, and close;
 //  5. access: a grant read by a user who is in no base ACL group (§9.6), while the sources stay
 //     unreadable to that user.
 //
@@ -122,22 +122,36 @@ type dsPublishRequest struct {
 	ExpectedVersion *int         `json:"expected_version,omitempty"`
 }
 
+// dsDataset is the Dataset schema of §10.2: `id`, `creation_date` (Unix seconds) and
+// `version` are the documented fields; `created_by`, `state` and `stats` are extensions.
 type dsDataset struct {
-	Name          string        `json:"name"`
-	Description   string        `json:"description,omitempty"`
-	CreatedBy     string        `json:"created_by"`
-	LatestVersion int           `json:"latest_version"`
-	State         string        `json:"state"`
-	Definition    *dsDefinition `json:"definition,omitempty"`
+	ID           string        `json:"id"`
+	Description  string        `json:"description,omitempty"`
+	CreatedBy    string        `json:"created_by,omitempty"`
+	CreationDate int64         `json:"creation_date"`
+	Version      int           `json:"version,omitempty"`
+	State        string        `json:"state,omitempty"`
+	Definition   *dsDefinition `json:"definition,omitempty"`
 }
 
+// dsVersion is the DatasetVersion schema of §10.2: `id` is `v<N>`, `author` replaces the
+// former `publisher`, and `creation_date` is Unix seconds.
 type dsVersion struct {
-	Version    int           `json:"version"`
-	CommitID   string        `json:"commit_id"`
-	Publisher  string        `json:"publisher"`
+	ID         string        `json:"id"`
+	CommitID   string        `json:"commit_id,omitempty"`
+	Author     string        `json:"author"`
 	Message    string        `json:"message,omitempty"`
 	ProposalID string        `json:"proposal_id,omitempty"`
 	Definition *dsDefinition `json:"definition,omitempty"`
+}
+
+// versionNumber parses the numeric part of a `v<N>` version id.
+func versionNumber(id string) int {
+	n := 0
+	if _, err := fmt.Sscanf(id, "v%d", &n); err != nil {
+		return 0
+	}
+	return n
 }
 
 type dsVersionList struct {
@@ -145,14 +159,22 @@ type dsVersionList struct {
 }
 
 type dsItemChange struct {
+	Type   string `json:"type"`
 	Target string `json:"target"`
-	Change string `json:"change"`
-	From   any    `json:"from,omitempty"`
-	To     any    `json:"to,omitempty"`
+	Left   any    `json:"left,omitempty"`
+	Right  any    `json:"right,omitempty"`
+}
+
+type dsMetadataChange struct {
+	Type  string   `json:"type"`
+	Key   string   `json:"key"`
+	Left  []string `json:"left,omitempty"`
+	Right []string `json:"right,omitempty"`
 }
 
 type dsDefinitionDiff struct {
-	Items []dsItemChange `json:"items"`
+	Metadata []dsMetadataChange `json:"metadata,omitempty"`
+	Data     []dsItemChange     `json:"data"`
 }
 
 type dsDataDiffEntry struct {
@@ -165,22 +187,40 @@ type dsDataDiff struct {
 	Results []dsDataDiffEntry `json:"results"`
 }
 
-type dsProposalCreateRequest struct {
+type dsPullRequestCreateRequest struct {
 	Definition  dsDefinition `json:"definition"`
 	Title       string       `json:"title"`
 	Description string       `json:"description,omitempty"`
 }
 
-type dsProposal struct {
+// dsPullRequest is the DatasetPullRequest schema of §10.2.
+type dsPullRequest struct {
 	ID            string        `json:"id"`
 	Dataset       string        `json:"dataset"`
 	BaseVersion   int           `json:"base_version"`
+	LatestVersion int           `json:"latest_version"`
 	Title         string        `json:"title"`
 	Author        string        `json:"author"`
 	Status        string        `json:"status"`
-	PreviewBranch string        `json:"preview_branch"`
+	Stale         bool          `json:"stale"`
+	Conflicted    bool          `json:"conflicted"`
+	SourceRef     string        `json:"source_ref"`
+	PreviewBranch string        `json:"preview_branch,omitempty"`
 	MergedVersion *int          `json:"merged_version,omitempty"`
 	Definition    *dsDefinition `json:"definition,omitempty"`
+}
+
+// dsPullRequestMerge is the 200 body of POST .../pulls/{id}/merge (§5.6).
+type dsPullRequestMerge struct {
+	Version   int    `json:"version"`
+	Reference string `json:"reference"`
+}
+
+type dsDatasetUpdate struct {
+	Definition dsDefinition `json:"definition"`
+	Publish    struct {
+		Message string `json:"message"`
+	} `json:"publish"`
 }
 
 type dsAccessGrant struct {
@@ -640,7 +680,7 @@ func (e *datasetsEnv) createDataset(t *testing.T, name string, def dsDefinition,
 	var created dsDataset
 	e.ds.must(t.Context(), http.StatusCreated, http.MethodPost, "",
 		dsCreateRequest{Name: name, Definition: def, Publish: &dsPublishOptions{Message: message}}, &created)
-	require.Equal(t, name, created.Name)
+	require.Equal(t, name, created.ID)
 	return created
 }
 
@@ -705,7 +745,7 @@ func TestDatasets(t *testing.T) {
 	t.Run("read_paths", func(t *testing.T) { testDatasetsReadPaths(t, env) })
 	t.Run("versions_and_diff", func(t *testing.T) { testDatasetsVersionsAndDiff(t, env) })
 	t.Run("gc_keeps_pinned_source_data", func(t *testing.T) { testDatasetsGCSafety(t, env) })
-	t.Run("proposal_flow", func(t *testing.T) { testDatasetsProposals(t, env) })
+	t.Run("pull_request_flow", func(t *testing.T) { testDatasetsPullRequests(t, env) })
 	t.Run("access_grant_outside_base_groups", func(t *testing.T) { testDatasetsAccessGrant(t, env) })
 }
 
@@ -748,7 +788,7 @@ func testDatasetsReadPaths(t *testing.T, env *datasetsEnv) {
 		},
 	}
 	created := env.createDataset(t, dataset, def, "initial dataset")
-	require.Equal(t, 1, created.LatestVersion, "create with publish produces v1")
+	require.Equal(t, 1, created.Version, "create with publish produces v1")
 	require.Equal(t, "active", created.State)
 
 	t.Run("rest", func(t *testing.T) {
@@ -780,7 +820,25 @@ func testDatasetsReadPaths(t *testing.T, env *datasetsEnv) {
 		}
 		env.ds.must(t.Context(), http.StatusOK, http.MethodGet, "?prefix="+dataset, nil, &list)
 		require.NotEmpty(t, list.Results)
-		require.Equal(t, dataset, list.Results[0].Name)
+		require.Equal(t, dataset, list.Results[0].ID)
+	})
+
+	t.Run("documented_routes", func(t *testing.T) {
+		// The pull-request listing is the documented global route, not a per-dataset
+		// composition (DOC-8).
+		var pulls struct {
+			Results []dsPullRequest `json:"results"`
+		}
+		env.ds.must(t.Context(), http.StatusOK, http.MethodGet, "pulls?dataset="+dataset, nil, &pulls)
+		require.Empty(t, pulls.Results)
+
+		// The metadata-key schema lives at /metadata and /metadata/{key} (DOC-9).
+		var keys struct {
+			Results []struct {
+				Name string `json:"name"`
+			} `json:"results"`
+		}
+		env.ds.must(t.Context(), http.StatusOK, http.MethodGet, "metadata", nil, &keys)
 	})
 }
 
@@ -817,19 +875,47 @@ func testDatasetsVersionsAndDiff(t *testing.T, env *datasetsEnv) {
 		Definition: dsDefinition{FormatVersion: 1, Data: []dsDataItem{prefixItem(commitV2)}},
 		Message:    "v2",
 	})
-	require.Equal(t, 2, v2.Version)
+	require.Equal(t, "v2", v2.ID)
 
 	var versions dsVersionList
 	env.ds.must(t.Context(), http.StatusOK, http.MethodGet, dataset+"/versions", nil, &versions)
 	require.Len(t, versions.Results, 2)
-	require.Equal(t, 2, versions.Results[0].Version, "versions are listed newest first")
+	require.Equal(t, "v2", versions.Results[0].ID, "versions are listed newest first")
+
+	t.Run("by_ref", func(t *testing.T) {
+		var atV2 dsDataset
+		env.ds.must(t.Context(), http.StatusOK, http.MethodGet, dataset+"/refs/v2", nil, &atV2)
+		require.Equal(t, dataset, atV2.ID)
+		require.Equal(t, 2, atV2.Version)
+
+		var atV1 dsDataset
+		env.ds.must(t.Context(), http.StatusOK, http.MethodGet, dataset+"/refs/v1", nil, &atV1)
+		require.Equal(t, 1, atV1.Version, "the ref route returns the named version, not latest")
+	})
+
+	t.Run("update_dataset", func(t *testing.T) {
+		// The documented update is PUT /datasets/{dataset}: a synchronous publish that
+		// answers the updated Dataset (DOC-4).
+		update := dsDatasetUpdate{Definition: dsDefinition{
+			FormatVersion: 1,
+			Description:   "updated through PUT",
+			Data:          []dsDataItem{prefixItem(commitV2)},
+		}}
+		update.Publish.Message = "v3 through PUT"
+
+		var updated dsDataset
+		env.ds.must(t.Context(), http.StatusOK, http.MethodPut, dataset, update, &updated)
+		require.Equal(t, 3, updated.Version)
+		require.NotNil(t, updated.Definition)
+		require.Equal(t, "updated through PUT", updated.Definition.Description)
+	})
 
 	t.Run("definition_diff", func(t *testing.T) {
 		var diff dsDefinitionDiff
 		env.ds.must(t.Context(), http.StatusOK, http.MethodGet, dataset+"/refs/v1/diff/v2", nil, &diff)
-		require.Len(t, diff.Items, 1)
-		require.Equal(t, "data", diff.Items[0].Target)
-		require.Equal(t, "changed", diff.Items[0].Change, "the pinned commit moved between v1 and v2")
+		require.Len(t, diff.Data, 1)
+		require.Equal(t, "data", diff.Data[0].Target)
+		require.Equal(t, "changed", diff.Data[0].Type, "the pinned commit moved between v1 and v2")
 	})
 
 	t.Run("data_diff", func(t *testing.T) {
@@ -1036,9 +1122,9 @@ func openActiveCommits(t *testing.T, prepared apigen.GarbageCollectionPrepareRes
 	return nil
 }
 
-// testDatasetsProposals covers §15.2 bullet 4 and §5.6: open a proposal with a preview branch,
+// testDatasetsPullRequests covers §15.2 bullet 4 and §5.6: open a pull request with a preview branch,
 // browse the preview data, merge it, and close a second one.
-func testDatasetsProposals(t *testing.T, env *datasetsEnv) {
+func testDatasetsPullRequests(t *testing.T, env *datasetsEnv) {
 	uid := uniqueSuffix()
 	source := "ds-proposals-" + uid
 	env.createRepo(t, source, mainBranch)
@@ -1069,9 +1155,9 @@ func testDatasetsProposals(t *testing.T, env *datasetsEnv) {
 		},
 	}}
 
-	var proposal dsProposal
-	env.ds.must(t.Context(), http.StatusCreated, http.MethodPost, dataset+"/proposals",
-		dsProposalCreateRequest{Definition: proposalDefinition, Title: "add c"}, &proposal)
+	var proposal dsPullRequest
+	env.ds.must(t.Context(), http.StatusCreated, http.MethodPost, dataset+"/pulls",
+		dsPullRequestCreateRequest{Definition: proposalDefinition, Title: "add c"}, &proposal)
 	require.Equal(t, 1, proposal.BaseVersion)
 	require.Equal(t, "open", proposal.Status)
 	require.NotEmpty(t, proposal.PreviewBranch, "the preview branch is returned for reviewers")
@@ -1084,22 +1170,27 @@ func testDatasetsProposals(t *testing.T, env *datasetsEnv) {
 	})
 
 	t.Run("merge_publishes_v2", func(t *testing.T) {
-		var merged dsVersion
-		env.ds.must(t.Context(), http.StatusCreated, http.MethodPost, dataset+"/proposals/"+proposal.ID+"/merge",
-			map[string]string{"message": "merge proposal"}, &merged)
+		var merged dsPullRequestMerge
+		env.ds.must(t.Context(), http.StatusOK, http.MethodPost, dataset+"/pulls/"+proposal.ID+"/merge", nil, &merged)
 		require.Equal(t, 2, merged.Version)
-		require.Equal(t, proposal.ID, merged.ProposalID)
+		require.Equal(t, "v2", merged.Reference)
+
+		var version dsVersion
+		env.ds.must(t.Context(), http.StatusOK, http.MethodGet, dataset+"/versions/v2", nil, &version)
+		require.Equal(t, proposal.ID, version.ProposalID)
 		require.Equal(t, []byte("c"), readObjectREST(t, env.core, dataset, "latest", "extra/c.txt"))
 	})
 
 	t.Run("close_discards_the_preview", func(t *testing.T) {
-		var second dsProposal
-		env.ds.must(t.Context(), http.StatusCreated, http.MethodPost, dataset+"/proposals",
-			dsProposalCreateRequest{Definition: proposalDefinition, Title: "discard me"}, &second)
+		var second dsPullRequest
+		env.ds.must(t.Context(), http.StatusCreated, http.MethodPost, dataset+"/pulls",
+			dsPullRequestCreateRequest{Definition: proposalDefinition, Title: "discard me"}, &second)
+		require.Equal(t, "pr/"+second.ID, second.SourceRef)
 
-		var closed dsProposal
-		env.ds.must(t.Context(), http.StatusOK, http.MethodPatch, dataset+"/proposals/"+second.ID,
-			map[string]string{"status": "closed"}, &closed)
+		// DELETE closes the pull request (§5.6); the record still answers 200 afterwards.
+		env.ds.must(t.Context(), http.StatusNoContent, http.MethodDelete, dataset+"/pulls/"+second.ID, nil, nil)
+		var closed dsPullRequest
+		env.ds.must(t.Context(), http.StatusOK, http.MethodGet, dataset+"/pulls/"+second.ID, nil, &closed)
 		require.Equal(t, "closed", closed.Status)
 		require.Nil(t, closed.MergedVersion)
 
@@ -1162,7 +1253,7 @@ func testDatasetsAccessGrant(t *testing.T, env *datasetsEnv) {
 
 		var got dsDataset
 		consumerDS.must(t.Context(), http.StatusOK, http.MethodGet, dataset, nil, &got)
-		require.Equal(t, 1, got.LatestVersion)
+		require.Equal(t, 1, got.Version)
 	})
 
 	t.Run("granted_user_does_not_gain_the_sources", func(t *testing.T) {

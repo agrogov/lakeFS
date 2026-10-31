@@ -290,6 +290,10 @@ type CreateRequest struct {
 	Publish bool
 	// Message is the v1 commit message when Publish is set.
 	Message string
+	// PreserveProposalID is the pull request a create-on-merge must not delete: a create
+	// removes leftover control-plane records of the name (BUG-7), and the merge still has
+	// to close this pull request record afterwards. Internal to the service.
+	PreserveProposalID string
 }
 
 // DatasetView is one dataset as the API returns it: the head record plus the record of the
@@ -297,6 +301,85 @@ type CreateRequest struct {
 type DatasetView struct {
 	Record  *DatasetRecord
 	Version *VersionRecord
+	// ItemStatuses is the source-resolution status of every data item of Version, in the
+	// order of its definition (§10.2 DataItemState.status). It is nil when there is no
+	// version to report on.
+	ItemStatuses []ItemStatus
+}
+
+// ItemStatus is the per-item source-resolution status of the Dataset schema (§10.2
+// DataItemState.status). It lets a consumer see which items of a published version are not
+// readable and why, without failing the whole read.
+type ItemStatus string
+
+const (
+	// ItemStatusOK is a source the caller can read right now.
+	ItemStatusOK ItemStatus = "ok"
+	// ItemStatusSourceRepoUnavailable is a source repository that no longer exists.
+	ItemStatusSourceRepoUnavailable ItemStatus = "source_repo_unavailable"
+	// ItemStatusSourceRefUnavailable is a source ref (commit) that no longer exists.
+	ItemStatusSourceRefUnavailable ItemStatus = "source_ref_unavailable"
+	// ItemStatusCallerUnauthorized is a source the caller may not read (§9.3).
+	ItemStatusCallerUnauthorized ItemStatus = "caller_unauthorized"
+)
+
+// itemStatuses resolves the status of every item of def for caller. The authorization check
+// runs first, so an unreadable source never reveals whether it still exists (SEC-4).
+func (s *Service) itemStatuses(ctx context.Context, caller Caller, def *Definition) ([]ItemStatus, error) {
+	if def == nil {
+		return nil, nil
+	}
+	statuses := make([]ItemStatus, len(def.Data))
+	for i := range def.Data {
+		status, err := s.itemStatus(ctx, caller, def.Data[i])
+		if err != nil {
+			return nil, err
+		}
+		statuses[i] = status
+	}
+	return statuses, nil
+}
+
+// itemStatus resolves one item. A failure to decide (rather than a denial) is returned: it
+// must never be reported as a status of the data.
+func (s *Service) itemStatus(ctx context.Context, caller Caller, item DataItem) (ItemStatus, error) {
+	if err := s.authorizer.CheckSources(ctx, caller, []DataItem{item}); err != nil {
+		var denied *PermissionError
+		if errors.As(err, &denied) {
+			return ItemStatusCallerUnauthorized, nil
+		}
+		return "", err
+	}
+	one := Definition{FormatVersion: FormatVersion, Data: []DataItem{item}}
+	if _, err := s.resolver.Resolve(ctx, &one); err != nil {
+		var sourceErr *SourceError
+		if errors.As(err, &sourceErr) && errors.Is(sourceErr.Err, ErrSourceRefNotFound) {
+			return ItemStatusSourceRefUnavailable, nil
+		}
+		if errors.As(err, &sourceErr) && errors.Is(sourceErr.Err, ErrSourceRepositoryNotFound) {
+			return ItemStatusSourceRepoUnavailable, nil
+		}
+		// A storage-ID mismatch or a nested dataset is an unusable source repository
+		// rather than a transient failure; anything else is a real error.
+		if errors.As(err, &sourceErr) {
+			return ItemStatusSourceRepoUnavailable, nil
+		}
+		return "", err
+	}
+	return ItemStatusOK, nil
+}
+
+// withItemStatuses attaches the per-item statuses of view's version.
+func (s *Service) withItemStatuses(ctx context.Context, caller Caller, view *DatasetView) (*DatasetView, error) {
+	if view == nil || view.Version == nil {
+		return view, nil
+	}
+	statuses, err := s.itemStatuses(ctx, caller, &view.Version.Definition)
+	if err != nil {
+		return nil, err
+	}
+	view.ItemStatuses = statuses
+	return view, nil
 }
 
 // Create creates the dataset repository and its control-plane record, and publishes version
@@ -372,7 +455,7 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 	// records of this name leaves them behind, because finishDelete deletes the dataset record
 	// last. They belong to the dataset that is gone; remove them before the repository exists so
 	// v1 does not collide with a stale v1 record.
-	if err := s.cleanupLeftoverRecords(ctx, req.Name); err != nil {
+	if err := s.cleanupLeftoverRecords(ctx, req.Name, req.PreserveProposalID); err != nil {
 		s.rollbackCreate(ctx, rec)
 		return nil, err
 	}
@@ -449,7 +532,7 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 		logging.FromContext(ctx).WithError(err).WithField("dataset", req.Name).
 			Warn("datasets: dataset created but the all-read policy was not updated; the reconciler will converge it")
 	}
-	return &DatasetView{Record: active, Version: version}, nil
+	return s.withItemStatuses(ctx, caller, &DatasetView{Record: active, Version: version})
 }
 
 // rollbackCreate undoes a create that failed before its first commit (BUG-10): the
@@ -519,7 +602,7 @@ func (s *Service) leavePending(ctx context.Context, dataset string, version int)
 // a stale v1 VersionRecord fails forever (version records are immutable), and the old proposals,
 // tasks and grants would be visible under the new dataset. The records are removed before the
 // dataset repository is created, while this create provably owns the name.
-func (s *Service) cleanupLeftoverRecords(ctx context.Context, dataset string) error {
+func (s *Service) cleanupLeftoverRecords(ctx context.Context, dataset, preserveProposalID string) error {
 	versions, err := s.store.ListVersions(ctx, dataset)
 	if err != nil {
 		return err
@@ -534,6 +617,9 @@ func (s *Service) cleanupLeftoverRecords(ctx context.Context, dataset string) er
 		return err
 	}
 	for _, proposal := range proposals {
+		if proposal.ID == preserveProposalID {
+			continue
+		}
 		if err := s.store.DeleteProposal(ctx, dataset, proposal.ID); err != nil && !isNotFound(err) {
 			return fmt.Errorf("datasets: remove leftover proposal %s of %q: %w", proposal.ID, dataset, err)
 		}
@@ -577,7 +663,40 @@ func (s *Service) Get(ctx context.Context, caller Caller, name string) (*Dataset
 			return nil, err
 		}
 	}
-	return view, nil
+	return s.withItemStatuses(ctx, caller, view)
+}
+
+// GetByRef returns the dataset as it is at ref (§10.1 GET /datasets/{ds}/refs/{ref}): `latest`
+// resolves to the dataset head, `vN`/`N` to that version. The record is always the head
+// record, so `version` and `state` describe the dataset now while `definition` and `stats`
+// describe the named version.
+func (s *Service) GetByRef(ctx context.Context, caller Caller, name, ref string) (*DatasetView, error) {
+	view, err := s.Get(ctx, caller, name)
+	if err != nil {
+		return nil, err
+	}
+	version, err := resolveVersionRef(view.Record, ref)
+	if err != nil {
+		return nil, err
+	}
+	if version == view.Record.LatestVersion && view.Version != nil {
+		return view, nil
+	}
+	stored, err := s.store.GetVersion(ctx, name, version)
+	if errors.Is(err, kv.ErrNotFound) {
+		return nil, fmt.Errorf("%w: dataset %q has no version %d", ErrVersionNotFound, name, version)
+	}
+	if err != nil {
+		return nil, err
+	}
+	// The dataset is read *at* the named version, so `version` reports that version and not
+	// the head's latest one.
+	record := *view.Record
+	record.LatestVersion = version
+	return s.withItemStatuses(ctx, caller, &DatasetView{
+		Record:  &record,
+		Version: s.withDefinition(ctx, stored),
+	})
 }
 
 // ListRequest is the input of Service.List: the filters and pagination of GET /datasets
@@ -650,6 +769,9 @@ func (s *Service) List(ctx context.Context, caller Caller, req ListRequest) (*Li
 			if errors.As(err, &denied) {
 				continue
 			}
+			return nil, err
+		}
+		if view, err = s.withItemStatuses(ctx, caller, view); err != nil {
 			return nil, err
 		}
 		filtered = append(filtered, view)
@@ -916,6 +1038,25 @@ func (s *Service) PublishVersion(ctx context.Context, caller Caller, name string
 		return nil, err
 	}
 	return &PublishOutcome{Version: version}, nil
+}
+
+// ErrPublishNotSynchronous reports a publish that was accepted as an asynchronous task where
+// the caller required it in the request. It is a wiring bug, not a client error.
+var ErrPublishNotSynchronous = errors.New("datasets: publish was not run synchronously")
+
+// UpdateDataset publishes a new version and returns the updated dataset (§10.1
+// PUT /datasets/{ds}). The publish always runs in the request, so the response can carry the
+// new Dataset; POST /datasets/{ds}/versions remains the asynchronous extension (§6.5).
+func (s *Service) UpdateDataset(ctx context.Context, caller Caller, name string, req PublishVersionRequest) (*DatasetView, error) {
+	req.Sync = true
+	outcome, err := s.PublishVersion(ctx, caller, name, req)
+	if err != nil {
+		return nil, err
+	}
+	if outcome.Accepted() || outcome.Version == nil {
+		return nil, fmt.Errorf("%w: dataset %q", ErrPublishNotSynchronous, name)
+	}
+	return s.Get(ctx, caller, name)
 }
 
 // beginPublish applies §5.4 steps 1-3: it reads the dataset record, enforces

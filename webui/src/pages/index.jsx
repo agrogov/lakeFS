@@ -126,7 +126,7 @@ export const IndexPage = () => {
                                         <Route path="versions" element={<DatasetVersionsPage />} />
                                         <Route path="compare" element={<DatasetComparePage />} />
                                         <Route path="edit" element={<DatasetEditorPage mode="edit" />} />
-                                        <Route path="proposals">
+                                        <Route path="pulls">
                                             <Route index element={<DatasetProposalsPage />} />
                                             <Route path=":proposalId" element={<DatasetProposalPage />} />
                                         </Route>

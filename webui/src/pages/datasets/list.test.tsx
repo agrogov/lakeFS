@@ -33,11 +33,11 @@ const datasetList = (results) => ({
 });
 
 const dataset = (overrides = {}) => ({
-    name: 'customer-360',
+    id: 'customer-360',
     description: 'Curated customer view for analytics',
-    created_at: 1710000000000,
+    creation_date: 1710000000,
     created_by: 'tester',
-    latest_version: 3,
+    version: 3,
     state: 'active',
     stats: { objects: 1200, bytes: 5 * 1024 * 1024, items: [] },
     definition: {

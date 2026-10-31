@@ -188,7 +188,7 @@ const DatasetComparePage: FC = () => {
     const { datasetId = '' } = useParams();
     const router = useRouter();
     const state = useDatasetVersion(datasetId, 'latest');
-    const latest = state.dataset?.latest_version ?? 0;
+    const latest = state.dataset?.version ?? 0;
     const defaults = defaultCompareRefs(latest);
     const leftParam = router.query[COMPARE_QUERY_KEYS.left];
     const rightParam = router.query[COMPARE_QUERY_KEYS.right];

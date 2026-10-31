@@ -65,12 +65,12 @@ func TestDatasetsHTTPPublishAndReadVersions(t *testing.T) {
 	published := doRequest(t, handler, http.MethodPost, "/http-versions/versions",
 		publishBody(def, "initial publish", nil), accessKey, secret)
 	require.Equal(t, http.StatusCreated, published.Code, "body: %s", published.Body.String())
-	var version apigen.Version
+	var version apigen.DatasetVersion
 	require.NoError(t, json.Unmarshal(published.Body.Bytes(), &version))
-	require.Equal(t, 1, version.Version)
+	require.Equal(t, "v1", version.Id)
 	require.Equal(t, "initial publish", deref(version.Message))
-	require.Equal(t, testUsername, version.Publisher)
-	require.NotEmpty(t, version.CommitId)
+	require.Equal(t, testUsername, version.Author)
+	require.NotEmpty(t, deref(version.CommitId))
 	require.NotNil(t, version.Definition)
 	require.NotNil(t, version.Stats)
 	require.Equal(t, int64(1), version.Stats.Objects)
@@ -79,10 +79,10 @@ func TestDatasetsHTTPPublishAndReadVersions(t *testing.T) {
 	for _, ref := range []string{"v1", "1", "latest"} {
 		rec := doRequest(t, handler, http.MethodGet, "/http-versions/versions/"+ref, "", accessKey, secret)
 		require.Equal(t, http.StatusOK, rec.Code, "ref %q: %s", ref, rec.Body.String())
-		var got apigen.Version
+		var got apigen.DatasetVersion
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
-		require.Equal(t, 1, got.Version, "ref %q", ref)
-		require.Equal(t, version.CommitId, got.CommitId, "ref %q", ref)
+		require.Equal(t, "v1", got.Id, "ref %q", ref)
+		require.Equal(t, deref(version.CommitId), deref(got.CommitId), "ref %q", ref)
 	}
 
 	// Publish v2 from a new source commit and check that the list is newest first.
@@ -95,7 +95,7 @@ func TestDatasetsHTTPPublishAndReadVersions(t *testing.T) {
 	list := doRequest(t, handler, http.MethodGet, "/http-versions/versions?amount=10", "", accessKey, secret)
 	require.Equal(t, http.StatusOK, list.Code, "body: %s", list.Body.String())
 	var versions struct {
-		Results    []apigen.Version `json:"results"`
+		Results    []apigen.DatasetVersion `json:"results"`
 		Pagination struct {
 			HasMore    bool `json:"has_more"`
 			Results    int  `json:"results"`
@@ -104,7 +104,7 @@ func TestDatasetsHTTPPublishAndReadVersions(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(list.Body.Bytes(), &versions))
 	require.Len(t, versions.Results, 2)
-	require.Equal(t, []int{2, 1}, []int{versions.Results[0].Version, versions.Results[1].Version})
+	require.Equal(t, []string{"v2", "v1"}, []string{versions.Results[0].Id, versions.Results[1].Id})
 	require.Equal(t, 2, versions.Pagination.Results)
 	require.False(t, versions.Pagination.HasMore)
 
@@ -113,7 +113,7 @@ func TestDatasetsHTTPPublishAndReadVersions(t *testing.T) {
 	require.Equal(t, http.StatusOK, got.Code)
 	var dataset apigen.Dataset
 	require.NoError(t, json.Unmarshal(got.Body.Bytes(), &dataset))
-	require.Equal(t, 2, dataset.LatestVersion)
+	require.Equal(t, 2, derefInt(dataset.Version))
 
 	// Failures: an unknown version, task and dataset are 404; a malformed version ref is the
 	// 400 of §10.4 (it names the offending parameter).
@@ -220,10 +220,17 @@ func TestDatasetsHTTPAsyncPublish(t *testing.T) {
 	require.Equal(t, http.StatusOK, got.Code)
 	var dataset apigen.Dataset
 	require.NoError(t, json.Unmarshal(got.Body.Bytes(), &dataset))
-	require.Equal(t, 1, dataset.LatestVersion)
-	require.Equal(t, DatasetStateActive, dataset.State)
+	require.Equal(t, 1, derefInt(dataset.Version))
+	require.Equal(t, DatasetStateActive, deref(dataset.State))
 	require.NotNil(t, dataset.Definition)
 	require.Equal(t, int64(2), dataset.Stats.Objects)
+}
+
+func derefInt(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func deref(value *string) string {

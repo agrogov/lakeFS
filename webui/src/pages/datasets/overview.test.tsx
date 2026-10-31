@@ -38,10 +38,10 @@ const definition = (targets: string[]): DatasetDefinition => ({
 });
 
 const version = (number: number, targets: string[]): Version => ({
-    version: number,
+    id: `v${number}`,
     message: `message for v${number}`,
-    publisher: `publisher-${number}`,
-    published_at: Date.UTC(2026, 0, number),
+    author: `publisher-${number}`,
+    creation_date: Date.UTC(2026, 0, number) / 1000,
     commit_id: `${number}`.repeat(40),
     definition: definition(targets),
     stats: {
@@ -54,11 +54,11 @@ const version = (number: number, targets: string[]): Version => ({
 const versions = [version(2, ['customers']), version(1, ['customers', 'orders'])];
 
 const dataset = {
-    name: 'customer-360',
+    id: 'customer-360',
     description: 'Curated customer view for analytics',
-    created_at: Date.UTC(2026, 0, 1),
+    creation_date: Date.UTC(2026, 0, 1) / 1000,
     created_by: 'creator',
-    latest_version: 2,
+    version: 2,
     state: 'active',
     definition: versions[0].definition,
     stats: versions[0].stats,
@@ -178,7 +178,7 @@ describe('DatasetOverviewPage', () => {
     });
 
     it('offers no items message when nothing is published', async () => {
-        fetchMock.mockResolvedValueOnce(jsonResponse({ ...dataset, latest_version: 0, definition: undefined }));
+        fetchMock.mockResolvedValueOnce(jsonResponse({ ...dataset, version: 0, definition: undefined }));
         fetchMock.mockResolvedValueOnce(jsonResponse({ results: [], pagination: {} }));
         renderPage();
 

@@ -57,9 +57,18 @@ const RefNameLatest = "latest"
 // is materialised on (and therefore the graveler ref a data diff of a proposal uses) is
 // `_proposal-<id>` (§5.6, §10.3).
 const (
-	ProposalRefPrefix           = "proposal-"
+	// ProposalRefPrefix is the deprecated proposal ref form, `proposal-<id>`. It is still
+	// accepted so refs written before the pull-request rename keep working.
+	ProposalRefPrefix = "proposal-"
+	// PullRequestRefPrefix is the documented pull-request ref form (§10.3): `pr/<id>`.
+	PullRequestRefPrefix        = "pr/"
 	proposalPreviewBranchPrefix = "_proposal-"
 )
+
+// PullRequestRef returns the ref of a pull request, `pr/<id>` (§10.2 source_ref).
+func PullRequestRef(id string) string {
+	return PullRequestRefPrefix + id
+}
 
 // ProposalPreviewBranch returns the hidden dataset-repository branch a proposal is
 // materialised on (§5.6). It is also what ProposalRecord.PreviewBranch holds.
@@ -493,10 +502,16 @@ func parseRefTarget(field, ref string) (refTarget, error) {
 		return invalid("must not be empty")
 	case ref == RefNameLatest:
 		return refTarget{latest: true}, nil
+	case strings.HasPrefix(ref, PullRequestRefPrefix):
+		id := strings.TrimPrefix(ref, PullRequestRefPrefix)
+		if !isAlphanumeric(id) {
+			return invalid(fmt.Sprintf("must be %q followed by the pull request id", PullRequestRefPrefix))
+		}
+		return refTarget{proposalID: id}, nil
 	case strings.HasPrefix(ref, ProposalRefPrefix):
 		id := strings.TrimPrefix(ref, ProposalRefPrefix)
 		if !isAlphanumeric(id) {
-			return invalid(fmt.Sprintf("must be %q followed by the proposal id", ProposalRefPrefix))
+			return invalid(fmt.Sprintf("must be %q followed by the pull request id", ProposalRefPrefix))
 		}
 		return refTarget{proposalID: id}, nil
 	}
@@ -506,7 +521,7 @@ func parseRefTarget(field, ref string) (refTarget, error) {
 		digits = digits[1:]
 	}
 	if !isDigits(digits) {
-		return invalid(`must be "latest", a version ("v3", "3") or a proposal ("proposal-<id>")`)
+		return invalid(`must be "latest", a version ("v3", "3") or a pull request ("pr/<id>")`)
 	}
 	version, err := strconv.Atoi(digits)
 	if err != nil || version <= 0 {

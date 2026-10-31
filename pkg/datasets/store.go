@@ -1067,6 +1067,31 @@ func (s *Store) ListProposals(ctx context.Context, dataset string) ([]*ProposalR
 	return proposals, nil
 }
 
+// ListAllProposals returns every proposal record of every dataset, newest first. It backs
+// the global GET /datasets/pulls listing of §10.1, which filters by dataset and status; an
+// installation without proposals yields an empty slice and no error.
+func (s *Store) ListAllProposals(ctx context.Context) ([]*ProposalRecord, error) {
+	proposals := make([]*ProposalRecord, 0)
+	err := s.scanPrefix(ctx, []byte(proposalKeyPrefix+kv.PathDelimiter), func(key, value []byte) error {
+		rec, err := decodeRecord[ProposalRecord]("proposal record", key, value)
+		if err != nil {
+			return err
+		}
+		proposals = append(proposals, rec)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(proposals, func(i, j int) bool {
+		if !proposals[i].CreatedAt.Equal(proposals[j].CreatedAt) {
+			return proposals[i].CreatedAt.After(proposals[j].CreatedAt)
+		}
+		return proposals[i].ID > proposals[j].ID
+	})
+	return proposals, nil
+}
+
 // ----------------------------------------------------------------------------
 // Metadata keys (§5.3, §5.5)
 // ----------------------------------------------------------------------------

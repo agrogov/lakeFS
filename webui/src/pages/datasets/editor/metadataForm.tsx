@@ -11,7 +11,7 @@ import { MetadataKey } from '../../../lib/api/datasets';
 import { MetadataDraft, MetadataProblems } from './editorModel';
 
 /**
- * The metadata form generated from the metadata keys (`GET /datasets/metadata-keys`, §5.5,
+ * The metadata form generated from the metadata keys (`GET /datasets/metadata`, §5.5,
  * §11.2): required markers, enum dropdowns, a date picker, a number input, a boolean toggle and
  * multi-value chips for `allow_multiple` keys.
  *

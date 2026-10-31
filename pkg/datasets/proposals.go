@@ -43,6 +43,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/graveler"
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/logging"
+	"github.com/treeverse/lakefs/pkg/permissions"
 )
 
 // Proposal errors. The HTTP layer maps them in writeServiceError (§10.4): not found is a
@@ -115,22 +116,52 @@ type MergeProposalRequest struct {
 	Message string
 }
 
-// ProposalView is one proposal as the API returns it: the record plus the diffs the detail
+// ProposalView is one pull request as the API returns it: the record plus the fields the
+// API derives from the dataset head (§10.2 DatasetPullRequest) and the diffs the detail
 // response carries (§5.6, §10.1 "includes diff summary against latest"). The diffs are nil
 // when they could not be computed - see proposalView - so a read never fails because a
 // preview branch is gone.
 type ProposalView struct {
-	Record   *ProposalRecord
-	Diff     *DefinitionDiff
-	DataDiff *DataDiff
+	Record *ProposalRecord
+	// LatestVersion is the dataset's latest version at read time; 0 when the dataset does
+	// not exist yet (a pull request that will create it).
+	LatestVersion int
+	// Stale reports BaseVersion != LatestVersion: the pull request must be updated before
+	// it can be merged (§5.6).
+	Stale bool
+	// Conflicted reports that this pull request targets a dataset that does not exist and
+	// whose name is not available any more. Merging it answers 409.
+	Conflicted bool
+	Diff       *DefinitionDiff
+	DataDiff   *DataDiff
 }
 
-// ProposalListResult is one page of GET /datasets/{ds}/proposals, newest first.
+// ProposalListResult is one page of GET /datasets/{ds}/pulls, newest first.
 type ProposalListResult struct {
 	Proposals  []*ProposalRecord
 	HasMore    bool
 	NextOffset string
 	MaxPerPage int
+	// LatestVersion and Conflicted are the derived fields every row of this dataset shares.
+	LatestVersion int
+	Conflicted    bool
+}
+
+// PullRequestFilter is the input of the global GET /datasets/pulls listing (§10.1).
+type PullRequestFilter struct {
+	Dataset string
+	// Status is "open", "closed", "merged" or "" / "all" for every state.
+	Status string
+	After  string
+	Amount int
+}
+
+// PullRequestListResult is one page of the global pull-request listing.
+type PullRequestListResult struct {
+	PullRequests []*ProposalView
+	HasMore      bool
+	NextOffset   string
+	MaxPerPage   int
 }
 
 // ListProposals lists the proposals of a dataset newest first, optionally filtered by status
@@ -140,7 +171,8 @@ func (s *Service) ListProposals(ctx context.Context, caller Caller, dataset, sta
 	if err := s.authorizer.CheckDataset(ctx, caller, ActionReadDataset, dataset); err != nil {
 		return nil, err
 	}
-	if err := s.requireDataset(ctx, dataset); err != nil {
+	rec, err := s.loadDatasetOrNil(ctx, dataset)
+	if err != nil {
 		return nil, err
 	}
 	switch status {
@@ -193,7 +225,19 @@ func (s *Service) ListProposals(ctx context.Context, caller Caller, dataset, sta
 	if hasMore && len(page) > 0 {
 		next = page[len(page)-1].ID
 	}
-	return &ProposalListResult{Proposals: page, HasMore: hasMore, NextOffset: next, MaxPerPage: amount}, nil
+	if rec == nil && len(stored) == 0 {
+		return nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, dataset)
+	}
+	latest := latestVersionOf(rec)
+	conflicted := rec == nil && s.nameUnavailable(ctx, dataset)
+	return &ProposalListResult{
+		Proposals:     page,
+		HasMore:       hasMore,
+		NextOffset:    next,
+		MaxPerPage:    amount,
+		LatestVersion: latest,
+		Conflicted:    conflicted,
+	}, nil
 }
 
 // CreateProposal opens a proposal against the dataset's current latest version (§5.6).
@@ -215,9 +259,17 @@ func (s *Service) CreateProposal(ctx context.Context, caller Caller, dataset str
 	if problems := ValidateName(dataset); len(problems) > 0 {
 		return nil, &ValidationError{Problems: problems}
 	}
-	rec, err := s.loadDataset(ctx, dataset)
+	rec, err := s.loadDatasetOrNil(ctx, dataset)
 	if err != nil {
 		return nil, err
+	}
+	if rec == nil {
+		// A pull request may be opened before its dataset exists (§5.6): the dataset is
+		// created when the pull request is merged. The name must be free, so a pull
+		// request never promises a dataset that can never be created.
+		if err := s.checkNameAvailable(ctx, dataset); err != nil {
+			return nil, err
+		}
 	}
 
 	def := req.Definition
@@ -244,20 +296,25 @@ func (s *Service) CreateProposal(ctx context.Context, caller Caller, dataset str
 		return nil, fmt.Errorf("datasets: generate proposal id: %w", err)
 	}
 	proposal := &ProposalRecord{
-		ID:            id,
-		Dataset:       dataset,
-		BaseVersion:   rec.LatestVersion,
-		Definition:    *resolved,
-		Title:         req.Title,
-		Description:   req.Description,
-		Author:        caller.Username,
-		Status:        ProposalStatusOpen,
-		CreatedAt:     now,
-		PreviewBranch: ProposalPreviewBranch(id),
+		ID:          id,
+		Dataset:     dataset,
+		BaseVersion: latestVersionOf(rec),
+		Definition:  *resolved,
+		Title:       req.Title,
+		Description: req.Description,
+		Author:      caller.Username,
+		Status:      ProposalStatusOpen,
+		CreatedAt:   now,
 	}
 
-	if err := s.materializePreview(ctx, rec, proposal, caller.Username); err != nil {
-		return nil, err
+	// A dataset that does not exist yet has no repository to materialise a preview on;
+	// the definition is still validated and authorized above, and the record carries no
+	// preview branch because no such branch exists.
+	if rec != nil {
+		proposal.PreviewBranch = ProposalPreviewBranch(id)
+		if err := s.materializePreview(ctx, rec, proposal, caller.Username); err != nil {
+			return nil, err
+		}
 	}
 	if err := s.store.PutProposalIf(ctx, proposal, nil); err != nil {
 		// The preview branch is useless without its record; removing it keeps the
@@ -275,7 +332,7 @@ func (s *Service) GetProposal(ctx context.Context, caller Caller, dataset, id st
 	if err := s.authorizer.CheckDataset(ctx, caller, ActionReadDataset, dataset); err != nil {
 		return nil, err
 	}
-	rec, err := s.loadDataset(ctx, dataset)
+	rec, err := s.loadDatasetOrNil(ctx, dataset)
 	if err != nil {
 		return nil, err
 	}
@@ -306,7 +363,7 @@ func (s *Service) UpdateProposal(ctx context.Context, caller Caller, dataset, id
 	if err := s.authorizeProposalWrite(ctx, caller, dataset, ""); err != nil {
 		return nil, err
 	}
-	rec, err := s.loadDataset(ctx, dataset)
+	rec, err := s.loadDatasetOrNil(ctx, dataset)
 	if err != nil {
 		return nil, err
 	}
@@ -369,9 +426,11 @@ func (s *Service) UpdateProposal(ctx context.Context, caller Caller, dataset, id
 	updated.Definition = *resolved
 	// §5.6: this is the rebase. The preview is materialised against the same version, so a
 	// merge right after an update never has to rebase (and never silently picks newer data).
-	updated.BaseVersion = rec.LatestVersion
-	if err := s.materializePreview(ctx, rec, &updated, caller.Username); err != nil {
-		return nil, err
+	updated.BaseVersion = latestVersionOf(rec)
+	if rec != nil {
+		if err := s.materializePreview(ctx, rec, &updated, caller.Username); err != nil {
+			return nil, err
+		}
 	}
 	if err := s.store.PutProposalIf(ctx, &updated, proposal); err != nil {
 		return nil, err
@@ -396,7 +455,7 @@ func (s *Service) MergeProposal(ctx context.Context, caller Caller, dataset, id 
 	if err := s.authorizer.CheckDataset(ctx, caller, ActionUpdateDataset, dataset); err != nil {
 		return nil, err
 	}
-	rec, err := s.loadDataset(ctx, dataset)
+	rec, err := s.loadDatasetOrNil(ctx, dataset)
 	if err != nil {
 		return nil, err
 	}
@@ -407,6 +466,54 @@ func (s *Service) MergeProposal(ctx context.Context, caller Caller, dataset, id 
 	if proposal.Status != ProposalStatusOpen {
 		return nil, fmt.Errorf("%w: proposal %s of dataset %s is %s", ErrProposalNotOpen, id, dataset, proposal.Status)
 	}
+	message := strings.TrimSpace(req.Message)
+	if message == "" {
+		message = mergeMessage(proposal)
+	}
+
+	// A pull request that was opened before its dataset existed creates the dataset on
+	// merge (§5.6). The name may have been taken in the meantime: that is the conflicted
+	// case of the API, answered as a 409 without closing the pull request.
+	if rec == nil {
+		if proposal.BaseVersion != 0 {
+			return nil, &RebaseRequiredError{
+				Dataset:       dataset,
+				ProposalID:    id,
+				BaseVersion:   proposal.BaseVersion,
+				LatestVersion: 0,
+			}
+		}
+		if err := s.checkNameAvailable(ctx, dataset); err != nil {
+			if errors.Is(err, ErrNameTaken) {
+				return nil, fmt.Errorf("%w: dataset name %q is no longer available", ErrDatasetConflict, dataset)
+			}
+			return nil, err
+		}
+		created, err := s.Create(ctx, caller, CreateRequest{
+			Name:               dataset,
+			Definition:         proposal.Definition,
+			Publish:            true,
+			Message:            message,
+			PreserveProposalID: proposal.ID,
+		})
+		if err != nil {
+			var conflict *VersionConflictError
+			if errors.As(err, &conflict) {
+				return nil, &RebaseRequiredError{
+					Dataset:       dataset,
+					ProposalID:    id,
+					BaseVersion:   proposal.BaseVersion,
+					LatestVersion: conflict.LatestVersion,
+				}
+			}
+			return nil, err
+		}
+		if created.Version == nil {
+			return nil, fmt.Errorf("%w: proposal %s of dataset %s", ErrProposalNotSynchronous, id, dataset)
+		}
+		return s.markProposalMerged(ctx, dataset, proposal, created.Version)
+	}
+
 	// §5.6: merging requires base_version == latest_version.
 	if proposal.BaseVersion != rec.LatestVersion {
 		return nil, &RebaseRequiredError{
@@ -417,10 +524,6 @@ func (s *Service) MergeProposal(ctx context.Context, caller Caller, dataset, id 
 		}
 	}
 
-	message := strings.TrimSpace(req.Message)
-	if message == "" {
-		message = mergeMessage(proposal)
-	}
 	base := proposal.BaseVersion
 	outcome, err := s.PublishVersion(ctx, caller, dataset, PublishVersionRequest{
 		Definition:      proposal.Definition,
@@ -449,8 +552,12 @@ func (s *Service) MergeProposal(ctx context.Context, caller Caller, dataset, id 
 		// closing a proposal for a version that does not exist yet.
 		return nil, fmt.Errorf("%w: proposal %s of dataset %s", ErrProposalNotSynchronous, id, dataset)
 	}
-	version := outcome.Version
+	return s.markProposalMerged(ctx, dataset, proposal, outcome.Version)
+}
 
+// markProposalMerged closes a pull request with the version its merge produced and deletes
+// the preview branch (§5.6).
+func (s *Service) markProposalMerged(ctx context.Context, dataset string, proposal *ProposalRecord, version *VersionRecord) (*VersionRecord, error) {
 	now := s.now()
 	merged := *proposal
 	merged.Status = ProposalStatusMerged
@@ -478,6 +585,133 @@ func (s *Service) loadDataset(ctx context.Context, dataset string) (*DatasetReco
 		return nil, err
 	}
 	return rec, nil
+}
+
+// loadDatasetOrNil reads the head record of a dataset, returning (nil, nil) when the dataset
+// does not exist. A pull request may be opened before its dataset exists (§5.6), so its
+// operations must tolerate the missing record instead of answering 404.
+func (s *Service) loadDatasetOrNil(ctx context.Context, dataset string) (*DatasetRecord, error) {
+	rec, _, err := s.store.GetDataset(ctx, dataset)
+	if errors.Is(err, kv.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return rec, nil
+}
+
+// latestVersionOf reports the latest published version of rec, or 0 for a dataset that does
+// not exist yet.
+func latestVersionOf(rec *DatasetRecord) int {
+	if rec == nil {
+		return 0
+	}
+	return rec.LatestVersion
+}
+
+// nameUnavailable reports whether name is taken by a dataset or by a repository, i.e. whether
+// a pull request that would create the dataset is conflicted. A failure to look the name up is
+// reported as not-conflicted: the merge is where the authoritative answer is produced.
+func (s *Service) nameUnavailable(ctx context.Context, name string) bool {
+	return errors.Is(s.checkNameAvailable(ctx, name), ErrNameTaken)
+}
+
+// CloseProposal closes an open pull request without publishing anything (§5.6): DELETE
+// /datasets/{ds}/pulls/{pullRequest}.
+func (s *Service) CloseProposal(ctx context.Context, caller Caller, dataset, id string) (*ProposalView, error) {
+	return s.UpdateProposal(ctx, caller, dataset, id, UpdateProposalRequest{Status: ProposalStatusClosed})
+}
+
+// ListAllPullRequests lists the pull requests of every dataset, newest first (§10.1
+// GET /datasets/pulls). Listing requires dataset:ListDatasets and each row is filtered by
+// dataset:ReadDataset, exactly like the dataset listing, so the global view never reveals a
+// pull request of a dataset the caller may not read.
+func (s *Service) ListAllPullRequests(ctx context.Context, caller Caller, filter PullRequestFilter) (*PullRequestListResult, error) {
+	listNode := permissions.Node{
+		Permission: permissions.Permission{
+			Action:   ActionListDatasets,
+			Resource: permissions.All,
+		},
+	}
+	if err := s.authorizer.Check(ctx, caller, listNode, ""); err != nil {
+		return nil, err
+	}
+	switch filter.Status {
+	case "", "all", ProposalStatusOpen, ProposalStatusClosed, ProposalStatusMerged:
+	default:
+		return nil, &ValidationError{Problems: []Problem{{
+			Path:    "status",
+			Message: fmt.Sprintf("must be %q, %q or %q", ProposalStatusOpen, ProposalStatusClosed, "all"),
+		}}}
+	}
+
+	stored, err := s.store.ListAllProposals(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// The cursor is applied to the unfiltered list, so a pull request that leaves the filter
+	// while the client pages cannot invalidate the page.
+	start := 0
+	if filter.After != "" {
+		start = -1
+		for i, proposal := range stored {
+			if proposal.ID == filter.After {
+				start = i + 1
+				break
+			}
+		}
+		if start < 0 {
+			return nil, &ValidationError{Problems: []Problem{{
+				Path:    "after",
+				Message: fmt.Sprintf("unknown pull request %q", filter.After),
+			}}}
+		}
+	}
+
+	records := make(map[string]*DatasetRecord)
+	page := make([]*ProposalView, 0, len(stored))
+	for _, proposal := range stored[start:] {
+		if filter.Dataset != "" && proposal.Dataset != filter.Dataset {
+			continue
+		}
+		if filter.Status != "" && filter.Status != "all" && proposal.Status != filter.Status {
+			continue
+		}
+		rec, ok := records[proposal.Dataset]
+		if !ok {
+			rec, err = s.loadDatasetOrNil(ctx, proposal.Dataset)
+			if err != nil {
+				return nil, err
+			}
+			records[proposal.Dataset] = rec
+		}
+		if err := s.authorizer.CheckDataset(ctx, caller, ActionReadDataset, proposal.Dataset); err != nil {
+			var denied *PermissionError
+			if errors.As(err, &denied) {
+				continue
+			}
+			return nil, err
+		}
+		page = append(page, &ProposalView{
+			Record:        proposal,
+			LatestVersion: latestVersionOf(rec),
+			Stale:         proposal.Status == ProposalStatusOpen && latestVersionOf(rec) != proposal.BaseVersion,
+			Conflicted:    proposal.Status == ProposalStatusOpen && rec == nil && s.nameUnavailable(ctx, proposal.Dataset),
+		})
+	}
+
+	amount := effectiveAmount(filter.Amount)
+	hasMore := len(page) > amount
+	if hasMore {
+		page = page[:amount]
+	}
+	next := ""
+	if hasMore && len(page) > 0 {
+		next = page[len(page)-1].Record.ID
+	}
+	return &PullRequestListResult{PullRequests: page, HasMore: hasMore, NextOffset: next, MaxPerPage: amount}, nil
 }
 
 // loadProposal reads one proposal, mapping a missing record to a 404 that names both the
@@ -602,7 +836,18 @@ func mergeMessage(proposal *ProposalRecord) string {
 // still a valid, readable review object, and the reconciler (§12.3) is what repairs a
 // missing branch.
 func (s *Service) proposalView(ctx context.Context, rec *DatasetRecord, proposal *ProposalRecord) *ProposalView {
-	view := &ProposalView{Record: proposal}
+	latestVersion := latestVersionOf(rec)
+	view := &ProposalView{
+		Record:        proposal,
+		LatestVersion: latestVersion,
+		Stale:         proposal.Status == ProposalStatusOpen && latestVersion != proposal.BaseVersion,
+		Conflicted:    proposal.Status == ProposalStatusOpen && rec == nil && s.nameUnavailable(ctx, proposal.Dataset),
+	}
+	// A pull request of a dataset that does not exist yet has no repository to diff
+	// against; its definition is still returned, without a diff.
+	if rec == nil {
+		return view
+	}
 	latest, err := s.latestVersionDefinition(ctx, rec)
 	if err != nil {
 		logging.FromContext(ctx).WithError(err).WithFields(logging.Fields{
