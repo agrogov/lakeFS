@@ -798,6 +798,12 @@ type ListResult struct {
 // Every result needs dataset:ReadDataset in addition to the dataset:ListDatasets check
 // that gates the endpoint: listing is not a way to discover datasets one cannot read, so
 // datasets without that permission are filtered out instead of failing the request.
+//
+// The listing pages in KV (BUG-14): the scan starts after the cursor and stops as soon as
+// the page plus one record is in hand, so the latest version is read only for the records
+// the page can contain, and the per-item source statuses - the expensive part, one
+// resolution and authorization per item - are computed only for the page that is returned.
+// A cursor is a dataset name, which is unique and stable while datasets come and go.
 func (s *Service) List(ctx context.Context, caller Caller, req ListRequest) (*ListResult, error) {
 	listNode := permissions.Node{
 		Permission: permissions.Permission{
@@ -809,19 +815,24 @@ func (s *Service) List(ctx context.Context, caller Caller, req ListRequest) (*Li
 		return nil, err
 	}
 
-	records, err := s.store.ListDatasets(ctx)
-	if err != nil {
-		return nil, err
+	// A cursor is a dataset name, and only this API produces one. A value that cannot be a
+	// name is a bad request rather than a key-building error the HTTP layer would map to 500.
+	if req.After != "" {
+		if problems := ValidateName(req.After); len(problems) > 0 {
+			return nil, &ValidationError{Problems: []Problem{{Path: "after", Message: "must be a dataset name"}}}
+		}
 	}
 
+	amount := effectiveAmount(req.Amount)
 	query := strings.ToLower(strings.TrimSpace(req.Search))
-	filtered := make([]*DatasetView, 0, len(records))
-	for _, rec := range records {
+	page := make([]*DatasetView, 0, amount+1)
+	err := s.store.ScanDatasets(ctx, req.After, func(rec *DatasetRecord) (bool, error) {
+		// The cheap filters first: a record they reject costs no version read.
 		if req.Prefix != "" && !strings.HasPrefix(rec.Name, req.Prefix) {
-			continue
+			return true, nil
 		}
 		if query != "" && !matchesSearch(rec, query) {
-			continue
+			return true, nil
 		}
 		view := &DatasetView{Record: rec}
 		if rec.LatestVersion > 0 {
@@ -833,35 +844,38 @@ func (s *Service) List(ctx context.Context, caller Caller, req ListRequest) (*Li
 				// See Get: the reconciler repairs the record; the dataset is listed
 				// without metadata, so metadata filters do not match it.
 			default:
-				return nil, err
+				return false, err
 			}
 		}
 		if !metadataMatches(view, req.Metadata) {
-			continue
+			return true, nil
 		}
 		if err := s.authorizer.CheckDataset(ctx, caller, ActionReadDataset, rec.Name); err != nil {
 			var denied *PermissionError
 			if errors.As(err, &denied) {
-				continue
+				return true, nil
 			}
-			return nil, err
+			return false, err
 		}
-		if view, err = s.withItemStatuses(ctx, caller, view); err != nil {
-			return nil, err
-		}
-		filtered = append(filtered, view)
+		page = append(page, view)
+		// One record past the page is what proves there is a next page; the scan stops
+		// there instead of walking the rest of the dataset set.
+		return len(page) <= amount, nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	amount := effectiveAmount(req.Amount)
-
-	// filtered preserves the name order of store.ListDatasets, so a cursor is a name.
-	start := sort.Search(len(filtered), func(i int) bool {
-		return filtered[i].Record.Name > req.After
-	})
-	page := filtered[start:]
 	hasMore := len(page) > amount
 	if hasMore {
 		page = page[:amount]
+	}
+	for i, view := range page {
+		enriched, err := s.withItemStatuses(ctx, caller, view)
+		if err != nil {
+			return nil, err
+		}
+		page[i] = enriched
 	}
 	next := ""
 	if hasMore && len(page) > 0 {
@@ -1439,6 +1453,12 @@ func (s *Service) runAsyncPublish(publishing *DatasetRecord, def Definition, req
 		task.Status = TaskStatusRunning
 	})
 	version, err := s.runPublish(ctx, publishing, def, req, publisher)
+	// The final task update reports the outcome of work that already happened, so it runs on a
+	// detached context: the context that ended the work may be the one being cancelled at
+	// shutdown (BUG-12), and a task stuck in "running" would be a lie about the publish. A
+	// task write failure is still only logged - the dataset record is the authority (§6.5).
+	taskCtx, cancel := detachedWriteContext(ctx)
+	defer cancel()
 	if err != nil {
 		// SEC-8: the task record is readable by any holder of dataset:ReadDataset, so it
 		// carries only the sanitised {code, message}; the full error - with block and physical
@@ -1448,14 +1468,14 @@ func (s *Service) runAsyncPublish(publishing *DatasetRecord, def Definition, req
 			"task":    taskID,
 		}).Error("datasets: asynchronous publish failed")
 		sanitized := taskErrorFor(err)
-		s.updateTask(ctx, publishing.Name, taskID, func(task *TaskRecord) {
+		s.updateTask(taskCtx, publishing.Name, taskID, func(task *TaskRecord) {
 			task.Status = TaskStatusFailed
 			task.Version = 0
 			task.Error = sanitized
 		})
 		return
 	}
-	s.updateTask(ctx, publishing.Name, taskID, func(task *TaskRecord) {
+	s.updateTask(taskCtx, publishing.Name, taskID, func(task *TaskRecord) {
 		task.Status = TaskStatusCompleted
 		task.Version = version.Version
 		task.Error = nil
@@ -1552,36 +1572,48 @@ type VersionListResult struct {
 // The pagination cursor is the version number of the last item of the previous page, not
 // an offset: versions are dense and append-only, so a number stays valid while a new
 // version is published, which an offset would silently skip.
+//
+// The page is read newest first from the cursor, one version record per entry and never
+// the whole partition (BUG-14); only the versions of the page have their definition
+// inlined, which is what reads the definition object of a large definition (§5.3).
 func (s *Service) ListVersions(ctx context.Context, caller Caller, name, after string, amount int) (*VersionListResult, error) {
 	if err := s.authorizer.CheckDataset(ctx, caller, ActionReadDataset, name); err != nil {
 		return nil, err
 	}
-	if err := s.requireDataset(ctx, name); err != nil {
+	rec, err := s.loadDatasetOrNil(ctx, name)
+	if err != nil {
 		return nil, err
 	}
+	if rec == nil {
+		return nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, name)
+	}
 
-	start := 0
+	// The first page starts at latest; a cursor names the last version of the previous page,
+	// so the next page starts one below it. A cursor past latest is clamped to latest: it can
+	// only come from a client that read another dataset, and answering with the newest page
+	// is better than reading versions that do not exist.
+	start := rec.LatestVersion
 	if after != "" {
 		version, err := parseVersionCursor(after)
 		if err != nil {
 			return nil, &ValidationError{Problems: []Problem{{Path: "after", Message: err.Error()}}}
 		}
-		start = version
-	}
-
-	stored, err := s.store.ListVersions(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-	page := make([]*VersionRecord, 0, len(stored))
-	for _, version := range stored {
-		if start > 0 && version.Version >= start {
-			continue
+		start = version - 1
+		if start > rec.LatestVersion {
+			start = rec.LatestVersion
 		}
-		page = append(page, version)
 	}
 
 	amount = effectiveAmount(amount)
+	page := make([]*VersionRecord, 0, amount+1)
+	err = s.store.ScanVersionsDescending(ctx, name, start, func(version *VersionRecord) (bool, error) {
+		page = append(page, version)
+		// One version past the page proves there is a next page.
+		return len(page) <= amount, nil
+	})
+	if err != nil {
+		return nil, err
+	}
 	hasMore := len(page) > amount
 	if hasMore {
 		page = page[:amount]
@@ -1748,8 +1780,22 @@ func effectiveAmount(amount int) int {
 
 // --- access grants (§9.2) ---
 
-// ListAccess returns the grants of a dataset (§10.1, §10.4 404 for an unknown dataset).
-func (s *Service) ListAccess(ctx context.Context, caller Caller, dataset string) ([]*GrantRecord, error) {
+// AccessListResult is one page of GET /datasets/{ds}/access.
+type AccessListResult struct {
+	Grants     []*GrantRecord
+	HasMore    bool
+	NextOffset string
+	MaxPerPage int
+}
+
+// ListAccess returns a page of the grants of a dataset (§10.1, §10.4 404 for an unknown
+// dataset).
+//
+// The page is read in key order (principal type, then principal id) from the cursor, so it
+// never loads the whole grant partition (BUG-14). The cursor is "<principal-type>/<id>" of
+// the last grant of the previous page; grants added or revoked while a client pages do not
+// shift it, because the key of a grant is its principal.
+func (s *Service) ListAccess(ctx context.Context, caller Caller, dataset, after string, amount int) (*AccessListResult, error) {
 	if err := s.authorizer.CheckDataset(ctx, caller, ActionManageAccess, dataset); err != nil {
 		return nil, err
 	}
@@ -1759,7 +1805,25 @@ func (s *Service) ListAccess(ctx context.Context, caller Caller, dataset string)
 		}
 		return nil, err
 	}
-	return s.store.ListGrants(ctx, dataset)
+	amount = effectiveAmount(amount)
+	page := make([]*GrantRecord, 0, amount+1)
+	err := s.store.ScanGrants(ctx, dataset, after, func(grant *GrantRecord) (bool, error) {
+		page = append(page, grant)
+		// One grant past the page proves there is a next page.
+		return len(page) <= amount, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	hasMore := len(page) > amount
+	if hasMore {
+		page = page[:amount]
+	}
+	next := ""
+	if hasMore && len(page) > 0 {
+		next = grantsCursor(page[len(page)-1])
+	}
+	return &AccessListResult{Grants: page, HasMore: hasMore, NextOffset: next, MaxPerPage: amount}, nil
 }
 
 // GrantAccess gives a user or a group read access to a dataset (§9.2): it creates the

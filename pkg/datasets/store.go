@@ -365,7 +365,13 @@ func versionsPrefix(dataset string) ([]byte, error) {
 	return []byte(kv.FormatPath(versionKeyPrefix, dataset, "")), nil
 }
 
-// proposalKey returns proposals/<name>/<id>.
+// proposalKey returns proposals/<name>/<descending id>, the record key of one proposal.
+//
+// The id segment is encoded in descending order (descendingKeySegment) so that a forward
+// KV scan returns the newest proposal first. The listing of §10.1 is newest first and its
+// cursor is the id of the last item of the previous page, so without the descending
+// encoding a page would have to scan the whole partition to find the tail (BUG-14). The
+// record itself still carries the id: the encoding is a property of the key only.
 func proposalKey(dataset, id string) ([]byte, error) {
 	if err := checkDatasetName(dataset); err != nil {
 		return nil, err
@@ -373,7 +379,29 @@ func proposalKey(dataset, id string) ([]byte, error) {
 	if err := checkSegment("proposal id", id); err != nil {
 		return nil, err
 	}
-	return []byte(kv.FormatPath(proposalKeyPrefix, dataset, id)), nil
+	return []byte(kv.FormatPath(proposalKeyPrefix, dataset, descendingKeySegment(id))), nil
+}
+
+// descendingKeySegment encodes a key segment so that lexicographic order on the encoding is
+// the reverse of lexicographic order on the segment itself.
+//
+// Every byte is complemented and written as two hex digits, and the encoding is terminated
+// by 'z', which sorts after every hex digit. Complementing reverses the order of the bytes;
+// hex encoding keeps the key free of the path delimiter and of control bytes; and the
+// terminator makes a segment sort after its own prefixes, so "ab" (the larger id) sorts
+// before "a" - the same order a descending sort of the ids produces. It is only ever used
+// for a key segment that carries sorted ids, never for a value a caller reads back.
+func descendingKeySegment(segment string) string {
+	const hexDigits = "0123456789abcdef"
+	var b strings.Builder
+	b.Grow(2*len(segment) + 1)
+	for i := 0; i < len(segment); i++ {
+		inverted := ^segment[i]
+		b.WriteByte(hexDigits[inverted>>4])
+		b.WriteByte(hexDigits[inverted&0x0f])
+	}
+	b.WriteByte('z')
+	return b.String()
 }
 
 // proposalsPrefix returns the key prefix of every proposal of dataset.
@@ -399,7 +427,13 @@ func metadataKeysPrefix() []byte {
 	return []byte(metadataKeyKeyPrefix + kv.PathDelimiter)
 }
 
-// pinKey returns pins/<repo>/<commit>.
+// pinKey returns pins/<repo>/<commit>, the key *prefix* of one pin (BUG-15).
+//
+// A pin is not one KV item: every reference it holds is a record of its own below this
+// prefix, pins/<repo>/<commit>/<dataset>@v<n>. A dataset version adds one small item, so
+// the pin of a commit that a thousand versions reference stays a thousand small items
+// instead of one item that outgrows DynamoDB's 400 KB limit (§14). The key of a pin is
+// also its prefix, which keeps "which references does this pin hold?" one bounded scan.
 func pinKey(repository, commitID string) ([]byte, error) {
 	if err := checkSegment("repository", repository); err != nil {
 		return nil, err
@@ -408,6 +442,29 @@ func pinKey(repository, commitID string) ([]byte, error) {
 		return nil, err
 	}
 	return []byte(kv.FormatPath(pinKeyPrefix, repository, commitID)), nil
+}
+
+// pinPrefix returns pins/<repo>/<commit>/, the prefix of the reference records of one pin.
+// The trailing delimiter is what keeps the pin of commit abc from matching a pin of
+// commit abcd: the next byte of abcd/... is a name byte, never the delimiter.
+func pinPrefix(repository, commitID string) ([]byte, error) {
+	key, err := pinKey(repository, commitID)
+	if err != nil {
+		return nil, err
+	}
+	return append(key, kv.PathDelimiter...), nil
+}
+
+// pinReferenceKey returns pins/<repo>/<commit>/<ref>, the record of one pin reference.
+func pinReferenceKey(repository, commitID, ref string) ([]byte, error) {
+	if err := checkSegment("pin reference", ref); err != nil {
+		return nil, err
+	}
+	prefix, err := pinPrefix(repository, commitID)
+	if err != nil {
+		return nil, err
+	}
+	return append(prefix, ref...), nil
 }
 
 // pinsPrefix returns the key prefix of every pin of repository.
@@ -529,7 +586,21 @@ func decodeRecord[T any](kind string, key, value []byte) (*T, error) {
 // scanPrefix calls fn for every entry of PartitionKey whose key starts with prefix,
 // in key order, and stops at the first key outside the prefix.
 func (s *Store) scanPrefix(ctx context.Context, prefix []byte, fn func(key, value []byte) error) error {
-	it, err := s.store.Scan(ctx, []byte(PartitionKey), kv.ScanOptions{KeyStart: prefix})
+	return s.scanPrefixFrom(ctx, prefix, prefix, func(key, value []byte) (bool, error) {
+		return true, fn(key, value)
+	})
+}
+
+// scanPrefixFrom is scanPrefix with a starting point and an early stop (BUG-14). The scan
+// begins at start - a full key, not a name - so a paginated read never decodes the records
+// before its cursor, and it stops as soon as fn returns false, so a page costs at most the
+// records it returns plus the one that proves there is no next page. A start before prefix
+// (or an empty one) means the beginning of the prefix.
+func (s *Store) scanPrefixFrom(ctx context.Context, prefix, start []byte, fn func(key, value []byte) (bool, error)) error {
+	if len(start) == 0 || bytes.Compare(start, prefix) < 0 {
+		start = prefix
+	}
+	it, err := s.store.Scan(ctx, []byte(PartitionKey), kv.ScanOptions{KeyStart: start})
 	if err != nil {
 		return err
 	}
@@ -542,8 +613,12 @@ func (s *Store) scanPrefix(ctx context.Context, prefix []byte, fn func(key, valu
 		if !bytes.HasPrefix(entry.Key, prefix) {
 			break
 		}
-		if err := fn(entry.Key, entry.Value); err != nil {
+		more, err := fn(entry.Key, entry.Value)
+		if err != nil {
 			return err
+		}
+		if !more {
+			break
 		}
 	}
 	return it.Err()
@@ -579,33 +654,53 @@ func (s *Store) GetDataset(ctx context.Context, name string) (*DatasetRecord, kv
 	return rec, res.Predicate, nil
 }
 
-// ListDatasets returns every dataset record in name order. It is the read behind GET
-// /datasets (§10.1), which filters the result in memory: the record set is small
-// (datasets are curated, not created per object) and the filters combine a name
-// prefix, a free-text search and metadata of the latest version, which a key range
-// cannot express.
+// ListDatasets returns every dataset record in name order. It is the read behind the
+// reconciler and the installation-wide managed policies, which need the whole set.
+//
+// GET /datasets (§10.1) does not use it: that read pages with ScanDatasets, so it never
+// loads (or enriches) datasets beyond the page it returns (BUG-14).
 func (s *Store) ListDatasets(ctx context.Context) ([]*DatasetRecord, error) {
-	prefix := []byte(datasetKeyPrefix + kv.PathDelimiter)
 	records := make([]*DatasetRecord, 0)
-	err := s.scanPrefix(ctx, prefix, func(key, value []byte) error {
+	err := s.ScanDatasets(ctx, "", func(rec *DatasetRecord) (bool, error) {
+		records = append(records, rec)
+		return true, nil
+	})
+	return records, err
+}
+
+// ScanDatasets calls fn for every dataset record whose name sorts after the given name, in
+// name order, and stops as soon as fn returns false (BUG-14). An empty after starts at the
+// first dataset.
+//
+// The scan is the paging primitive of GET /datasets: the caller stops it when its page is
+// full, so the records before the cursor and after the page are never read. Dataset names
+// are unique keys, so a name is a stable cursor while datasets are created and deleted.
+func (s *Store) ScanDatasets(ctx context.Context, after string, fn func(*DatasetRecord) (bool, error)) error {
+	prefix := []byte(datasetKeyPrefix + kv.PathDelimiter)
+	start := prefix
+	if after != "" {
+		key, err := datasetKey(after)
+		if err != nil {
+			return err
+		}
+		// "/" sorts before every byte a dataset name can contain, so datasets/<after>/ is
+		// greater than datasets/<after> and smaller than datasets/<after...> of a longer
+		// name: the cursor itself is skipped and its successors are not.
+		start = append(key, kv.PathDelimiter...)
+	}
+	return s.scanPrefixFrom(ctx, prefix, start, func(key, value []byte) (bool, error) {
 		// The reconcile lease (§12.3) lives at datasets/_lease, under the same prefix as the
 		// dataset records. It is a lease, not a dataset, so it is skipped by name rather than
 		// decoded (its value would look like a record with an empty name and state).
 		if bytes.Equal(key, []byte(ReconcileLeaseKey)) {
-			return nil
+			return true, nil
 		}
 		rec, err := decodeRecord[DatasetRecord]("dataset record", key, value)
 		if err != nil {
-			return err
+			return false, err
 		}
-		records = append(records, rec)
-		return nil
+		return fn(rec)
 	})
-	if err != nil {
-		return nil, err
-	}
-	sort.SliceStable(records, func(i, j int) bool { return records[i].Name < records[j].Name })
-	return records, nil
 }
 
 // PutDatasetIf writes rec only if the stored record still matches the caller's view of
@@ -776,35 +871,6 @@ func (s *Store) deleteIf(ctx context.Context, key []byte, predicate kv.Predicate
 	return s.delete(ctx, key)
 }
 
-// deleteIfUnchanged removes key only if its stored value is still expected, compared in
-// canonical encoding (see canonicalValue). It is the delete form of setIfUnchanged: the
-// caller has just written expected and must not delete a value that a concurrent writer
-// replaced in between. A missing key is already deleted and is not an error; a changed
-// value is reported as kv.ErrPredicateFailed and the record is left alone.
-func (s *Store) deleteIfUnchanged(ctx context.Context, key, expected []byte, canon func([]byte) ([]byte, error)) error {
-	res, err := s.store.Get(ctx, []byte(PartitionKey), key)
-	if errors.Is(err, kv.ErrNotFound) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	current, err := canon(res.Value)
-	if err != nil {
-		return err
-	}
-	want, err := canon(expected)
-	if err != nil {
-		return err
-	}
-	if !bytes.Equal(current, want) {
-		return kv.ErrPredicateFailed
-	}
-	// Delete under the predicate that guarded the value just compared, so a writer that
-	// lands between the read and the delete keeps its record.
-	return s.deleteIf(ctx, key, res.Predicate)
-}
-
 // datasetValue encodes a dataset record as stored. It is what PutDatasetIf and
 // DeleteDataset compare a nil predicate against; it is never itself used as a
 // kv.Predicate.
@@ -953,6 +1019,40 @@ func (s *Store) ListVersions(ctx context.Context, dataset string) ([]*VersionRec
 	return versions, nil
 }
 
+// ScanVersionsDescending calls fn for the version records of dataset newest first, starting
+// at version start and walking down to v1, and stops as soon as fn returns false (BUG-14).
+//
+// It is the paging primitive of GET /datasets/{ds}/versions. Versions are dense and
+// append-only (§5.4), so the page after "v4" is "v3, v2, ..." and every entry can be read
+// with one Get: a page costs the versions it contains, never the whole partition. A version
+// record that is missing (a crash the reconciler rebuilds, §12.3) is skipped, like the full
+// listing skips it.
+func (s *Store) ScanVersionsDescending(ctx context.Context, dataset string, start int, fn func(*VersionRecord) (bool, error)) error {
+	if err := checkDatasetName(dataset); err != nil {
+		return err
+	}
+	for version := start; version >= 1; version-- {
+		rec, err := s.GetVersion(ctx, dataset, version)
+		switch {
+		case errors.Is(err, kv.ErrNotFound):
+			continue
+		case err != nil:
+			return err
+		}
+		more, err := fn(rec)
+		if err != nil {
+			return err
+		}
+		if !more {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ----------------------------------------------------------------------------
 // Proposal records (§5.3, §5.6)
 // ----------------------------------------------------------------------------
@@ -1065,6 +1165,41 @@ func (s *Store) ListProposals(ctx context.Context, dataset string) ([]*ProposalR
 		return proposals[i].ID > proposals[j].ID // ULIDs: descending is newest first
 	})
 	return proposals, nil
+}
+
+// ScanProposals calls fn for the proposals of dataset newest first, starting strictly after
+// the proposal with id after (or at the newest one when after is empty), and stops as soon as
+// fn returns false (BUG-14).
+//
+// The cursor is the id of the last item of the previous page, and the keys are encoded in
+// descending id order (proposalKey), so the scan starts at the cursor key and reads only the
+// page: it never walks the proposals of the dataset that the page does not contain. An
+// unknown after starts the scan where that id would be, which is a continuation from that
+// point rather than an error; validating the cursor is the caller's job.
+func (s *Store) ScanProposals(ctx context.Context, dataset, after string, fn func(*ProposalRecord) (bool, error)) error {
+	prefix, err := proposalsPrefix(dataset)
+	if err != nil {
+		return err
+	}
+	start := prefix
+	cursor := ""
+	if after != "" {
+		key, err := proposalKey(dataset, after)
+		if err != nil {
+			return err
+		}
+		start, cursor = key, string(key)
+	}
+	return s.scanPrefixFrom(ctx, prefix, start, func(key, value []byte) (bool, error) {
+		if cursor != "" && bytes.Equal(key, []byte(cursor)) {
+			return true, nil // the cursor itself belongs to the previous page
+		}
+		rec, err := decodeRecord[ProposalRecord]("proposal record", key, value)
+		if err != nil {
+			return false, err
+		}
+		return fn(rec)
+	})
 }
 
 // ListAllProposals returns every proposal record of every dataset, newest first. It backs
@@ -1205,69 +1340,149 @@ func (s *Store) ListMetadataKeys(ctx context.Context) ([]MetadataKey, error) {
 // GC pins (§5.3, §8.2)
 // ----------------------------------------------------------------------------
 
-// GetPin reads the pin of one (repository, commit), returning kv.ErrNotFound
-// unchanged when it does not exist.
-//
-// The predicate is the one kv.Store.Get returned with the record; AddPinReference and
-// RemovePinReference condition their compare-and-swap on it.
-func (s *Store) GetPin(ctx context.Context, repository, commitID string) (*PinRecord, kv.Predicate, error) {
-	key, err := pinKey(repository, commitID)
-	if err != nil {
-		return nil, nil, err
-	}
-	res, err := s.store.Get(ctx, []byte(PartitionKey), key)
-	if err != nil {
-		return nil, nil, err
-	}
-	rec, err := decodeRecord[PinRecord]("pin record", key, res.Value)
-	if err != nil {
-		return nil, nil, err
-	}
-	return rec, res.Predicate, nil
+// PinReferenceRecord is one stored pin reference (BUG-15), the value at
+// pins/<repo>/<commit>/<dataset>@v<n>. It repeats the identity of the reference so a
+// record that is read back can be checked against the key it came from, like every other
+// record of this file.
+type PinReferenceRecord struct {
+	Repository string `json:"repository"`
+	CommitID   string `json:"commit_id"`
+	Reference  string `json:"reference"`
 }
 
-// PutPin writes a pin record, normalising References to a sorted, duplicate-free
-// set. Use AddPinReference and RemovePinReference for reference changes: they apply
-// the update as a compare-and-swap, which this unconditional write does not.
+// GetPin reads the pin of one (repository, commit) by assembling its reference records,
+// returning kv.ErrNotFound unchanged when the pin has no reference left (and so does not
+// exist).
+//
+// The predicate is always nil. A pin is not one record any more (BUG-15), so there is no
+// single value a conditional write could be guarded by; the writers that used to compare
+// and swap the set now touch exactly the reference record they name, which is race-free
+// per reference. DeletePinReferences deletes exactly the references it is given, which is
+// the compare-and-swap the orphan cleanup needs (BUG-4): a reference added in between is a
+// different key and survives.
+func (s *Store) GetPin(ctx context.Context, repository, commitID string) (*PinRecord, kv.Predicate, error) {
+	references, err := s.pinReferences(ctx, repository, commitID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(references) == 0 {
+		return nil, nil, kv.ErrNotFound
+	}
+	return &PinRecord{Repository: repository, CommitID: commitID, References: references}, nil, nil
+}
+
+// pinReferences returns the sorted references of one pin, each read from its own record.
+func (s *Store) pinReferences(ctx context.Context, repository, commitID string) ([]string, error) {
+	prefix, err := pinPrefix(repository, commitID)
+	if err != nil {
+		return nil, err
+	}
+	references := make([]string, 0)
+	err = s.scanPrefix(ctx, prefix, func(key, value []byte) error {
+		rec, err := decodeReferenceRecord(repository, commitID, key, value)
+		if err != nil {
+			return err
+		}
+		references = append(references, rec.Reference)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return normaliseReferences(references), nil
+}
+
+// decodeReferenceRecord decodes a stored pin reference and checks it against its key, so a
+// record written under another pin cannot be mistaken for a reference of this one.
+func decodeReferenceRecord(repository, commitID string, key, value []byte) (*PinReferenceRecord, error) {
+	rec, err := decodeRecord[PinReferenceRecord]("pin reference record", key, value)
+	if err != nil {
+		return nil, err
+	}
+	if rec.Repository != repository || rec.CommitID != commitID {
+		return nil, fmt.Errorf("%w: pin reference key %q holds record of %s/%s",
+			ErrRecordMismatch, key, rec.Repository, rec.CommitID)
+	}
+	return rec, nil
+}
+
+// PutPin writes a pin as the given set of references, normalising References to a sorted,
+// duplicate-free set and removing references the record no longer carries. Use
+// AddPinReference and RemovePinReference for reference changes: they touch one reference
+// record each and never rewrite the rest of the set.
 func (s *Store) PutPin(ctx context.Context, rec *PinRecord) error {
 	if rec == nil {
 		return fmt.Errorf("datasets: %w", ErrNilRecord)
 	}
-	key, err := pinKey(rec.Repository, rec.CommitID)
+	wanted := normaliseReferences(rec.References)
+	current, err := s.pinReferences(ctx, rec.Repository, rec.CommitID)
 	if err != nil {
 		return err
 	}
-	normalised := *rec
-	normalised.References = normaliseReferences(rec.References)
-	value, err := json.Marshal(normalised)
-	if err != nil {
-		return fmt.Errorf("datasets: encode pin record %s/%s: %w", rec.Repository, rec.CommitID, err)
+	keep := make(map[string]struct{}, len(wanted))
+	for _, ref := range wanted {
+		keep[ref] = struct{}{}
 	}
-	return s.put(ctx, key, value)
+	for _, ref := range current {
+		if _, ok := keep[ref]; ok {
+			continue
+		}
+		if _, err := s.deletePinReference(ctx, rec.Repository, rec.CommitID, ref); err != nil {
+			return err
+		}
+	}
+	for _, ref := range wanted {
+		if _, err := s.writePinReference(ctx, rec.Repository, rec.CommitID, ref); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// DeletePin removes the pin record of (repository, commit); deleting a missing pin
-// is not an error. It does not delete the hidden pin branch: that is the caller's
-// job when RemovePinReference reports that the set became empty (§8.2).
+// DeletePin removes every reference record of (repository, commit); deleting a missing pin
+// is not an error. It does not delete the hidden pin branch: that is the caller's job when
+// RemovePinReference reports that the set became empty (§8.2).
 func (s *Store) DeletePin(ctx context.Context, repository, commitID string) error {
-	key, err := pinKey(repository, commitID)
+	references, err := s.pinReferences(ctx, repository, commitID)
 	if err != nil {
 		return err
 	}
-	return s.delete(ctx, key)
+	for _, ref := range references {
+		if _, err := s.deletePinReference(ctx, repository, commitID, ref); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// DeletePinIf removes the pin record of (repository, commit) only if it is still the record
-// that predicate guards, the kv.Predicate that GetPin returned for it. A record a concurrent
-// AddPinReference changed is left untouched and kv.ErrPredicateFailed is returned, so
-// orphan cleanup never deletes a pin that just gained a reference (BUG-4). Deleting a
-// missing pin is not an error. Like DeletePin it does not delete the hidden pin branch.
-func (s *Store) DeletePinIf(ctx context.Context, repository, commitID string, predicate kv.Predicate) error {
-	key, err := pinKey(repository, commitID)
-	if err != nil {
-		return err
+// DeletePinReferences removes refs from the pin of (repository, commit) and reports how many
+// references the pin has left. Only the named records are deleted, never the rest of the
+// pin, so a reference another writer added is kept (BUG-4) and the caller can delete the
+// hidden branch only when the returned count is zero. Deleting a reference that is not
+// there is not an error.
+func (s *Store) DeletePinReferences(ctx context.Context, repository, commitID string, refs []string) (int, error) {
+	remaining, _, err := s.deletePinReferences(ctx, repository, commitID, refs)
+	return remaining, err
+}
+
+// deletePinReferences is DeletePinReferences that also reports how many references it
+// actually removed, which is what tells a release of a reference that was never there apart
+// from a release that emptied the pin.
+func (s *Store) deletePinReferences(ctx context.Context, repository, commitID string, refs []string) (remaining, removed int, err error) {
+	for _, ref := range refs {
+		existed, err := s.deletePinReference(ctx, repository, commitID, ref)
+		if err != nil {
+			return 0, 0, err
+		}
+		if existed {
+			removed++
+		}
 	}
-	return s.deleteIf(ctx, key, predicate)
+	left, err := s.pinReferences(ctx, repository, commitID)
+	if err != nil {
+		return 0, 0, err
+	}
+	return len(left), removed, nil
 }
 
 // AddPinReference adds ref - a PinReference value, "<dataset>@v<n>" - to the pin of
@@ -1277,144 +1492,138 @@ func (s *Store) DeletePinIf(ctx context.Context, repository, commitID string, pr
 // Publish pins its sources before it writes data (§6.2 step 5, §8.2), so this is the
 // call that protects a dataset version from the source repository's GC.
 //
-// The update is a compare-and-swap with bounded retries: a pin has many writers (one
-// per dataset version that references the same commit) and losing a reference would
-// let GC collect objects a dataset still serves.
+// Every reference is its own record (BUG-15), so the write touches one small item and
+// never rewrites the rest of the pin: adding a reference twice is a no-op, and two
+// concurrent publishers of the same commit cannot lose each other's reference. The
+// returned record is the assembled pin, as GetPin reads it.
 func (s *Store) AddPinReference(ctx context.Context, repository, commitID, ref string) (*PinRecord, error) {
-	if err := checkSegment("pin reference", ref); err != nil {
+	if _, err := s.writePinReference(ctx, repository, commitID, ref); err != nil {
 		return nil, err
 	}
-	key, err := pinKey(repository, commitID)
+	rec, _, err := s.GetPin(ctx, repository, commitID)
 	if err != nil {
 		return nil, err
 	}
-	for attempt := 0; attempt < pinCASRetries; attempt++ {
-		current, predicate, err := s.readPin(ctx, key)
-		if err != nil {
-			return nil, err
-		}
-		next := PinRecord{Repository: repository, CommitID: commitID}
-		if current != nil {
-			next = *current
-		}
-		if containsReference(next.References, ref) {
-			return &next, nil
-		}
-		next.References = normaliseReferences(append(next.References, ref))
-		value, err := json.Marshal(next)
-		if err != nil {
-			return nil, fmt.Errorf("datasets: encode pin record %s/%s: %w", repository, commitID, err)
-		}
-		err = s.store.SetIf(ctx, []byte(PartitionKey), key, value, predicate)
-		if errors.Is(err, kv.ErrPredicateFailed) {
-			continue // another writer changed the pin; re-read and retry
-		}
-		if err != nil {
-			return nil, err
-		}
-		return &next, nil
-	}
-	return nil, kv.ErrPredicateFailed
+	return rec, nil
 }
 
-// RemovePinReference removes ref from the pin of (repository, commit). When that
-// leaves the set empty, the pin becomes an orphan: the record is deleted (§5.3: "the
-// branch is deleted when the set becomes empty") and deleted reports true, so the
-// caller also removes the hidden pin branch. Removing a reference that is not there,
-// or from a pin that does not exist, is a no-op and reports false.
-//
-// The empty set is written with a compare-and-swap before the record is deleted, and the
-// delete itself is conditioned on that empty-set value: a concurrent AddPinReference that
-// lands in between replaces the value and keeps its pin (BUG-5), and the removal is retried
-// instead of dropping the new reference. If the pin is gone on the retry, the removal has
-// already happened and the branch is kept.
-func (s *Store) RemovePinReference(ctx context.Context, repository, commitID, ref string) (deleted bool, err error) {
-	if err := checkSegment("pin reference", ref); err != nil {
-		return false, err
-	}
-	key, err := pinKey(repository, commitID)
+// writePinReference stores one reference record and reports whether this call created it.
+// An existing record is not overwritten: the reference names itself, so a second write
+// would only repeat it.
+func (s *Store) writePinReference(ctx context.Context, repository, commitID, ref string) (bool, error) {
+	key, err := pinReferenceKey(repository, commitID, ref)
 	if err != nil {
 		return false, err
 	}
-	for attempt := 0; attempt < pinCASRetries; attempt++ {
-		current, predicate, err := s.readPin(ctx, key)
-		if err != nil {
-			return false, err
-		}
-		if current == nil || !containsReference(current.References, ref) {
-			return false, nil
-		}
-		remaining := make([]string, 0, len(current.References))
-		for _, existing := range current.References {
-			if existing != ref {
-				remaining = append(remaining, existing)
-			}
-		}
-		next := *current
-		next.References = remaining
-		value, err := json.Marshal(next)
-		if err != nil {
-			return false, fmt.Errorf("datasets: encode pin record %s/%s: %w", repository, commitID, err)
-		}
-		err = s.store.SetIf(ctx, []byte(PartitionKey), key, value, predicate)
-		if errors.Is(err, kv.ErrPredicateFailed) {
-			continue // another writer changed the pin; re-read and retry
-		}
-		if err != nil {
-			return false, err
-		}
-		if len(remaining) > 0 {
-			return false, nil
-		}
-		err = s.deleteIfUnchanged(ctx, key, value, canonicalValue[PinRecord])
-		if errors.Is(err, kv.ErrPredicateFailed) {
-			continue // a reference landed on the empty set; re-read and retry
-		}
-		if err != nil {
-			return false, err
-		}
-		return true, nil
+	value, err := json.Marshal(PinReferenceRecord{Repository: repository, CommitID: commitID, Reference: ref})
+	if err != nil {
+		return false, fmt.Errorf("datasets: encode pin reference %s/%s: %w", repository, commitID, err)
 	}
-	return false, kv.ErrPredicateFailed
+	// A nil predicate means "only if absent", so the record is never replaced; losing that
+	// race means the reference is already recorded, which is the desired outcome.
+	err = s.store.SetIf(ctx, []byte(PartitionKey), key, value, nil)
+	if errors.Is(err, kv.ErrPredicateFailed) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// deletePinReference removes one reference record and reports whether it was there. It is
+// a plain delete: the record names exactly the reference, so it cannot remove another one.
+func (s *Store) deletePinReference(ctx context.Context, repository, commitID, ref string) (bool, error) {
+	key, err := pinReferenceKey(repository, commitID, ref)
+	if err != nil {
+		return false, err
+	}
+	res, err := s.store.Get(ctx, []byte(PartitionKey), key)
+	if errors.Is(err, kv.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	// Delete under the predicate that guarded the value just read, so a record that was
+	// replaced in between is left alone and reported as not deleted.
+	if err := s.deleteIf(ctx, key, res.Predicate); err != nil {
+		if errors.Is(err, kv.ErrPredicateFailed) || errors.Is(err, kv.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// RemovePinReference removes ref from the pin of (repository, commit). When that leaves
+// the pin empty, it becomes an orphan: its last record is gone (§5.3: "the branch is
+// deleted when the set becomes empty") and deleted reports true, so the caller also
+// removes the hidden pin branch. Removing a reference that is not there, or from a pin
+// that does not exist, is a no-op and reports false.
+//
+// A concurrent AddPinReference writes a different key and is never lost (BUG-5): this
+// removal deletes only its own record and then re-reads the pin, so the branch is deleted
+// only when nothing is left; and deletePinBranch re-establishes a branch that a reference
+// re-created while it was being deleted.
+func (s *Store) RemovePinReference(ctx context.Context, repository, commitID, ref string) (deleted bool, err error) {
+	remaining, removed, err := s.deletePinReferences(ctx, repository, commitID, []string{ref})
+	if err != nil {
+		return false, err
+	}
+	if removed == 0 {
+		return false, nil // nothing was released, so nothing became an orphan
+	}
+	return remaining == 0, nil
 }
 
 // ListPins returns every pin of repository in commit order. An unknown repository
-// yields an empty slice and no error.
+// yields an empty slice and no error. The reference records are grouped by commit,
+// because a pin is a set of references (BUG-15).
 func (s *Store) ListPins(ctx context.Context, repository string) ([]*PinRecord, error) {
 	prefix, err := pinsPrefix(repository)
 	if err != nil {
 		return nil, err
 	}
-	pins := make([]*PinRecord, 0)
-	err = s.scanPrefix(ctx, prefix, func(key, value []byte) error {
-		rec, err := decodeRecord[PinRecord]("pin record", key, value)
+	return s.pinsIn(ctx, prefix)
+}
+
+// pinsIn assembles the pins stored under prefix, in key (repository, commit) order.
+func (s *Store) pinsIn(ctx context.Context, prefix []byte) ([]*PinRecord, error) {
+	bySource := make(map[PinnedSource][]string)
+	order := make([]PinnedSource, 0)
+	err := s.scanPrefix(ctx, prefix, func(key, value []byte) error {
+		rec, err := decodeRecord[PinReferenceRecord]("pin reference record", key, value)
 		if err != nil {
 			return err
 		}
-		pins = append(pins, rec)
+		expected, err := pinReferenceKey(rec.Repository, rec.CommitID, rec.Reference)
+		if err != nil {
+			return fmt.Errorf("%w: pin reference key %q: %w", ErrRecordMismatch, key, err)
+		}
+		if !bytes.Equal(key, expected) {
+			return fmt.Errorf("%w: pin reference key %q holds %q", ErrRecordMismatch, key, expected)
+		}
+		src := PinnedSource{Repository: rec.Repository, CommitID: rec.CommitID}
+		if _, ok := bySource[src]; !ok {
+			order = append(order, src)
+		}
+		bySource[src] = append(bySource[src], rec.Reference)
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	sortPinnedSources(order)
+	pins := make([]*PinRecord, 0, len(order))
+	for _, src := range order {
+		pins = append(pins, &PinRecord{
+			Repository: src.Repository,
+			CommitID:   src.CommitID,
+			References: normaliseReferences(bySource[src]),
+		})
+	}
 	return pins, nil
-}
-
-// readPin reads a pin record together with the predicate that a conditional write
-// needs. A missing pin yields (nil, nil): the caller is about to create it.
-func (s *Store) readPin(ctx context.Context, key []byte) (*PinRecord, kv.Predicate, error) {
-	res, err := s.store.Get(ctx, []byte(PartitionKey), key)
-	if errors.Is(err, kv.ErrNotFound) {
-		return nil, nil, nil
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-	rec, err := decodeRecord[PinRecord]("pin record", key, res.Value)
-	if err != nil {
-		return nil, nil, err
-	}
-	return rec, res.Predicate, nil
 }
 
 // containsReference reports whether refs contains ref.
@@ -1574,21 +1783,47 @@ func (s *Store) DeleteTask(ctx context.Context, dataset, id string) error {
 // ListGrants returns every grant of dataset, ordered by principal type then
 // principal id. An unknown dataset yields an empty slice and no error.
 func (s *Store) ListGrants(ctx context.Context, dataset string) ([]*GrantRecord, error) {
+	grants := make([]*GrantRecord, 0)
+	err := s.ScanGrants(ctx, dataset, "", func(rec *GrantRecord) (bool, error) {
+		grants = append(grants, rec)
+		return true, nil
+	})
+	return grants, err
+}
+
+// grantsCursor renders the cursor of the grant listing: the principal type and id of the
+// last grant of the previous page, in key order ("user/alice"). It is the inverse of the
+// key's last two segments, so it stays valid across grants being added and revoked.
+func grantsCursor(rec *GrantRecord) string {
+	if rec == nil {
+		return ""
+	}
+	return kv.FormatPath(rec.PrincipalType, rec.PrincipalID)
+}
+
+// ScanGrants calls fn for the grants of dataset in key order (principal type, then principal
+// id), starting strictly after the grant named by the cursor, and stops as soon as fn returns
+// false (BUG-14). An empty cursor starts at the first grant.
+//
+// The scan reads only the page: a grant is keyed by its principal, so the cursor is a seek,
+// not a filter, and grants added or revoked while a client pages do not shift it.
+func (s *Store) ScanGrants(ctx context.Context, dataset, after string, fn func(*GrantRecord) (bool, error)) error {
 	prefix, err := grantsPrefix(dataset)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	grants := make([]*GrantRecord, 0)
-	err = s.scanPrefix(ctx, prefix, func(key, value []byte) error {
+	start := prefix
+	if after != "" {
+		// See ScanDatasets: the delimiter sorts before every name byte, so the cursor itself
+		// is skipped and the grants that follow it are not. The cursor is copied first, so
+		// the prefix slice owned by the caller is never appended to in place.
+		start = append(append(append([]byte(nil), prefix...), []byte(after)...), kv.PathDelimiter...)
+	}
+	return s.scanPrefixFrom(ctx, prefix, start, func(key, value []byte) (bool, error) {
 		rec, err := decodeRecord[GrantRecord]("grant record", key, value)
 		if err != nil {
-			return err
+			return false, err
 		}
-		grants = append(grants, rec)
-		return nil
+		return fn(rec)
 	})
-	if err != nil {
-		return nil, err
-	}
-	return grants, nil
 }

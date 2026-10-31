@@ -846,9 +846,10 @@ func TestServiceAccessGrantRoundTrip(t *testing.T) {
 		require.NoError(t, err)
 		_, err = f.svc.GrantAccess(f.ctx, f.caller(), "shared-set", PrincipalTypeGroup, "analysts")
 		require.NoError(t, err)
-		grants, err := f.svc.ListAccess(f.ctx, f.caller(), "shared-set")
+		grants, err := f.svc.ListAccess(f.ctx, f.caller(), "shared-set", "", 0)
 		require.NoError(t, err)
-		require.Len(t, grants, 2)
+		require.Len(t, grants.Grants, 2)
+		require.False(t, grants.HasMore)
 	})
 
 	t.Run("unknown principal is 404", func(t *testing.T) {

@@ -60,6 +60,68 @@ func partitionKeys(t *testing.T, kvs kv.Store, ctx context.Context) []string {
 	return keys
 }
 
+// partitionEntries returns every key and value stored in the datasets partition, in key
+// order, so a test can assert the size of an individual KV item.
+func partitionEntries(t *testing.T, kvs kv.Store, ctx context.Context) map[string][]byte {
+	t.Helper()
+	it, err := kvs.Scan(ctx, []byte(PartitionKey), kv.ScanOptions{})
+	require.NoError(t, err)
+	defer it.Close()
+	entries := make(map[string][]byte)
+	for it.Next() {
+		entry := it.Entry()
+		require.NotNil(t, entry)
+		entries[string(entry.Key)] = entry.Value
+	}
+	require.NoError(t, it.Err())
+	return entries
+}
+
+// TestStorePinReferencesAreSeparateItems is BUG-15: the pin of one commit must not grow into
+// a single KV item as datasets pin it, because DynamoDB caps an item at 400KB. Every
+// reference is its own record under the pin's prefix, so no item grows with the pin.
+func TestStorePinReferencesAreSeparateItems(t *testing.T) {
+	store, kvs, ctx := newTestStore(t)
+	const (
+		repository = "lakehouse-repo"
+		commitID   = "30f9eb1c"
+		references = 500
+	)
+	for i := 0; i < references; i++ {
+		_, err := store.AddPinReference(ctx, repository, commitID, PinReference(fmt.Sprintf("customer-%d", i), 1))
+		require.NoError(t, err)
+	}
+
+	// One record per reference, all under pins/<repo>/<commit>/, and no single record that
+	// carries the whole set.
+	entries := partitionEntries(t, kvs, ctx)
+	prefix := "pins/" + repository + "/" + commitID + "/"
+	require.Len(t, entries, references)
+	largest := 0
+	for key, value := range entries {
+		require.Contains(t, key, prefix)
+		if len(value) > largest {
+			largest = len(value)
+		}
+	}
+	require.Less(t, largest, 1024, "a pin reference record must stay a small fixed-size item")
+
+	// The assembled view still reports the whole set, sorted.
+	pin, _, err := store.GetPin(ctx, repository, commitID)
+	require.NoError(t, err)
+	require.Len(t, pin.References, references)
+	require.IsIncreasing(t, pin.References)
+	require.Equal(t, PinReference("customer-0", 1), pin.References[0])
+
+	// Releasing one reference removes exactly its item; the rest of the pin stays.
+	deleted, err := store.RemovePinReference(ctx, repository, commitID, PinReference("customer-7", 1))
+	require.NoError(t, err)
+	require.False(t, deleted)
+	entries = partitionEntries(t, kvs, ctx)
+	require.Len(t, entries, references-1)
+	require.NotContains(t, entries, prefix+PinReference("customer-7", 1))
+}
+
 func TestStoreKeyLayout(t *testing.T) {
 	// The §5.3 table, key for key.
 	tests := []struct {
@@ -78,9 +140,11 @@ func TestStoreKeyLayout(t *testing.T) {
 			want: "versions/customer-360/0000000007",
 		},
 		{
+			// BUG-14: the id segment is encoded so that key order is newest-first, which is
+			// what lets the listing page with a forward scan.
 			name: "proposal",
 			key:  func() ([]byte, error) { return proposalKey("customer-360", "01J9Z6Q0K8") },
-			want: "proposals/customer-360/01J9Z6Q0K8",
+			want: "proposals/customer-360/" + descendingKeySegment("01J9Z6Q0K8"),
 		},
 		{
 			name: "metadata key",
@@ -88,9 +152,17 @@ func TestStoreKeyLayout(t *testing.T) {
 			want: "metadata_keys/retention",
 		},
 		{
+			// BUG-15: a pin is a prefix, and each of its references is a record below it.
 			name: "pin",
 			key:  func() ([]byte, error) { return pinKey("lakehouse-repo", "30f9eb1c") },
 			want: "pins/lakehouse-repo/30f9eb1c",
+		},
+		{
+			name: "pin reference",
+			key: func() ([]byte, error) {
+				return pinReferenceKey("lakehouse-repo", "30f9eb1c", PinReference("customer-360", 2))
+			},
+			want: "pins/lakehouse-repo/30f9eb1c/customer-360@v2",
 		},
 		{
 			name: "grant",
@@ -766,13 +838,14 @@ func TestStorePartitionLayout(t *testing.T) {
 	require.NoError(t, err)
 
 	// Everything the control plane stores lives in the one dedicated partition, under
-	// the §5.3 prefixes.
+	// the §5.3 prefixes. A pin is one item per reference (BUG-15), and a proposal's id
+	// segment is encoded newest-first so the listing can page (BUG-14).
 	require.Equal(t, []string{
 		"datasets/customer-360",
 		"grants/customer-360/user/carol",
 		"metadata_keys/tier",
-		"pins/lakehouse-repo/30f9eb1c",
-		"proposals/customer-360/01J9Z6Q0K8",
+		"pins/lakehouse-repo/30f9eb1c/customer-360@v2",
+		"proposals/customer-360/" + descendingKeySegment("01J9Z6Q0K8"),
 		"versions/customer-360/0000000001",
 		"versions/customer-360/0000000002",
 	}, partitionKeys(t, kvs, ctx))

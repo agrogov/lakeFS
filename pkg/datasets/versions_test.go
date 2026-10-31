@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -775,4 +776,117 @@ func TestTaskErrorForIsSanitised(t *testing.T) {
 			require.NotContains(t, got.Message, "blockstore")
 		})
 	}
+}
+
+// TestPublishManyVersionsOnOneCommitKeepsPinItemsSmall is BUG-15 end to end: every version of
+// a dataset pins the same source commit, so one pin accumulates one reference per version.
+// Each reference is its own KV item under the pin prefix, so no item grows with the number of
+// versions, while the assembled pin still holds them all.
+func TestPublishManyVersionsOnOneCommitKeepsPinItemsSmall(t *testing.T) {
+	const (
+		dataset  = "many-versions-one-commit"
+		source   = "src-many-versions"
+		versions = 12
+	)
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+	def := prefixDefinition(source, commit.String(), "data", "data/")
+	// DOC-14: the create publishes v1, so the explicit publishes below produce v2..v12. A
+	// distinct target per version makes every publish differ from the previous data (a publish
+	// that reproduces it is the no-op of §6.2 step 8) while every version still pins the same
+	// source commit.
+	f.createDatasetV1(t, dataset, def)
+	for i := 2; i <= versions; i++ {
+		version := f.publishVersion(t, dataset, PublishVersionRequest{
+			Definition: prefixDefinition(source, commit.String(), fmt.Sprintf("target%d", i), "data/"),
+			Message:    fmt.Sprintf("v%d", i),
+		})
+		require.Equal(t, i, version.Version)
+	}
+
+	// One reference per version, assembled from one record per reference.
+	pin, _, err := f.svc.store.GetPin(f.ctx, source, commit.String())
+	require.NoError(t, err)
+	require.Len(t, pin.References, versions)
+
+	prefix, err := pinPrefix(source, commit.String())
+	require.NoError(t, err)
+	largest, records := 0, 0
+	for key, value := range partitionEntries(t, f.kvStore, f.ctx) {
+		if !strings.HasPrefix(key, string(prefix)) {
+			continue
+		}
+		records++
+		if len(value) > largest {
+			largest = len(value)
+		}
+	}
+	require.Equal(t, versions, records, "one item per (commit, dataset@vN)")
+	require.Less(t, largest, 1024, "no item grows with the number of versions")
+
+	// Deleting the dataset releases every reference and removes the pin.
+	require.NoError(t, f.svc.Delete(f.ctx, f.caller(), dataset))
+	_, _, err = f.svc.store.GetPin(f.ctx, source, commit.String())
+	require.ErrorIs(t, err, kv.ErrNotFound)
+}
+
+// TestAsyncPublishIsCancelledAndDrainedOnShutdown is BUG-12: an accepted publish runs on the
+// server's context, so cancelling it stops the materialisation, and drainOnShutdown (started
+// by RoutesBuilder) waits for the goroutine before the process exits. The task reports the
+// outcome even though the context that ran it was cancelled.
+func TestAsyncPublishIsCancelledAndDrainedOnShutdown(t *testing.T) {
+	const dataset = "async-shutdown"
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, "src-async-shutdown", map[string]string{
+		"data/a.parquet": "a",
+		"data/b.parquet": "b",
+	})
+	def := prefixDefinition("src-async-shutdown", commit.String(), "data", "data/")
+	// DOC-14: the create publishes v1 in the request, on the real materialiser.
+	f.createDatasetV1(t, dataset, def)
+	f.cfg.SyncPublishMaxObjects = 1 // more than one object per version means asynchronous
+
+	// The server's lifetime context, as run.go hands it to RoutesBuilder.
+	serverCtx, shutdown := context.WithCancel(t.Context())
+	f.svc.SetBackgroundContext(serverCtx)
+
+	started := make(chan struct{})
+	f.svc.publishFn = func(ctx context.Context, _ *Materializer, _ PublishRequest) (*PublishResult, error) {
+		close(started)
+		<-ctx.Done() // a materialisation that listens to the server's lifetime
+		return nil, ctx.Err()
+	}
+
+	outcome, err := f.svc.PublishVersion(f.ctx, f.caller(), dataset, PublishVersionRequest{
+		Definition: prefixDefinition("src-async-shutdown", commit.String(), "v2", "data/"),
+		Message:    "v2",
+	})
+	require.NoError(t, err)
+	require.True(t, outcome.Accepted())
+	<-started
+
+	drained := drainOnShutdown(serverCtx, f.svc, nil)
+	select {
+	case <-drained:
+		t.Fatal("the drain returned while a publish was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Shutdown: the publish is cancelled and the drain waits for it to finish.
+	shutdown()
+	select {
+	case <-drained:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the drain did not finish after shutdown")
+	}
+
+	// The publish failed on its own, left no v2 behind, and its task says so.
+	task, err := f.svc.GetTask(f.ctx, f.caller(), dataset, outcome.Task.ID)
+	require.NoError(t, err)
+	require.Equal(t, TaskStatusFailed, task.Status)
+	require.NotNil(t, task.Error)
+	_, err = f.svc.store.GetVersion(f.ctx, dataset, 2)
+	require.ErrorIs(t, err, kv.ErrNotFound)
+	require.Equal(t, DatasetStateActive, f.datasetRecord(t, dataset).State)
+	require.Equal(t, 1, f.datasetRecord(t, dataset).LatestVersion, "v1 of the create is untouched")
 }

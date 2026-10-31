@@ -27,7 +27,6 @@ package datasets
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -519,6 +518,16 @@ func (p *Pins) CheckDatasetDegraded(ctx context.Context, dataset string) (missin
 	if err != nil {
 		return nil, false, err
 	}
+	return p.checkDatasetDegraded(ctx, dataset, records)
+}
+
+// checkDatasetDegraded is CheckDatasetDegraded over pin records the caller already has. The
+// reconciler passes the records of its pinIndex, built once for the whole pass (BUG-14),
+// instead of scanning the pin partition once per dataset.
+func (p *Pins) checkDatasetDegraded(ctx context.Context, dataset string, records []*PinRecord) (missing []PinnedSource, marked bool, err error) {
+	if err := p.available(); err != nil {
+		return nil, false, err
+	}
 	missing, err = p.DegradedSources(ctx, sourcesOfPins(records))
 	if err != nil {
 		return missing, false, err
@@ -791,8 +800,9 @@ func referencesWithPrefix(refs []string, prefix string) []string {
 //
 // A pin is keyed by the source (repository, commit), not by the dataset, so answering "which pins
 // does this dataset hold?" means scanning the pin prefix. That is what a dataset delete (§6.6 step
-// 3) and the degraded check (§12.3 step 4) need, and they run rarely; a per-dataset index would be a
-// second source of truth for the same fact.
+// 3) and the degraded check (§12.3 step 4) need for one dataset. A caller that asks the question
+// for every dataset of a reconcile pass builds a pinIndex from one listAllPins instead (BUG-14):
+// doing this per dataset would be one full pin scan per dataset.
 func (s *Store) ListDatasetPins(ctx context.Context, dataset string) ([]*PinRecord, error) {
 	if err := checkDatasetName(dataset); err != nil {
 		return nil, err
@@ -801,102 +811,72 @@ func (s *Store) ListDatasetPins(ctx context.Context, dataset string) ([]*PinReco
 	if err != nil {
 		return nil, err
 	}
-	prefix := dataset + "@" // PinReference(dataset, n), and "@" cannot continue a dataset name
-	mine := make([]*PinRecord, 0, len(pins))
-	for _, pin := range pins {
-		if len(referencesWithPrefix(pin.References, prefix)) == 0 {
-			continue
-		}
-		mine = append(mine, pin)
-	}
-	return mine, nil
+	return newPinIndex(pins).forDataset(dataset), nil
 }
 
 // listAllPins returns every pin record of the partition, in key order.
 func (s *Store) listAllPins(ctx context.Context) ([]*PinRecord, error) {
-	pins := make([]*PinRecord, 0)
-	prefix := []byte(pinKeyPrefix + kv.PathDelimiter)
-	err := s.scanPrefix(ctx, prefix, func(key, value []byte) error {
-		rec, err := decodeRecord[PinRecord]("pin record", key, value)
-		if err != nil {
-			return err
-		}
-		pins = append(pins, rec)
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return pins, nil
+	return s.pinsIn(ctx, []byte(pinKeyPrefix+kv.PathDelimiter))
 }
 
-// RemovePinReferences removes several references from one pin in a single compare-and-swap and
-// reports whether the pin became an orphan, i.e. whether the caller must delete the pin branch.
+// pinIndex is the pins of the partition grouped by the dataset that references them (BUG-14).
+// It is built once from one pin scan, so a pass over every dataset costs O(pins) instead of
+// O(datasets x pins): the pin records name the dataset of every reference, and grouping them
+// once answers "which pins does this dataset hold?" for every dataset of the pass.
 //
-// It is the bulk form of RemovePinReference, used by ReleaseDataset: removing references one at a
-// time would delete the branch on the first removal (an empty set) and then fail to recreate it for
-// the next one.
+// The index is a snapshot, like the pin listing it was built from. A caller that must not act
+// on a stale answer (the orphan cleanup) re-reads the pin it is about to delete.
+type pinIndex map[string][]*PinRecord
+
+// newPinIndex groups pins by the dataset named in each of their references.
+func newPinIndex(pins []*PinRecord) pinIndex {
+	index := make(pinIndex, len(pins))
+	for _, pin := range pins {
+		if pin == nil {
+			continue
+		}
+		seen := make(map[string]struct{}, len(pin.References))
+		for _, ref := range pin.References {
+			dataset, ok := datasetOfPinReference(ref)
+			if !ok {
+				continue
+			}
+			if _, ok := seen[dataset]; ok {
+				continue
+			}
+			seen[dataset] = struct{}{}
+			index[dataset] = append(index[dataset], pin)
+		}
+	}
+	return index
+}
+
+// forDataset returns the pin records that carry a reference of dataset, in the order of the
+// listing the index was built from.
+func (idx pinIndex) forDataset(dataset string) []*PinRecord {
+	if len(idx) == 0 {
+		return nil
+	}
+	return idx[dataset]
+}
+
+// RemovePinReferences removes several references from one pin and reports whether the pin became an
+// orphan, i.e. whether the caller must delete the pin branch.
+//
+// It is the bulk form of RemovePinReference, used by ReleaseDataset. Every reference is its own
+// record (BUG-15), so the removals are independent deletes and the pin is re-read once afterwards;
+// a reference a concurrent writer added in the meantime keeps the pin (BUG-5) and is reported as
+// still remaining.
 func (s *Store) RemovePinReferences(ctx context.Context, repository, commitID string, refs []string) (orphaned bool, err error) {
 	if len(refs) == 0 {
 		return false, nil
 	}
-	for _, ref := range refs {
-		if err := checkSegment("pin reference", ref); err != nil {
-			return false, err
-		}
-	}
-	key, err := pinKey(repository, commitID)
+	remaining, removed, err := s.deletePinReferences(ctx, repository, commitID, refs)
 	if err != nil {
 		return false, err
 	}
-	drop := make(map[string]struct{}, len(refs))
-	for _, ref := range refs {
-		drop[ref] = struct{}{}
+	if removed == 0 {
+		return false, nil // none of the references was there; the pin is not ours to orphan
 	}
-	for attempt := 0; attempt < pinCASRetries; attempt++ {
-		current, predicate, err := s.readPin(ctx, key)
-		if err != nil {
-			return false, err
-		}
-		if current == nil {
-			return false, nil
-		}
-		remaining := make([]string, 0, len(current.References))
-		for _, existing := range current.References {
-			if _, drop := drop[existing]; drop {
-				continue
-			}
-			remaining = append(remaining, existing)
-		}
-		if len(remaining) == len(current.References) {
-			return false, nil
-		}
-		next := *current
-		next.References = remaining
-		value, err := json.Marshal(next)
-		if err != nil {
-			return false, fmt.Errorf("datasets: encode pin record %s/%s: %w", repository, commitID, err)
-		}
-		err = s.store.SetIf(ctx, []byte(PartitionKey), key, value, predicate)
-		if errors.Is(err, kv.ErrPredicateFailed) {
-			continue // another writer changed the pin; re-read and retry
-		}
-		if err != nil {
-			return false, err
-		}
-		if len(remaining) > 0 {
-			return false, nil
-		}
-		// Delete conditioned on the empty-set value just written: a concurrent AddPinReference
-		// that landed in between replaced it and keeps its pin (BUG-5).
-		err = s.deleteIfUnchanged(ctx, key, value, canonicalValue[PinRecord])
-		if errors.Is(err, kv.ErrPredicateFailed) {
-			continue // a reference landed on the empty set; re-read and retry
-		}
-		if err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-	return false, kv.ErrPredicateFailed
+	return remaining == 0, nil
 }

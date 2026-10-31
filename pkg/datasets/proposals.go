@@ -63,6 +63,13 @@ var (
 	// publish (PublishVersionRequest.Sync), because the proposal must be closed in the same
 	// request that publishes it, so this is a wiring bug rather than a client error.
 	ErrProposalNotSynchronous = errors.New("proposal merge was not published synchronously")
+
+	// ErrDatasetStateConflict reports an operation the dataset's current state forbids (409).
+	// BUG-16: a pull request may only be opened against an active or publishing dataset - a
+	// dataset that is being created, deleted or is degraded has no current version to review
+	// and may not have a preview branch. It wraps ErrDatasetConflict so every conflict of the
+	// control plane is recognisable with one errors.Is, like VersionConflictError does.
+	ErrDatasetStateConflict = fmt.Errorf("%w: dataset state does not allow this operation", ErrDatasetConflict)
 )
 
 // RebaseRequiredError is the 409 of §5.6 when a proposal's base_version is no longer the
@@ -184,39 +191,37 @@ func (s *Service) ListProposals(ctx context.Context, caller Caller, dataset, sta
 		}}}
 	}
 
-	stored, err := s.store.ListProposals(ctx, dataset)
-	if err != nil {
-		return nil, err
-	}
-
-	// The cursor is applied to the unfiltered list, so a proposal that leaves the filter
+	// The cursor is applied to the unfiltered order, so a proposal that leaves the filter
 	// while the client pages (an open one that was just closed) cannot invalidate the page.
-	start := 0
+	// With the descending key order the store can seek to the cursor, so the check is one
+	// read and not a walk over the proposals before it (BUG-14).
 	if after != "" {
-		start = -1
-		for i, proposal := range stored {
-			if proposal.ID == after {
-				start = i + 1
-				break
+		if _, err := s.store.GetProposal(ctx, dataset, after); err != nil {
+			// An id the key layout cannot hold (it carries a separator) and an id that is not
+			// there are both "this cursor names no proposal": a bad request, not a 500.
+			if errors.Is(err, kv.ErrNotFound) || errors.Is(err, ErrInvalidRecordKey) {
+				return nil, &ValidationError{Problems: []Problem{{
+					Path:    "after",
+					Message: fmt.Sprintf("unknown proposal %q", after),
+				}}}
 			}
+			return nil, err
 		}
-		if start < 0 {
-			return nil, &ValidationError{Problems: []Problem{{
-				Path:    "after",
-				Message: fmt.Sprintf("unknown proposal %q", after),
-			}}}
-		}
-	}
-
-	page := make([]*ProposalRecord, 0, len(stored))
-	for _, proposal := range stored[start:] {
-		if status != "" && proposal.Status != status {
-			continue
-		}
-		page = append(page, proposal)
 	}
 
 	amount = effectiveAmount(amount)
+	page := make([]*ProposalRecord, 0, amount+1)
+	err = s.store.ScanProposals(ctx, dataset, after, func(proposal *ProposalRecord) (bool, error) {
+		if status != "" && proposal.Status != status {
+			return true, nil
+		}
+		page = append(page, proposal)
+		// One matching proposal past the page proves there is a next page.
+		return len(page) <= amount, nil
+	})
+	if err != nil {
+		return nil, err
+	}
 	hasMore := len(page) > amount
 	if hasMore {
 		page = page[:amount]
@@ -225,8 +230,17 @@ func (s *Service) ListProposals(ctx context.Context, caller Caller, dataset, sta
 	if hasMore && len(page) > 0 {
 		next = page[len(page)-1].ID
 	}
-	if rec == nil && len(stored) == 0 {
-		return nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, dataset)
+	if rec == nil {
+		// A pull request may exist for a dataset that does not (it creates it on merge),
+		// so only an empty proposal set is a 404. This is one bounded read, and only for
+		// the not-yet-existing dataset.
+		any, err := s.hasProposals(ctx, dataset)
+		if err != nil {
+			return nil, err
+		}
+		if !any {
+			return nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, dataset)
+		}
 	}
 	latest := latestVersionOf(rec)
 	conflicted := rec == nil && s.nameUnavailable(ctx, dataset)
@@ -270,6 +284,16 @@ func (s *Service) CreateProposal(ctx context.Context, caller Caller, dataset str
 		if err := s.checkNameAvailable(ctx, dataset); err != nil {
 			return nil, err
 		}
+	}
+	// BUG-16: a pull request reviews the dataset's published definition against its
+	// current latest version, so the dataset must be able to serve one. An active dataset
+	// can; a publishing one can too (its own writer owns the transition, and the preview
+	// branch is a separate branch). A dataset that is being created or deleted, or that is
+	// degraded, may not have a repository to materialise the preview on, and a pull request
+	// opened against it would promise a review of data that does not exist.
+	if rec != nil && rec.State != DatasetStateActive && rec.State != DatasetStatePublishing {
+		return nil, fmt.Errorf("%w: dataset %q is %s; a pull request needs an active or publishing dataset",
+			ErrDatasetStateConflict, dataset, rec.State)
 	}
 
 	def := req.Definition
@@ -598,6 +622,21 @@ func (s *Service) loadDatasetOrNil(ctx context.Context, dataset string) (*Datase
 		return nil, err
 	}
 	return rec, nil
+}
+
+// hasProposals reports whether dataset has at least one proposal record, reading at most one
+// (BUG-14). It is the existence check behind the 404 of a listing for a dataset that does not
+// exist yet but may already carry pull requests.
+func (s *Service) hasProposals(ctx context.Context, dataset string) (bool, error) {
+	found := false
+	err := s.store.ScanProposals(ctx, dataset, "", func(*ProposalRecord) (bool, error) {
+		found = true
+		return false, nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return found, nil
 }
 
 // latestVersionOf reports the latest published version of rec, or 0 for a dataset that does

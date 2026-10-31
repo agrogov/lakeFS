@@ -908,10 +908,15 @@ func TestProposalPreviewBranchReuseOnUpdate(t *testing.T) {
 	require.Equal(t, DiffTypeData, result.Type)
 	require.Contains(t, result.Data.Entries, DataDiffEntry{Path: "data/b.parquet", Type: ChangeAdded, SizeBytes: int64(len("b"))})
 
-	// The proposal id is a valid store key and a valid preview branch name.
+	// The proposal id is a valid store key and a valid preview branch name. The id segment of
+	// the key is encoded newest-first (BUG-14), so the key must be under the dataset's
+	// proposal prefix and must read back the record, not spell the id out.
 	key, err := proposalKey(dataset, proposal.Record.ID)
 	require.NoError(t, err)
-	require.Contains(t, string(key), proposal.Record.ID)
+	require.Contains(t, string(key), "proposals/"+dataset+"/")
+	stored, err := f.svc.store.GetProposal(f.ctx, dataset, proposal.Record.ID)
+	require.NoError(t, err)
+	require.Equal(t, proposal.Record.ID, stored.ID)
 	require.NoError(t, graveler.ValidateBranchID(graveler.BranchID(updated.Record.PreviewBranch)))
 
 	// The record is a plain KV record: deleting it is the only cleanup a proposal needs.
@@ -1001,6 +1006,53 @@ func TestUpdateProposalAuthorizesBeforeLoading(t *testing.T) {
 			status, body := statusOf(t, err)
 			require.Equal(t, http.StatusForbidden, status)
 			require.NotContains(t, body, "not found", "the answer must not disclose whether the record exists")
+		})
+	}
+}
+
+// TestCreateProposalRequiresAnActiveOrPublishingDataset is BUG-16: a pull request may only be
+// opened against a dataset that can serve a current version, i.e. one that is active or
+// publishing. Every other state is a conflict, not a silently accepted review of nothing.
+func TestCreateProposalRequiresAnActiveOrPublishingDataset(t *testing.T) {
+	const (
+		dataset = "proposal-state"
+		source  = "src-proposal-state"
+	)
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+	def := prefixDefinition(source, commit.String(), "data", "data/")
+	f.createDatasetV1(t, dataset, def)
+	req := CreateProposalRequest{Definition: def, Title: "state"}
+
+	// setState CASes the dataset record into state, as the publish or delete path would.
+	setState := func(state string) {
+		t.Helper()
+		rec, predicate, err := f.svc.store.GetDataset(f.ctx, dataset)
+		require.NoError(t, err)
+		next := *rec
+		next.State = state
+		require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &next, rec, predicate))
+	}
+
+	// active: accepted.
+	view, err := f.svc.CreateProposal(f.ctx, f.caller(), dataset, req)
+	require.NoError(t, err)
+	require.Equal(t, ProposalStatusOpen, view.Record.Status)
+
+	// publishing: accepted (the preview branch is a branch of its own, and §12.3 owns the
+	// record's transition, not the reviewer).
+	setState(DatasetStatePublishing)
+	_, err = f.svc.CreateProposal(f.ctx, f.caller(), dataset, CreateProposalRequest{Definition: def, Title: "publishing"})
+	require.NoError(t, err)
+
+	for _, state := range []string{DatasetStateCreating, DatasetStateDeleting, DatasetStateDegraded} {
+		t.Run(state, func(t *testing.T) {
+			setState(state)
+			_, err := f.svc.CreateProposal(f.ctx, f.caller(), dataset, req)
+			require.ErrorIs(t, err, ErrDatasetStateConflict)
+			require.ErrorIs(t, err, ErrDatasetConflict, "the HTTP layer maps it to 409")
+			status, _ := statusOf(t, err)
+			require.Equal(t, http.StatusConflict, status)
 		})
 	}
 }

@@ -290,25 +290,28 @@ func (s *server) ValidateDataset(w http.ResponseWriter, r *http.Request, body ap
 	})
 }
 
-func (s *server) ListAccess(w http.ResponseWriter, r *http.Request, dataset apigen.DatasetName) {
+func (s *server) ListAccess(w http.ResponseWriter, r *http.Request, dataset apigen.DatasetName, params apigen.ListAccessParams) {
 	caller, err := s.caller(r)
 	if err != nil {
 		writeUnauthenticated(w, r)
 		return
 	}
-	grants, err := s.svc.ListAccess(r.Context(), caller, string(dataset))
+	result, err := s.svc.ListAccess(r.Context(), caller, string(dataset),
+		string(valueOrZero(params.After)), int(valueOrZero(params.Amount)))
 	if err != nil {
 		s.writeServiceError(w, r, err)
 		return
 	}
 	body := apigen.AccessGrantList{
-		Results: make([]apigen.AccessGrant, 0, len(grants)),
+		Results: make([]apigen.AccessGrant, 0, len(result.Grants)),
 		Pagination: apigen.Pagination{
-			Results:    len(grants),
-			MaxPerPage: len(grants),
+			HasMore:    result.HasMore,
+			NextOffset: result.NextOffset,
+			Results:    len(result.Grants),
+			MaxPerPage: result.MaxPerPage,
 		},
 	}
-	for _, grant := range grants {
+	for _, grant := range result.Grants {
 		body.Results = append(body.Results, grantToAPI(grant))
 	}
 	httputil.WriteAPIResponse(w, r, http.StatusOK, body)

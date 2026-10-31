@@ -91,40 +91,48 @@ func TestStoreCASWithOpaquePredicate(t *testing.T) {
 	require.ErrorIs(t, err, kv.ErrNotFound)
 }
 
-// TestStorePinCASWithOpaquePredicate is the pin half of BUG-1: acquiring and releasing
-// references must apply the predicate of the pin record as read, not a re-encoding of it.
+// TestStorePinCASWithOpaquePredicate is the pin half of BUG-1 on the BUG-15 layout: a pin is
+// one record per reference, and the conditional writes on a reference record must apply the
+// predicate the store returned for it, not a re-encoding of the value.
 func TestStorePinCASWithOpaquePredicate(t *testing.T) {
 	store, ctx := newETagStore(t)
+	const (
+		repository = "lakehouse-repo"
+		commitID   = "30f9eb1c"
+	)
+	ref := PinReference("customer-360", 2)
 
-	pin, err := store.AddPinReference(ctx, "lakehouse-repo", "30f9eb1c", PinReference("customer-360", 2))
+	pin, err := store.AddPinReference(ctx, repository, commitID, ref)
 	require.NoError(t, err, "creating a pin needs a nil predicate")
-	require.Equal(t, []string{PinReference("customer-360", 2)}, pin.References)
+	require.Equal(t, []string{ref}, pin.References)
 
-	read, predicate, err := store.GetPin(ctx, "lakehouse-repo", "30f9eb1c")
+	read, predicate, err := store.GetPin(ctx, repository, commitID)
 	require.NoError(t, err)
 	require.Equal(t, pin, read)
+	require.Nil(t, predicate, "a pin has no single record a predicate could guard (BUG-15)")
 
-	added, err := store.AddPinReference(ctx, "lakehouse-repo", "30f9eb1c", PinReference("customer-360", 3))
+	// The reference's own record carries the predicate: the store rejects a create over it
+	// and accepts a write conditioned on the value as read, even though the predicate is an
+	// opaque ETag here.
+	key, err := pinReferenceKey(repository, commitID, ref)
+	require.NoError(t, err)
+	stored, err := store.store.Get(ctx, []byte(PartitionKey), key)
+	require.NoError(t, err)
+	require.ErrorIs(t, store.store.SetIf(ctx, []byte(PartitionKey), key, stored.Value, nil), kv.ErrPredicateFailed)
+	require.NoError(t, store.store.SetIf(ctx, []byte(PartitionKey), key, stored.Value, stored.Predicate))
+
+	// A second reference is another record, so the two do not contend for one predicate.
+	added, err := store.AddPinReference(ctx, repository, commitID, PinReference("customer-360", 3))
 	require.NoError(t, err)
 	require.Equal(t, 2, len(added.References))
 
-	// The predicate guards the pin as it was before the second reference: the store
-	// rejects it, and the stale write does not drop a reference.
-	mutated := *read
-	mutated.References = []string{PinReference("customer-360", 9)}
-	mutatedValue, err := json.Marshal(mutated)
-	require.NoError(t, err)
-	key, err := pinKey("lakehouse-repo", "30f9eb1c")
-	require.NoError(t, err)
-	require.ErrorIs(t, store.store.SetIf(ctx, []byte(PartitionKey), key, mutatedValue, predicate), kv.ErrPredicateFailed)
-
-	deleted, err := store.RemovePinReference(ctx, "lakehouse-repo", "30f9eb1c", PinReference("customer-360", 2))
+	deleted, err := store.RemovePinReference(ctx, repository, commitID, ref)
 	require.NoError(t, err)
 	require.False(t, deleted)
-	deleted, err = store.RemovePinReference(ctx, "lakehouse-repo", "30f9eb1c", PinReference("customer-360", 3))
+	deleted, err = store.RemovePinReference(ctx, repository, commitID, PinReference("customer-360", 3))
 	require.NoError(t, err)
-	require.True(t, deleted, "the empty set deletes the pin")
-	_, _, err = store.GetPin(ctx, "lakehouse-repo", "30f9eb1c")
+	require.True(t, deleted, "the last reference deletes the pin")
+	_, _, err = store.GetPin(ctx, repository, commitID)
 	require.ErrorIs(t, err, kv.ErrNotFound)
 }
 

@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/spf13/cobra"
+	"github.com/treeverse/lakefs/pkg/api/apiutil"
 	"github.com/treeverse/lakefs/pkg/datasets/apigen"
 )
 
@@ -31,7 +32,8 @@ from.`,
 // accessOptions is the parsed command line of `datasets access list`.
 type accessOptions struct {
 	Dataset string
-	Output  outputFormat
+	paginationOptions
+	Output outputFormat
 }
 
 // parseAccessOptions parses and validates the arguments of `datasets access list`.
@@ -39,11 +41,15 @@ func parseAccessOptions(cmd *cobra.Command, args []string) (accessOptions, error
 	if len(args) != 1 {
 		return accessOptions{}, invalidArguments("access list expects exactly one dataset name, got %d arguments", len(args))
 	}
+	pagination, err := parsePaginationOptions(cmd)
+	if err != nil {
+		return accessOptions{}, err
+	}
 	output, err := outputOf(cmd)
 	if err != nil {
 		return accessOptions{}, err
 	}
-	return accessOptions{Dataset: args[0], Output: output}, nil
+	return accessOptions{Dataset: args[0], paginationOptions: pagination, Output: output}, nil
 }
 
 func accessListCmd() *cobra.Command {
@@ -60,6 +66,7 @@ func accessListCmd() *cobra.Command {
 			return runAccessList(cmd, options)
 		},
 	}
+	withPaginationFlags(cmd)
 	return cmd
 }
 
@@ -68,7 +75,11 @@ func runAccessList(cmd *cobra.Command, options accessOptions) error {
 	if err != nil {
 		return err
 	}
-	resp, err := client.ListAccessWithResponse(cmd.Context(), apigen.DatasetName(options.Dataset))
+	params := &apigen.ListAccessParams{Amount: apiutil.Ptr(apigen.Amount(options.Amount))}
+	if options.After != "" {
+		params.After = apiutil.Ptr(apigen.After(options.After))
+	}
+	resp, err := client.ListAccessWithResponse(cmd.Context(), apigen.DatasetName(options.Dataset), params)
 	if err != nil {
 		return err
 	}
@@ -93,7 +104,7 @@ func runAccessList(cmd *cobra.Command, options accessOptions) error {
 	}
 	printTable(cmd,
 		[]any{"Principal Type", "Principal", "Granted By", "Granted At"},
-		rows, resp.JSON200.Pagination, 0)
+		rows, resp.JSON200.Pagination, options.Amount)
 	return nil
 }
 

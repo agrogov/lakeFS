@@ -418,6 +418,14 @@ func (m *Materializer) materialize(ctx context.Context, req PublishRequest, bran
 	// that knows the previous metarange ID but not the previous definition (the
 	// reconciler resuming a publish, §12.3). A publish that merely repeats the previous
 	// definition was already rejected above.
+	//
+	// Known divergence (docs/datasets.md, "Known design divergences"): this branch cannot
+	// fire in practice. The metarange always contains the synthetic _dataset/definition.json
+	// entry of §6.4, and that document carries the version number, so the metarange of vN+1
+	// differs from vN's even when the data does not - and the definition comparison above
+	// already rejected that case. The check stays as a defensive net for a caller that
+	// supplies a previous metarange but no previous definition; removing it would silently
+	// drop the only guard such a caller has.
 	if req.Previous.MetaRangeID != "" && req.Previous.MetaRangeID == *metaRangeID {
 		return nil, fmt.Errorf("datasets: %s version %d: %w", req.Dataset, req.Version, ErrNoChanges)
 	}
@@ -563,7 +571,9 @@ func (m *Materializer) putDefinition(ctx context.Context, dsRepo *graveler.Repos
 // default 64) and prescribes merging in two passes with WriteRange above that. This
 // implementation opens all of them for the duration of the merge: the iterators are
 // metadata-only, and datasets.max_items bounds the count at 1000 by default. The two-pass
-// variant is a later performance step, not a correctness one.
+// variant is a later performance step, not a correctness one. It is a documented divergence
+// (docs/datasets.md, "Known design divergences"): datasets.merge_fan_in is validated but not
+// applied, so do not rely on it to cap concurrent source iterators.
 func (m *Materializer) openItems(ctx context.Context, def Definition) ([]*itemIterator, error) {
 	items := make([]*itemIterator, 0, len(def.Data))
 	for i := range def.Data {

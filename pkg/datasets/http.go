@@ -18,6 +18,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/datasets/apigen"
 	"github.com/treeverse/lakefs/pkg/httputil"
+	"github.com/treeverse/lakefs/pkg/logging"
 )
 
 //go:generate go run github.com/deepmap/oapi-codegen/cmd/oapi-codegen@v1.5.6 -package apigen -generate "types,client,chi-server,spec" -templates ../api/tmpl -o apigen/datasets.gen.go ../../api/datasets.yml
@@ -72,7 +73,13 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 	if err != nil {
 		return err
 	}
+	// BUG-12: ctx is the server's lifetime context (run.go cancels it on SIGINT/SIGTERM).
+	// Handing it to the service binds every asynchronous publish to the server, and the
+	// drain below waits for the ones already running when it is cancelled, so a shutdown
+	// does not abandon a publish mid-flight. A publish interrupted by the cancellation
+	// fails on its own and leaves the reconciler a state it resumes (§12.3 item 1).
 	svc.SetBackgroundContext(ctx)
+	drainOnShutdown(ctx, svc, deps.Logger)
 
 	// SEC-1: datasets is configured, so its installation-wide objects must exist before the
 	// first request. Bootstrap is idempotent and safe on every start; a failure is fatal
@@ -113,6 +120,36 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 	reconciler.log = deps.Logger
 	go reconciler.Run(ctx)
 	return nil
+}
+
+// drainOnShutdown ties asynchronous publishes to the server's lifetime (BUG-12). The service
+// runs every accepted publish on the context installed by SetBackgroundContext, so cancelling
+// that context aborts the materialisation in flight; this goroutine then waits for those
+// goroutines to finish, so a graceful shutdown does not race the reconciler or a KV close,
+// and so a test can observe that the drain happened.
+//
+// It is a goroutine of its own because RoutesBuilder returns once the routes are mounted and
+// must not block startup. A context without a Done channel (context.Background, the zero-value
+// fallback for a nil ctx) never ends, so no goroutine is started for it, and the returned
+// channel is already closed.
+//
+// The returned channel closes when the drain is done, so a test can observe the wait without a
+// logger fake; RoutesBuilder ignores it.
+func drainOnShutdown(ctx context.Context, svc *Service, log logging.Logger) <-chan struct{} {
+	done := make(chan struct{})
+	if svc == nil || ctx == nil || ctx.Done() == nil {
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		<-ctx.Done()
+		svc.Wait()
+		if log != nil {
+			log.Info("datasets: drained the publishes that were in flight at shutdown")
+		}
+	}()
+	return done
 }
 
 // newClientIPResolver builds the client-IP resolver used by authorization conditions from the

@@ -848,7 +848,13 @@ paths:
       operationId: listAccess
       tags: [access]
       summary: List dataset access grants
-      description: Users and groups that hold the managed read policy of this dataset (§9.2).
+      description: |-
+        Users and groups that hold the managed read policy of this dataset (§9.2). Grants are
+        listed by principal type and then principal id; the cursor is `<principal-type>/<principal-id>`
+        of the last grant of the previous page.
+      parameters:
+        - $ref: "#/components/parameters/After"
+        - $ref: "#/components/parameters/Amount"
       responses:
         "200":
           description: Access grant list

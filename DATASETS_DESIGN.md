@@ -352,9 +352,9 @@ the rest of lakeFS, so it's covered by existing backup/HA). Values are JSON (no 
 |---|---|---|
 | `datasets/<name>` | `DatasetRecord` | head pointer, CAS target |
 | `versions/<name>/<n:010d>` | `VersionRecord` | immutable after write |
-| `proposals/<name>/<id>` | `ProposalRecord` | |
+| `proposals/<name>/<desc-id>` | `ProposalRecord` | `desc-id` encodes the id so key order is newest-first (the listing pages with a forward scan) |
 | `metadata_keys/<key>` | `MetadataKey` | |
-| `pins/<repo>/<commit>` | `PinRecord` | set of `<dataset>@v<n>` references |
+| `pins/<repo>/<commit>/<dataset>@v<n>` | `PinReferenceRecord` | one item per reference; a pin is the prefix, so no item grows past DynamoDB's 400KB limit |
 | `grants/<name>/<principal-type>/<principal>` | `GrantRecord` | mirror of attached policies, for listing |
 
 ```go
@@ -639,8 +639,10 @@ _lakefs_ds_pin_<commit-id>
   (`ref/manager.go:498`, `ShowHidden: true`). Branch HEADs are always retained regardless of retention rules, so the
   whole tree at that commit survives GC.
 - Hidden branches don't show up in default branch listings in the UI/`lakectl`.
-- Refcount: `pins/<repo>/<commit>` holds the set of `dataset@vN` that reference it. The branch is deleted when the set
-  becomes empty (dataset deleted; versions aren't deleted in the MVP, so in practice only on dataset delete).
+- Refcount: every `dataset@vN` that references a commit is one record under `pins/<repo>/<commit>/`, and the pin is the
+  set of records under that prefix (one item per reference, so the pin does not grow into one oversized item). The
+  branch is deleted when the last record is removed (dataset deleted; versions aren't deleted in the MVP, so in practice
+  only on dataset delete).
 - Branch names use the commit ID only (not the dataset name), so many datasets share one pin and dataset names aren't
   leaked to readers of the source repo.
 - Read-only source repos: `Force` bypasses read-only. Protected-branch rules matching `*` would block creation (protection

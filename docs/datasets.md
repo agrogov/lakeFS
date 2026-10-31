@@ -375,3 +375,24 @@ span storage IDs are rejected.
   `DatasetsManageMetadataKeys` and attaches them to the base groups (see [Access](#access)).
 - **No dataset-level Python helper.** Reads work through the lakeFS SDK, `lakectl`,
   Spark and the S3 gateway; the CLI helper is the `lakectl-datasets` plugin.
+
+### Known design divergences
+
+These are documented gaps, not regressions: the behaviour below is what this build does, and
+the design document says something stricter.
+
+- **`datasets.merge_fan_in` is accepted but not applied.** The materialiser opens one
+  metadata-only iterator per data item and merges them in one pass, instead of merging in
+  two passes above the fan-in. `datasets.max_items` (1000 by default) bounds the number of
+  open iterators, so the divergence costs memory, not correctness. The configuration key is
+  validated and kept for compatibility.
+- **The "identical metarange" check never fires.** A publish whose data would equal the
+  previous version is rejected earlier, by comparing the definition, and the metarange
+  includes the synthetic `_dataset/definition.json` entry, which carries the version number.
+  The metarange comparison in `materialize.go` therefore can never succeed for a new version;
+  it stays as a defensive check for a caller that knows only the previous metarange.
+- **A commit on `latest` without `dataset.version` is not detected.** The reconciler repairs
+  and rolls back *transient* dataset records (`creating`, `publishing`, `deleting`). A commit
+  that reached `latest` without the `dataset.version` metadata on an otherwise `active`
+  dataset is not found by the repair pass, because only the version tags, not every commit
+  of `latest`, are inspected. Publishing the next version still tags `latest + 1` correctly.
