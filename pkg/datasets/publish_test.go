@@ -5,7 +5,10 @@ package datasets
 // no-op detection of §6.2 step 8.
 
 import (
+	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/catalog"
@@ -506,10 +509,203 @@ func TestPublish_VersionRecordMatchesStore(t *testing.T) {
 	require.Equal(t, PreviousVersion{}, PreviousVersionFromRecord(nil))
 }
 
+// TestPublish_PostCommitPutVersionRetryKeepsPins covers BUG-2: once the version commit exists
+// a one-shot VersionRecord failure is retried, the pins stay, the head reaches N and the next
+// publish is N+1 instead of colliding on tag vN.
+func TestPublish_PostCommitPutVersionRetryKeepsPins(t *testing.T) {
+	const dataset = "post-commit-retry"
+	f := newServiceFixture(t)
+	first := f.sourceRepo(t, "src-post-commit", map[string]string{"data/a.parquet": "a"})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition("src-post-commit", first.String(), "data", "data/"),
+		Publish:    true,
+	})
+	require.NoError(t, err)
+
+	second := f.commitTo(t, "src-post-commit", "main", map[string]string{"data/a.parquet": "b"})
+	def := prefixDefinition("src-post-commit", second.String(), "data", "data/")
+
+	calls := 0
+	f.svc.putVersionFn = func(ctx context.Context, rec VersionRecord) (*VersionRecord, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("injected version record write failure")
+		}
+		return f.svc.store.PutVersion(ctx, rec)
+	}
+	version := f.publishVersion(t, dataset, PublishVersionRequest{Definition: def, Message: "v2"})
+	require.Equal(t, 2, version.Version)
+	require.GreaterOrEqual(t, calls, 2, "the VersionRecord write is retried after the commit")
+
+	head := f.datasetRecord(t, dataset)
+	require.Equal(t, DatasetStateActive, head.State)
+	require.Equal(t, 2, head.LatestVersion)
+	require.Zero(t, head.PendingVersion)
+	require.True(t, datasetPinsInclude(t, f, dataset, 2), "the pins of the committed version remain")
+
+	third := f.commitTo(t, "src-post-commit", "main", map[string]string{"data/a.parquet": "c"})
+	next := f.publishVersion(t, dataset, PublishVersionRequest{
+		Definition: prefixDefinition("src-post-commit", third.String(), "data", "data/"),
+		Message:    "v3",
+	})
+	require.Equal(t, 3, next.Version, "the next publish is N+1, not a retry of N")
+}
+
+// TestPublish_PostCommitPutVersionFailureLeavesPublishingForReconciler covers the exhausted
+// retry of BUG-2: the record stays in publishing(PendingVersion=N), the pins stay, the
+// reconciler rebuilds the missing VersionRecord from the tag, and the next publish is N+1.
+func TestPublish_PostCommitPutVersionFailureLeavesPublishingForReconciler(t *testing.T) {
+	const dataset = "post-commit-reconcile"
+	f := newServiceFixture(t)
+	first := f.sourceRepo(t, "src-post-reconcile", map[string]string{"data/a.parquet": "a"})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition("src-post-reconcile", first.String(), "data", "data/"),
+		Publish:    true,
+	})
+	require.NoError(t, err)
+
+	second := f.commitTo(t, "src-post-reconcile", "main", map[string]string{"data/a.parquet": "b"})
+	f.svc.putVersionFn = func(context.Context, VersionRecord) (*VersionRecord, error) {
+		return nil, errors.New("kv unavailable after the commit")
+	}
+	_, err = f.svc.PublishVersion(f.ctx, f.caller(), dataset, PublishVersionRequest{
+		Definition: prefixDefinition("src-post-reconcile", second.String(), "data", "data/"),
+		Message:    "v2",
+	})
+	require.Error(t, err)
+	var committed *commitExistsError
+	require.ErrorAs(t, err, &committed)
+	require.Equal(t, 2, committed.version)
+
+	head := f.datasetRecord(t, dataset)
+	require.Equal(t, DatasetStatePublishing, head.State)
+	require.Equal(t, 2, head.PendingVersion)
+	require.Equal(t, 1, head.LatestVersion)
+	require.True(t, datasetPinsInclude(t, f, dataset, 2), "pins are never released after the commit")
+
+	// The reconciler only takes over a transient state once it is stale.
+	stale := *head
+	stale.UpdatedAt = f.svc.now().Add(-f.cfg.PublishTimeout - time.Minute)
+	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &stale, head))
+
+	f.svc.putVersionFn = f.svc.store.PutVersion
+	report := f.reconcile(t)
+	require.Equal(t, 1, report.StatesRepaired)
+	require.Equal(t, 1, report.VersionsRebuilt)
+
+	head = f.datasetRecord(t, dataset)
+	require.Equal(t, DatasetStateActive, head.State)
+	require.Equal(t, 2, head.LatestVersion)
+	require.Zero(t, head.PendingVersion)
+
+	third := f.commitTo(t, "src-post-reconcile", "main", map[string]string{"data/a.parquet": "c"})
+	next := f.publishVersion(t, dataset, PublishVersionRequest{
+		Definition: prefixDefinition("src-post-reconcile", third.String(), "data", "data/"),
+		Message:    "v3",
+	})
+	require.Equal(t, 3, next.Version)
+}
+
+// TestPublish_StalePendingAdoptsCommittedTag covers the takeover half of BUG-2: a stale
+// publishing record whose tag vN already points at the version commit is adopted through
+// completeVersion, so the new publish does not try to create vN again.
+func TestPublish_StalePendingAdoptsCommittedTag(t *testing.T) {
+	const dataset = "adopt-committed"
+	f := newServiceFixture(t)
+	first := f.sourceRepo(t, "src-adopt", map[string]string{"data/a.parquet": "a"})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition("src-adopt", first.String(), "data", "data/"),
+		Publish:    true,
+	})
+	require.NoError(t, err)
+
+	second := f.commitTo(t, "src-adopt", "main", map[string]string{"data/a.parquet": "b"})
+	f.svc.putVersionFn = func(context.Context, VersionRecord) (*VersionRecord, error) {
+		return nil, errors.New("kv unavailable after the commit")
+	}
+	_, err = f.svc.PublishVersion(f.ctx, f.caller(), dataset, PublishVersionRequest{
+		Definition: prefixDefinition("src-adopt", second.String(), "data", "data/"),
+		Message:    "v2",
+	})
+	require.Error(t, err)
+
+	current := f.datasetRecord(t, dataset)
+	stale := *current
+	stale.UpdatedAt = f.svc.now().Add(-f.cfg.PublishTimeout - time.Minute)
+	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &stale, current))
+	f.svc.putVersionFn = f.svc.store.PutVersion
+
+	third := f.commitTo(t, "src-adopt", "main", map[string]string{"data/a.parquet": "c"})
+	next := f.publishVersion(t, dataset, PublishVersionRequest{
+		Definition: prefixDefinition("src-adopt", third.String(), "data", "data/"),
+		Message:    "v3",
+	})
+	require.Equal(t, 3, next.Version)
+
+	head := f.datasetRecord(t, dataset)
+	require.Equal(t, DatasetStateActive, head.State)
+	require.Equal(t, 3, head.LatestVersion)
+	versions, err := f.svc.store.ListVersions(f.ctx, dataset)
+	require.NoError(t, err)
+	require.Equal(t, []int{3, 2, 1}, versionNumbers(versions))
+}
+
+// datasetPinsInclude reports whether any pin record of dataset references its version.
+func datasetPinsInclude(t *testing.T, f *serviceFixture, dataset string, version int) bool {
+	t.Helper()
+	pins, err := f.svc.store.ListDatasetPins(f.ctx, dataset)
+	require.NoError(t, err)
+	want := PinReference(dataset, version)
+	for _, pin := range pins {
+		for _, ref := range pin.References {
+			if ref == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // twoDigits renders a zero-padded two-digit number for stable, sortable test keys.
 func twoDigits(i int) string {
 	if i < 10 {
 		return "0" + string(rune('0'+i))
 	}
 	return string(rune('0'+i/10)) + string(rune('0'+i%10))
+}
+
+// TestPublish_CancelledContextAfterCommitStillAdvancesHead: a request context cancelled once
+// the version is durable must not strand the record in publishing.
+func TestPublish_CancelledContextAfterCommitStillAdvancesHead(t *testing.T) {
+	const dataset = "post-commit-cancel"
+	f := newServiceFixture(t)
+	first := f.sourceRepo(t, "src-post-cancel", map[string]string{"data/a.parquet": "a"})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition("src-post-cancel", first.String(), "data", "data/"),
+		Publish:    true,
+	})
+	require.NoError(t, err)
+
+	second := f.commitTo(t, "src-post-cancel", "main", map[string]string{"data/a.parquet": "b"})
+	ctx, cancel := context.WithCancel(f.ctx)
+	defer cancel()
+	f.svc.putVersionFn = func(c context.Context, rec VersionRecord) (*VersionRecord, error) {
+		stored, err := f.svc.store.PutVersion(c, rec)
+		cancel() // the client goes away right after the version record is written
+		return stored, err
+	}
+	version, err := f.svc.PublishVersion(ctx, f.caller(), dataset, PublishVersionRequest{
+		Definition: prefixDefinition("src-post-cancel", second.String(), "data", "data/"),
+		Message:    "v2",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 2, version.Version.Version)
+
+	head := f.datasetRecord(t, dataset)
+	require.Equal(t, DatasetStateActive, head.State)
+	require.Equal(t, 2, head.LatestVersion)
 }

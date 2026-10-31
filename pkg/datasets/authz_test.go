@@ -93,19 +93,18 @@ func TestDatasetArns(t *testing.T) {
 		got  string
 		want string
 	}{
-		{"dataset", DatasetArn("customer-360"), "arn:lakefs:datasets:::dataset/customer-360"},
-		{"metadata key", MetadataKeyArn("classification"), "arn:lakefs:datasets:::metadata-key/classification"},
-		{"dataset empty name", DatasetArn(""), "arn:lakefs:datasets:::dataset/"},
+		{"dataset", DatasetArn("customer-360"), "arn:lakefs:dataset:::dataset/customer-360"},
+		{"dataset wildcard", DatasetArn("*"), "arn:lakefs:dataset:::dataset/*"},
+		{"dataset empty name", DatasetArn(""), "arn:lakefs:dataset:::dataset/"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			require.Equal(t, tt.want, tt.got)
-			// The helpers must produce ARNs the policy validator accepts, and the datasets
-			// service part must be the one of §9.1.
+			// The helpers must produce ARNs the policy validator accepts, and the dataset
+			// service part must be the singular one of the public RBAC documentation.
 			require.NoError(t, model.ValidateArn(tt.got), "policy validator must accept %q", tt.got)
-			require.True(t, strings.HasPrefix(tt.got, "arn:lakefs:datasets:::dataset/") ||
-				strings.HasPrefix(tt.got, "arn:lakefs:datasets:::metadata-key/"))
+			require.True(t, strings.HasPrefix(tt.got, "arn:lakefs:dataset:::dataset/"))
 		})
 	}
 }
@@ -115,19 +114,22 @@ func TestActionConstantsAreValid(t *testing.T) {
 	// §9.1. The values are the contract: policies written by hand, by the UI or by the service
 	// all use these strings.
 	actions := map[string]string{
-		ActionListDatasets:       "datasets:ListDatasets",
-		ActionCreateDataset:      "datasets:CreateDataset",
-		ActionReadDataset:        "datasets:ReadDataset",
-		ActionPublishVersion:     "datasets:PublishVersion",
-		ActionCreateProposal:     "datasets:CreateProposal",
-		ActionDeleteDataset:      "datasets:DeleteDataset",
-		ActionManageAccess:       "datasets:ManageAccess",
-		ActionManageMetadataKeys: "datasets:ManageMetadataKeys",
+		ActionListDatasets:      "dataset:ListDatasets",
+		ActionCreateDataset:     "dataset:CreateDataset",
+		ActionReadDataset:       "dataset:ReadDataset",
+		ActionUpdateDataset:     "dataset:UpdateDataset",
+		ActionDeleteDataset:     "dataset:DeleteDataset",
+		ActionManageAccess:      "dataset:ManageAccess",
+		ActionListMetadataKeys:  "dataset:ListMetadataKeys",
+		ActionReadMetadataKey:   "dataset:ReadMetadataKey",
+		ActionCreateMetadataKey: "dataset:CreateMetadataKey",
+		ActionUpdateMetadataKey: "dataset:UpdateMetadataKey",
+		ActionDeleteMetadataKey: "dataset:DeleteMetadataKey",
 	}
 	for got, want := range actions {
 		require.Equal(t, want, got)
-		// The "datasets" serviceSet entry exists in pkg/permissions/actions.go (RBAC work), so
-		// these actions validate without any actions.gen.go codegen.
+		// The "dataset" serviceSet entry exists in pkg/permissions/actions.go, so these
+		// actions validate without any actions.gen.go codegen.
 		require.NoErrorf(t, permissions.IsValidAction(got), "action %q must be valid", got)
 		require.NoErrorf(t, model.ValidateActionName(got), "policy validator must accept %q", got)
 	}
@@ -163,12 +165,12 @@ func TestConsumerReadPolicy(t *testing.T) {
 		},
 		{
 			Effect:   model.StatementEffectAllow,
-			Action:   []string{"datasets:ReadDataset"},
-			Resource: "arn:lakefs:datasets:::dataset/customer-360",
+			Action:   []string{"dataset:ReadDataset"},
+			Resource: "arn:lakefs:dataset:::dataset/customer-360",
 		},
 		{
 			Effect:   model.StatementEffectAllow,
-			Action:   []string{"fs:ListRepositories", "datasets:ListDatasets"},
+			Action:   []string{"fs:ListRepositories", "dataset:ListDatasets"},
 			Resource: "*",
 		},
 	}, policy.Statement)
@@ -181,10 +183,10 @@ func TestConsumerReadPolicy(t *testing.T) {
 			require.NotContains(t, []string{
 				"fs:WriteObject", "fs:DeleteObject", "fs:CreateCommit", "fs:DeleteRepository",
 			}, action, "the consumer read policy must not grant writes")
-			require.Falsef(t, strings.HasPrefix(action, "datasets:Publish") ||
-				strings.HasPrefix(action, "datasets:Create") ||
-				strings.HasPrefix(action, "datasets:Delete") ||
-				strings.HasPrefix(action, "datasets:Manage"), "unexpected control-plane action %q", action)
+			require.Falsef(t, strings.HasPrefix(action, "dataset:Update") ||
+				strings.HasPrefix(action, "dataset:Create") ||
+				strings.HasPrefix(action, "dataset:Delete") ||
+				strings.HasPrefix(action, "dataset:Manage"), "unexpected control-plane action %q", action)
 		}
 		require.NotContains(t, stmt.Resource, "repository/ref-data",
 			"a consumer grant is on the dataset repository only (§9.2)")
@@ -570,13 +572,13 @@ func TestAuthorizerFailsClosed(t *testing.T) {
 	}
 }
 
-// TestMetadataKeyPermission pins the §9.1 metadata-key ARN.
+// TestMetadataKeyPermission pins the documented dataset/* resource of metadata-key actions.
 func TestMetadataKeyPermission(t *testing.T) {
 	t.Parallel()
-	node := MetadataKeyPermission(ActionManageMetadataKeys, "classification")
+	node := MetadataKeyPermission(ActionUpdateMetadataKey)
 	require.Equal(t, []permissions.Permission{{
-		Action:   "datasets:ManageMetadataKeys",
-		Resource: "arn:lakefs:datasets:::metadata-key/classification",
+		Action:   "dataset:UpdateMetadataKey",
+		Resource: "arn:lakefs:dataset:::dataset/*",
 	}}, requiredPermissions(node))
 }
 

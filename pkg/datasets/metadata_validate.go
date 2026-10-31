@@ -38,6 +38,12 @@ const (
 	ProblemAllowedValuesRequired = "allowed_values_required"
 	// ProblemAllowedValuesNotAllowed reports allowed_values on a non-enum key.
 	ProblemAllowedValuesNotAllowed = "allowed_values_not_allowed"
+	// ProblemAllowedValuesTooMany reports more than MaxMetadataAllowedValues values.
+	ProblemAllowedValuesTooMany = "allowed_values_too_many"
+	// ProblemAllowedValuesDuplicate reports a repeated allowed value.
+	ProblemAllowedValuesDuplicate = "allowed_values_duplicate"
+	// ProblemAllowedValuesInvalid reports an allowed value that is empty or too long.
+	ProblemAllowedValuesInvalid = "allowed_values_invalid"
 	// ProblemRequiredMissing reports a required key absent from the values.
 	ProblemRequiredMissing = "required_missing"
 	// ProblemUnknownKey reports an undefined key while metadata.strict is set.

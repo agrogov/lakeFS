@@ -38,7 +38,7 @@ security:
 tags:
   - name: datasets
     description: Dataset lifecycle, versions, diffs and proposals
-  - name: metadata-keys
+  - name: metadata
     description: Metadata key definitions used to type dataset metadata
   - name: access
     description: Dataset-level access grants
@@ -144,15 +144,18 @@ paths:
         "501":
           $ref: "#/components/responses/NotImplemented"
 
-  /metadata-keys:
+  /metadata:
     get:
       operationId: listMetadataKeys
-      tags: [metadata-keys]
+      tags: [metadata]
       summary: List metadata keys
-      description: Every metadata key definition (needed by every definition editor, §5.5).
+      description: |
+        Every metadata key definition (needed by every definition editor, §5.5), optionally
+        filtered to names starting with `prefix`.
       parameters:
         - $ref: "#/components/parameters/After"
         - $ref: "#/components/parameters/Amount"
+        - $ref: "#/components/parameters/Prefix"
       responses:
         "200":
           description: Metadata key list
@@ -170,11 +173,11 @@ paths:
           $ref: "#/components/responses/NotImplemented"
     post:
       operationId: createMetadataKey
-      tags: [metadata-keys]
+      tags: [metadata]
       summary: Create a metadata key
       description: |
         Creates a typed metadata key (§5.5). Metadata keys are global, not per dataset.
-        `datasets:ManageMetadataKeys` on `arn:lakefs:datasets:::metadata-key/<key>`.
+        Requires `dataset:CreateMetadataKey` on `arn:lakefs:dataset:::dataset/*`.
       requestBody:
         required: true
         content:
@@ -199,12 +202,12 @@ paths:
         "501":
           $ref: "#/components/responses/NotImplemented"
 
-  /metadata-keys/{key}:
+  /metadata/{key}:
     parameters:
       - $ref: "#/components/parameters/MetadataKeyName"
     get:
       operationId: getMetadataKey
-      tags: [metadata-keys]
+      tags: [metadata]
       summary: Get a metadata key
       responses:
         "200":
@@ -223,12 +226,13 @@ paths:
           $ref: "#/components/responses/NotImplemented"
     put:
       operationId: updateMetadataKey
-      tags: [metadata-keys]
-      summary: Update a metadata key
+      tags: [metadata]
+      summary: Replace a metadata key
       description: |
-        Changes `required`, `allowed_values` and `description` (§5.5). Changing `type` is
-        rejected (`409`): delete and recreate the key instead. Existing dataset versions are
-        never re-validated, so a new required key affects only the next definition write.
+        Full replacement: `type` is required and the absent optional fields reset to their
+        zero values. Changing `type` is rejected (`409`): delete and recreate the key
+        instead. Existing dataset versions are never re-validated, so a new required key
+        affects only the next definition write.
       requestBody:
         required: true
         content:
@@ -256,7 +260,7 @@ paths:
           $ref: "#/components/responses/NotImplemented"
     delete:
       operationId: deleteMetadataKey
-      tags: [metadata-keys]
+      tags: [metadata]
       summary: Delete a metadata key
       description: |
         Deletes the definition only; existing metadata values become free-form (§5.5).
@@ -886,7 +890,7 @@ components:
       in: query
       required: false
       allowEmptyValue: true
-      description: Return datasets whose name starts with this prefix
+      description: Return items whose name starts with this prefix
       schema:
         type: string
 
@@ -1446,8 +1450,13 @@ components:
         allowed_values:
           type: array
           description: Non-empty for `enum` keys only
+          minItems: 1
+          maxItems: 256
+          uniqueItems: true
           items:
             type: string
+            minLength: 1
+            maxLength: 256
         allow_multiple:
           type: boolean
           description: The value is a JSON array
@@ -1490,8 +1499,13 @@ components:
           default: false
         allowed_values:
           type: array
+          minItems: 1
+          maxItems: 256
+          uniqueItems: true
           items:
             type: string
+            minLength: 1
+            maxLength: 256
         allow_multiple:
           type: boolean
           default: false
@@ -1501,16 +1515,29 @@ components:
     MetadataKeyUpdateRequest:
       type: object
       description: |
-        Partial update. `type` is immutable (§5.5); changing the name is a delete plus create.
+        Full replacement (`DatasetMetadataKeyUpdate`). `type` is required and immutable
+        (§5.5); changing the name is a delete plus create.
+      required:
+        - type
       properties:
+        type:
+          type: string
+          enum: [string, enum, number, boolean, date]
         required:
           type: boolean
+          default: false
         allowed_values:
           type: array
+          minItems: 1
+          maxItems: 256
+          uniqueItems: true
           items:
             type: string
+            minLength: 1
+            maxLength: 256
         allow_multiple:
           type: boolean
+          default: false
         description:
           type: string
 

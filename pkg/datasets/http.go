@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/getkin/kin-openapi/openapi3filter"
@@ -70,6 +71,16 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 	svc, err := NewService(cfg, deps.KVStore, deps.Catalog, deps.AuthService)
 	if err != nil {
 		return err
+	}
+	svc.SetBackgroundContext(ctx)
+
+	// SEC-1: datasets is configured, so its installation-wide objects must exist before the
+	// first request. Bootstrap is idempotent and safe on every start; a failure is fatal
+	// because without datasets-pins-protect and the built-in groups the immutability and pin
+	// guarantees of §8.2 and §9.4 do not hold.
+	if err := Bootstrap(ctx, deps.AuthService, time.Now(),
+		WithPinsProtectGroups(ImmutabilityGuardGroups(cfg.ImmutableGuardGroups))); err != nil {
+		return fmt.Errorf("datasets: bootstrap: %w", err)
 	}
 
 	// The core AuthMiddleware is bound to the swagger routes, so the datasets router wraps

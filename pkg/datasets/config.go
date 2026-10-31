@@ -165,6 +165,13 @@ func (c *Config) applyViperOverrides() {
 	if viper.IsSet(metadataStrictKey) {
 		c.Metadata.Strict = viper.GetBool(metadataStrictKey)
 	}
+
+	// DOC-16: the public documentation has no datasets.enabled switch, only a storage namespace
+	// prefix. A configured namespace therefore enables the feature when enabled is unset; an
+	// explicit enabled: false still wins.
+	if !viper.IsSet(enabledKey) && c.StorageNamespacePrefix != "" {
+		c.Enabled = true
+	}
 }
 
 // setDefaults fills every unset field with its documented default. Zero values mean "unset"

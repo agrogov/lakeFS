@@ -146,8 +146,8 @@ func TestDatasetsSpecLoadsAndValidates(t *testing.T) {
 		endpoints := map[string][]string{
 			"/":                             {http.MethodGet, http.MethodPost},
 			"/config":                       {http.MethodGet},
-			"/metadata-keys":                {http.MethodGet, http.MethodPost},
-			"/metadata-keys/{key}":          {http.MethodGet, http.MethodPut, http.MethodDelete},
+			"/metadata":                     {http.MethodGet, http.MethodPost},
+			"/metadata/{key}":               {http.MethodGet, http.MethodPut, http.MethodDelete},
 			"/{dataset}":                    {http.MethodGet, http.MethodDelete},
 			"/{dataset}/validate":           {http.MethodPost},
 			"/{dataset}/versions":           {http.MethodGet, http.MethodPost},
@@ -278,7 +278,7 @@ func TestDatasetsUnauthenticated401(t *testing.T) {
 		{"publish version", http.MethodPost, "/customer-360/versions", validPublishBody},
 		{"delete dataset", http.MethodDelete, "/customer-360", ""},
 		{"config", http.MethodGet, "/config", ""},
-		{"list metadata keys", http.MethodGet, "/metadata-keys", ""},
+		{"list metadata keys", http.MethodGet, "/metadata", ""},
 		{"diff", http.MethodGet, "/customer-360/refs/v1/diff/v2?type=data", ""},
 		{"task", http.MethodGet, "/customer-360/tasks/01J8Z", ""},
 	}
@@ -356,7 +356,7 @@ func TestDatasetsBadRequest400(t *testing.T) {
 		{
 			name:   "invalid metadata key in path",
 			method: http.MethodGet,
-			path:   "/metadata-keys/Bad-Key",
+			path:   "/metadata/Bad-Key",
 		},
 		{
 			name:   "invalid access principal type",
@@ -389,36 +389,6 @@ func TestDatasetsBadRequest400(t *testing.T) {
 // routes are absent from the table below.
 func TestDatasetsNotImplemented501(t *testing.T) {
 	handler, accessKey, secret := newControlPlane(t)
-
-	cases := []struct {
-		operation string
-		method    string
-		path      string
-		body      string
-	}{
-		{"GetDatasetsConfig", http.MethodGet, "/config", ""},
-		{"ListMetadataKeys", http.MethodGet, "/metadata-keys", ""},
-		{"CreateMetadataKey", http.MethodPost, "/metadata-keys", validMetadataKeyBody},
-		{"GetMetadataKey", http.MethodGet, "/metadata-keys/classification", ""},
-		{"UpdateMetadataKey", http.MethodPut, "/metadata-keys/classification", `{"required": true}`},
-		{"DeleteMetadataKey", http.MethodDelete, "/metadata-keys/classification", ""},
-		// The version and task routes of §10.1 are implemented; their HTTP contract is covered
-		// by versions_http_test.go. The DiffRefs route of §10.3 is implemented too; its HTTP
-		// contract is covered by TestDatasetsHTTPDiff in diff_test.go. The proposal routes of
-		// §5.6 are implemented too; their HTTP contract is covered by proposals_http_test.go.
-		// None of them answer 501 any more, so none has a row here.
-	}
-	for _, tc := range cases {
-		t.Run(tc.operation, func(t *testing.T) {
-			rec := doRequest(t, handler, tc.method, tc.path, tc.body, accessKey, secret)
-			require.Equal(t, http.StatusNotImplemented, rec.Code, "body: %s", rec.Body.String())
-			require.Equal(t, "application/json", rec.Header().Get("Content-Type"))
-			message := decodeError(t, rec).Message
-			// Clearly marked not-implemented error naming the operation.
-			require.True(t, strings.HasPrefix(message, ErrNotImplemented.Error()+": "), "message: %q", message)
-			require.Contains(t, message, tc.operation)
-		})
-	}
 
 	t.Run("validation runs before the stub", func(t *testing.T) {
 		rec := doRequest(t, handler, http.MethodPost, "/customer-360/versions", `{"message": "x"}`, accessKey, secret)

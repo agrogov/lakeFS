@@ -71,7 +71,7 @@ func TestValidateName(t *testing.T) {
 		// Reserved names (§5.2 rule 1, §10.1): they match the pattern but would
 		// collide with control-plane routes or internal names.
 		{name: "config", wantProblems: 1, wantReserved: true},
-		{name: "metadata-keys", wantProblems: 1, wantReserved: true},
+		{name: "metadata", wantProblems: 1, wantReserved: true},
 		// _datasets does not match the pattern either, so it gets two problems.
 		{name: "_datasets", wantProblems: 2, wantReserved: true},
 		{name: "datasets", wantProblems: 0},

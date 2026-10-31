@@ -108,6 +108,40 @@ func (e *VersionConflictError) Unwrap() error { return ErrDatasetConflict }
 // (proposals.go) implements too.
 func (e *VersionConflictError) latestVersion() int { return e.LatestVersion }
 
+// publishWriteRetries and publishWriteBackoff bound the retries of the two writes that
+// follow the version commit (BUG-2): once the commit and tag exist, a transient KV failure
+// must not release the pins or roll the record back, because that would leave latest
+// serving an unpinned commit and make every later publish collide on the tag.
+const (
+	publishWriteRetries = 5
+	publishWriteBackoff = 10 * time.Millisecond
+)
+
+// commitExistsError marks a publish that failed after the version commit was written. The
+// caller must not release pins or roll the record back; the record is left in a transient
+// state so the reconciler finishes it from the tag (reconciler.completeVersion).
+type commitExistsError struct {
+	dataset string
+	version int
+	err     error
+}
+
+func (e *commitExistsError) Error() string {
+	return fmt.Sprintf("datasets: version %d of %q is committed but its record was not written: %v",
+		e.version, e.dataset, e.err)
+}
+
+func (e *commitExistsError) Unwrap() error { return e.err }
+
+// asCommitExists reports the version of a publish that failed after its commit.
+func asCommitExists(err error) (*commitExistsError, bool) {
+	var committed *commitExistsError
+	if errors.As(err, &committed) {
+		return committed, true
+	}
+	return nil, false
+}
+
 // Service is the datasets control plane. One instance serves every request of a process; it
 // holds no per-request state.
 //
@@ -143,6 +177,10 @@ type Service struct {
 	// §5.4 step 5 covers.
 	publishFn func(ctx context.Context, materializer *Materializer, req PublishRequest) (*PublishResult, error)
 
+	// putVersionFn writes the VersionRecord after the commit. It is a field so tests can
+	// inject a failure between the commit and the record, the window BUG-2 covers.
+	putVersionFn func(ctx context.Context, rec VersionRecord) (*VersionRecord, error)
+
 	// bgCtx bounds asynchronous publishes (§6.5). It is deliberately *not* a request
 	// context: an accepted publish must finish (or fail on its own) even when the client
 	// disconnects. wg lets tests and shutdown wait for those goroutines.
@@ -170,7 +208,7 @@ func NewService(cfg *Config, kvs kv.Store, cat *catalog.Catalog, authService aut
 		return nil, ErrNoAuthorizer
 	}
 	store := NewStore(kvs)
-	return &Service{
+	svc := &Service{
 		cfg:          cfg,
 		store:        store,
 		catalog:      cat,
@@ -183,7 +221,11 @@ func NewService(cfg *Config, kvs kv.Store, cat *catalog.Catalog, authService aut
 		newULID:      newULID,
 		publishFn:    publishWithMaterializer,
 		bgCtx:        context.Background(),
-	}, nil
+	}
+	svc.store.now = svc.now
+	svc.pins.now = svc.now
+	svc.putVersionFn = svc.store.PutVersion
+	return svc, nil
 }
 
 // publishWithMaterializer is the production publishFn: the materialisation primitive of
@@ -238,7 +280,7 @@ type DatasetView struct {
 // repository as a dataset (lakefs.dataset=true, lakefs.dataset.format=1) and the per-dataset
 // immutability deny policy of §9.4 is attached before any version is published.
 func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) (*DatasetView, error) {
-	// §9.1: creating a dataset needs datasets:CreateDataset on the (future) dataset ARN.
+	// §9.1: creating a dataset needs dataset:CreateDataset on the (future) dataset ARN.
 	if err := s.authorizer.CheckDataset(ctx, caller, ActionCreateDataset, req.Name); err != nil {
 		return nil, err
 	}
@@ -313,12 +355,14 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 		RepositoryMetadataFormatKey:    strconv.Itoa(FormatVersion),
 	}
 	if err := s.catalog.UpdateRepositoryMetadata(ctx, req.Name, metadata); err != nil {
+		s.rollbackCreate(ctx, rec)
 		return nil, fmt.Errorf("datasets: mark repository %q as a dataset: %w", req.Name, err)
 	}
 
 	// §9.4: protect the repository before the first write, so no window exists in which a
 	// guarded principal could write to it without the deny policy.
 	if err := s.ensureImmutabilityGuard(ctx, req.Name); err != nil {
+		s.rollbackCreate(ctx, rec)
 		return nil, err
 	}
 
@@ -327,29 +371,109 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 	if req.Publish {
 		version, err = s.publish(ctx, current, *resolved, req.Message, caller.Username, "")
 		if err != nil {
+			if committed, ok := asCommitExists(err); ok {
+				// The commit exists: leaving the record for the reconciler is the only safe
+				// outcome (BUG-2); deleting the repository would destroy the version.
+				s.leavePending(ctx, req.Name, committed.version)
+				return nil, err
+			}
+			s.rollbackCreate(ctx, rec)
 			return nil, err
 		}
 	}
 
-	active := *current
-	active.State = DatasetStateActive
-	active.UpdatedAt = s.now()
+	active := current
 	if version != nil {
-		active.LatestVersion = version.Version
-	}
-	if err := s.store.PutDatasetIf(ctx, &active, current); err != nil {
-		if errors.Is(err, kv.ErrPredicateFailed) {
-			return nil, fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, req.Name)
+		active, err = s.advanceDataset(ctx, current, version.Version)
+		if err != nil {
+			// The version is committed; never delete its repository. Leave the record
+			// pending so the reconciler completes it from the tag (BUG-2).
+			s.leavePending(ctx, req.Name, version.Version)
+			return nil, err
 		}
-		return nil, err
+	} else {
+		next := *current
+		next.State = DatasetStateActive
+		next.PendingVersion = 0
+		next.UpdatedAt = s.now()
+		if err := s.store.PutDatasetIf(ctx, &next, current); err != nil {
+			s.rollbackCreate(ctx, rec)
+			if errors.Is(err, kv.ErrPredicateFailed) {
+				return nil, fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, req.Name)
+			}
+			return nil, err
+		}
+		active = &next
 	}
 
 	// §9.5 note: the aggregate read policy lists every dataset repository and must follow
 	// create/delete.
+	// The dataset is already active here; a failure only delays the policy, which the
+	// reconciler converges, so it must not fail the create.
 	if err := s.ensureAllReadPolicy(ctx); err != nil {
-		return nil, err
+		logging.FromContext(ctx).WithError(err).WithField("dataset", req.Name).
+			Warn("datasets: dataset created but the all-read policy was not updated; the reconciler will converge it")
 	}
-	return &DatasetView{Record: &active, Version: version}, nil
+	return &DatasetView{Record: active, Version: version}, nil
+}
+
+// rollbackCreate undoes a create that failed before its first commit (BUG-10): the
+// repository, the immutability guard and the record are removed inline, so a retry does not
+// have to wait for the reconciler. Errors are logged rather than returned: the original
+// failure is the one the caller needs to see.
+func (s *Service) rollbackCreate(ctx context.Context, rec *DatasetRecord) {
+	var errs []error
+	if err := s.catalog.DeleteRepository(ctx, rec.Name, graveler.WithForce(true)); err != nil && !isNotFound(err) {
+		errs = append(errs, err)
+	}
+	errs = append(errs, s.dropImmutabilityGuard(ctx, rec.Name)...)
+	// The record may have been modified since it was created (e.g. by a concurrent writer);
+	// CAS against the fresh record so a stale predicate does not orphan it.
+	if fresh, err := s.store.GetDataset(ctx, rec.Name); err == nil {
+		if err := s.store.DeleteDataset(ctx, rec.Name, fresh); err != nil && !isNotFound(err) {
+			errs = append(errs, err)
+		}
+	} else if !errors.Is(err, kv.ErrNotFound) {
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		logging.FromContext(ctx).WithError(errors.Join(errs...)).WithField("dataset", rec.Name).
+			Warn("datasets: could not fully roll back a failed create; the reconciler will")
+	}
+}
+
+// leavePending parks a record whose version commit exists but whose head was not written,
+// in publishing(PendingVersion=N), which is the state reconciler.completeVersion repairs
+// (BUG-2). It is best effort: a record already deleting or active is left alone.
+func (s *Service) leavePending(ctx context.Context, dataset string, version int) {
+	ctx, cancel := detachedWriteContext(ctx)
+	defer cancel()
+	for attempt := 0; attempt < publishWriteRetries; attempt++ {
+		current, err := s.store.GetDataset(ctx, dataset)
+		if errors.Is(err, kv.ErrNotFound) {
+			return
+		}
+		if err != nil {
+			s.pausePublishWrite(ctx, attempt)
+			continue
+		}
+		if current.State == DatasetStateDeleting ||
+			((current.State == DatasetStateActive || current.State == DatasetStateDegraded) &&
+				current.LatestVersion >= version) {
+			return
+		}
+		next := *current
+		next.State = DatasetStatePublishing
+		next.PendingVersion = version
+		next.UpdatedAt = s.now()
+		err = s.store.PutDatasetIf(ctx, &next, current)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, kv.ErrPredicateFailed) {
+			s.pausePublishWrite(ctx, attempt)
+		}
+	}
 }
 
 // Get returns a dataset and the record of its latest version (§10.1). A dataset without a
@@ -403,7 +527,7 @@ type ListResult struct {
 
 // List returns the datasets the caller may read (§10.1, §9.1).
 //
-// Every result needs datasets:ReadDataset in addition to the datasets:ListDatasets check
+// Every result needs dataset:ReadDataset in addition to the dataset:ListDatasets check
 // that gates the endpoint: listing is not a way to discover datasets one cannot read, so
 // datasets without that permission are filtered out instead of failing the request.
 func (s *Service) List(ctx context.Context, caller Caller, req ListRequest) (*ListResult, error) {
@@ -491,6 +615,13 @@ func (s *Service) Delete(ctx context.Context, caller Caller, name string) error 
 	}
 	if err != nil {
 		return err
+	}
+	// BUG-9: a delete that races a live publish would remove the repository under the
+	// version it is committing. Only a stale publishing record may be deleted; its owner
+	// checks for "deleting" before the commit and leaves the version to the reconciler.
+	if rec.State == DatasetStatePublishing && !s.pendingIsStale(rec) {
+		return fmt.Errorf("%w: dataset %q version %d is still being published", ErrPublishInProgress,
+			name, rec.PendingVersion)
 	}
 	// Read the version records before deleting anything: the control-plane records are
 	// removed one by one after the repository is gone (§6.6 step 4).
@@ -652,8 +783,8 @@ func (o *PublishOutcome) Accepted() bool { return o != nil && o.Task != nil }
 // already CASed to "publishing", so a node that restarts mid-publish leaves exactly the
 // state the reconciler of §12.3 resumes or rolls back.
 func (s *Service) PublishVersion(ctx context.Context, caller Caller, name string, req PublishVersionRequest) (*PublishOutcome, error) {
-	// §9.1: publishing needs datasets:PublishVersion on the dataset ARN.
-	if err := s.authorizer.CheckDataset(ctx, caller, ActionPublishVersion, name); err != nil {
+	// §9.1: publishing needs dataset:UpdateDataset on the dataset ARN.
+	if err := s.authorizer.CheckDataset(ctx, caller, ActionUpdateDataset, name); err != nil {
 		return nil, err
 	}
 	if problems := ValidateName(name); len(problems) > 0 {
@@ -709,49 +840,97 @@ func (s *Service) PublishVersion(ctx context.Context, caller Caller, name string
 // is what keeps a single crashed publish from blocking a dataset until the reconciler runs
 // (§12.3). A non-stale publish in flight is a 409 (ErrPublishInProgress).
 func (s *Service) beginPublish(ctx context.Context, name string, expected *int) (*DatasetRecord, error) {
-	rec, err := s.store.GetDataset(ctx, name)
-	if errors.Is(err, kv.ErrNotFound) {
-		return nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, name)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	// §5.4: expected_version behaves like an ETag on the dataset head.
-	if expected != nil && *expected != rec.LatestVersion {
-		return nil, &VersionConflictError{Dataset: name, Expected: *expected, LatestVersion: rec.LatestVersion}
-	}
-
-	switch rec.State {
-	case DatasetStateActive, DatasetStateDegraded:
-		// A degraded dataset (§12.3 step 4) still accepts publishes: the new definition may
-		// replace the sources that disappeared, and repairing is better than blocking.
-	case DatasetStatePublishing:
-		if !s.pendingIsStale(rec) {
-			return nil, fmt.Errorf("%w: dataset %q version %d started at %s", ErrPublishInProgress,
-				name, rec.PendingVersion, rec.UpdatedAt.UTC().Format(time.RFC3339))
+	for attempt := 0; attempt < publishWriteRetries; attempt++ {
+		rec, err := s.store.GetDataset(ctx, name)
+		if errors.Is(err, kv.ErrNotFound) {
+			return nil, fmt.Errorf("%w: %q", ErrDatasetNotFound, name)
 		}
-		logging.FromContext(ctx).WithFields(logging.Fields{
-			"dataset":         name,
-			"pending_version": rec.PendingVersion,
-			"updated_at":      rec.UpdatedAt.UTC().Format(time.RFC3339),
-		}).Warn("datasets: taking over a stale publishing state")
-	default:
-		return nil, fmt.Errorf("%w: dataset %q is %s", ErrDatasetConflict, name, rec.State)
-	}
+		if err != nil {
+			return nil, err
+		}
 
-	version := rec.LatestVersion + 1
-	next := *rec
-	next.State = DatasetStatePublishing
-	next.PendingVersion = version
-	next.UpdatedAt = s.now()
-	if err := s.store.PutDatasetIf(ctx, &next, rec); err != nil {
+		// §5.4: expected_version behaves like an ETag on the dataset head.
+		if expected != nil && *expected != rec.LatestVersion {
+			return nil, &VersionConflictError{Dataset: name, Expected: *expected, LatestVersion: rec.LatestVersion}
+		}
+
+		switch rec.State {
+		case DatasetStateActive, DatasetStateDegraded:
+			// A degraded dataset (§12.3 step 4) still accepts publishes: the new definition may
+			// replace the sources that disappeared, and repairing is better than blocking.
+		case DatasetStatePublishing:
+			if !s.pendingIsStale(rec) {
+				return nil, fmt.Errorf("%w: dataset %q version %d started at %s", ErrPublishInProgress,
+					name, rec.PendingVersion, rec.UpdatedAt.UTC().Format(time.RFC3339))
+			}
+			// BUG-2: the stale attempt may already have committed and tagged vN. Adopt it
+			// through completeVersion instead of publishing N again (which would collide on
+			// the tag).
+			pending := rec.PendingVersion
+			if pending <= 0 {
+				pending = rec.LatestVersion + 1
+			}
+			adopted, err := s.adoptCommittedVersion(ctx, rec, pending)
+			if err != nil {
+				return nil, err
+			}
+			if adopted {
+				continue // re-read the record the reconciler just advanced
+			}
+			logging.FromContext(ctx).WithFields(logging.Fields{
+				"dataset":         name,
+				"pending_version": rec.PendingVersion,
+				"updated_at":      rec.UpdatedAt.UTC().Format(time.RFC3339),
+			}).Warn("datasets: taking over a stale publishing state")
+		default:
+			return nil, fmt.Errorf("%w: dataset %q is %s", ErrDatasetConflict, name, rec.State)
+		}
+
+		version := rec.LatestVersion + 1
+		next := *rec
+		next.State = DatasetStatePublishing
+		next.PendingVersion = version
+		next.UpdatedAt = s.now()
+		err = s.store.PutDatasetIf(ctx, &next, rec)
 		if errors.Is(err, kv.ErrPredicateFailed) {
-			return nil, fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, name)
+			continue // somebody moved the record; re-read and retry the state machine
 		}
-		return nil, err
+		if err != nil {
+			s.pausePublishWrite(ctx, attempt)
+			continue
+		}
+		return &next, nil
 	}
-	return &next, nil
+	return nil, fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, name)
+}
+
+// adoptCommittedVersion finishes a stale publish whose tag vN already points at a commit
+// carrying dataset.version=N (BUG-2). It reuses reconciler.completeVersion, so the
+// VersionRecord and the head are rebuilt from the same authoritative source the repair
+// pass uses.
+func (s *Service) adoptCommittedVersion(ctx context.Context, rec *DatasetRecord, version int) (bool, error) {
+	tag := VersionTag(version)
+	commitID, err := s.catalog.GetTag(ctx, rec.Name, tag)
+	switch {
+	case err == nil:
+	case isNotFound(err):
+		return false, nil
+	default:
+		return false, fmt.Errorf("datasets: read tag %s of %q: %w", tag, rec.Name, err)
+	}
+	commitLog, err := s.catalog.GetCommit(ctx, rec.Name, commitID)
+	if err != nil {
+		return false, fmt.Errorf("datasets: read commit %s of %q: %w", commitID, rec.Name, err)
+	}
+	if commitLog.Metadata[CommitMetadataVersionKey] != strconv.Itoa(version) {
+		return false, fmt.Errorf("%w: tag %s of dataset %q points at a commit that is not version %d",
+			ErrDatasetConflict, tag, rec.Name, version)
+	}
+	r := NewReconciler(s)
+	if err := r.completeVersion(ctx, rec, version, commitID, &ReconcileReport{}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // pendingIsStale reports whether a record in "publishing" has been left alone for longer
@@ -774,21 +953,25 @@ func (s *Service) publishIsAsync(estimate ItemStats) bool {
 
 // runPublish performs §6.2 steps 4-11 for a record that is already CASed to "publishing":
 // materialise (which takes the pins first), write the VersionRecord, and advance the
-// dataset record. Any failure is rolled back to "active" on a best-effort basis.
+// dataset record. A failure before the commit is rolled back to "active" on a best-effort
+// basis; a failure after it is left in publishing(PendingVersion=N) for the reconciler
+// (BUG-2).
 func (s *Service) runPublish(ctx context.Context, publishing *DatasetRecord, def Definition, req PublishVersionRequest, publisher string) (*VersionRecord, error) {
-	started := time.Now()
+	started := s.now()
 	version, err := s.publish(ctx, publishing, def, req.Message, publisher, req.ProposalID)
 	if err != nil {
-		err = s.rollbackPublish(ctx, publishing, err)
+		if _, committed := asCommitExists(err); !committed {
+			err = s.rollbackPublish(ctx, publishing, err)
+		}
 		// §12.4: every attempt is observed, with the same classification the HTTP layer uses.
-		dsMetrics.observePublish(publishResultOf(err), time.Since(started).Seconds(), 0)
+		dsMetrics.observePublish(publishResultOf(err), s.now().Sub(started).Seconds(), 0)
 		return nil, err
 	}
 	// §5.4 step 4: the version is durable; advance the head. This CAS losing is not a
 	// rollback case - the version exists - so it is reported as a conflict and left to
 	// the reconciler (§5.4, §12.3).
-	if err := s.activateDataset(ctx, publishing, version.Version); err != nil {
-		dsMetrics.observePublish(publishResultOf(err), time.Since(started).Seconds(), 0)
+	if _, err := s.advanceDataset(ctx, publishing, version.Version); err != nil {
+		dsMetrics.observePublish(publishResultOf(err), s.now().Sub(started).Seconds(), 0)
 		return nil, err
 	}
 	// §12.4: one audit line per published version, in the same Fields shape as
@@ -799,26 +982,72 @@ func (s *Service) runPublish(ctx context.Context, publishing *DatasetRecord, def
 		"user":    publisher,
 		"action":  "PublishVersion",
 	}).Info("datasets: published a version")
-	dsMetrics.observePublish(publishResultSuccess, time.Since(started).Seconds(), version.Stats.Objects)
+	dsMetrics.observePublish(publishResultSuccess, s.now().Sub(started).Seconds(), version.Stats.Objects)
 	return version, nil
 }
 
-// activateDataset advances the head record to the version that was just published
-// (§6.2 step 11).
-func (s *Service) activateDataset(ctx context.Context, publishing *DatasetRecord, version int) error {
-	next := *publishing
-	next.State = DatasetStateActive
-	next.PendingVersion = 0
-	next.LatestVersion = version
-	next.UpdatedAt = s.now()
-	if err := s.store.PutDatasetIf(ctx, &next, publishing); err != nil {
-		if errors.Is(err, kv.ErrPredicateFailed) {
-			return fmt.Errorf("%w: dataset %q changed while publishing version %d; the reconciler will repair it",
-				ErrDatasetConflict, publishing.Name, version)
+// advanceDataset CASes the head record to active at version (§6.2 step 11), retrying both
+// transient write failures and a lost predicate (re-reading the record) with backoff. Once
+// the version is committed the caller must not roll it back; if the CAS still fails the
+// record stays in publishing(PendingVersion=N) and reconciler.completeVersion finishes it.
+func (s *Service) advanceDataset(ctx context.Context, base *DatasetRecord, version int) (*DatasetRecord, error) {
+	ctx, cancel := detachedWriteContext(ctx)
+	defer cancel()
+	current := base
+	for attempt := 0; attempt < publishWriteRetries; attempt++ {
+		if current.State == DatasetStateDeleting {
+			return nil, fmt.Errorf("%w: dataset %q is deleting", ErrDatasetConflict, current.Name)
 		}
-		return err
+		if current.State == DatasetStatePublishing && current.PendingVersion != version {
+			return nil, fmt.Errorf("%w: dataset %q is publishing version %d, not %d",
+				ErrDatasetConflict, current.Name, current.PendingVersion, version)
+		}
+		if (current.State == DatasetStateActive || current.State == DatasetStateDegraded) &&
+			current.LatestVersion >= version {
+			return current, nil
+		}
+		next := *current
+		next.State = DatasetStateActive
+		next.PendingVersion = 0
+		next.LatestVersion = version
+		next.UpdatedAt = s.now()
+		err := s.store.PutDatasetIf(ctx, &next, current)
+		if err == nil {
+			return &next, nil
+		}
+		if errors.Is(err, kv.ErrPredicateFailed) {
+			latest, getErr := s.store.GetDataset(ctx, current.Name)
+			if getErr != nil {
+				return nil, err
+			}
+			current = latest
+			continue
+		}
+		s.pausePublishWrite(ctx, attempt)
 	}
-	return nil
+	return nil, fmt.Errorf("%w: dataset %q changed while publishing version %d; the reconciler will repair it",
+		ErrDatasetConflict, base.Name, version)
+}
+
+// postCommitWriteTimeout bounds the writes that follow a durable commit.
+const postCommitWriteTimeout = 30 * time.Second
+
+// detachedWriteContext returns a context that survives cancellation of ctx (a client that
+// disconnects after the commit must not strand the record) but is bounded in time.
+func detachedWriteContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), postCommitWriteTimeout)
+}
+
+// pausePublishWrite waits before the next write retry, with a backoff bounded by
+// publishWriteBackoff, or returns early when the context is cancelled.
+func (s *Service) pausePublishWrite(ctx context.Context, attempt int) {
+	delay := publishWriteBackoff << attempt
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
 }
 
 // rollbackPublish is the best-effort CAS back to "active" of §5.4 step 5. It never masks
@@ -1241,6 +1470,141 @@ func (s *Service) RevokeAccess(ctx context.Context, caller Caller, dataset, prin
 	return nil
 }
 
+// --- metadata keys (§5.5, §10.1) ---
+
+// MetadataKeyListResult is one page of metadata key definitions.
+type MetadataKeyListResult struct {
+	Keys       []MetadataKey
+	HasMore    bool
+	NextOffset string
+	MaxPerPage int
+}
+
+// ListMetadataKeys returns the metadata key definitions whose name starts with
+// prefix, paginated by name (§10.1). Metadata keys are global, so the authorization
+// is the list action on the datasets metadata namespace.
+func (s *Service) ListMetadataKeys(ctx context.Context, caller Caller, prefix, after string, amount int) (*MetadataKeyListResult, error) {
+	if err := s.authorizer.CheckMetadataKey(ctx, caller, ActionListMetadataKeys); err != nil {
+		return nil, err
+	}
+	keys, err := s.store.ListMetadataKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+	filtered := make([]MetadataKey, 0, len(keys))
+	for _, key := range keys {
+		if prefix != "" && !strings.HasPrefix(key.Name, prefix) {
+			continue
+		}
+		filtered = append(filtered, key)
+	}
+
+	pageAmount := effectiveAmount(amount, len(filtered))
+	start := sort.Search(len(filtered), func(i int) bool { return filtered[i].Name > after })
+	page := filtered[start:]
+	hasMore := len(page) > pageAmount
+	if hasMore {
+		page = page[:pageAmount]
+	}
+	next := ""
+	if hasMore && len(page) > 0 {
+		next = page[len(page)-1].Name
+	}
+	return &MetadataKeyListResult{Keys: page, HasMore: hasMore, NextOffset: next, MaxPerPage: pageAmount}, nil
+}
+
+// GetMetadataKey returns one metadata key definition.
+func (s *Service) GetMetadataKey(ctx context.Context, caller Caller, name string) (*MetadataKey, error) {
+	if err := s.authorizer.CheckMetadataKey(ctx, caller, ActionReadMetadataKey); err != nil {
+		return nil, err
+	}
+	if !IsValidMetadataKeyName(name) {
+		return nil, invalidMetadataKeyName(name)
+	}
+	key, err := s.store.GetMetadataKey(ctx, name)
+	if errors.Is(err, kv.ErrNotFound) {
+		return nil, fmt.Errorf("%w: %q", ErrMetadataKeyNotFound, name)
+	}
+	return key, err
+}
+
+// CreateMetadataKey creates a typed metadata key shared by every dataset (§5.5).
+func (s *Service) CreateMetadataKey(ctx context.Context, caller Caller, key MetadataKey) (*MetadataKey, error) {
+	if err := s.authorizer.CheckMetadataKey(ctx, caller, ActionCreateMetadataKey); err != nil {
+		return nil, err
+	}
+	key.CreatedAt = s.now()
+	key.CreatedBy = caller.Username
+	if problems := ValidateMetadataKey(key); len(problems) > 0 {
+		return nil, &ValidationError{Problems: problems}
+	}
+	if err := s.store.PutMetadataKey(ctx, key, nil); err != nil {
+		if errors.Is(err, kv.ErrPredicateFailed) {
+			return nil, fmt.Errorf("%w: metadata key %q already exists", ErrNameTaken, key.Name)
+		}
+		return nil, err
+	}
+	return &key, nil
+}
+
+// UpdateMetadataKey replaces a metadata key definition. type is part of the
+// replacement and may not change (409); the name is the KV key and may not change
+// either. CreatedAt/CreatedBy are preserved from the stored definition.
+func (s *Service) UpdateMetadataKey(ctx context.Context, caller Caller, name string, update MetadataKey) (*MetadataKey, error) {
+	if err := s.authorizer.CheckMetadataKey(ctx, caller, ActionUpdateMetadataKey); err != nil {
+		return nil, err
+	}
+	if !IsValidMetadataKeyName(name) {
+		return nil, invalidMetadataKeyName(name)
+	}
+	old, err := s.store.GetMetadataKey(ctx, name)
+	if errors.Is(err, kv.ErrNotFound) {
+		return nil, fmt.Errorf("%w: %q", ErrMetadataKeyNotFound, name)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	update.Name = name
+	if update.Type == "" {
+		return nil, &ValidationError{Problems: []Problem{metadataProblem(name, ProblemInvalidKeyType,
+			fmt.Sprintf("type is required and must be one of %s", strings.Join(sortedMetadataTypes(), ", ")))}}
+	}
+	if err := ValidateKeyUpdate(*old, update); err != nil {
+		return nil, err
+	}
+	update.CreatedAt = old.CreatedAt
+	update.CreatedBy = old.CreatedBy
+	if err := s.store.PutMetadataKey(ctx, update, old); err != nil {
+		return nil, err
+	}
+	return &update, nil
+}
+
+// DeleteMetadataKey deletes a definition. Existing metadata values become free-form.
+func (s *Service) DeleteMetadataKey(ctx context.Context, caller Caller, name string) error {
+	if err := s.authorizer.CheckMetadataKey(ctx, caller, ActionDeleteMetadataKey); err != nil {
+		return err
+	}
+	if !IsValidMetadataKeyName(name) {
+		return invalidMetadataKeyName(name)
+	}
+	old, err := s.store.GetMetadataKey(ctx, name)
+	if errors.Is(err, kv.ErrNotFound) {
+		return fmt.Errorf("%w: %q", ErrMetadataKeyNotFound, name)
+	}
+	if err != nil {
+		return err
+	}
+	return s.store.DeleteMetadataKey(ctx, name, old)
+}
+
+// invalidMetadataKeyName reports a name that cannot be a metadata key.
+func invalidMetadataKeyName(name string) error {
+	return &ValidationError{Problems: []Problem{metadataProblem(name, ProblemInvalidKeyName,
+		fmt.Sprintf("metadata key name must match %s", metadataKeyNameRe.String()))}}
+}
+
 // --- internals ---
 
 // validateDefinition runs the structural validation of §5.2 with the metadata key rules of
@@ -1332,6 +1696,15 @@ func (s *Service) publish(ctx context.Context, rec *DatasetRecord, def Definitio
 		Previous:   previous,
 	}
 
+	// BUG-9: the publish owner re-checks its ownership before the commit. A delete that
+	// CASed the record to "deleting" must win, and the pins are released because nothing
+	// has been committed yet.
+	if rec.State == DatasetStatePublishing {
+		if err := s.ensurePublishOwnership(ctx, rec, version); err != nil {
+			return nil, errors.Join(err, s.pins.Release(ctx, def, ref))
+		}
+	}
+
 	// §5.2 rule 6 is enforced on every publish, not only on create, so the materialiser
 	// is built with the metadata key rules that are in force right now (§5.5).
 	materializer, err := s.materializerFor(ctx)
@@ -1340,6 +1713,12 @@ func (s *Service) publish(ctx context.Context, rec *DatasetRecord, def Definitio
 	}
 	result, err := s.publishFn(ctx, materializer, req)
 	if err != nil {
+		// A tag failure can happen after the commit was written. Detect that case before
+		// releasing anything: after the commit exists the pins must stay and the record is
+		// left for the reconciler (BUG-2).
+		if s.versionCommitted(ctx, rec.Name, version) {
+			return nil, &commitExistsError{dataset: rec.Name, version: version, err: err}
+		}
 		if releaseErr := s.pins.Release(ctx, def, ref); releaseErr != nil {
 			err = errors.Join(err, releaseErr)
 		}
@@ -1351,14 +1730,80 @@ func (s *Service) publish(ctx context.Context, rec *DatasetRecord, def Definitio
 		return nil, err
 	}
 
-	stored, err := s.store.PutVersion(ctx, *result.VersionRecord(req, s.now()))
+	stored, err := s.putVersionWithRetry(ctx, *result.VersionRecord(req, s.now()))
 	if err != nil {
-		if releaseErr := s.pins.Release(ctx, def, ref); releaseErr != nil {
-			err = errors.Join(err, releaseErr)
-		}
-		return nil, err
+		// The commit and the tag are durable: never release the pins or roll back. The
+		// caller leaves the record in publishing(PendingVersion=N) and the reconciler
+		// rebuilds the missing VersionRecord from the tag (BUG-2).
+		return nil, &commitExistsError{dataset: rec.Name, version: version, err: err}
 	}
 	return stored, nil
+}
+
+// ensurePublishOwnership verifies, right before the commit, that this attempt still owns the
+// publishing record: a concurrent delete has moved it to "deleting", or a stale takeover is
+// publishing another version (BUG-9).
+func (s *Service) ensurePublishOwnership(ctx context.Context, rec *DatasetRecord, version int) error {
+	current, err := s.store.GetDataset(ctx, rec.Name)
+	if errors.Is(err, kv.ErrNotFound) {
+		return fmt.Errorf("%w: dataset %q was deleted", ErrPublishInProgress, rec.Name)
+	}
+	if err != nil {
+		return err
+	}
+	switch {
+	case current.State == DatasetStateDeleting:
+		return fmt.Errorf("%w: dataset %q is being deleted", ErrPublishInProgress, rec.Name)
+	case current.State != DatasetStatePublishing || current.PendingVersion != version:
+		return fmt.Errorf("%w: dataset %q is no longer publishing version %d",
+			ErrDatasetConflict, rec.Name, version)
+	}
+	return nil
+}
+
+// putVersionWithRetry writes the VersionRecord that follows a committed version, retrying
+// transient failures with backoff (BUG-2). The version record is derived state: the commit
+// and the tag are authoritative, so a caller that exhausts the retries leaves it to
+// reconciler.completeVersion rather than touching the pins.
+func (s *Service) putVersionWithRetry(ctx context.Context, rec VersionRecord) (*VersionRecord, error) {
+	ctx, cancel := detachedWriteContext(ctx)
+	defer cancel()
+	var (
+		stored *VersionRecord
+		err    error
+	)
+	for attempt := 0; attempt < publishWriteRetries; attempt++ {
+		stored, err = s.putVersionFn(ctx, rec)
+		if err == nil {
+			return stored, nil
+		}
+		if ctx.Err() != nil {
+			return nil, errors.Join(err, ctx.Err())
+		}
+		if attempt+1 < publishWriteRetries {
+			s.pausePublishWrite(ctx, attempt)
+		}
+	}
+	return nil, err
+}
+
+// versionCommitted reports whether the version's tag or the latest HEAD commit already
+// carries dataset.version=N, i.e. the materialisation wrote the commit even though it
+// returned an error (BUG-2).
+func (s *Service) versionCommitted(ctx context.Context, dataset string, version int) bool {
+	want := strconv.Itoa(version)
+	if commitID, err := s.catalog.GetTag(ctx, dataset, VersionTag(version)); err == nil {
+		if commitLog, err := s.catalog.GetCommit(ctx, dataset, commitID); err == nil &&
+			commitLog.Metadata[CommitMetadataVersionKey] == want {
+			return true
+		}
+	}
+	head, err := s.catalog.GetBranchReference(ctx, dataset, DefaultBranch)
+	if err != nil {
+		return false
+	}
+	commitLog, err := s.catalog.GetCommit(ctx, dataset, head)
+	return err == nil && commitLog.Metadata[CommitMetadataVersionKey] == want
 }
 
 // previousVersion loads the record of the version a publish supersedes, for the no-op check

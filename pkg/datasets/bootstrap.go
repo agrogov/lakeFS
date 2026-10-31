@@ -15,22 +15,23 @@ import (
 	"errors"
 	"reflect"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/model"
+	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/permissions"
 )
 
 // Built-in datasets policies, DATASETS_DESIGN.md §9.5. The display names are the policy IDs the
 // service writes and attaches.
 const (
-	// DatasetsFullAccessPolicyName is "datasets:*" on "*"; the data-plane read of every dataset
+	// DatasetsFullAccessPolicyName is "dataset:*" on "*"; the data-plane read of every dataset
 	// is granted by the managed DatasetsAllReadPolicyName policy below, not by this one.
 	DatasetsFullAccessPolicyName = "DatasetsFullAccess"
-	// DatasetsReadWriteAllPolicyName covers listing, creating, reading, publishing and
-	// proposing on every dataset. It intentionally does not include DeleteDataset,
-	// ManageAccess or ManageMetadataKeys.
+	// DatasetsReadWriteAllPolicyName covers listing, creating, reading and updating every
+	// dataset. It intentionally does not include DeleteDataset or ManageAccess.
 	DatasetsReadWriteAllPolicyName = "DatasetsReadWriteAll"
 	// DatasetsReadAllPolicyName covers listing and reading datasets.
 	DatasetsReadAllPolicyName = "DatasetsReadAll"
@@ -65,19 +66,15 @@ func datasetsFullAccessPolicy(ts time.Time) *model.Policy {
 		Statement: model.Statements{
 			{
 				Effect:   model.StatementEffectAllow,
-				Action:   []string{"datasets:*"},
-				Resource: permissions.All,
+				Action:   []string{"dataset:*"},
+				Resource: DatasetArn("*"),
 			},
 		},
 	}
 }
 
-// datasetsReadWriteAllPolicy is the §9.5 DatasetsReadWriteAll policy:
-// datasets:{ListDatasets, CreateDataset, ReadDataset, PublishVersion, CreateProposal} on "*".
-// The design writes the action set in brace notation with a trailing "*"; it is expanded here to
-// the five exact action names, because those are the only actions with those prefixes and an
-// exact list cannot silently grow when a later phase adds an action (for example
-// datasets:DeleteDataset).
+// datasetsReadWriteAllPolicy is the §9.5 DatasetsReadWriteAll policy: list, read, create and
+// update every dataset, plus reading the shared metadata keys.
 func datasetsReadWriteAllPolicy(ts time.Time) *model.Policy {
 	return &model.Policy{
 		CreatedAt:   ts,
@@ -87,12 +84,13 @@ func datasetsReadWriteAllPolicy(ts time.Time) *model.Policy {
 				Effect: model.StatementEffectAllow,
 				Action: []string{
 					ActionListDatasets,
-					ActionCreateDataset,
 					ActionReadDataset,
-					ActionPublishVersion,
-					ActionCreateProposal,
+					ActionCreateDataset,
+					ActionUpdateDataset,
+					ActionListMetadataKeys,
+					ActionReadMetadataKey,
 				},
-				Resource: permissions.All,
+				Resource: DatasetArn("*"),
 			},
 		},
 	}
@@ -109,8 +107,10 @@ func datasetsReadAllPolicy(ts time.Time) *model.Policy {
 				Action: []string{
 					ActionListDatasets,
 					ActionReadDataset,
+					ActionListMetadataKeys,
+					ActionReadMetadataKey,
 				},
-				Resource: permissions.All,
+				Resource: DatasetArn("*"),
 			},
 		},
 	}
@@ -125,9 +125,13 @@ func datasetsManageMetadataKeysPolicy(ts time.Time) *model.Policy {
 			{
 				Effect: model.StatementEffectAllow,
 				Action: []string{
-					ActionManageMetadataKeys,
+					ActionListMetadataKeys,
+					ActionReadMetadataKey,
+					ActionCreateMetadataKey,
+					ActionUpdateMetadataKey,
+					ActionDeleteMetadataKey,
 				},
-				Resource: permissions.All,
+				Resource: DatasetArn("*"),
 			},
 		},
 	}
@@ -253,6 +257,131 @@ func normalizeStatements(statements model.Statements) model.Statements {
 	return out
 }
 
+// legacyDatasetArnPrefix and legacyActionPrefix are the plural names used before the service
+// was renamed to match the public RBAC documentation. They are read only by the migration below.
+const (
+	legacyDatasetArnPrefix = "arn:lakefs:datasets:::"
+	legacyActionPrefix     = "datasets:"
+)
+
+// IsLegacyManagedPolicy reports whether name is one of the policies this package manages and
+// whose statements may still carry the pre-rename dataset actions or ARNs.
+func IsLegacyManagedPolicy(name string) bool {
+	switch name {
+	case DatasetsFullAccessPolicyName, DatasetsReadWriteAllPolicyName, DatasetsReadAllPolicyName,
+		DatasetsManageMetadataKeysPolicyName, DatasetsAllReadPolicyName, DatasetsPinsProtectPolicyName:
+		return true
+	}
+	return strings.HasPrefix(name, "dataset-") &&
+		(strings.HasSuffix(name, "-read") || strings.HasSuffix(name, "-immutable"))
+}
+
+// MigrateLegacyManagedPolicies rewrites the legacy plural datasets actions and ARN prefix in the
+// managed policies (the built-ins and the per-dataset read / immutability policies) to their
+// singular dataset names. It reports whether any policy was written.
+//
+// The migration is idempotent: it rewrites only statements that still contain a legacy action or
+// resource, so a policy that has already been migrated is not touched.
+func MigrateLegacyManagedPolicies(ctx context.Context, authService auth.Service) (bool, error) {
+	if authService == nil {
+		return false, ErrNoAuthorizer
+	}
+	policies, _, err := authService.ListPolicies(ctx, &model.PaginationParams{Amount: -1})
+	if err != nil {
+		return false, err
+	}
+	changed := false
+	for _, policy := range policies {
+		if !IsLegacyManagedPolicy(policy.DisplayName) {
+			continue
+		}
+		statements, migrated := migrateLegacyStatements(policy.Statement)
+		if !migrated {
+			continue
+		}
+		policy.Statement = statements
+		if err := authService.WritePolicy(ctx, policy, true /* update */); err != nil {
+			return changed, err
+		}
+		changed = true
+	}
+	return changed, nil
+}
+
+// migrateLegacyStatements returns a migrated copy of statements and reports whether anything
+// changed.
+func migrateLegacyStatements(statements model.Statements) (model.Statements, bool) {
+	if statements == nil {
+		return nil, false
+	}
+	out := make(model.Statements, len(statements))
+	changed := false
+	for i, statement := range statements {
+		statement.Action, changed = mergeMigration(statement.Action, migrateLegacyActions(statement.Action), changed)
+		if resource := migrateLegacyResource(statement.Resource); resource != statement.Resource {
+			statement.Resource = resource
+			changed = true
+		}
+		out[i] = statement
+	}
+	return out, changed
+}
+
+// migrateLegacyActions maps one statement's legacy action list to the singular namespace. A
+// legacy PublishVersion or CreateProposal becomes UpdateDataset; the coarse ManageMetadataKeys
+// action expands to the five documented metadata-key actions.
+func migrateLegacyActions(actions []string) []string {
+	out := make([]string, 0, len(actions))
+	seen := make(map[string]struct{}, len(actions))
+	add := func(items ...string) {
+		for _, item := range items {
+			if _, ok := seen[item]; ok {
+				continue
+			}
+			seen[item] = struct{}{}
+			out = append(out, item)
+		}
+	}
+	for _, action := range actions {
+		switch action {
+		case legacyActionPrefix + "*":
+			add("dataset:*")
+		case legacyActionPrefix + "PublishVersion", legacyActionPrefix + "CreateProposal":
+			add(ActionUpdateDataset)
+		case legacyActionPrefix + "ManageMetadataKeys":
+			add(ActionListMetadataKeys, ActionReadMetadataKey,
+				ActionCreateMetadataKey, ActionUpdateMetadataKey, ActionDeleteMetadataKey)
+		default:
+			if strings.HasPrefix(action, legacyActionPrefix) {
+				add("dataset:" + strings.TrimPrefix(action, legacyActionPrefix))
+				continue
+			}
+			add(action)
+		}
+	}
+	return out
+}
+
+// migrateLegacyResource maps a legacy datasets ARN to the singular prefix. A legacy metadata-key
+// ARN becomes the documented dataset/* resource.
+func migrateLegacyResource(resource string) string {
+	resource = strings.ReplaceAll(resource, legacyDatasetArnPrefix+"metadata-key/", datasetArnPrefix+"dataset/*")
+	return strings.ReplaceAll(resource, legacyDatasetArnPrefix, datasetArnPrefix)
+}
+
+// mergeMigration returns migrated and reports whether it differs from original.
+func mergeMigration(original, migrated []string, changed bool) ([]string, bool) {
+	if len(original) != len(migrated) {
+		return migrated, true
+	}
+	for i := range original {
+		if original[i] != migrated[i] {
+			return migrated, true
+		}
+	}
+	return original, changed
+}
+
 // BootstrapConfig holds the optional inputs of Bootstrap.
 type BootstrapConfig struct {
 	// Datasets are the datasets that exist right now. They seed the managed datasets-all-read
@@ -333,6 +462,10 @@ func Bootstrap(ctx context.Context, authService auth.Service, ts time.Time, opts
 	cfg := &BootstrapConfig{}
 	for _, opt := range opts {
 		opt(cfg)
+	}
+
+	if _, err := MigrateLegacyManagedPolicies(ctx, authService); err != nil {
+		return err
 	}
 
 	if err := createDatasetPolicies(ctx, authService, []*model.Policy{
@@ -416,10 +549,19 @@ func createDatasetGroups(ctx context.Context, authService auth.Service, ts time.
 // attachDatasetPolicies attaches policies to group, ignoring auth.ErrAlreadyExists. It is a
 // re-attach, not a replace: detaching a built-in policy from a built-in group is undone on the
 // next bootstrap, which is what the reconciler promises for the immutability guard too (§12.3).
+//
+// A group that does not exist in this installation's template (the ACL groups vs the RBAC
+// groups, §9.4) is skipped with a debug log rather than failing the whole bootstrap: the
+// datasets-pins-protect attachment already does the same for the base groups.
 func attachDatasetPolicies(ctx context.Context, authService auth.Service, group string, policies []string) error {
 	for _, policy := range policies {
 		err := authService.AttachPolicyToGroup(ctx, policy, group)
-		if err != nil && !errors.Is(err, auth.ErrAlreadyExists) {
+		switch {
+		case err == nil, errors.Is(err, auth.ErrAlreadyExists):
+		case errors.Is(err, auth.ErrNotFound):
+			logging.FromContext(ctx).WithError(err).WithField("group", group).
+				Debug("datasets: group is not part of this installation's template; skipping policy attachment")
+		default:
 			return err
 		}
 	}

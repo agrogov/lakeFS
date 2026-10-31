@@ -44,11 +44,10 @@ const MetadataFilterPrefix = "metadata."
 
 // server implements apigen.ServerInterface.
 //
-// The in-scope operations delegate to Service: create, get, list, delete, validate, the
-// access grants (§10.1), publish and the version reads, the version diff of §10.3 and the
-// proposals of §5.6. The remaining operations - metadata-key CRUD and GET /datasets/config -
-// still answer 501 with ErrNotImplemented, so a client gets a precise answer instead of a
-// routing error.
+// Every operation delegates to Service: create, get, list, delete, validate, the access
+// grants (§10.1), publish and the version reads, the version diff of §10.3, the proposals of
+// §5.6, metadata-key CRUD and GET /datasets/config. Only reserved item types still map to
+// 501 (ErrUnsupported).
 type server struct {
 	svc      *Service
 	clientIP *httputil.ClientIPResolver
@@ -119,9 +118,9 @@ func writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
 	// ErrRefNotFound came in with the diff card (§10.3 bad left/right ref), ErrProposalNotFound
 	// came in with the proposals card (§5.6, §10.1), and isNotFound covers the store/catalog
 	// path. Every one of them must map to 404: dropping any sends a client-fixable case to 500.
-	case errors.Is(err, ErrDatasetNotFound), errors.Is(err, ErrVersionNotFound), errors.Is(err, ErrTaskNotFound), errors.Is(err, ErrRefNotFound), errors.Is(err, ErrProposalNotFound), isNotFound(err):
+	case errors.Is(err, ErrDatasetNotFound), errors.Is(err, ErrVersionNotFound), errors.Is(err, ErrTaskNotFound), errors.Is(err, ErrRefNotFound), errors.Is(err, ErrProposalNotFound), errors.Is(err, ErrMetadataKeyNotFound), isNotFound(err):
 		httputil.WriteAPIError(w, r, http.StatusNotFound, err.Error())
-	case errors.Is(err, ErrNameTaken), errors.Is(err, ErrDatasetConflict), errors.Is(err, ErrPublishInProgress), errors.Is(err, ErrProposalNotOpen), errors.Is(err, kv.ErrPredicateFailed):
+	case errors.Is(err, ErrNameTaken), errors.Is(err, ErrDatasetConflict), errors.Is(err, ErrPublishInProgress), errors.Is(err, ErrProposalNotOpen), errors.Is(err, ErrMetadataKeyTypeChange), errors.Is(err, ErrMetadataKeyRename), errors.Is(err, kv.ErrPredicateFailed):
 		httputil.WriteAPIError(w, r, http.StatusConflict, err.Error())
 	default:
 		httputil.WriteAPIError(w, r, http.StatusInternalServerError, err.Error())
@@ -322,30 +321,107 @@ func (s *server) RevokeAccess(w http.ResponseWriter, r *http.Request, dataset ap
 	httputil.WriteAPIResponse(w, r, http.StatusNoContent, nil)
 }
 
-// --- generated server interface: operations of later phases ---
+// --- generated server interface: configuration and metadata keys ---
 
 func (s *server) GetDatasetsConfig(w http.ResponseWriter, r *http.Request) {
-	notImplemented(w, r, "GetDatasetsConfig")
+	cfg := s.svc.Config()
+	accessModel := cfg.AccessModel
+	maxItems := cfg.MaxItems
+	storageID := cfg.StorageID
+	syncPublishMaxObjects := int64(cfg.SyncPublishMaxObjects)
+	httputil.WriteAPIResponse(w, r, http.StatusOK, apigen.DatasetsConfig{
+		Enabled:               cfg.Enabled,
+		StorageId:             &storageID,
+		MaxItems:              &maxItems,
+		AccessModel:           &accessModel,
+		SyncPublishMaxObjects: &syncPublishMaxObjects,
+	})
 }
 
-func (s *server) ListMetadataKeys(w http.ResponseWriter, r *http.Request, _ apigen.ListMetadataKeysParams) {
-	notImplemented(w, r, "ListMetadataKeys")
+func (s *server) ListMetadataKeys(w http.ResponseWriter, r *http.Request, params apigen.ListMetadataKeysParams) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	prefix := string(valueOrZero(params.Prefix))
+	result, err := s.svc.ListMetadataKeys(r.Context(), caller, prefix,
+		string(valueOrZero(params.After)), int(valueOrZero(params.Amount)))
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	body := apigen.MetadataKeyList{
+		Results: make([]apigen.MetadataKey, 0, len(result.Keys)),
+		Pagination: apigen.Pagination{
+			HasMore:    result.HasMore,
+			NextOffset: result.NextOffset,
+			Results:    len(result.Keys),
+			MaxPerPage: result.MaxPerPage,
+		},
+	}
+	for _, key := range result.Keys {
+		body.Results = append(body.Results, metadataKeyToAPI(key))
+	}
+	httputil.WriteAPIResponse(w, r, http.StatusOK, body)
 }
 
-func (s *server) CreateMetadataKey(w http.ResponseWriter, r *http.Request, _ apigen.CreateMetadataKeyJSONRequestBody) {
-	notImplemented(w, r, "CreateMetadataKey")
+func (s *server) CreateMetadataKey(w http.ResponseWriter, r *http.Request, body apigen.CreateMetadataKeyJSONRequestBody) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	key, err := s.svc.CreateMetadataKey(r.Context(), caller, metadataKeyFromCreateAPI(apigen.MetadataKeyCreateRequest(body)))
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	logAction(r, ActionCreateMetadataKey, key.Name, 0)
+	httputil.WriteAPIResponse(w, r, http.StatusCreated, metadataKeyToAPI(*key))
 }
 
-func (s *server) GetMetadataKey(w http.ResponseWriter, r *http.Request, _ apigen.MetadataKeyName) {
-	notImplemented(w, r, "GetMetadataKey")
+func (s *server) GetMetadataKey(w http.ResponseWriter, r *http.Request, name apigen.MetadataKeyName) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	key, err := s.svc.GetMetadataKey(r.Context(), caller, string(name))
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	httputil.WriteAPIResponse(w, r, http.StatusOK, metadataKeyToAPI(*key))
 }
 
-func (s *server) UpdateMetadataKey(w http.ResponseWriter, r *http.Request, _ apigen.UpdateMetadataKeyJSONRequestBody, _ apigen.MetadataKeyName) {
-	notImplemented(w, r, "UpdateMetadataKey")
+func (s *server) UpdateMetadataKey(w http.ResponseWriter, r *http.Request, body apigen.UpdateMetadataKeyJSONRequestBody, name apigen.MetadataKeyName) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	key, err := s.svc.UpdateMetadataKey(r.Context(), caller, string(name), metadataKeyFromUpdateAPI(string(name), apigen.MetadataKeyUpdateRequest(body)))
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	logAction(r, ActionUpdateMetadataKey, key.Name, 0)
+	httputil.WriteAPIResponse(w, r, http.StatusOK, metadataKeyToAPI(*key))
 }
 
-func (s *server) DeleteMetadataKey(w http.ResponseWriter, r *http.Request, _ apigen.MetadataKeyName) {
-	notImplemented(w, r, "DeleteMetadataKey")
+func (s *server) DeleteMetadataKey(w http.ResponseWriter, r *http.Request, name apigen.MetadataKeyName) {
+	caller, err := s.caller(r)
+	if err != nil {
+		writeUnauthenticated(w, r)
+		return
+	}
+	if err := s.svc.DeleteMetadataKey(r.Context(), caller, string(name)); err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	logAction(r, ActionDeleteMetadataKey, string(name), 0)
+	httputil.WriteAPIResponse(w, r, http.StatusNoContent, nil)
 }
 
 func (s *server) ListVersions(w http.ResponseWriter, r *http.Request, dataset apigen.DatasetName, params apigen.ListVersionsParams) {
@@ -832,6 +908,65 @@ func grantToAPI(grant *GrantRecord) apigen.AccessGrant {
 		GrantedBy:     &grantedBy,
 		GrantedAt:     &grantedAt,
 	}
+}
+
+// metadataKeyToAPI renders a metadata key definition as the §10.2 MetadataKey schema.
+func metadataKeyToAPI(key MetadataKey) apigen.MetadataKey {
+	out := apigen.MetadataKey{
+		Name:          key.Name,
+		Type:          key.Type,
+		Required:      key.Required,
+		AllowMultiple: key.AllowMultiple,
+		CreatedAt:     key.CreatedAt.UnixMilli(),
+		CreatedBy:     key.CreatedBy,
+	}
+	if len(key.AllowedValues) > 0 {
+		allowed := append([]string(nil), key.AllowedValues...)
+		out.AllowedValues = &allowed
+	}
+	if key.Description != "" {
+		description := key.Description
+		out.Description = &description
+	}
+	return out
+}
+
+// metadataKeyFromCreateAPI converts a create request into the package model. The
+// optional fields default to false/empty, which is the full definition.
+func metadataKeyFromCreateAPI(in apigen.MetadataKeyCreateRequest) MetadataKey {
+	out := MetadataKey{Name: in.Name, Type: in.Type}
+	if in.Required != nil {
+		out.Required = *in.Required
+	}
+	if in.AllowMultiple != nil {
+		out.AllowMultiple = *in.AllowMultiple
+	}
+	if in.AllowedValues != nil {
+		out.AllowedValues = append([]string(nil), (*in.AllowedValues)...)
+	}
+	if in.Description != nil {
+		out.Description = *in.Description
+	}
+	return out
+}
+
+// metadataKeyFromUpdateAPI converts a full-replacement update into the package model.
+// The name travels in the path, not the body.
+func metadataKeyFromUpdateAPI(name string, in apigen.MetadataKeyUpdateRequest) MetadataKey {
+	out := MetadataKey{Name: name, Type: in.Type}
+	if in.Required != nil {
+		out.Required = *in.Required
+	}
+	if in.AllowMultiple != nil {
+		out.AllowMultiple = *in.AllowMultiple
+	}
+	if in.AllowedValues != nil {
+		out.AllowedValues = append([]string(nil), (*in.AllowedValues)...)
+	}
+	if in.Description != nil {
+		out.Description = *in.Description
+	}
+	return out
 }
 
 // proposalToAPI renders a proposal view as the §10.2 Proposal schema. The diffs of the

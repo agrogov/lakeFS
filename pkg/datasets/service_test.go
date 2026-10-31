@@ -6,6 +6,8 @@ package datasets
 // service, which is the implementation the lakefs-sso binary runs.
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"sort"
@@ -496,6 +498,104 @@ func TestServiceDeleteReleasesPinsAndPolicies(t *testing.T) {
 	})
 }
 
+// TestServiceDeleteRejectsLivePublish covers BUG-9: a delete racing a live publish is a 409,
+// while a stale publishing record may be deleted and its resources released.
+func TestServiceDeleteRejectsLivePublish(t *testing.T) {
+	const dataset = "delete-during-publish"
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, "src-delete-publish", map[string]string{"data/a.parquet": "a"})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition("src-delete-publish", commit.String(), "data", "data/"),
+		Publish:    true,
+	})
+	require.NoError(t, err)
+
+	current := f.datasetRecord(t, dataset)
+	live := *current
+	live.State = DatasetStatePublishing
+	live.PendingVersion = 2
+	live.UpdatedAt = f.svc.now()
+	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &live, current))
+
+	err = f.svc.Delete(f.ctx, f.caller(), dataset)
+	require.ErrorIs(t, err, ErrPublishInProgress)
+	require.ErrorIs(t, err, ErrDatasetConflict)
+	_, err = f.cat.GetRepository(f.ctx, dataset)
+	require.NoError(t, err, "the repository survives a rejected delete")
+	require.Equal(t, DatasetStatePublishing, f.datasetRecord(t, dataset).State)
+
+	stale := live
+	stale.UpdatedAt = f.svc.now().Add(-f.cfg.PublishTimeout - time.Minute)
+	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &stale, &live))
+	require.NoError(t, f.svc.Delete(f.ctx, f.caller(), dataset))
+	_, err = f.cat.GetRepository(f.ctx, dataset)
+	require.True(t, isNotFound(err), "a stale publishing record is deleted")
+}
+
+// TestServiceCreateFailureRollsBackInline covers BUG-10: a create that fails after the
+// repository and the guard were written removes them and the record inline, so the name is
+// immediately reusable instead of staying "creating" for a reconcile timeout.
+func TestServiceCreateFailureRollsBackInline(t *testing.T) {
+	const dataset = "create-rollback"
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, "src-create-rollback", map[string]string{"data/a.parquet": "a"})
+	def := prefixDefinition("src-create-rollback", commit.String(), "data", "data/")
+
+	f.svc.publishFn = func(context.Context, *Materializer, PublishRequest) (*PublishResult, error) {
+		return nil, errors.New("metarange write failed")
+	}
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def, Publish: true})
+	require.Error(t, err)
+
+	_, err = f.svc.store.GetDataset(f.ctx, dataset)
+	require.ErrorIs(t, err, kv.ErrNotFound)
+	_, err = f.cat.GetRepository(f.ctx, dataset)
+	require.True(t, isNotFound(err), "the repository of a failed create is removed")
+	_, err = f.authService.GetPolicy(f.ctx, ImmutabilityPolicyName(dataset))
+	require.ErrorIs(t, err, auth.ErrNotFound, "the guard of a failed create is removed")
+
+	f.svc.publishFn = publishWithMaterializer
+	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def, Publish: true})
+	require.NoError(t, err)
+	require.Equal(t, 1, view.Record.LatestVersion)
+}
+
+// TestServiceInjectedClock pins BUG-13: the pin manager and the reconcile lease use the
+// service clock, not time.Now, so fake-clock tests can drive staleness.
+func TestServiceInjectedClock(t *testing.T) {
+	const dataset = "clocked"
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, "src-clocked", map[string]string{"data/a.parquet": "a"})
+	f.createEmptyDataset(t, dataset, prefixDefinition("src-clocked", commit.String(), "data", "data/"))
+
+	fixed := time.Date(2031, 3, 4, 5, 6, 7, 0, time.UTC)
+	f.svc.now = func() time.Time { return fixed }
+	f.svc.store.now = f.svc.now
+	f.svc.pins.now = f.svc.now
+
+	current := f.datasetRecord(t, dataset)
+	degraded := *current
+	degraded.State = DatasetStateDegraded
+	degraded.UpdatedAt = fixed.Add(-time.Hour)
+	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &degraded, current))
+	cleared, err := f.svc.pins.ClearDatasetDegraded(f.ctx, dataset)
+	require.NoError(t, err)
+	require.True(t, cleared)
+	require.True(t, f.datasetRecord(t, dataset).UpdatedAt.Equal(fixed),
+		"the pin manager writes the injected clock")
+
+	acquired, err := f.svc.store.AcquireLease(f.ctx, "clocked-owner", time.Minute)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	res, err := f.kvStore.Get(f.ctx, []byte(PartitionKey), []byte(ReconcileLeaseKey))
+	require.NoError(t, err)
+	var lease leaseRecord
+	require.NoError(t, json.Unmarshal(res.Value, &lease))
+	require.True(t, lease.ExpiresAt.Equal(fixed.Add(time.Minute)),
+		"the reconcile lease uses the injected clock")
+}
+
 func TestServiceValidateReportsEveryProblem(t *testing.T) {
 	f := newServiceFixture(t)
 	def := Definition{
@@ -774,4 +874,48 @@ func policyNames(policies []*model.Policy) []string {
 		names[i] = policy.DisplayName
 	}
 	return names
+}
+
+// TestRollbackCreate_ModifiedRecordIsStillRemoved: the CAS predicate is the freshly read
+// record, so a record changed since creation does not survive the repository's deletion.
+func TestRollbackCreate_ModifiedRecordIsStillRemoved(t *testing.T) {
+	const dataset = "rollback-modified"
+	f := newServiceFixture(t)
+	def := prefixDefinition("src-rollback", "main", "data", "data/")
+	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def})
+	require.NoError(t, err)
+	stale := view.Record
+
+	changed := *stale
+	changed.UpdatedAt = stale.UpdatedAt.Add(time.Minute)
+	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &changed, stale))
+
+	f.svc.rollbackCreate(f.ctx, stale)
+
+	_, err = f.svc.store.GetDataset(f.ctx, dataset)
+	require.ErrorIs(t, err, kv.ErrNotFound)
+}
+
+// failingAllReadAuth fails writes of the aggregate read policy.
+type failingAllReadAuth struct{ auth.Service }
+
+func (a failingAllReadAuth) WritePolicy(ctx context.Context, p *model.Policy, update bool) error {
+	if p.DisplayName == DatasetsAllReadPolicyName {
+		return errors.New("injected all-read policy failure")
+	}
+	return a.Service.WritePolicy(ctx, p, update)
+}
+
+// TestCreate_AllReadPolicyFailureStillReturnsDataset: the dataset is active once the policy
+// sync runs; the reconciler converges the policy, so Create does not fail.
+func TestCreate_AllReadPolicyFailureStillReturnsDataset(t *testing.T) {
+	const dataset = "policy-fails"
+	f := newServiceFixture(t)
+	f.svc.authService = failingAllReadAuth{Service: f.svc.authService}
+	def := prefixDefinition("src-policy", "main", "data", "data/")
+
+	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def})
+	require.NoError(t, err)
+	require.Equal(t, DatasetStateActive, view.Record.State)
+	require.Equal(t, DatasetStateActive, f.datasetRecord(t, dataset).State)
 }

@@ -79,7 +79,7 @@ func (s *Store) AcquireLease(ctx context.Context, owner string, ttl time.Duratio
 	}
 	key := []byte(ReconcileLeaseKey)
 	for attempt := 0; attempt < pinCASRetries; attempt++ {
-		now := time.Now().UTC()
+		now := s.clock().UTC()
 		var predicate kv.Predicate
 		res, err := s.store.Get(ctx, []byte(PartitionKey), key)
 		switch {
@@ -183,11 +183,15 @@ func NewReconciler(svc *Service) *Reconciler {
 			timeout = svc.cfg.PublishTimeout
 		}
 	}
+	clock := time.Now
+	if svc != nil && svc.now != nil {
+		clock = svc.now
+	}
 	owner := reconcileOwnerPrefix
-	if id, err := newULID(time.Now()); err == nil {
+	if id, err := newULID(clock()); err == nil {
 		owner += "-" + id
 	} else {
-		owner += "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+		owner += "-" + strconv.FormatInt(clock().UnixNano(), 36)
 	}
 	r := &Reconciler{
 		svc:      svc,
@@ -696,6 +700,13 @@ func (r *Reconciler) ensureDatasetPolicies(ctx context.Context, dataset string, 
 // ensureInstallationPolicies keeps the installation-wide managed policies in step with the
 // dataset set and re-attaches them to their groups (§9.5 note, §12.3 item 3).
 func (r *Reconciler) ensureInstallationPolicies(ctx context.Context, names []string, report *ReconcileReport) error {
+	// DOC-1: rewrite managed policies still written with the legacy plural namespace.
+	if migrated, err := MigrateLegacyManagedPolicies(ctx, r.svc.authService); err != nil {
+		return err
+	} else if migrated {
+		report.PoliciesReattached++
+		r.log.Warn("datasets: migrated legacy managed policies to the dataset: namespace")
+	}
 	drift, err := DetectDatasetsAllReadDrift(ctx, r.svc.authService, names, r.now())
 	if err != nil {
 		return err

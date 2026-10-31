@@ -1,10 +1,10 @@
 // Package datasets implements the lakeFS OSS Datasets control plane (see DATASETS_DESIGN.md).
 //
 // authz.go holds the authorization building blocks of the control plane, design §9.1-§9.4:
-// the datasets:* action constants, the dataset / metadata-key ARNs, the Authorize helpers the
-// service layer calls, and the per-dataset policies the service attaches (the consumer read
-// policy of §9.2 and the immutability deny policy of §9.4). It contains no HTTP handler: the
-// handlers of §10 map the typed errors below onto 403/500 (§10.4).
+// the dataset:* action constants, the dataset ARNs, the Authorize helpers the service layer
+// calls, and the per-dataset policies the service attaches (the consumer read policy of §9.2
+// and the immutability deny policy of §9.4). It contains no HTTP handler: the handlers of §10
+// map the typed errors below onto 403/500 (§10.4).
 //
 // Clean-room note (§2): written from DATASETS_DESIGN.md and the public lakeFS documentation
 // only. No code, SQL, protobuf or UI asset from lakeFS Enterprise, and nothing from upstream
@@ -24,49 +24,44 @@ import (
 	"github.com/treeverse/lakefs/pkg/permissions"
 )
 
-// datasetsArnPrefix is the ARN prefix of the datasets service, §9.1. The service name is the
-// plural "datasets", which is the serviceSet entry added to pkg/permissions/actions.go by the
-// RBAC work.
-const datasetsArnPrefix = "arn:lakefs:datasets:::"
+// datasetArnPrefix is the ARN prefix of the dataset service, §9.1. The service name is the
+// singular "dataset", matching the public RBAC documentation.
+const datasetArnPrefix = "arn:lakefs:dataset:::"
 
 // Control-plane actions, DATASETS_DESIGN.md §9.1.
 //
 // These constants deliberately live here rather than in pkg/permissions/actions.go: design
-// §4.4 keeps the datasets actions out of actions.gen.go codegen, so nothing has to be
-// regenerated. The "datasets" serviceSet entry already exists in pkg/permissions/actions.go
-// (added by the RBAC work, with the same plural service name), so permissions.IsValidAction -
-// and therefore model.ValidateActionName when a policy is written - accepts every constant
-// below by service prefix alone. No codegen is needed for them, and none may be added: the
-// codegen that produces actions.gen.go only reads pkg/permissions/actions.go.
+// §4.4 keeps the dataset actions out of actions.gen.go codegen, so nothing has to be
+// regenerated. The "dataset" serviceSet entry exists in pkg/permissions/actions.go, so
+// permissions.IsValidAction - and therefore model.ValidateActionName when a policy is written -
+// accepts every constant below by service prefix alone. No codegen is needed for them, and none
+// may be added: the codegen that produces actions.gen.go only reads pkg/permissions/actions.go.
 const (
 	// ActionListDatasets lists datasets. The results are filtered by ActionReadDataset (§9.1).
-	ActionListDatasets = "datasets:ListDatasets"
+	ActionListDatasets = "dataset:ListDatasets"
 	// ActionCreateDataset creates a dataset and its materialised repository (§9.1).
-	ActionCreateDataset = "datasets:CreateDataset"
+	ActionCreateDataset = "dataset:CreateDataset"
 	// ActionReadDataset reads a dataset: definition, versions, diff and proposals (§9.1).
-	ActionReadDataset = "datasets:ReadDataset"
-	// ActionPublishVersion publishes a version, directly or by merging a proposal (§9.1).
-	ActionPublishVersion = "datasets:PublishVersion"
-	// ActionCreateProposal opens, updates or closes a dataset proposal (§9.1).
-	ActionCreateProposal = "datasets:CreateProposal"
+	ActionReadDataset = "dataset:ReadDataset"
+	// ActionUpdateDataset publishes a version, directly or by merging a proposal (§9.1).
+	ActionUpdateDataset = "dataset:UpdateDataset"
 	// ActionDeleteDataset deletes a dataset, its repository and its grants (§9.1, §6.6).
-	ActionDeleteDataset = "datasets:DeleteDataset"
-	// ActionManageAccess grants and revokes consumer access to a dataset (§9.1, §9.2).
-	ActionManageAccess = "datasets:ManageAccess"
-	// ActionManageMetadataKeys manages the typed metadata keys shared by all datasets (§9.1, §5.5).
-	ActionManageMetadataKeys = "datasets:ManageMetadataKeys"
+	ActionDeleteDataset = "dataset:DeleteDataset"
+	// ActionManageAccess grants and revokes consumer access to a dataset (§9.1, §9.2). It is an
+	// extension of this implementation: the public documentation has no access-management action.
+	ActionManageAccess = "dataset:ManageAccess"
+	// Metadata-key actions manage the typed metadata keys shared by all datasets (§9.1, §5.5).
+	ActionListMetadataKeys  = "dataset:ListMetadataKeys"
+	ActionReadMetadataKey   = "dataset:ReadMetadataKey"
+	ActionCreateMetadataKey = "dataset:CreateMetadataKey"
+	ActionUpdateMetadataKey = "dataset:UpdateMetadataKey"
+	ActionDeleteMetadataKey = "dataset:DeleteMetadataKey"
 )
 
 // DatasetArn returns the ARN of the dataset name, §9.1:
-// arn:lakefs:datasets:::dataset/<name>.
+// arn:lakefs:dataset:::dataset/<name>.
 func DatasetArn(name string) string {
-	return datasetsArnPrefix + "dataset/" + name
-}
-
-// MetadataKeyArn returns the ARN of the metadata key key, §9.1:
-// arn:lakefs:datasets:::metadata-key/<key>.
-func MetadataKeyArn(key string) string {
-	return datasetsArnPrefix + "metadata-key/" + key
+	return datasetArnPrefix + "dataset/" + name
 }
 
 // ErrPermissionDenied reports that the authorization decision was "not allowed". Every
@@ -235,10 +230,10 @@ func (a *Authorizer) CheckDataset(ctx context.Context, caller Caller, action, da
 	return a.Check(ctx, caller, DatasetPermission(action, dataset), "")
 }
 
-// CheckMetadataKey authorizes action - ActionManageMetadataKeys or ActionListDatasets - on the
-// metadata key key (§9.1).
-func (a *Authorizer) CheckMetadataKey(ctx context.Context, caller Caller, action, key string) error {
-	return a.Check(ctx, caller, MetadataKeyPermission(action, key), "")
+// CheckMetadataKey authorizes one of the metadata-key actions on the datasets metadata namespace
+// (§9.1).
+func (a *Authorizer) CheckMetadataKey(ctx context.Context, caller Caller, action string) error {
+	return a.Check(ctx, caller, MetadataKeyPermission(action), "")
 }
 
 // CheckSources runs the attach-time source check of §9.3 for every data item: the caller must be
@@ -273,15 +268,11 @@ func DatasetPermission(action, dataset string) permissions.Node {
 	}
 }
 
-// MetadataKeyPermission builds the leaf permission node of a datasets control-plane action on a
-// metadata key (§9.1).
-func MetadataKeyPermission(action, key string) permissions.Node {
-	return permissions.Node{
-		Permission: permissions.Permission{
-			Action:   action,
-			Resource: MetadataKeyArn(key),
-		},
-	}
+// MetadataKeyPermission builds the leaf permission node of a metadata-key action (§9.1). The
+// public action table authorizes every metadata-key operation on the datasets namespace
+// arn:lakefs:dataset:::dataset/*, not on the individual key.
+func MetadataKeyPermission(action string) permissions.Node {
+	return DatasetPermission(action, "*")
 }
 
 // SourceReadNode builds the §9.3 source-read requirement of one data item, as an And node:
@@ -549,8 +540,10 @@ var PinBranchResourcePattern = "arn:lakefs:fs:::repository/*/branch/" + PinBranc
 
 // pinsProtectDeniedActions is the deny action list of the datasets-pins-protect policy (§8.2).
 // fs:DeleteBranch is the action the design names: it removes the pin and disarms the protection of
-// every dataset version pinned to that commit. The other two are the remaining ways a principal can
-// defeat a pin through the API, and both are authorized against a *branch* ARN
+// every dataset version pinned to that commit. fs:CreateBranch is the squatting vector: a
+// principal able to pre-create the pin branch pointing somewhere else makes every publish that
+// pins that commit fail with ErrPinBranchConflict. The other two are the remaining ways a
+// principal can defeat a pin through the API, and both are authorized against a *branch* ARN
 // (pkg/api Controller.Commit and Controller.ResetBranch), so the pin resource pattern matches them:
 // fs:CreateCommit moves the pin's HEAD off the pinned commit, and fs:RevertBranch does the same by
 // pointing it at an ancestor. Deleting the whole source repository also deletes its pins, but that
@@ -558,6 +551,7 @@ var PinBranchResourcePattern = "arn:lakefs:fs:::repository/*/branch/" + PinBranc
 // match); it is the "source repo deleted" risk of §8.2, handled by degraded detection instead.
 var pinsProtectDeniedActions = []string{
 	permissions.DeleteBranchAction,
+	permissions.CreateBranchAction,
 	permissions.CreateCommitAction,
 	permissions.RevertBranchAction,
 }

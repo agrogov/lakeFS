@@ -23,7 +23,7 @@
 //     through the caller's own permissions. The dataset repository is read-only and covered
 //     by the immutability deny policy (§9.4), so the write must happen in the service with
 //     graveler.WithForce(true) (§4.6) - and the reviewer who approves must not need write
-//     access to `latest`, only datasets:PublishVersion (§9.1). Keeping the review state in
+//     access to `latest`, only dataset:UpdateDataset (§9.1). Keeping the review state in
 //     KV keeps that separation: the reviewer's authority is a datasets action, not fs:Write*.
 //
 // The preview branch exists only so a reviewer can browse the actual data; it is not the
@@ -209,7 +209,7 @@ func (s *Service) ListProposals(ctx context.Context, caller Caller, dataset, sta
 // A failure in step 3 leaves no record behind; a failure in step 4 removes the preview
 // branch again, so a proposal is either fully reviewable or absent.
 func (s *Service) CreateProposal(ctx context.Context, caller Caller, dataset string, req CreateProposalRequest) (*ProposalView, error) {
-	if err := s.authorizer.CheckDataset(ctx, caller, ActionCreateProposal, dataset); err != nil {
+	if err := s.authorizer.CheckDataset(ctx, caller, ActionUpdateDataset, dataset); err != nil {
 		return nil, err
 	}
 	if problems := ValidateName(dataset); len(problems) > 0 {
@@ -262,7 +262,7 @@ func (s *Service) CreateProposal(ctx context.Context, caller Caller, dataset str
 	if err := s.materializePreview(ctx, rec, proposal, caller.Username); err != nil {
 		return nil, err
 	}
-	if err := s.store.PutProposal(ctx, proposal); err != nil {
+	if err := s.store.PutProposalIf(ctx, proposal, nil); err != nil {
 		// The preview branch is useless without its record; removing it keeps the
 		// repository free of branches no proposal points at (§5.6).
 		if removeErr := s.removePreviewBranch(ctx, dataset, proposal.PreviewBranch); removeErr != nil {
@@ -300,9 +300,8 @@ func (s *Service) GetProposal(ctx context.Context, caller Caller, dataset, id st
 // `status: closed` closes the proposal and deletes the preview branch with Force, tolerating
 // "not found" (§5.6).
 //
-// Authorization (§10.1): the author needs datasets:CreateProposal on the dataset; any other
-// principal is updating on the author's behalf and needs datasets:PublishVersion, the action
-// a merge needs.
+// Authorization (§10.1): opening, updating and closing a proposal all need
+// dataset:UpdateDataset on the dataset. The docs do not define a separate proposal action.
 func (s *Service) UpdateProposal(ctx context.Context, caller Caller, dataset, id string, req UpdateProposalRequest) (*ProposalView, error) {
 	rec, err := s.loadDataset(ctx, dataset)
 	if err != nil {
@@ -343,7 +342,7 @@ func (s *Service) UpdateProposal(ctx context.Context, caller Caller, dataset, id
 		now := s.now()
 		updated.Status = ProposalStatusClosed
 		updated.ClosedAt = &now
-		if err := s.store.PutProposal(ctx, &updated); err != nil {
+		if err := s.store.PutProposalIf(ctx, &updated, proposal); err != nil {
 			return nil, err
 		}
 		if err := s.removePreviewBranch(ctx, dataset, previewBranchOf(proposal)); err != nil {
@@ -377,7 +376,7 @@ func (s *Service) UpdateProposal(ctx context.Context, caller Caller, dataset, id
 	if err := s.materializePreview(ctx, rec, &updated, caller.Username); err != nil {
 		return nil, err
 	}
-	if err := s.store.PutProposal(ctx, &updated); err != nil {
+	if err := s.store.PutProposalIf(ctx, &updated, proposal); err != nil {
 		return nil, err
 	}
 	return s.proposalView(ctx, rec, &updated), nil
@@ -397,7 +396,7 @@ func (s *Service) UpdateProposal(ctx context.Context, caller Caller, dataset, id
 // On success the proposal is marked merged with the version it produced, and the preview
 // branch is deleted with Force, tolerating "not found" (§5.6).
 func (s *Service) MergeProposal(ctx context.Context, caller Caller, dataset, id string, req MergeProposalRequest) (*VersionRecord, error) {
-	if err := s.authorizer.CheckDataset(ctx, caller, ActionPublishVersion, dataset); err != nil {
+	if err := s.authorizer.CheckDataset(ctx, caller, ActionUpdateDataset, dataset); err != nil {
 		return nil, err
 	}
 	rec, err := s.loadDataset(ctx, dataset)
@@ -460,7 +459,7 @@ func (s *Service) MergeProposal(ctx context.Context, caller Caller, dataset, id 
 	merged.Status = ProposalStatusMerged
 	merged.ClosedAt = &now
 	merged.MergedVersion = version.Version
-	if err := s.store.PutProposal(ctx, &merged); err != nil {
+	if err := s.store.PutProposalIf(ctx, &merged, proposal); err != nil {
 		return nil, err
 	}
 	if err := s.removePreviewBranch(ctx, dataset, previewBranchOf(proposal)); err != nil {
@@ -500,14 +499,11 @@ func (s *Service) loadProposal(ctx context.Context, dataset, id string) (*Propos
 	return proposal, nil
 }
 
-// authorizeProposalWrite applies the authorization split of §10.1 for a proposal write: the
-// author acts with datasets:CreateProposal, any other principal is publishing on the
-// author's behalf and needs datasets:PublishVersion.
-func (s *Service) authorizeProposalWrite(ctx context.Context, caller Caller, dataset, author string) error {
-	if caller.Username == author {
-		return s.authorizer.CheckDataset(ctx, caller, ActionCreateProposal, dataset)
-	}
-	return s.authorizer.CheckDataset(ctx, caller, ActionPublishVersion, dataset)
+// authorizeProposalWrite applies the authorization of §10.1 for a proposal write: the public
+// action table has no separate proposal action, so every proposal write needs
+// dataset:UpdateDataset on the dataset.
+func (s *Service) authorizeProposalWrite(ctx context.Context, caller Caller, dataset, _ string) error {
+	return s.authorizer.CheckDataset(ctx, caller, ActionUpdateDataset, dataset)
 }
 
 // previewBranchOf returns the preview branch of a record, falling back to the derived name

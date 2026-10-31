@@ -486,10 +486,10 @@ func TestProposalMergeRequiresSourceReadForMerger(t *testing.T) {
 		Title:      "a",
 	})
 
-	// PublishVersion on this dataset, but no read access to the source repository.
+	// UpdateDataset on this dataset, but no read access to the source repository.
 	f.addPolicyUser(t, "weak-merger", "weak-merger-publish", model.Statements{{
 		Effect:   model.StatementEffectAllow,
-		Action:   []string{ActionPublishVersion},
+		Action:   []string{ActionUpdateDataset},
 		Resource: DatasetArn(dataset),
 	}})
 
@@ -661,11 +661,11 @@ func TestProposalUpdateRequiresProposalAction(t *testing.T) {
 		UpdateProposalRequest{Title: ptr("hijacked")})
 	require.ErrorIs(t, err, ErrPermissionDenied)
 
-	// A principal with PublishVersion may edit somebody else's proposal (§10.1), and the
+	// A principal with UpdateDataset may edit somebody else's proposal (§10.1), and the
 	// source check of §9.3 then runs for them.
 	f.addPolicyUser(t, "proposal-maintainer", "proposal-maintainer", model.Statements{{
 		Effect:   model.StatementEffectAllow,
-		Action:   []string{ActionPublishVersion},
+		Action:   []string{ActionUpdateDataset},
 		Resource: DatasetArn(dataset),
 	}})
 	updated, err := f.svc.UpdateProposal(f.ctx, f.callerFor("proposal-maintainer"), dataset, proposal.Record.ID,

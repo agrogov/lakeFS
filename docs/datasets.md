@@ -201,10 +201,14 @@ managed `dataset-<name>-immutable` deny policy keeps every non-service principal
 `DELETE /api/v1/datasets/{dataset}/access/{principal_type}/{principal_id}`; listing is
 `GET /api/v1/datasets/{dataset}/access`.
 
-Control-plane actions are authorised on `arn:lakefs:datasets:::dataset/<name>`:
-`datasets:ListDatasets`, `datasets:CreateDataset`, `datasets:ReadDataset`,
-`datasets:PublishVersion`, `datasets:CreateProposal`, `datasets:DeleteDataset`,
-`datasets:ManageAccess` and `datasets:ManageMetadataKeys`. Whoever creates or publishes a
+Control-plane actions are authorised on `arn:lakefs:dataset:::dataset/<name>`:
+`dataset:ListDatasets`, `dataset:ReadDataset`, `dataset:CreateDataset`, `dataset:UpdateDataset`
+(publishing a version, opening or merging a proposal) and `dataset:DeleteDataset`; the metadata-key
+actions `dataset:ListMetadataKeys`, `dataset:ReadMetadataKey`, `dataset:CreateMetadataKey`,
+`dataset:UpdateMetadataKey` and `dataset:DeleteMetadataKey` are authorised on
+`arn:lakefs:dataset:::dataset/*`. `dataset:ManageAccess` (grant and revoke consumer access) is an
+extension of this implementation. The legacy `datasets:` namespace is still accepted when policies
+are validated and managed policies are migrated automatically. Whoever creates or publishes a
 dataset must be able to read every source it attaches (`fs:ReadCommit`, `fs:ReadObject`,
 `fs:ListObjects` on the source repository); a failure names the item that could not be read.
 On a merge the source check runs for the merging principal, because the merge publishes the
@@ -221,7 +225,7 @@ data under their authority.
   consumers, service accounts, and users created without group membership. For those, the
   grant is what makes a dataset readable, and it grants nothing else: the sources stay
   unreadable, and publishing is still denied.
-- The control plane (`datasets:*`) is always governed by policies, never by the base groups'
+- The control plane (`dataset:*`) is always governed by policies, never by the base groups'
   blanket read access.
 
 A `strict` access model that replaces the global read ACLs with per-repository policies is not
@@ -278,7 +282,7 @@ span storage IDs are rejected.
   `GET /datasets/config` are not implemented in this build and answer `501`.
 - **Built-in datasets policies are not created by default.** The RBAC bootstrap can create the
   datasets policies, but it ships with the feature switched off, so a stock installation has
-  no principal with `datasets:*`. Grant the control-plane actions explicitly (see
+  no principal with `dataset:*`. Grant the control-plane actions explicitly (see
   [Access](#access)) or run the bootstrap with the datasets policies enabled before relying on
   the built-in `DatasetsFullAccess` / `DatasetsReadAll` policies.
 - **No dataset-level Python helper.** Reads work through the lakeFS SDK, `lakectl`,

@@ -160,12 +160,25 @@ type PinCatalog interface {
 type Pins struct {
 	store   *Store
 	catalog PinCatalog
+
+	// now is the clock used for the timestamps of the records the manager writes;
+	// production uses the wall clock and the service injects its own clock.
+	now func() time.Time
 }
 
 // NewPins returns a pin manager over the datasets KV store and the catalog. The manager does not
 // own either.
 func NewPins(store *Store, cat PinCatalog) *Pins {
-	return &Pins{store: store, catalog: cat}
+	return &Pins{store: store, catalog: cat, now: time.Now}
+}
+
+// clock reports the manager's clock, falling back to the wall clock when the manager was
+// built without one.
+func (p *Pins) clock() time.Time {
+	if p.now != nil {
+		return p.now()
+	}
+	return time.Now()
 }
 
 // available reports whether the manager is usable. Every public method checks it and fails closed
@@ -371,7 +384,7 @@ func (p *Pins) ClearDatasetDegraded(ctx context.Context, dataset string) (bool, 
 		}
 		next := *rec
 		next.State = DatasetStateActive
-		next.UpdatedAt = time.Now().UTC()
+		next.UpdatedAt = p.clock().UTC()
 		err = p.store.PutDatasetIf(ctx, &next, rec)
 		if errors.Is(err, kv.ErrPredicateFailed) {
 			continue // the record changed under us; re-read and retry
@@ -531,7 +544,7 @@ func (p *Pins) markDegraded(ctx context.Context, dataset string) (bool, error) {
 		}
 		next := *rec
 		next.State = DatasetStateDegraded
-		next.UpdatedAt = time.Now().UTC()
+		next.UpdatedAt = p.clock().UTC()
 		err = p.store.PutDatasetIf(ctx, &next, rec)
 		if errors.Is(err, kv.ErrPredicateFailed) {
 			continue // the record changed under us; re-read and retry

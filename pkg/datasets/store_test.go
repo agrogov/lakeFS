@@ -270,7 +270,7 @@ func TestStoreRoundTrip(t *testing.T) {
 			CreatedAt:     testTime(),
 			CreatedBy:     "alice",
 		}
-		require.NoError(t, store.PutMetadataKey(ctx, want))
+		require.NoError(t, store.PutMetadataKey(ctx, want, nil))
 		got, err := store.GetMetadataKey(ctx, want.Name)
 		require.NoError(t, err)
 		requireJSONEq(t, want, got)
@@ -401,7 +401,7 @@ func TestStoreNotFound(t *testing.T) {
 	// Deleting a missing record is not an error.
 	require.NoError(t, store.DeleteDataset(ctx, "customer-360", nil))
 	require.NoError(t, store.DeleteProposal(ctx, "customer-360", "01J9Z6Q0K8"))
-	require.NoError(t, store.DeleteMetadataKey(ctx, "tier"))
+	require.NoError(t, store.DeleteMetadataKey(ctx, "tier", nil))
 	require.NoError(t, store.DeletePin(ctx, "lakehouse-repo", "30f9eb1c"))
 	require.NoError(t, store.DeleteGrant(ctx, "customer-360", PrincipalTypeUser, "alice"))
 }
@@ -755,7 +755,7 @@ func TestStorePartitionLayout(t *testing.T) {
 		Status:    ProposalStatusOpen,
 		CreatedAt: testTime(),
 	}))
-	require.NoError(t, store.PutMetadataKey(ctx, MetadataKey{Name: "tier", Type: MetadataTypeString}))
+	require.NoError(t, store.PutMetadataKey(ctx, MetadataKey{Name: "tier", Type: MetadataTypeString}, nil))
 	require.NoError(t, store.PutGrant(ctx, &GrantRecord{
 		Dataset:       "customer-360",
 		PrincipalType: PrincipalTypeUser,

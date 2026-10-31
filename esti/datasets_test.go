@@ -431,7 +431,7 @@ func grantDatasetsControlPlane(t *testing.T, env *datasetsEnv) {
 		Id: policyID,
 		Statement: []apigen.Statement{{
 			Effect:   "allow",
-			Action:   []string{"datasets:*"},
+			Action:   []string{"dataset:*"},
 			Resource: "*",
 		}},
 	})

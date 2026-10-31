@@ -218,7 +218,7 @@ func TestSpikeS2b_ArnMatchWildcardInResource(t *testing.T) {
 		{"suffix wildcard inside a mid-resource wildcard", "arn:lakefs:fs:::repository/lakehouse-repo/branch/_lakefs_ds_pin_30f9*", pinBranch, true},
 		{"mid-resource wildcard with a fixed repo name does not leak to another repo", "arn:lakefs:fs:::repository/lakehouse-repo/branch/_lakefs_ds_pin_*", permissions.BranchArn("lakehouse-repo-2", "_lakefs_ds_pin_30f9eb1c"), false},
 		{"all-resources policy matches", permissions.All, pinBranch, true},
-		{"service mismatch does not match", "arn:lakefs:datasets:::dataset/*", pinBranch, false},
+		{"service mismatch does not match", "arn:lakefs:catalog:::dataset/*", pinBranch, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

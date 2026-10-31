@@ -6,12 +6,14 @@
 package datasets
 
 import (
+	"errors"
 	"sort"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/contrib/auth/acl"
+	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/model"
 	"github.com/treeverse/lakefs/pkg/permissions"
 )
@@ -93,33 +95,39 @@ func TestBootstrapCreatesTheBuiltins(t *testing.T) {
 	// known datasets is the list statement alone.
 	tests := map[string]model.Statements{
 		DatasetsFullAccessPolicyName: {
-			{Effect: model.StatementEffectAllow, Action: []string{"datasets:*"}, Resource: permissions.All},
+			{Effect: model.StatementEffectAllow, Action: []string{"dataset:*"}, Resource: DatasetArn("*")},
 		},
 		DatasetsReadWriteAllPolicyName: {
-			{Effect: model.StatementEffectAllow, Resource: permissions.All, Action: []string{
-				"datasets:ListDatasets", "datasets:CreateDataset", "datasets:ReadDataset",
-				"datasets:PublishVersion", "datasets:CreateProposal",
+			{Effect: model.StatementEffectAllow, Resource: DatasetArn("*"), Action: []string{
+				"dataset:ListDatasets", "dataset:ReadDataset", "dataset:CreateDataset",
+				"dataset:UpdateDataset",
+				"dataset:ListMetadataKeys", "dataset:ReadMetadataKey",
 			}},
 		},
 		DatasetsReadAllPolicyName: {
-			{Effect: model.StatementEffectAllow, Resource: permissions.All, Action: []string{
-				"datasets:ListDatasets", "datasets:ReadDataset",
+			{Effect: model.StatementEffectAllow, Resource: DatasetArn("*"), Action: []string{
+				"dataset:ListDatasets", "dataset:ReadDataset",
+				"dataset:ListMetadataKeys", "dataset:ReadMetadataKey",
 			}},
 		},
 		DatasetsManageMetadataKeysPolicyName: {
-			{Effect: model.StatementEffectAllow, Resource: permissions.All, Action: []string{
-				"datasets:ManageMetadataKeys",
+			{Effect: model.StatementEffectAllow, Resource: DatasetArn("*"), Action: []string{
+				"dataset:ListMetadataKeys", "dataset:ReadMetadataKey", "dataset:CreateMetadataKey",
+				"dataset:UpdateMetadataKey", "dataset:DeleteMetadataKey",
 			}},
 		},
 		DatasetsAllReadPolicyName: {
 			{Effect: model.StatementEffectAllow, Resource: permissions.All, Action: []string{
-				"fs:ListRepositories", "datasets:ListDatasets",
+				"fs:ListRepositories", "dataset:ListDatasets",
 			}},
 		},
 		DatasetsPinsProtectPolicyName: {
 			{
-				Effect:   model.StatementEffectDeny,
-				Action:   []string{permissions.DeleteBranchAction, permissions.CreateCommitAction, permissions.RevertBranchAction},
+				Effect: model.StatementEffectDeny,
+				Action: []string{
+					permissions.DeleteBranchAction, permissions.CreateBranchAction,
+					permissions.CreateCommitAction, permissions.RevertBranchAction,
+				},
 				Resource: "arn:lakefs:fs:::repository/*/branch/_lakefs_ds_pin_*",
 			},
 		},
@@ -131,14 +139,15 @@ func TestBootstrapCreatesTheBuiltins(t *testing.T) {
 		require.Equal(t, ts, policy.CreatedAt, "policy %s must carry the bootstrap timestamp", name)
 	}
 
-	// §9.5: ReadWriteAll must not hand out deletion, access management or metadata-key
-	// management, and DatasetsReadAll must not hand out publishing.
+	// §9.5: ReadWriteAll must not hand out access management or metadata-key management, and
+	// DatasetsReadAll must not hand out publishing.
 	for _, denied := range []string{
-		ActionDeleteDataset, ActionManageAccess, ActionManageMetadataKeys,
+		ActionManageAccess,
+		ActionCreateMetadataKey, ActionUpdateMetadataKey, ActionDeleteMetadataKey,
 	} {
 		require.NotContains(t, actionSet(t, f, DatasetsReadWriteAllPolicyName), denied)
 	}
-	require.NotContains(t, actionSet(t, f, DatasetsReadAllPolicyName), ActionPublishVersion)
+	require.NotContains(t, actionSet(t, f, DatasetsReadAllPolicyName), ActionUpdateDataset)
 }
 
 // TestBootstrapIsIdempotent is the §15.1 idempotency test: a second run creates no duplicate
@@ -216,10 +225,10 @@ func TestDatasetsAllReadPolicy(t *testing.T) {
 	// Sorted and deduplicated, so the statement list is stable for a given dataset set.
 	require.Equal(t, "arn:lakefs:fs:::repository/customer-360", policy.Statement[0].Resource)
 	require.Equal(t, "arn:lakefs:fs:::repository/customer-360/object/*", policy.Statement[1].Resource)
-	require.Equal(t, "arn:lakefs:datasets:::dataset/customer-360", policy.Statement[2].Resource)
+	require.Equal(t, "arn:lakefs:dataset:::dataset/customer-360", policy.Statement[2].Resource)
 	require.Equal(t, "arn:lakefs:fs:::repository/events", policy.Statement[3].Resource)
 	require.Equal(t, "arn:lakefs:fs:::repository/events/object/*", policy.Statement[4].Resource)
-	require.Equal(t, "arn:lakefs:datasets:::dataset/events", policy.Statement[5].Resource)
+	require.Equal(t, "arn:lakefs:dataset:::dataset/events", policy.Statement[5].Resource)
 
 	for i := 0; i < 6; i++ {
 		require.Equal(t, model.StatementEffectAllow, policy.Statement[i].Effect)
@@ -308,7 +317,7 @@ func TestBootstrapAllReadGrantsDataPlaneRead(t *testing.T) {
 		"a consumer must be able to read the data of an existing dataset")
 	require.NoError(t, f.authz.CheckDataset(ctx, consumer, ActionReadDataset, "customer-360"))
 	// The consumer grant is data-plane only: it does not publish, delete or manage access.
-	for _, action := range []string{ActionPublishVersion, ActionDeleteDataset, ActionManageAccess} {
+	for _, action := range []string{ActionUpdateDataset, ActionDeleteDataset, ActionManageAccess} {
 		require.Error(t, f.authz.CheckDataset(ctx, consumer, action, "customer-360"),
 			"a consumer must not be allowed to %s", action)
 	}
@@ -347,12 +356,20 @@ func TestBootstrapPinsProtectDeniesPinBranchDeletion(t *testing.T) {
 			Resource: permissions.BranchArn(repo, branch),
 		}}
 	}
+	createBranch := func(repo, branch string) permissions.Node {
+		return permissions.Node{Permission: permissions.Permission{
+			Action:   permissions.CreateBranchAction,
+			Resource: permissions.BranchArn(repo, branch),
+		}}
+	}
 	for _, user := range []string{"writer", "operator"} {
 		caller := Caller{Username: user}
 		require.ErrorIs(t, f.authz.Check(ctx, caller, deleteBranch("lakehouse-repo", "_lakefs_ds_pin_30f9eb1c"), ""),
 			ErrPermissionDenied, "%s must not be able to delete a pin branch", user)
 		require.ErrorIs(t, f.authz.Check(ctx, caller, deleteBranch("ref-data", "_lakefs_ds_pin_abc"), ""),
 			ErrPermissionDenied, "%s must not be able to delete a pin branch in another repository", user)
+		require.ErrorIs(t, f.authz.Check(ctx, caller, createBranch("lakehouse-repo", "_lakefs_ds_pin_squat"), ""),
+			ErrPermissionDenied, "%s must not be able to pre-create a pin branch", user)
 	}
 
 	// The deny is scoped to pin branches: with the default deny-all base policy, an ordinary branch
@@ -365,6 +382,75 @@ func TestBootstrapPinsProtectDeniesPinBranchDeletion(t *testing.T) {
 	f.attachToGroup(t, "allow-delete-feature", "Writers")
 	require.NoError(t, f.authz.Check(ctx, Caller{Username: "writer"}, deleteBranch("lakehouse-repo", "feature"), ""),
 		"datasets-pins-protect must not affect ordinary branches")
+}
+
+// TestMigrateLegacyManagedPolicies pins the DOC-1 migration: legacy plural datasets actions and
+// ARNs in the managed policies are rewritten to the singular dataset namespace, coarse
+// ManageMetadataKeys expands to the five documented actions, and the migration is idempotent.
+func TestMigrateLegacyManagedPolicies(t *testing.T) {
+	t.Parallel()
+	f := newAuthzFixture(t)
+	ctx := t.Context()
+	ts := time.Date(2026, 10, 28, 10, 0, 0, 0, time.UTC)
+
+	legacyRead := &model.Policy{
+		CreatedAt:   ts,
+		DisplayName: "dataset-customer-360-read",
+		Statement: model.Statements{
+			{Effect: model.StatementEffectAllow, Action: []string{permissions.ReadRepositoryAction}, Resource: permissions.RepoArn("customer-360")},
+			{Effect: model.StatementEffectAllow, Action: []string{"datasets:ReadDataset"}, Resource: "arn:lakefs:datasets:::dataset/customer-360"},
+			{Effect: model.StatementEffectAllow, Action: []string{permissions.ListRepositoriesAction, "datasets:ListDatasets"}, Resource: permissions.All},
+		},
+	}
+	require.NoError(t, f.svc.WritePolicy(ctx, legacyRead, false))
+	require.NoError(t, f.svc.WritePolicy(ctx, &model.Policy{
+		CreatedAt:   ts,
+		DisplayName: DatasetsFullAccessPolicyName,
+		Statement:   model.Statements{{Effect: model.StatementEffectAllow, Action: []string{"datasets:*"}, Resource: permissions.All}},
+	}, false))
+	require.NoError(t, f.svc.WritePolicy(ctx, &model.Policy{
+		CreatedAt:   ts,
+		DisplayName: DatasetsManageMetadataKeysPolicyName,
+		Statement:   model.Statements{{Effect: model.StatementEffectAllow, Action: []string{"datasets:ManageMetadataKeys"}, Resource: permissions.All}},
+	}, false))
+	require.NoError(t, f.svc.WritePolicy(ctx, &model.Policy{
+		CreatedAt:   ts,
+		DisplayName: DatasetsPinsProtectPolicyName,
+		Statement:   model.Statements{{Effect: model.StatementEffectDeny, Action: []string{permissions.DeleteBranchAction}, Resource: PinBranchResourcePattern}},
+	}, false))
+
+	changed, err := MigrateLegacyManagedPolicies(ctx, f.svc)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	read, err := f.svc.GetPolicy(ctx, "dataset-customer-360-read")
+	require.NoError(t, err)
+	require.Equal(t, model.Statements{
+		{Effect: model.StatementEffectAllow, Action: []string{permissions.ReadRepositoryAction}, Resource: permissions.RepoArn("customer-360"), Condition: map[string]map[string][]string{}},
+		{Effect: model.StatementEffectAllow, Action: []string{"dataset:ReadDataset"}, Resource: "arn:lakefs:dataset:::dataset/customer-360", Condition: map[string]map[string][]string{}},
+		{Effect: model.StatementEffectAllow, Action: []string{permissions.ListRepositoriesAction, "dataset:ListDatasets"}, Resource: permissions.All, Condition: map[string]map[string][]string{}},
+	}, read.Statement)
+
+	full, err := f.svc.GetPolicy(ctx, DatasetsFullAccessPolicyName)
+	require.NoError(t, err)
+	require.Equal(t, []string{"dataset:*"}, full.Statement[0].Action)
+
+	keys, err := f.svc.GetPolicy(ctx, DatasetsManageMetadataKeysPolicyName)
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		ActionListMetadataKeys, ActionReadMetadataKey, ActionCreateMetadataKey,
+		ActionUpdateMetadataKey, ActionDeleteMetadataKey,
+	}, keys.Statement[0].Action)
+
+	// The pins-protect policy had no legacy token, so it was not rewritten.
+	pins, err := f.svc.GetPolicy(ctx, DatasetsPinsProtectPolicyName)
+	require.NoError(t, err)
+	require.Equal(t, ts, pins.CreatedAt)
+
+	// A second run changes nothing.
+	changed, err = MigrateLegacyManagedPolicies(ctx, f.svc)
+	require.NoError(t, err)
+	require.False(t, changed)
 }
 
 // TestBootstrapWithoutServiceFailsClosed pins that a missing auth service is an error, not a
@@ -396,4 +482,89 @@ func actionSet(t *testing.T, f *authzFixture, policyName string) []string {
 		actions = append(actions, stmt.Action...)
 	}
 	return actions
+}
+
+// TestBootstrapFreshRBACInstall pins SEC-1: on a fresh RBAC installation (Admins, SuperUsers,
+// Developers and Viewers exist) Bootstrap creates datasets-pins-protect and attaches it to
+// Developers and Admins, attaches the built-ins by the documented group mapping, and the
+// reconciler pass that follows reports no error.
+func TestBootstrapFreshRBACInstall(t *testing.T) {
+	t.Parallel()
+	f := newServiceFixture(t)
+	ctx := f.ctx
+	for _, name := range []string{"Admins", "SuperUsers", "Developers", "Viewers"} {
+		_, err := f.authService.CreateGroup(ctx, &model.Group{CreatedAt: f.ts, DisplayName: name})
+		if !errors.Is(err, auth.ErrAlreadyExists) {
+			require.NoError(t, err)
+		}
+	}
+	require.NoError(t, Bootstrap(ctx, f.authService, f.ts))
+	require.NoError(t, Bootstrap(ctx, f.authService, f.ts), "bootstrap must be idempotent")
+
+	groupPolicies := func(group string) []string {
+		policies, _, err := f.authService.ListGroupPolicies(ctx, group, &model.PaginationParams{Amount: -1})
+		require.NoError(t, err)
+		names := make([]string, 0, len(policies))
+		for _, policy := range policies {
+			names = append(names, policy.DisplayName)
+		}
+		return names
+	}
+	require.Contains(t, groupPolicies("Developers"), DatasetsPinsProtectPolicyName)
+	require.Contains(t, groupPolicies("Admins"), DatasetsPinsProtectPolicyName)
+
+	report, err := f.reconcilerFor().Reconcile(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, report)
+	require.Zero(t, report.Errors)
+}
+
+// TestPinsProtectDeniesDevelopers checks that a member of Developers can neither delete nor
+// pre-create a pin branch (SEC-9) while an ordinary allow still works elsewhere.
+func TestPinsProtectDeniesDevelopers(t *testing.T) {
+	t.Parallel()
+	f := newAuthzFixture(t)
+	ctx := t.Context()
+	f.group(t, "Developers")
+	f.user(t, "dev")
+	f.addToGroup(t, "dev", "Developers")
+	require.NoError(t, Bootstrap(ctx, f.svc, time.Date(2026, 10, 28, 10, 0, 0, 0, time.UTC)))
+	require.Contains(t, f.groupPolicyNames(t, "Developers"), DatasetsPinsProtectPolicyName)
+
+	for _, action := range []string{permissions.DeleteBranchAction, permissions.CreateBranchAction} {
+		node := permissions.Node{Permission: permissions.Permission{
+			Action:   action,
+			Resource: permissions.BranchArn("src", "_lakefs_ds_pin_x"),
+		}}
+		require.ErrorIs(t, f.authz.Check(ctx, Caller{Username: "dev"}, node, ""), ErrPermissionDenied, action)
+	}
+}
+
+func TestDatasetsReadWriteAllDeniesDelete(t *testing.T) {
+	t.Parallel()
+	f := newAuthzFixture(t)
+	ts := time.Date(2026, 10, 28, 10, 0, 0, 0, time.UTC)
+	ctx := t.Context()
+
+	f.user(t, "publisher")
+	require.NoError(t, Bootstrap(ctx, f.svc, ts))
+	f.addToGroup(t, "publisher", DatasetPublishersGroup)
+
+	caller := Caller{Username: "publisher"}
+	require.NoError(t, f.authz.CheckDataset(ctx, caller, ActionUpdateDataset, "customer-360"))
+	require.Error(t, f.authz.CheckDataset(ctx, caller, ActionDeleteDataset, "customer-360"),
+		"DatasetsReadWriteAll must not grant dataset:DeleteDataset")
+	for _, a := range datasetsReadWriteAllPolicy(ts).Statement[0].Action {
+		require.NotEqual(t, ActionDeleteDataset, a)
+	}
+}
+
+func TestMigrateLegacyActionsDeduplicates(t *testing.T) {
+	t.Parallel()
+	got := migrateLegacyActions([]string{
+		legacyActionPrefix + "PublishVersion",
+		legacyActionPrefix + "CreateProposal",
+		ActionUpdateDataset,
+	})
+	require.Equal(t, []string{ActionUpdateDataset}, got)
 }

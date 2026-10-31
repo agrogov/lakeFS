@@ -271,12 +271,25 @@ func PinReference(dataset string, version int) string {
 // The zero Store is unusable: build one with NewStore.
 type Store struct {
 	store kv.Store
+
+	// now is the clock used for records owned by the store (the reconcile lease);
+	// production uses the wall clock and tests replace it through the service.
+	now func() time.Time
 }
 
 // NewStore returns a Store backed by kvs. The Store does not own kvs and never
 // closes it.
 func NewStore(kvs kv.Store) *Store {
-	return &Store{store: kvs}
+	return &Store{store: kvs, now: time.Now}
+}
+
+// clock reports the store's clock, falling back to the wall clock when the store was
+// built without one.
+func (s *Store) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
 }
 
 // ----------------------------------------------------------------------------
@@ -565,26 +578,68 @@ func (s *Store) PutDatasetIf(ctx context.Context, rec, previous *DatasetRecord) 
 	if err != nil {
 		return err
 	}
-	var predicate kv.Predicate
-	if previous != nil {
-		if previous.Name != rec.Name {
-			return fmt.Errorf("%w: previous record is dataset %q, new record is %q",
-				ErrRecordMismatch, previous.Name, rec.Name)
-		}
-		// The predicate is compared byte for byte with the stored value, and
-		// DatasetRecord has neither map nor float fields, so re-encoding the record
-		// that was read reproduces the stored value exactly.
-		previousValue, err := datasetValue(previous)
-		if err != nil {
-			return err
-		}
-		predicate = previousValue
-	}
 	value, err := datasetValue(rec)
 	if err != nil {
 		return err
 	}
-	return s.store.SetIf(ctx, []byte(PartitionKey), key, value, predicate)
+	if previous == nil {
+		return s.store.SetIf(ctx, []byte(PartitionKey), key, value, nil)
+	}
+	if previous.Name != rec.Name {
+		return fmt.Errorf("%w: previous record is dataset %q, new record is %q",
+			ErrRecordMismatch, previous.Name, rec.Name)
+	}
+	expected, err := datasetValue(previous)
+	if err != nil {
+		return err
+	}
+	return s.setIfUnchanged(ctx, key, value, expected, canonicalValue[DatasetRecord])
+}
+
+// setIfUnchanged writes value at key only if the stored record is still the one
+// expected (compared in canonical encoding, see canonicalValue).
+//
+// The SetIf predicate is the one kv.Store.Get returned for the value just compared,
+// never one rebuilt from a record: a store may use an opaque predicate (CosmosDB uses
+// an ETag, pkg/kv/cosmosdb/store.go), and the others compare bytes. Because the
+// predicate guards exactly the value that was compared, the read-compare-write is
+// atomic. A record that vanished in between is a lost race, like any other change.
+func (s *Store) setIfUnchanged(ctx context.Context, key, value, expected []byte, canon func([]byte) ([]byte, error)) error {
+	res, err := s.store.Get(ctx, []byte(PartitionKey), key)
+	if errors.Is(err, kv.ErrNotFound) {
+		return kv.ErrPredicateFailed
+	}
+	if err != nil {
+		return err
+	}
+	current, err := canon(res.Value)
+	if err != nil {
+		return err
+	}
+	// Canonicalize the expected side the same way, so the comparison does not depend
+	// on how the caller encoded previous.
+	want, err := canon(expected)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(current, want) {
+		return kv.ErrPredicateFailed
+	}
+	return s.store.SetIf(ctx, []byte(PartitionKey), key, value, res.Predicate)
+}
+
+// canonicalValue decodes a stored record and encodes it again, so that two encodings
+// of the same record compare equal even when the record has map fields.
+func canonicalValue[T any](raw []byte) ([]byte, error) {
+	var rec T
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		return nil, fmt.Errorf("datasets: decode record for compare: %w", err)
+	}
+	out, err := json.Marshal(&rec)
+	if err != nil {
+		return nil, fmt.Errorf("datasets: encode record for compare: %w", err)
+	}
+	return out, nil
 }
 
 // CreateDataset writes a new dataset record. It fails with kv.ErrPredicateFailed if a
@@ -596,10 +651,10 @@ func (s *Store) CreateDataset(ctx context.Context, rec *DatasetRecord) error {
 // DeleteDataset removes the record of name.
 //
 // previous bounds the delete the way PutDatasetIf bounds a write: pass the record as
-// last read or written, or nil to delete unconditionally. kv.Store has no
-// conditional delete, so the comparison is a read followed by a delete; on conflict
-// the record is left untouched and kv.ErrPredicateFailed is returned. A delete that
-// loses that race is finished by the reconciler (§6.6, §12.3).
+// last read or written, or nil to delete unconditionally. kv.Store has no conditional
+// delete (and so no predicate to pass), so the comparison is a read followed by a
+// delete; on conflict the record is left untouched and kv.ErrPredicateFailed is
+// returned. A delete that loses that race is finished by the reconciler (§6.6, §12.3).
 func (s *Store) DeleteDataset(ctx context.Context, name string, previous *DatasetRecord) error {
 	key, err := datasetKey(name)
 	if err != nil {
@@ -616,6 +671,12 @@ func (s *Store) DeleteDataset(ctx context.Context, name string, previous *Datase
 		}
 		current, err := s.get(ctx, key)
 		if err != nil {
+			return err
+		}
+		if current, err = canonicalValue[DatasetRecord](current); err != nil {
+			return err
+		}
+		if want, err = canonicalValue[DatasetRecord](want); err != nil {
 			return err
 		}
 		if !bytes.Equal(current, want) {
@@ -782,11 +843,41 @@ func (s *Store) GetProposal(ctx context.Context, dataset, id string) (*ProposalR
 	return decodeRecord[ProposalRecord]("proposal record", key, value)
 }
 
-// PutProposal writes a proposal record. Unlike a DatasetRecord, a proposal is
-// mutable (title, description, status and definition change while it is open, §5.6),
-// so this is a plain last-writer-wins Set. The guard against a stale proposal is
-// BaseVersion against the dataset's LatestVersion at merge time (§5.6), not the KV
-// write.
+// PutProposalIf writes a proposal record only if the stored record still equals
+// previous (the record as last read by GetProposal), so a merge racing a close or an
+// update cannot overwrite it (DATASETS_REVIEW BUG-8). A nil previous means "the
+// proposal must not exist yet", which is how a proposal is created.
+//
+// kv.ErrPredicateFailed is returned unchanged when the caller lost the race. The
+// predicate handed to SetIf comes from kv.Get (see setIfUnchanged).
+func (s *Store) PutProposalIf(ctx context.Context, rec, previous *ProposalRecord) error {
+	if rec == nil {
+		return fmt.Errorf("datasets: %w", ErrNilRecord)
+	}
+	key, err := proposalKey(rec.Dataset, rec.ID)
+	if err != nil {
+		return err
+	}
+	value, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("datasets: encode proposal record %q: %w", rec.ID, err)
+	}
+	if previous == nil {
+		return s.store.SetIf(ctx, []byte(PartitionKey), key, value, nil)
+	}
+	if previous.Dataset != rec.Dataset || previous.ID != rec.ID {
+		return fmt.Errorf("%w: previous record is proposal %q/%q, new record is %q/%q",
+			ErrRecordMismatch, previous.Dataset, previous.ID, rec.Dataset, rec.ID)
+	}
+	expected, err := json.Marshal(previous)
+	if err != nil {
+		return fmt.Errorf("datasets: encode proposal record %q: %w", previous.ID, err)
+	}
+	return s.setIfUnchanged(ctx, key, value, expected, canonicalValue[ProposalRecord])
+}
+
+// PutProposal writes a proposal record unconditionally. Service code uses
+// PutProposalIf; this remains for tests and tools that seed records.
 func (s *Store) PutProposal(ctx context.Context, rec *ProposalRecord) error {
 	if rec == nil {
 		return fmt.Errorf("datasets: %w", ErrNilRecord)
@@ -861,7 +952,12 @@ func (s *Store) GetMetadataKey(ctx context.Context, name string) (*MetadataKey, 
 // PutMetadataKey writes a metadata key definition. Metadata keys are global (§5.5),
 // so this is not namespaced by dataset name. Callers validate the definition with
 // ValidateMetadataKey or ValidateKeyUpdate first; the store does not.
-func (s *Store) PutMetadataKey(ctx context.Context, key MetadataKey) error {
+//
+// previous is the definition as last read (GetMetadataKey): the write is then a CAS
+// against it and returns kv.ErrPredicateFailed when another client changed the key.
+// A nil previous means "the key must not exist yet", which is how a create is
+// expressed (§5.5).
+func (s *Store) PutMetadataKey(ctx context.Context, key MetadataKey, previous *MetadataKey) error {
 	path, err := metadataKeyKey(key.Name)
 	if err != nil {
 		return err
@@ -870,15 +966,57 @@ func (s *Store) PutMetadataKey(ctx context.Context, key MetadataKey) error {
 	if err != nil {
 		return fmt.Errorf("datasets: encode metadata key %q: %w", key.Name, err)
 	}
-	return s.put(ctx, path, value)
+	if previous == nil {
+		return s.store.SetIf(ctx, []byte(PartitionKey), path, value, nil)
+	}
+	if previous.Name != key.Name {
+		return fmt.Errorf("%w: previous metadata key is %q, new key is %q",
+			ErrRecordMismatch, previous.Name, key.Name)
+	}
+	expected, err := json.Marshal(previous)
+	if err != nil {
+		return fmt.Errorf("datasets: encode previous metadata key %q: %w", key.Name, err)
+	}
+	return s.setIfUnchanged(ctx, path, value, expected, canonicalValue[MetadataKey])
 }
 
 // DeleteMetadataKey removes a metadata key definition. Existing metadata values are
 // not touched: they simply become free-form (§5.5).
-func (s *Store) DeleteMetadataKey(ctx context.Context, name string) error {
+//
+// previous bounds the delete like PutMetadataKey: pass the definition as last read, or
+// nil to delete unconditionally. A concurrent update leaves the key untouched and
+// returns kv.ErrPredicateFailed.
+func (s *Store) DeleteMetadataKey(ctx context.Context, name string, previous *MetadataKey) error {
 	key, err := metadataKeyKey(name)
 	if err != nil {
 		return err
+	}
+	if previous != nil {
+		if previous.Name != name {
+			return fmt.Errorf("%w: previous metadata key is %q, delete is for %q",
+				ErrRecordMismatch, previous.Name, name)
+		}
+		expected, err := json.Marshal(previous)
+		if err != nil {
+			return fmt.Errorf("datasets: encode previous metadata key %q: %w", name, err)
+		}
+		current, err := s.get(ctx, key)
+		if errors.Is(err, kv.ErrNotFound) {
+			return kv.ErrPredicateFailed
+		}
+		if err != nil {
+			return err
+		}
+		current, err = canonicalValue[MetadataKey](current)
+		if err != nil {
+			return err
+		}
+		if expected, err = canonicalValue[MetadataKey](expected); err != nil {
+			return err
+		}
+		if !bytes.Equal(current, expected) {
+			return kv.ErrPredicateFailed
+		}
 	}
 	return s.delete(ctx, key)
 }
