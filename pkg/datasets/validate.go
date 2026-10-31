@@ -216,9 +216,15 @@ func validateItems(d *Definition) []Problem {
 			if item.Object != nil && item.Object.Path == "" {
 				problems = append(problems, Problem{Path: itemPath(i, "object.path"), Message: "required"})
 			}
+			if item.Object != nil {
+				problems = append(problems, wildcardProblems(itemPath(i, "object.path"), item.Object.Path)...)
+			}
 		case ItemTypePrefix:
 			// Both the target and the prefix source path may be empty here:
 			// they mean "repository root" and "whole source repository".
+			if item.Prefix != nil {
+				problems = append(problems, wildcardProblems(itemPath(i, "prefix.path"), item.Prefix.Path)...)
+			}
 		case ItemTypeTable, ItemTypeNamespace:
 			problems = append(problems, Problem{
 				Path:    itemPath(i, "type"),
@@ -234,6 +240,16 @@ func validateItems(d *Definition) []Problem {
 		problems = append(problems, targetProblems(i, d, first)...)
 	}
 	return problems
+}
+
+// wildcardProblems rejects the policy wildcards "*" and "?" in a source path (SEC-3). Source paths
+// are literal object keys, but they are also spliced into resource ARNs that are matched as
+// patterns, so a wildcard would let an item widen what the authorization check looks at.
+func wildcardProblems(path, value string) []Problem {
+	if strings.ContainsAny(value, "*?") {
+		return []Problem{{Path: path, Message: `must not contain the wildcard characters "*" or "?"`}}
+	}
+	return nil
 }
 
 // validateSourceDescriptors enforces that exactly one source descriptor is set and

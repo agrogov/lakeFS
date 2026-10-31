@@ -1,0 +1,124 @@
+package datasets
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"github.com/treeverse/lakefs/pkg/auth"
+	"github.com/treeverse/lakefs/pkg/auth/model"
+	"github.com/treeverse/lakefs/pkg/permissions"
+)
+
+// TestImmutabilityAuthServiceDeniesRegardlessOfGroups is the SEC-2 test: a custom group with
+// FSFullAccess and a user with a directly attached fs:* policy are both refused every write
+// action on a dataset repository, and are still allowed on other repositories and for reads.
+func TestImmutabilityAuthServiceDeniesRegardlessOfGroups(t *testing.T) {
+	f := newAuthzFixture(t)
+	full := model.Statements{{Effect: model.StatementEffectAllow, Action: []string{"fs:*", "pr:*"}, Resource: "*"}}
+	f.policy(t, "FSFullAccess", full)
+	f.group(t, "data-eng")
+	f.attachToGroup(t, "FSFullAccess", "data-eng")
+	f.user(t, "grouped")
+	f.addToGroup(t, "grouped", "data-eng")
+	f.user(t, "direct")
+	f.attachToUser(t, "FSFullAccess", "direct")
+
+	repos := newDatasetRepoSet(func(context.Context) ([]string, error) { return []string{"foo"}, nil }, time.Hour, time.Now)
+	guard := NewImmutabilityAuthService(f.svc, repos)
+	authz := NewAuthorizer(guard)
+
+	writes := map[string]string{
+		permissions.WriteObjectAction:      permissions.ObjectArn("foo", "latest/a"),
+		permissions.CreateTagAction:        permissions.TagArn("foo", "v3"),
+		permissions.DeleteBranchAction:     permissions.BranchArn("foo", "latest"),
+		permissions.UpdateRepositoryAction: permissions.RepoArn("foo"),
+		permissions.ImportCancelAction:     permissions.BranchArn("foo", "latest"),
+		permissions.WritePullRequestAction: permissions.RepoArn("foo"),
+	}
+	for _, user := range []string{"grouped", "direct"} {
+		caller := Caller{Username: user}
+		for action, resource := range writes {
+			node := permissions.Node{Permission: permissions.Permission{Action: action, Resource: resource}}
+			err := authz.Check(t.Context(), caller, node, "")
+			require.ErrorIsf(t, err, ErrPermissionDenied, "%s %s on dataset repo", user, action)
+			require.Equal(t, 403, asStatus(err))
+
+			// The same action on an ordinary repository is untouched.
+			other := permissions.Node{Permission: permissions.Permission{Action: action, Resource: swapRepo(resource, "foo", "plain")}}
+			require.NoErrorf(t, authz.Check(t.Context(), caller, other, ""), "%s %s on plain repo", user, action)
+		}
+		// Reads on the dataset repository stay allowed.
+		read := permissions.Node{Permission: permissions.Permission{Action: permissions.ReadObjectAction, Resource: permissions.ObjectArn("foo", "x")}}
+		require.NoError(t, authz.Check(t.Context(), caller, read, ""))
+
+		// The datasets service itself is exempt.
+		svcCtx := WithServiceCaller(t.Context())
+		node := permissions.Node{Permission: permissions.Permission{Action: permissions.WriteObjectAction, Resource: permissions.ObjectArn("foo", "x")}}
+		require.NoError(t, authz.Check(svcCtx, caller, node, ""))
+	}
+
+	// An Or node survives while one alternative is allowed, an And node does not.
+	caller := Caller{Username: "direct"}
+	deniedLeaf := permissions.Node{Permission: permissions.Permission{Action: permissions.DeleteTagAction, Resource: permissions.TagArn("foo", "v1")}}
+	okLeaf := permissions.Node{Permission: permissions.Permission{Action: permissions.ReadTagAction, Resource: permissions.TagArn("foo", "v1")}}
+	require.NoError(t, authz.Check(t.Context(), caller, permissions.Node{Type: permissions.NodeTypeOr, Nodes: []permissions.Node{deniedLeaf, okLeaf}}, ""))
+	require.ErrorIs(t, authz.Check(t.Context(), caller, permissions.Node{Type: permissions.NodeTypeAnd, Nodes: []permissions.Node{deniedLeaf, okLeaf}}, ""), ErrPermissionDenied)
+}
+
+func swapRepo(resource, from, to string) string {
+	return strings.Replace(resource, "repository/"+from, "repository/"+to, 1)
+}
+
+// TestDatasetRepoSetCacheAndFailClosed covers the cached name set: TTL refresh, stale fallback on
+// a failing refresh, and the error when nothing was ever loaded.
+func TestDatasetRepoSetCacheAndFailClosed(t *testing.T) {
+	now := time.Unix(1000, 0)
+	names := []string{"a"}
+	var failing bool
+	calls := 0
+	set := newDatasetRepoSet(func(context.Context) ([]string, error) {
+		calls++
+		if failing {
+			return nil, errors.New("kv down")
+		}
+		return names, nil
+	}, time.Second, func() time.Time { return now })
+
+	ok, err := set.Contains(t.Context(), "a")
+	require.NoError(t, err)
+	require.True(t, ok)
+	names = []string{"a", "b"}
+	ok, _ = set.Contains(t.Context(), "b")
+	require.False(t, ok, "served from cache inside the TTL")
+	require.Equal(t, 1, calls)
+	now = now.Add(2 * time.Second)
+	ok, _ = set.Contains(t.Context(), "b")
+	require.True(t, ok, "refreshed after the TTL")
+
+	failing = true
+	now = now.Add(2 * time.Second)
+	ok, err = set.Contains(t.Context(), "a")
+	require.NoError(t, err)
+	require.True(t, ok, "stale set used when the refresh fails")
+
+	cold := newDatasetRepoSet(func(context.Context) ([]string, error) { return nil, errors.New("kv down") }, time.Second, time.Now)
+	_, err = cold.Contains(t.Context(), "a")
+	require.Error(t, err)
+
+	// Authorize fails closed (an error, never an allow) when the set cannot be loaded.
+	guard := NewImmutabilityAuthService(&stubAuthService{}, cold)
+	_, err = guard.Authorize(t.Context(), &auth.AuthorizationRequest{RequiredPermissions: permissions.Node{
+		Permission: permissions.Permission{Action: permissions.WriteObjectAction, Resource: permissions.ObjectArn("a", "x")}}})
+	require.Error(t, err)
+}
+
+// stubAuthService allows everything.
+type stubAuthService struct{ auth.Service }
+
+func (*stubAuthService) Authorize(context.Context, *auth.AuthorizationRequest) (*auth.AuthorizationResponse, error) {
+	return &auth.AuthorizationResponse{Allowed: true}, nil
+}

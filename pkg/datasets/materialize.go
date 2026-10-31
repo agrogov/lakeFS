@@ -122,6 +122,12 @@ type Materializer struct {
 	// definition that lacks a required metadata key fails the publish with a
 	// *ValidationError instead of becoming a version.
 	ValidateOptions ValidateOptions
+
+	// RequireSourceAuthz makes every source read fail unless the context carries the caller's
+	// per-object source-read check (SEC-3). The service sets it, so a code path that forgets to
+	// authorize fails closed instead of copying objects the caller may not read. Tests that
+	// drive the primitive directly leave it false.
+	RequireSourceAuthz bool
 }
 
 // PublishRequest is everything one publish needs. The definition must already be
@@ -601,7 +607,16 @@ func (m *Materializer) openItem(ctx context.Context, index int, item *DataItem) 
 // openSource opens the source-key-space iterator of one item: a single-key get for an
 // object item, a prefix-bounded Store.List for a prefix item (§6.3).
 func (m *Materializer) openSource(ctx context.Context, stream *itemStream) (graveler.ValueIterator, error) {
+	reader := sourceReaderFrom(ctx)
+	if reader == nil && m.RequireSourceAuthz {
+		return nil, ErrSourceAuthzMissing
+	}
 	if stream.object {
+		if reader != nil {
+			if err := checkSourceObject(ctx, reader, stream, stream.sourceKey); err != nil {
+				return nil, err
+			}
+		}
 		value, err := m.Catalog.Store.Get(ctx, stream.repository, graveler.Ref(stream.commitID), graveler.Key(stream.sourceKey))
 		if err != nil {
 			if errors.Is(err, graveler.ErrNotFound) {
@@ -627,7 +642,80 @@ func (m *Materializer) openSource(ctx context.Context, stream *itemStream) (grav
 		// An empty prefix is the whole repository (§5.2), which is where List starts.
 		it.SeekGE(graveler.Key(stream.sourceKey))
 	}
-	return &prefixIterator{it: it, prefix: stream.sourceKey}, nil
+	var src graveler.ValueIterator = &prefixIterator{it: it, prefix: stream.sourceKey}
+	if reader != nil {
+		src = &authorizedIterator{ValueIterator: src, ctx: ctx, reader: reader, stream: stream}
+	}
+	return src, nil
+}
+
+// ErrSourceAuthzMissing reports a source read attempted without the caller's authorization
+// check on the context. It is a programming error and fails the operation (SEC-3).
+var ErrSourceAuthzMissing = errors.New("datasets: source read without a per-object authorization check")
+
+// checkSourceObject authorizes the read of one source key, mapping a denial to the SourceError
+// that names the item and the first denied path (SEC-3).
+func checkSourceObject(ctx context.Context, reader *SourceReader, stream *itemStream, key string) error {
+	err := reader.CheckObject(ctx, stream.repository.RepositoryID.String(), key)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrSourceReadDenied) {
+		return &SourceError{
+			Item:       stream.index,
+			Repository: stream.repository.RepositoryID.String(),
+			Ref:        SourceRef{Type: RefTypeCommit, ID: stream.commitID.String()},
+			Err:        err,
+		}
+	}
+	return err
+}
+
+// authorizedIterator authorizes fs:ReadObject on every key the wrapped source iterator yields,
+// for the caller of the operation, and stops at the first denied path (SEC-3). The check runs
+// before the entry is decoded, counted or copied, so a denied object contributes nothing - not
+// even to a size estimate.
+type authorizedIterator struct {
+	graveler.ValueIterator
+	ctx    context.Context
+	reader *SourceReader
+	stream *itemStream
+	err    error
+}
+
+// Next implements graveler.ValueIterator.
+func (it *authorizedIterator) Next() bool {
+	if it.err != nil {
+		return false
+	}
+	if !it.ValueIterator.Next() {
+		return false
+	}
+	record := it.ValueIterator.Value()
+	if record == nil {
+		return true
+	}
+	if err := checkSourceObject(it.ctx, it.reader, it.stream, string(record.Key)); err != nil {
+		it.err = err
+		return false
+	}
+	return true
+}
+
+// Value implements graveler.ValueIterator.
+func (it *authorizedIterator) Value() *graveler.ValueRecord {
+	if it.err != nil {
+		return nil
+	}
+	return it.ValueIterator.Value()
+}
+
+// Err implements graveler.ValueIterator.
+func (it *authorizedIterator) Err() error {
+	if it.err != nil {
+		return it.err
+	}
+	return it.ValueIterator.Err()
 }
 
 // closeItemIterators closes the iterators of items that were opened before a failure.

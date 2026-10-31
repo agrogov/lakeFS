@@ -215,7 +215,7 @@ func NewService(cfg *Config, kvs kv.Store, cat *catalog.Catalog, authService aut
 		authService:  authService,
 		authorizer:   NewAuthorizer(authService),
 		resolver:     &Resolver{Catalog: cat, StorageID: graveler.StorageID(cfg.StorageID)},
-		materializer: &Materializer{Catalog: cat},
+		materializer: &Materializer{Catalog: cat, RequireSourceAuthz: true},
 		pins:         NewPins(store, cat),
 		now:          time.Now,
 		newULID:      newULID,
@@ -298,12 +298,9 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 	var resolved *Definition
 	if req.Publish {
 		var err error
-		resolved, err = s.resolver.Resolve(ctx, &def)
-		if err != nil {
-			return nil, err
-		}
 		// §9.3: the creator must be able to read every source they attach.
-		if err := s.authorizer.CheckSources(ctx, caller, resolved.Data); err != nil {
+		resolved, ctx, err = s.resolveAuthorized(ctx, caller, &def)
+		if err != nil {
 			return nil, err
 		}
 		// §5.2 rule 5, before anything is created: an object item whose key is not at
@@ -707,11 +704,8 @@ func (s *Service) Validate(ctx context.Context, caller Caller, name string, def 
 	if err := s.validateDefinition(ctx, &def); err != nil {
 		return nil, err
 	}
-	resolved, err := s.resolver.Resolve(ctx, &def)
+	resolved, ctx, err := s.resolveAuthorized(ctx, caller, &def)
 	if err != nil {
-		return nil, err
-	}
-	if err := s.authorizer.CheckSources(ctx, caller, resolved.Data); err != nil {
 		return nil, err
 	}
 	stats, err := s.sourceStats(ctx, resolved)
@@ -798,12 +792,9 @@ func (s *Service) PublishVersion(ctx context.Context, caller Caller, name string
 	}
 	// §6.2 step 2: branch/tag refs become commit IDs (§5.2) and the sources of §5.2
 	// rule 4 are checked (they exist, are not datasets, share the storage ID).
-	resolved, err := s.resolver.Resolve(ctx, &def)
-	if err != nil {
-		return nil, err
-	}
 	// §6.2 step 3: the publisher must be able to read every source (§9.3).
-	if err := s.authorizer.CheckSources(ctx, caller, resolved.Data); err != nil {
+	resolved, ctx, err := s.resolveAuthorized(ctx, caller, &def)
+	if err != nil {
 		return nil, err
 	}
 	// §5.2 rule 5 (every source is there) and the §6.5 size estimate come from the same walk,
@@ -1090,10 +1081,11 @@ func (s *Service) startAsyncPublish(ctx context.Context, publishing *DatasetReco
 	}
 	s.notifyTask(*task)
 
+	reader := sourceReaderFrom(ctx)
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.runAsyncPublish(publishing, def, req, publisher, id)
+		s.runAsyncPublish(publishing, def, req, publisher, id, reader)
 	}()
 	return &PublishOutcome{Task: task}, nil
 }
@@ -1101,11 +1093,13 @@ func (s *Service) startAsyncPublish(ctx context.Context, publishing *DatasetReco
 // runAsyncPublish is the body of the goroutine started by startAsyncPublish. It runs on
 // the service background context, never on the request's, so a client that disconnects
 // does not abort a publish the server already accepted (202).
-func (s *Service) runAsyncPublish(publishing *DatasetRecord, def Definition, req PublishVersionRequest, publisher, taskID string) {
+func (s *Service) runAsyncPublish(publishing *DatasetRecord, def Definition, req PublishVersionRequest, publisher, taskID string, reader *SourceReader) {
 	ctx := s.bgCtx
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// SEC-3: the task reads the sources with the authority of the caller who accepted it.
+	ctx = withSourceReader(ctx, reader)
 	s.updateTask(ctx, publishing.Name, taskID, func(task *TaskRecord) {
 		task.Status = TaskStatusRunning
 	})
@@ -1658,6 +1652,31 @@ func (s *Service) checkNameAvailable(ctx context.Context, name string) error {
 		return err
 	}
 	return nil
+}
+
+// resolveAuthorized is the source side of every definition-carrying operation (SEC-3, SEC-4,
+// §9.3), in this order:
+//
+//  1. fs:ReadRepository on every distinct source repository, before the resolver looks at
+//     anything: an unreadable repository and a missing one are the same 403;
+//  2. Resolve (refs become commits, storage IDs and dataset sources are checked);
+//  3. the attach-time check on every item (CheckSources).
+//
+// It returns the resolved definition and a context carrying the caller's per-object read check,
+// which the materialiser and the source walks use to authorize each object. The returned
+// context must be used for every later read of the sources.
+func (s *Service) resolveAuthorized(ctx context.Context, caller Caller, def *Definition) (*Definition, context.Context, error) {
+	if err := s.authorizer.CheckSourceRepositories(ctx, caller, def.Data); err != nil {
+		return nil, ctx, err
+	}
+	resolved, err := s.resolver.Resolve(ctx, def)
+	if err != nil {
+		return nil, ctx, err
+	}
+	if err := s.authorizer.CheckSources(ctx, caller, resolved.Data); err != nil {
+		return nil, ctx, err
+	}
+	return resolved, withSourceReader(ctx, s.authorizer.SourceReader(caller)), nil
 }
 
 // publish materialises one version of the dataset and writes its VersionRecord (§6.2). It

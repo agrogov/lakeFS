@@ -97,6 +97,10 @@ func writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
 			Message: validation.Error(),
 			Errors:  problemDetails(validation.Problems),
 		})
+	case errors.As(err, &source) && errors.Is(source.Err, ErrPermissionDenied):
+		// SEC-3: the caller may not read a source object. It is a permission problem, not a
+		// document problem.
+		httputil.WriteAPIError(w, r, http.StatusForbidden, err.Error())
 	case errors.As(err, &source):
 		// §5.2 rule 4: a storage-ID mismatch is a deployment problem (422), every other
 		// source problem is a definition problem the client can fix (400).

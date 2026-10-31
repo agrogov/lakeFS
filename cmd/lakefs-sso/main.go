@@ -21,8 +21,10 @@ import (
 	"github.com/spf13/cobra"
 	lakefsCmd "github.com/treeverse/lakefs/cmd/lakefs/cmd"
 	"github.com/treeverse/lakefs/contrib/auth/acl"
+	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/crypt"
 	authparams "github.com/treeverse/lakefs/pkg/auth/params"
+	"github.com/treeverse/lakefs/pkg/config"
 	"github.com/treeverse/lakefs/pkg/datasets"
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/kv/kvparams"
@@ -32,7 +34,7 @@ import (
 
 func main() {
 	// Override both service factories with SSO-aware implementations.
-	lakefsCmd.SetAuthServiceBuilder(sso.BuildAuthService)
+	lakefsCmd.SetAuthServiceBuilder(buildAuthService)
 	lakefsCmd.SetAuthenticationServiceBuilder(sso.BuildAuthenticationService)
 
 	// Register the sso-migrate and rbac-migrate subcommands.
@@ -44,6 +46,17 @@ func main() {
 	lakefsCmd.AddExtraRoutesBuilder(datasets.RoutesBuilder)
 
 	lakefsCmd.Execute()
+}
+
+// buildAuthService is sso.BuildAuthService plus, when datasets are enabled, the SEC-2
+// immutability guard: an authorizer-level deny of every write action on dataset repositories,
+// independent of the groups and policies a principal holds.
+func buildAuthService(ctx context.Context, cfg config.Config, logger logging.Logger, kvStore kv.Store, mm *auth.KVMetadataManager) auth.Service {
+	svc := sso.BuildAuthService(ctx, cfg, logger, kvStore, mm)
+	if dcfg, err := datasets.LoadConfig(); err == nil && dcfg.Enabled {
+		return datasets.NewImmutabilityAuthService(svc, datasets.NewDatasetRepoSet(kvStore))
+	}
+	return svc
 }
 
 // newSSOmigrateCmd returns the "sso-migrate" cobra command that copies the existing

@@ -17,7 +17,7 @@
 //     metadata_validate.go, metadata_keys.go);
 //   - the control-plane KV store (store.go, §5.3);
 //   - authorization and bootstrap: actions, ARNs, per-dataset managed policies and grants
-//     (authz.go), and the installation-wide policies and groups (bootstrap.go, §9);
+//     (authz.go, immutability_guard.go), and the installation-wide policies and groups (bootstrap.go, §9);
 //   - the OpenAPI spec, its generated stubs and the HTTP plumbing (api/datasets.yml,
 //     apigen, http.go, handlers.go, §10);
 //   - materialisation (resolve.go, materialize.go, §6);

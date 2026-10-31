@@ -209,7 +209,10 @@ func TestImmutabilityPolicy(t *testing.T) {
 		"fs:WriteObject", "fs:DeleteObject", "fs:CreateCommit", "fs:CreateBranch", "fs:DeleteBranch",
 		"fs:RevertBranch", "fs:CreateTag", "fs:DeleteTag", "fs:UpdateRepository", "fs:DeleteRepository",
 		"fs:ImportFromStorage", "fs:AttachStorageNamespace", "branches:SetBranchProtectionRules",
-		"retention:SetGarbageCollectionRules", "ci:WriteAction",
+		"retention:SetGarbageCollectionRules", "fs:ImportCancel", "pr:WritePullRequest",
+		"catalog:CreateNamespace", "catalog:UpdateNamespace", "catalog:DeleteNamespace",
+		"catalog:CreateTable", "catalog:UpdateTable", "catalog:DeleteTable",
+		"catalog:CreateView", "catalog:UpdateView", "catalog:DeleteView", "ci:WriteAction",
 	}
 	require.Len(t, policy.Statement, 2, "exactly two statements: repository and repository/*")
 	for i, stmt := range policy.Statement {
@@ -325,9 +328,8 @@ func TestSourceReadNode(t *testing.T) {
 			node := SourceReadNode(tt.item)
 			require.Equal(t, permissions.NodeTypeAnd, node.Type)
 			require.Equal(t, []permissions.Permission{
-				{Action: "fs:ReadCommit", Resource: "arn:lakefs:fs:::repository/" + tt.item.Repository},
+				{Action: "fs:ListObjects", Resource: "arn:lakefs:fs:::repository/" + tt.item.Repository},
 				{Action: "fs:ReadObject", Resource: tt.wantObject},
-				{Action: "fs:ListObjects", Resource: tt.wantObject},
 			}, requiredPermissions(node))
 			require.Equal(t, tt.wantObject, SourceObjectArn(tt.item))
 		})
@@ -371,19 +373,20 @@ func TestAuthorizerSourceCheckMatrix(t *testing.T) {
 		Object:     &PathSource{Path: "geo/countries.csv"},
 	}
 
+	// DOC-15: the documented grant - fs:ListObjects on the repository, fs:ReadObject on the path.
 	repoRead := model.Statement{
 		Effect:   model.StatementEffectAllow,
-		Action:   []string{permissions.ReadCommitAction},
+		Action:   []string{permissions.ListObjectsAction},
 		Resource: permissions.RepoArn(src),
 	}
 	prefixRead := model.Statement{
 		Effect:   model.StatementEffectAllow,
-		Action:   []string{permissions.ReadObjectAction, permissions.ListObjectsAction},
+		Action:   []string{permissions.ReadObjectAction},
 		Resource: permissions.ObjectArn(src, "data/*"),
 	}
 	objectRead := model.Statement{
 		Effect:   model.StatementEffectAllow,
-		Action:   []string{permissions.ReadObjectAction, permissions.ListObjectsAction},
+		Action:   []string{permissions.ReadObjectAction},
 		Resource: permissions.ObjectArn(src, "geo/countries.csv"),
 	}
 
@@ -408,7 +411,7 @@ func TestAuthorizerSourceCheckMatrix(t *testing.T) {
 			wantStatus: http.StatusForbidden,
 		},
 		{
-			name:       "commit read only",
+			name:       "list on the repository only",
 			statements: model.Statements{repoRead},
 			items:      []DataItem{prefixItem},
 			wantErr:    true,
@@ -416,7 +419,7 @@ func TestAuthorizerSourceCheckMatrix(t *testing.T) {
 			wantStatus: http.StatusForbidden,
 		},
 		{
-			name:       "repository read instead of commit read",
+			name:       "repository read instead of list and object read",
 			statements: model.Statements{{Effect: model.StatementEffectAllow, Action: []string{permissions.ReadRepositoryAction}, Resource: permissions.RepoArn(src)}},
 			items:      []DataItem{prefixItem},
 			wantErr:    true,
@@ -424,7 +427,7 @@ func TestAuthorizerSourceCheckMatrix(t *testing.T) {
 			wantStatus: http.StatusForbidden,
 		},
 		{
-			name:       "data prefix read but no commit read",
+			name:       "data prefix read but no list on the repository",
 			statements: model.Statements{prefixRead},
 			items:      []DataItem{prefixItem},
 			wantErr:    true,
@@ -432,12 +435,12 @@ func TestAuthorizerSourceCheckMatrix(t *testing.T) {
 			wantStatus: http.StatusForbidden,
 		},
 		{
-			name:       "commit read and prefix read",
+			name:       "list on the repository and prefix read",
 			statements: model.Statements{repoRead, prefixRead},
 			items:      []DataItem{prefixItem},
 		},
 		{
-			name:       "commit read and object read",
+			name:       "list on the repository and object read",
 			statements: model.Statements{repoRead, objectRead},
 			items:      []DataItem{objectItem},
 		},
@@ -445,7 +448,7 @@ func TestAuthorizerSourceCheckMatrix(t *testing.T) {
 			name: "object item covered by a broader prefix grant",
 			statements: model.Statements{repoRead, {
 				Effect:   model.StatementEffectAllow,
-				Action:   []string{permissions.ReadObjectAction, permissions.ListObjectsAction},
+				Action:   []string{permissions.ReadObjectAction},
 				Resource: permissions.ObjectArn(src, "geo/*"),
 			}},
 			items: []DataItem{objectItem},
@@ -460,7 +463,7 @@ func TestAuthorizerSourceCheckMatrix(t *testing.T) {
 		},
 		{
 			name:       "read object without list objects",
-			statements: model.Statements{repoRead, {Effect: model.StatementEffectAllow, Action: []string{permissions.ReadObjectAction}, Resource: permissions.ObjectArn(src, "geo/countries.csv")}},
+			statements: model.Statements{{Effect: model.StatementEffectAllow, Action: []string{permissions.ReadObjectAction}, Resource: permissions.ObjectArn(src, "geo/countries.csv")}},
 			items:      []DataItem{objectItem},
 			wantErr:    true,
 			wantItem:   `data[0] "reference/countries.csv"`,

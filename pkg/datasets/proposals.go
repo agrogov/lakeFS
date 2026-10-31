@@ -224,14 +224,11 @@ func (s *Service) CreateProposal(ctx context.Context, caller Caller, dataset str
 	if err := s.validateDefinition(ctx, &def); err != nil {
 		return nil, err
 	}
-	resolved, err := s.resolver.Resolve(ctx, &def)
-	if err != nil {
-		return nil, err
-	}
 	// §9.3: the author must be able to read every source they attach. The merger's check
 	// happens again at merge time (MergeProposal), because the merger publishes under their
 	// own authority.
-	if err := s.authorizer.CheckSources(ctx, caller, resolved.Data); err != nil {
+	resolved, ctx, err := s.resolveAuthorized(ctx, caller, &def)
+	if err != nil {
 		return nil, err
 	}
 	// §5.2 rule 5, before anything is written: an object item whose key is not at its
@@ -358,11 +355,8 @@ func (s *Service) UpdateProposal(ctx context.Context, caller Caller, dataset, id
 	if err := s.validateDefinition(ctx, &def); err != nil {
 		return nil, err
 	}
-	resolved, err := s.resolver.Resolve(ctx, &def)
+	resolved, ctx, err := s.resolveAuthorized(ctx, caller, &def)
 	if err != nil {
-		return nil, err
-	}
-	if err := s.authorizer.CheckSources(ctx, caller, resolved.Data); err != nil {
 		return nil, err
 	}
 	if _, err := s.sourceStats(ctx, resolved); err != nil {

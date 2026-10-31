@@ -257,6 +257,76 @@ func (a *Authorizer) CheckSources(ctx context.Context, caller Caller, items []Da
 	return nil
 }
 
+// CheckSourceRepositories authorizes fs:ReadRepository on every distinct source repository of
+// items, before anything about the repositories is resolved (SEC-4): the resolver's errors reveal
+// whether a repository, ref or dataset exists, so a caller who cannot read the repository gets
+// the same 403 whether or not it exists. The denial names the first item that uses the
+// repository, built from the request's own fields only.
+func (a *Authorizer) CheckSourceRepositories(ctx context.Context, caller Caller, items []DataItem) error {
+	seen := make(map[string]struct{}, len(items))
+	for i, item := range items {
+		if _, ok := seen[item.Repository]; ok {
+			continue
+		}
+		seen[item.Repository] = struct{}{}
+		node := permissions.Node{Permission: permissions.Permission{
+			Action:   permissions.ReadRepositoryAction,
+			Resource: permissions.RepoArn(item.Repository),
+		}}
+		if err := a.Check(ctx, caller, node, SourceItemName(i, item)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ErrSourceReadDenied reports that the caller may not read a source object (SEC-3). It matches
+// ErrPermissionDenied, so the control plane answers 403.
+var ErrSourceReadDenied = fmt.Errorf("%w: source object read denied", ErrPermissionDenied)
+
+// SourceReader authorizes the per-object source reads of the materialiser for one caller (SEC-3).
+type SourceReader struct {
+	authorizer *Authorizer
+	caller     Caller
+}
+
+// SourceReader returns the per-object source-read check of caller.
+func (a *Authorizer) SourceReader(caller Caller) *SourceReader {
+	return &SourceReader{authorizer: a, caller: caller}
+}
+
+// CheckObject authorizes fs:ReadObject on one source object. A denial is returned wrapping
+// ErrSourceReadDenied and naming the path; a failure to decide is returned as the
+// *AuthorizationError (500) and is never turned into a denial or an allow.
+func (r *SourceReader) CheckObject(ctx context.Context, repository, path string) error {
+	node := permissions.Node{Permission: permissions.Permission{
+		Action:   permissions.ReadObjectAction,
+		Resource: permissions.ObjectArn(repository, path),
+	}}
+	err := r.authorizer.Check(ctx, r.caller, node, "")
+	if err == nil {
+		return nil
+	}
+	var denied *PermissionError
+	if errors.As(err, &denied) {
+		return fmt.Errorf("%w: user %s may not read %q in repository %q", ErrSourceReadDenied, r.caller.Username, path, repository)
+	}
+	return err
+}
+
+type sourceReaderKey struct{}
+
+// withSourceReader attaches the per-object source-read check to ctx; the materialiser consults it
+// for every source object it opens or lists.
+func withSourceReader(ctx context.Context, r *SourceReader) context.Context {
+	return context.WithValue(ctx, sourceReaderKey{}, r)
+}
+
+func sourceReaderFrom(ctx context.Context) *SourceReader {
+	r, _ := ctx.Value(sourceReaderKey{}).(*SourceReader)
+	return r
+}
+
 // DatasetPermission builds the leaf permission node of a datasets control-plane action on a
 // dataset (§9.1).
 func DatasetPermission(action, dataset string) permissions.Node {
@@ -275,40 +345,38 @@ func MetadataKeyPermission(action string) permissions.Node {
 	return DatasetPermission(action, "*")
 }
 
-// SourceReadNode builds the §9.3 source-read requirement of one data item, as an And node:
+// SourceReadNode builds the §9.3 attach-time source-read requirement of one data item, as an And
+// node (DOC-15, matching the public documentation and the core API):
 //
-//	fs:ReadCommit on arn:lakefs:fs:::repository/<src>
-//	fs:ReadObject on the object ARN of the item
-//	fs:ListObjects on the same object ARN
+//	fs:ListObjects on arn:lakefs:fs:::repository/<src>   (the core API authorizes listing on the repository)
+//	fs:ReadObject  on the object ARN of the item
 //
 // where the object ARN is ObjectArn(src, <path>) for an "object" item and
 // ObjectArn(src, <prefix>*) for a "prefix" item (a prefix of "" - the whole repository - becomes
 // ObjectArn(src, "*")).
 //
+// This node is only the coarse, attach-time gate: the policy side is the pattern in ArnMatch, so a
+// Deny on a sub-path of a prefix does not match the requested literal glob (SEC-3). The
+// authoritative check is SourceReader.CheckObject, which authorizes fs:ReadObject on every
+// object the materialiser reads.
+//
 // "table" and "namespace" items are rejected by validation in the MVP (§1.2); they fall back to
 // requiring the whole repository, which is stricter, so a future implementation that forgets to
 // extend this function fails closed.
 func SourceReadNode(item DataItem) permissions.Node {
-	objectArn := SourceObjectArn(item)
 	return permissions.Node{
 		Type: permissions.NodeTypeAnd,
 		Nodes: []permissions.Node{
 			{
 				Permission: permissions.Permission{
-					Action:   permissions.ReadCommitAction,
+					Action:   permissions.ListObjectsAction,
 					Resource: permissions.RepoArn(item.Repository),
 				},
 			},
 			{
 				Permission: permissions.Permission{
 					Action:   permissions.ReadObjectAction,
-					Resource: objectArn,
-				},
-			},
-			{
-				Permission: permissions.Permission{
-					Action:   permissions.ListObjectsAction,
-					Resource: objectArn,
+					Resource: SourceObjectArn(item),
 				},
 			},
 		},
@@ -484,6 +552,17 @@ var immutabilityDeniedActions = []string{
 	permissions.AttachStorageNamespaceAction,
 	permissions.SetBranchProtectionRulesAction,
 	permissions.SetGarbageCollectionRulesAction,
+	permissions.ImportCancelAction,
+	permissions.WritePullRequestAction,
+	permissions.CatalogCreateNamespaceAction,
+	permissions.CatalogUpdateNamespaceAction,
+	permissions.CatalogDeleteNamespaceAction,
+	permissions.CatalogCreateTableAction,
+	permissions.CatalogUpdateTableAction,
+	permissions.CatalogDeleteTableAction,
+	permissions.CatalogCreateViewAction,
+	permissions.CatalogUpdateViewAction,
+	permissions.CatalogDeleteViewAction,
 	ciWriteAction,
 }
 

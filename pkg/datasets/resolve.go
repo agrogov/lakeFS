@@ -100,6 +100,9 @@ func (e *SourceError) Unwrap() error { return e.Err }
 // HTTPStatusCode of authz.go's *PermissionError, so the API can map any error the
 // resolve/publish path returns without type-switching on the concrete error.
 func (e *SourceError) HTTPStatusCode() int {
+	if errors.Is(e.Err, ErrPermissionDenied) {
+		return http.StatusForbidden
+	}
 	if errors.Is(e.Err, ErrStorageIDMismatch) {
 		return http.StatusUnprocessableEntity
 	}

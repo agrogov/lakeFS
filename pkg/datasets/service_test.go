@@ -61,6 +61,9 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 
 	fixture := &serviceFixture{datasetFixture: f, svc: svc, cfg: cfg, authService: authService, ts: ts}
 	fixture.addUser(t, testServiceUser, acl.AdminsGroup, DatasetAdminsGroup)
+	// Tests that drive the internal source walks directly (estimateSourceObjects, publish) read the
+	// sources as the default admin caller, the way resolveAuthorized sets it up for a request.
+	fixture.ctx = withSourceReader(fixture.ctx, svc.authorizer.SourceReader(fixture.caller()))
 	return fixture
 }
 
