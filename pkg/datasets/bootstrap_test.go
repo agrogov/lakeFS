@@ -535,11 +535,31 @@ func TestBootstrapFreshRBACInstall(t *testing.T) {
 	}
 	require.Contains(t, groupPolicies("Developers"), DatasetsPinsProtectPolicyName)
 	require.Contains(t, groupPolicies("Admins"), DatasetsPinsProtectPolicyName)
+	// DOC-3: the RBAC base groups get the datasets built-ins even when the version-gated RBAC
+	// bootstrap ran before datasets was enabled.
+	require.Contains(t, groupPolicies("Admins"), DatasetsFullAccessPolicyName)
+	require.Contains(t, groupPolicies("SuperUsers"), DatasetsReadWriteAllPolicyName)
+	require.Contains(t, groupPolicies("Developers"), DatasetsReadWriteAllPolicyName)
+	require.Contains(t, groupPolicies("Viewers"), DatasetsReadAllPolicyName)
 
 	report, err := f.reconcilerFor().Reconcile(ctx)
 	require.NoError(t, err)
 	require.NotNil(t, report)
 	require.Zero(t, report.Errors)
+}
+
+// TestBootstrapLeavesACLAdminsAlone: the simplified ACL template also has an "Admins" group, and
+// without the RBAC SuperUsers group the RBAC base-group mapping (DOC-3) must not touch it.
+func TestBootstrapLeavesACLAdminsAlone(t *testing.T) {
+	t.Parallel()
+	f := newAuthzFixture(t)
+	ctx := t.Context()
+	for _, name := range []string{"Admins", "Supers", "Writers", "Readers"} {
+		f.group(t, name)
+	}
+	require.NoError(t, Bootstrap(ctx, f.svc, time.Date(2026, 10, 28, 10, 0, 0, 0, time.UTC)))
+	require.NotContains(t, f.groupPolicyNames(t, "Admins"), DatasetsFullAccessPolicyName)
+	require.Contains(t, f.groupPolicyNames(t, "Admins"), DatasetsPinsProtectPolicyName)
 }
 
 // TestPinsProtectDeniesDevelopers checks that a member of Developers can neither delete nor
@@ -590,4 +610,21 @@ func TestMigrateLegacyActionsDeduplicates(t *testing.T) {
 		ActionUpdateDataset,
 	})
 	require.Equal(t, []string{ActionUpdateDataset}, got)
+}
+
+// TestStartupBootstrapKeepsAllRead: the server's startup Bootstrap passes the current dataset
+// names, so a restart does not empty datasets-all-read until the first reconcile pass.
+func TestStartupBootstrapKeepsAllRead(t *testing.T) {
+	t.Parallel()
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, "src-restart", map[string]string{"data/a.csv": "a"})
+	f.createPublishedDataset(t, "restart", prefixDefinition("src-restart", commit.String(), "data", "data/"))
+
+	names, err := f.svc.datasetNames(f.ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{"restart"}, names)
+	require.NoError(t, Bootstrap(f.ctx, f.authService, f.ts, WithBootstrapDatasets(names)))
+	drift, err := DetectDatasetsAllReadDrift(f.ctx, f.authService, names, f.ts)
+	require.NoError(t, err)
+	require.False(t, drift, "datasets-all-read must still cover the existing dataset after a restart")
 }

@@ -2089,6 +2089,22 @@ func (s *Service) storageNamespace(name string, now time.Time) (string, error) {
 	return strings.TrimSuffix(s.cfg.StorageNamespacePrefix, "/") + "/" + name + "-" + id, nil
 }
 
+// datasetNames lists the names of every dataset record, the list the managed datasets-all-read
+// policy is built from (the reconciler derives it the same way on each pass).
+func (s *Service) datasetNames(ctx context.Context) ([]string, error) {
+	records, err := s.store.ListDatasets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(records))
+	for _, rec := range records {
+		if rec != nil {
+			names = append(names, rec.Name)
+		}
+	}
+	return names, nil
+}
+
 // checkNameAvailable rejects a name used by a dataset or by any repository (§10.4 409).
 //
 // Both clashes return the same generic ErrNameTaken (SEC-7): the endpoint runs for a caller who

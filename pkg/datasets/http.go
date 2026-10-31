@@ -85,7 +85,15 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 	// first request. Bootstrap is idempotent and safe on every start; a failure is fatal
 	// because without datasets-pins-protect and the built-in groups the immutability and pin
 	// guarantees of §8.2 and §9.4 do not hold.
+	//
+	// The current dataset names go along, so the managed datasets-all-read policy keeps its
+	// statements across a restart instead of being emptied until the first reconcile pass.
+	datasetNames, err := svc.datasetNames(ctx)
+	if err != nil {
+		return fmt.Errorf("datasets: bootstrap: %w", err)
+	}
 	if err := Bootstrap(ctx, deps.AuthService, time.Now(),
+		WithBootstrapDatasets(datasetNames),
 		WithPinsProtectGroups(ImmutabilityGuardGroups(cfg.ImmutableGuardGroups))); err != nil {
 		return fmt.Errorf("datasets: bootstrap: %w", err)
 	}

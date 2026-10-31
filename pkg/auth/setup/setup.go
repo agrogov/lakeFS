@@ -85,15 +85,14 @@ func datasetsBuiltinPolicies(ts time.Time) []*model.Policy {
 	}
 }
 
-// defaultDatasetsEnabled is the production default of the datasets feature switch: off.
+// defaultDatasetsEnabled is the default of the datasets feature switch when no option is passed:
+// off.
 //
-// The datasets feature is not part of this binary yet, so nothing can turn it on: the
-// production bootstrap (pkg/sso.EnsureRBACBase) calls the bootstrap without options and
-// therefore gets the off behaviour. When the feature lands, the flag has to be plumbed from
-// configuration into EnsureRBACBaseGroups, and that wiring has to be coordinated with
-// RBACBootstrapVersion in pkg/sso/rbac_bootstrap.go: the version guard skips the bootstrap
-// once a version has been recorded, so a later switch from off to on must either bump the
-// version or bypass the guard, otherwise the datasets policies are never created.
+// The production bootstrap (pkg/sso.EnsureRBACBase) passes WithDatasetsEnabled with the datasets
+// configuration. That bootstrap is version-gated (RBACBootstrapVersion in
+// pkg/sso/rbac_bootstrap.go) and does not run again when datasets is enabled later, so
+// pkg/datasets.Bootstrap, which runs on every start of a datasets-enabled server, also creates
+// the datasets policies and attaches them to these base groups.
 const defaultDatasetsEnabled = false
 
 // BaseGroupsOption configures optional parts of the RBAC bootstrap.

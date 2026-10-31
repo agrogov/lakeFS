@@ -441,6 +441,9 @@ func WithPinsProtectGroups(groups []string) BootstrapOption {
 //	DatasetPublishers DatasetsReadWriteAll
 //	DatasetConsumers  DatasetsReadAll, datasets-all-read
 //
+// On an RBAC installation it also attaches the built-ins to the RBAC base groups, as the RBAC
+// template does (see attachRBACBaseGroupPolicies).
+//
 // datasets-pins-protect is not attached to a dataset group: it protects *source* repositories, so
 // it goes to the base groups of both group templates (§9.4's non-service principals) plus the
 // extra groups of datasets.immutable_guard_groups. Attaching it to a group that does not exist in
@@ -511,7 +514,46 @@ func Bootstrap(ctx context.Context, authService auth.Service, ts time.Time, opts
 			return err
 		}
 	}
+	if err := attachRBACBaseGroupPolicies(ctx, authService); err != nil {
+		return err
+	}
 	return attachPinsProtectPolicy(ctx, authService, cfg.PinsProtectGroups)
+}
+
+// rbacBaseGroupAttachments are the datasets built-ins the RBAC template gives its base groups
+// (DOC-3, pkg/auth/setup.EnsureRBACBaseGroups with WithDatasetsEnabled(true)).
+var rbacBaseGroupAttachments = []struct {
+	group    string
+	policies []string
+}{
+	{"Admins", []string{DatasetsFullAccessPolicyName}},
+	{"SuperUsers", []string{DatasetsReadWriteAllPolicyName}},
+	{"Developers", []string{DatasetsReadWriteAllPolicyName}},
+	{"Viewers", []string{DatasetsReadAllPolicyName}},
+}
+
+// attachRBACBaseGroupPolicies attaches the datasets built-ins to the RBAC base groups (DOC-3).
+//
+// The RBAC bootstrap does the same when datasets is enabled, but it is version-gated
+// (pkg/sso.RBACBootstrapVersion): an installation that recorded the current version before
+// datasets was turned on never runs it again, and its base groups would never get the datasets
+// policies. Doing it here, on every start, closes that gap. It only applies to an RBAC
+// installation, recognised by its SuperUsers group: the simplified ACL template also has an
+// "Admins" group, which the RBAC mapping must not touch.
+func attachRBACBaseGroupPolicies(ctx context.Context, authService auth.Service) error {
+	_, err := authService.GetGroup(ctx, "SuperUsers")
+	switch {
+	case errors.Is(err, auth.ErrNotFound):
+		return nil
+	case err != nil:
+		return err
+	}
+	for _, attachment := range rbacBaseGroupAttachments {
+		if err := attachDatasetPolicies(ctx, authService, attachment.group, attachment.policies); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // attachPinsProtectPolicy attaches datasets-pins-protect (§8.2) to the non-service groups of the
