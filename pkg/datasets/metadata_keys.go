@@ -168,7 +168,9 @@ func ValidateKeyUpdate(oldKey, newKey MetadataKey) error {
 			ErrMetadataKeyTypeChange, oldKey.Name, oldKey.Type, newKey.Type)
 	}
 	if problems := ValidateMetadataKey(newKey); len(problems) > 0 {
-		return fmt.Errorf("cannot update metadata key %q: %w", newKey.Name, problemsError(problems))
+		// DOC-10: an invalid replacement is a client problem (400 with one entry per
+		// problem), not an internal error. The type and rename rules above stay 409s.
+		return &ValidationError{Problems: problems}
 	}
 	return nil
 }

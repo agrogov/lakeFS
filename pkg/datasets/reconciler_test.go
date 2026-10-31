@@ -59,7 +59,6 @@ func (f *serviceFixture) publishFirstVersion(t *testing.T, dataset, source strin
 	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition(source, commit.String(), "data", "data/"),
-		Publish:    true,
 		Message:    "v1",
 	})
 	require.NoError(t, err, "create dataset %s", dataset)
@@ -742,7 +741,6 @@ func TestReconcile_DeleteKeepsTheRecordUntilEveryRecordIsGone(t *testing.T) {
 	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition(source, commit.String(), "data", "data/"),
-		Publish:    true,
 		Message:    "v1 again",
 	})
 	require.NoError(t, err)
@@ -773,7 +771,6 @@ func TestCreate_CleansUpLeftoverVersionRecord(t *testing.T) {
 	recreated, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition(source, sourceCommit.String(), "data", "data/"),
-		Publish:    true,
 		Message:    "v1",
 	})
 	require.NoError(t, err, "Create cleans the leftover version record and publishes v1")
@@ -850,13 +847,13 @@ func TestReconcile_SettlesInterruptedPublishTasks(t *testing.T) {
 		)
 		f := newServiceFixture(t)
 		commit := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
-		f.createEmptyDataset(t, dataset, prefixDefinition(source, commit.String(), "data", "data/"))
+		f.createDatasetV1(t, dataset, prefixDefinition(source, commit.String(), "data", "data/"))
 		now := f.svc.now()
 		require.NoError(t, f.svc.store.PutTask(f.ctx, &TaskRecord{
 			ID: taskID, Dataset: dataset, Kind: TaskKindPublish, Status: TaskStatusRunning,
 			CreatedAt: now, UpdatedAt: now,
 		}))
-		f.leaveInTransientState(t, dataset, DatasetStatePublishing, 1)
+		f.leaveInTransientState(t, dataset, DatasetStatePublishing, 2)
 
 		report := f.reconcile(t)
 		require.Equal(t, 1, report.StatesRepaired)

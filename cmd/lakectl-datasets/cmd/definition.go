@@ -12,9 +12,14 @@ import (
 	"github.com/treeverse/lakefs/pkg/datasets/apigen"
 )
 
-// versionRefPattern matches the refs a definition write and a version read accept
-// (DATASETS_DESIGN.md §10.1, §10.3): `vN`, a bare version number, `latest` or `proposal-<id>`.
-var versionRefPattern = regexp.MustCompile(`^(latest|v[0-9]+|[0-9]+|proposal-[0-9A-Za-z]+)$`)
+// The ref patterns of the spec (api/datasets.yml, DOC-19). A version read accepts `latest`
+// and `v<N>`; a diff also accepts the `source_ref` of a pull request, `pr/<id>`. The bare
+// `3`, upper-case `V3` and old `proposal-<id>` forms are not documented and are rejected
+// here exactly as the server rejects them.
+var (
+	versionRefPattern = regexp.MustCompile(`^(latest|v[0-9]{1,9})$`)
+	diffRefPattern    = regexp.MustCompile(`^(latest|v[0-9]{1,9}|pr/[0-9A-Za-z]{1,64})$`)
+)
 
 // loadedDefinition is the result of reading a -f definition file.
 type loadedDefinition struct {
@@ -82,13 +87,26 @@ func parseDefinitionDocument(data []byte) (loadedDefinition, error) {
 // definitionEnvelopeKey is the property that marks the definition envelope of §5.1.
 const definitionEnvelopeKey = "definition"
 
-// parseVersionRef validates a ref accepted by `show --version` and `versions`.
+// parseVersionRef validates a ref accepted by `show --version` and `versions`: `latest` or
+// `v<N>` (api/datasets.yml VersionRef, DOC-19).
 func parseVersionRef(value string) (string, error) {
 	if value == "" {
-		return "", invalidArguments("empty version: use %q, %q, %q or a commit id", "latest", "vN", "N")
+		return "", invalidArguments("empty version: use %q or %q", "latest", "v<N>")
 	}
 	if !versionRefPattern.MatchString(value) {
-		return "", invalidArguments("invalid version %q: use %q, %q, %q or %q", value, "latest", "vN", "N", "proposal-<id>")
+		return "", invalidArguments("invalid version %q: use %q or %q", value, "latest", "v<N>")
+	}
+	return value, nil
+}
+
+// parseDiffRef validates a ref accepted by `diff`: `latest`, `v<N>` or a pull request's
+// `source_ref`, `pr/<id>` (api/datasets.yml LeftRef/RightRef, DOC-19).
+func parseDiffRef(value string) (string, error) {
+	if value == "" {
+		return "", invalidArguments("empty ref: use %q, %q or %q", "latest", "v<N>", "pr/<id>")
+	}
+	if !diffRefPattern.MatchString(value) {
+		return "", invalidArguments("invalid ref %q: use %q, %q or %q", value, "latest", "v<N>", "pr/<id>")
 	}
 	return value, nil
 }

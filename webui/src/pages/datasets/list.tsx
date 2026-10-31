@@ -22,7 +22,7 @@ import { humanSize } from '../../lib/components/repository/tree';
 
 dayjs.extend(relativeTime);
 
-export const CREATE_DATASET_BUTTON_TEXT = 'Create dataset';
+export const CREATE_DATASET_BUTTON_TEXT = 'Create Dataset';
 export const EMPTY_DATASETS_TEXT = 'No datasets yet';
 
 /** Query-parameter prefix of the metadata filters (`metadata.<key>=<value>`, §10.1). */

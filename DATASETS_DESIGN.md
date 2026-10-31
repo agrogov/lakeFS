@@ -48,11 +48,23 @@ Iceberg REST catalog (the routes return 501 via `api.MountNotImplementedServices
 
 ### 1.2 Non-Goals (MVP)
 
-- Iceberg `table` / `namespace` items and `catalog.<ds>.<ref>.<ns>.<table>` addressing (Phase 5, needs an Iceberg REST catalog).
-- Wire compatibility with the Enterprise REST API beyond path shape and definition format (we have no access to its spec).
+- Iceberg `table` / `namespace` items and `catalog.<ds>.<ref>.<ns>.<table>` addressing (Phase 5, needs
+  an Iceberg REST catalog; see [`ICEBERG_CATALOG_PLAN.md`](ICEBERG_CATALOG_PLAN.md)). Those items decode and
+  answer `501`.
+- Wire compatibility with the Enterprise REST API beyond the compatibility target below.
 - Datasets spanning different storage IDs (multi-blockstore) — rejected at validation time.
 - Version deletion / retention policies for dataset versions.
 - Copy-on-publish ("snapshot") mode that physically copies data.
+
+**Compatibility target.** The public Enterprise OpenAPI, **ent-swagger v1.108**
+(`docs.lakefs.io/reference/api/enterprise/v1.108/swagger.yml`), is the specification this control plane
+follows: the definition format, the control-plane paths, the field names and the `dataset:*` RBAC actions.
+The deliberate deviations are `GET /datasets/config`, `POST /{dataset}/validate`, `POST /{dataset}/versions`
+and its asynchronous `202` (also reachable as `?async=true` on create), `GET /{dataset}/tasks/{id}`,
+`GET|POST /{dataset}/access` with `DELETE /{dataset}/access/{principal_type}/{principal_id}`, the
+`?type=data` diff extension, and the `dataset:ManageAccess` action. The request side accepts a superset in
+two places: metadata values may be scalars or arrays (responses always use arrays of strings), and a
+source ref may be a `branch` or `tag` as well as a `commit` (stored definitions only hold commits).
 
 ---
 
@@ -322,7 +334,7 @@ Normalisation rules (applied before validation and storage):
 Validation (`validate.go`):
 
 1. `name` matches `^[a-z0-9][a-z0-9-]{2,62}$` and isn't `reservedNames` (`_datasets`, …).
-2. `format_version == 1`; `1 <= len(data) <= datasets.max_items` (default 1000).
+2. `format_version` is absent on the wire or `1` (the server stores 1, DOC-12); `1 <= len(data) <= datasets.max_items` (default 1000).
 3. Targets must not overlap: no target equal to or a path-prefix of another (`a` vs `a/b` → error). This guarantees
    each output key has exactly one source and makes materialisation a pure merge.
 4. Source repository exists, isn't itself a dataset (no nesting in MVP), and has the same `StorageID` as the dataset
@@ -799,13 +811,13 @@ Base path `/api/v1/datasets`. Errors use the core `Error` schema `{"message": ".
 | Method & path | Action | Description |
 |---|---|---|
 | `GET /datasets?prefix=&after=&amount=&search=&metadata.<k>=<v>` | `ListDatasets` (+ `ReadDataset` filter) | Paginated list with latest version summary. Metadata filters match the latest version. |
-| `POST /datasets` | `CreateDataset` | Body = definition envelope (§5.1). Without `publish`, creates an empty dataset (no version; `latest` has only the initial commit). With `publish`, creates `v1`. `201` + `Dataset`; `202` + `Task` for large ones. |
+| `POST /datasets` | `CreateDataset` | Body = definition envelope (§5.1). A create always publishes `v1` (DOC-14); `publish.message` names it and defaults to `Create dataset <name>`. `201` + `Dataset`; `202` + `Task` only with the explicit `?async=true` opt-in. |
 | `GET /datasets/{ds}` | `ReadDataset` | `Dataset` (record + latest definition). |
 | `DELETE /datasets/{ds}` | `DeleteDataset` | `204`. |
 | `POST /datasets/{ds}/validate` | `ReadDataset` | Dry run: normalise, resolve, validate, authorise sources, return resolved definition + stats estimate. No writes. |
 | `POST /datasets/{ds}/versions` | `PublishVersion` | Body `{definition, message, expected_version?}`. `201` + `Version` / `202` + `Task` / `409`. |
 | `GET /datasets/{ds}/versions?after=&amount=` | `ReadDataset` | Newest first. |
-| `GET /datasets/{ds}/versions/{version}` | `ReadDataset` | `version` = `vN` \| `N` \| `latest`. Full definition. |
+| `GET /datasets/{ds}/versions/{version}` | `ReadDataset` | `version` = `latest` \| `vN` (DOC-19: no bare or upper-case form). Full definition. |
 | `GET /datasets/{ds}/refs/{leftRef}/diff/{rightRef}?type=definition\|data&prefix=&after=&amount=` | `ReadDataset` | §10.3. Same path shape as Enterprise. |
 | `GET /datasets/{ds}/proposals?status=&after=&amount=` | `ReadDataset` | |
 | `POST /datasets/{ds}/proposals` | `CreateProposal` | Body `{definition, title, description}`. |
@@ -857,7 +869,7 @@ Task: {id, status, version, error, created_at, updated_at}
 
 ### 10.3 Diff
 
-- `leftRef`/`rightRef` accept `vN`, `latest`, or `proposal-<id>`.
+- `leftRef`/`rightRef` accept `latest`, `vN`, or the pull request `source_ref` `pr/<id>` (DOC-19).
 - `type=definition` (default): structural diff of the two resolved definitions, matched by `target`. An item is
   `changed` when repository, commit, type or source path differs.
 - `type=data`: `Catalog.Diff(ctx, ds, leftGravelerRef, rightGravelerRef, params)` on the dataset repo — native
@@ -947,7 +959,7 @@ credentials) → no change to upstream `cmd/lakectl`:
 ```
 lakectl datasets list [--prefix P] [--metadata k=v]
 lakectl datasets show <ds> [--version vN] [-o json]
-lakectl datasets create <ds> -f definition.json [--publish -m "msg"]
+lakectl datasets create <ds> -f definition.json [-m "msg"] [--async]
 lakectl datasets publish <ds> -f definition.json -m "msg" [--expected-version N] [--wait]
 lakectl datasets validate <ds> -f definition.json
 lakectl datasets versions <ds>

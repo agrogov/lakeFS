@@ -206,8 +206,9 @@ func TestDiffDefinitionsNormalisation(t *testing.T) {
 	})
 }
 
-// TestParseRefTarget covers the ref grammar of §10.3 / api/datasets.yml: `vN` (and the `N`
-// and `VN` forms the spec pattern allows), `latest` and `proposal-<id>`.
+// TestParseRefTarget covers the documented ref grammar of §10.3 / api/datasets.yml (DOC-19):
+// `latest`, `v<N>` and a pull request's `pr/<id>`. The bare `3`, upper-case `V7` and old
+// `proposal-<id>` forms are rejected, exactly as the spec rejects them.
 func TestParseRefTarget(t *testing.T) {
 	valid := []struct {
 		ref      string
@@ -216,9 +217,7 @@ func TestParseRefTarget(t *testing.T) {
 		{"latest", refTarget{latest: true}},
 		{"v1", refTarget{version: 1}},
 		{"v42", refTarget{version: 42}},
-		{"V7", refTarget{version: 7}},
-		{"3", refTarget{version: 3}},
-		{"proposal-01J8Z6Q0K8", refTarget{proposalID: "01J8Z6Q0K8"}},
+		{"pr/01J8Z6Q0K8", refTarget{proposalID: "01J8Z6Q0K8"}},
 	}
 	for _, tc := range valid {
 		t.Run(tc.ref, func(t *testing.T) {
@@ -228,7 +227,10 @@ func TestParseRefTarget(t *testing.T) {
 		})
 	}
 
-	invalid := []string{"", "v0", "0", "v", "version1", "main", "proposal-", "proposal-a/b", "-1", "v-1", "v1.5"}
+	invalid := []string{
+		"", "v0", "0", "3", "V7", "v", "version1", "main", "proposal-01J8Z6Q0K8",
+		"proposal-", "proposal-a/b", "pr/", "pr/a/b", "-1", "v-1", "v1.5", "v0000000000",
+	}
 	for _, ref := range invalid {
 		t.Run("invalid "+ref, func(t *testing.T) {
 			_, err := parseRefTarget("left_ref", ref)
@@ -308,7 +310,6 @@ func newDiffFixture(t *testing.T) *diffFixture {
 	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       diffDataset,
 		Definition: v1Def,
-		Publish:    true,
 		Message:    "v1",
 	})
 	require.NoError(t, err)
@@ -660,13 +661,12 @@ func TestServiceResolveRef(t *testing.T) {
 		require.Equal(t, f.v1, *ref.Definition)
 	})
 
-	t.Run("version accepts N and VN", func(t *testing.T) {
-		for _, form := range []string{"2", "V2"} {
-			ref, err := f.svc.resolveRef(f.ctx, diffDataset, "ref", form)
-			require.NoError(t, err, "ref %q", form)
-			require.Equal(t, 2, ref.Version)
-			require.Equal(t, "v2", ref.GravelerRef)
-			require.Equal(t, f.v2, *ref.Definition)
+	t.Run("bare version and V form are rejected", func(t *testing.T) {
+		// DOC-19: only the documented `latest`, `v<N>` and `pr/<id>` forms are refs.
+		for _, form := range []string{"2", "V2", "proposal-01J8Z6Q0K8"} {
+			_, err := f.svc.resolveRef(f.ctx, diffDataset, "ref", form)
+			var validation *ValidationError
+			require.ErrorAs(t, err, &validation, "ref %q", form)
 		}
 	})
 
@@ -737,9 +737,9 @@ func TestServiceResolveRef(t *testing.T) {
 			PreviewBranch: previewBranch,
 		}))
 
-		ref, err := f.svc.resolveRef(f.ctx, diffDataset, "ref", ProposalRefPrefix+id)
+		ref, err := f.svc.resolveRef(f.ctx, diffDataset, "ref", PullRequestRef(id))
 		require.NoError(t, err)
-		require.Equal(t, ProposalRefPrefix+id, ref.Ref)
+		require.Equal(t, PullRequestRef(id), ref.Ref)
 		require.Equal(t, 0, ref.Version)
 		require.Equal(t, id, ref.ProposalID)
 		require.Equal(t, previewBranch, ref.GravelerRef)
@@ -749,7 +749,7 @@ func TestServiceResolveRef(t *testing.T) {
 			result, err := f.svc.Diff(f.ctx, f.caller(), DiffRequest{
 				Dataset:  diffDataset,
 				LeftRef:  RefNameLatest,
-				RightRef: ProposalRefPrefix + id,
+				RightRef: PullRequestRef(id),
 			})
 			require.NoError(t, err)
 			diff := result.Definition
@@ -766,7 +766,7 @@ func TestServiceResolveRef(t *testing.T) {
 			result, err := f.svc.Diff(f.ctx, f.caller(), DiffRequest{
 				Dataset:  diffDataset,
 				LeftRef:  RefNameLatest,
-				RightRef: ProposalRefPrefix + id,
+				RightRef: PullRequestRef(id),
 				Type:     DiffTypeData,
 			})
 			require.NoError(t, err)
@@ -793,8 +793,8 @@ func TestServiceResolveRef(t *testing.T) {
 		require.ErrorIs(t, err, ErrRefNotFound)
 	})
 
-	t.Run("unknown proposal", func(t *testing.T) {
-		_, err := f.svc.resolveRef(f.ctx, diffDataset, "ref", "proposal-01J8Z6Q0K8MISSING")
+	t.Run("unknown pull request", func(t *testing.T) {
+		_, err := f.svc.resolveRef(f.ctx, diffDataset, "ref", "pr/01J8Z6Q0K8MISSING")
 		require.ErrorIs(t, err, ErrRefNotFound)
 	})
 
@@ -804,13 +804,14 @@ func TestServiceResolveRef(t *testing.T) {
 	})
 
 	t.Run("latest without a published version", func(t *testing.T) {
-		commit := f.sourceRepo(t, "src-for-empty", map[string]string{"a": "a"})
-		_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
-			Name:       "empty-dataset",
-			Definition: objectDefinition("src-for-empty", commit.String(), "a", "a"),
-		})
-		require.NoError(t, err)
-		_, err = f.svc.resolveRef(f.ctx, "empty-dataset", "ref", RefNameLatest)
+		// DOC-14 makes an empty dataset unrepresentable through the API; a record left by
+		// the reconciler before its first version still has to answer a ref 404.
+		now := f.svc.now()
+		require.NoError(t, f.svc.store.CreateDataset(f.ctx, &DatasetRecord{
+			Name: "empty-dataset", CreatedBy: testServiceUser, CreatedAt: now, UpdatedAt: now,
+			State: DatasetStateActive, StorageID: f.svc.cfg.StorageID, StorageNS: "mem://empty-dataset",
+		}))
+		_, err := f.svc.resolveRef(f.ctx, "empty-dataset", "ref", RefNameLatest)
 		require.ErrorIs(t, err, ErrRefNotFound)
 	})
 }

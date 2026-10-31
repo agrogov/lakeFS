@@ -51,7 +51,7 @@ func TestCommandsIssueExpectedRequests(t *testing.T) {
 		},
 		{
 			name:       "create",
-			args:       []string{"create", "customer-360", "--file", file, "--publish", "--message", "initial"},
+			args:       []string{"create", "customer-360", "--file", file, "--message", "initial"},
 			status:     http.StatusCreated,
 			body:       testDatasetBody,
 			wantMethod: http.MethodPost,

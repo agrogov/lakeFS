@@ -372,7 +372,7 @@ func TestValidateItemStructure(t *testing.T) {
 		},
 		{
 			name:      "namespace items are not supported in the MVP",
-			item:      DataItem{Target: "t", Repository: "r", Ref: SourceRef{Type: RefTypeCommit, ID: "c"}, Type: ItemTypeNamespace, Namespace: &NsSrc{Name: "ns"}},
+			item:      DataItem{Target: "t", Repository: "r", Ref: SourceRef{Type: RefTypeCommit, ID: "c"}, Type: ItemTypeNamespace, Namespace: ptr("ns")},
 			wantPaths: []string{"data[0].type"},
 		},
 		{

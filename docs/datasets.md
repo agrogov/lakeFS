@@ -13,10 +13,12 @@ The companion design document is [`DATASETS_DESIGN.md`](../DATASETS_DESIGN.md).
 
 ## Enabling datasets
 
-Datasets are disabled by default and are served by the `lakefs-sso` binary, which mounts the
-control plane under `/api/v1/datasets`. Enable them with a `datasets:` block (see
-[Configuration](#configuration)); an installation that has the block but sets
-`enabled: false` answers `501` on every control-plane request.
+Datasets are served by the `lakefs-sso` binary, which mounts the control plane under
+`/api/v1/datasets`. As in the documented configuration there is no separate switch to
+remember: setting `datasets.storage_namespace_prefix` (see
+[Configuration](#configuration)) enables the feature. `datasets.enabled` still exists as an
+override — an explicit `enabled: false` wins, so an installation can keep the section for
+later and answer `501` on every control-plane request.
 
 ## Definition format
 
@@ -59,15 +61,15 @@ Fields:
 
 | Field | Meaning |
 |---|---|
-| `definition.format_version` | Always `1`. |
+| `definition.format_version` | Set by the server on write: it may be omitted and is stored as `1`. |
 | `definition.description` | Free text, optional. |
-| `definition.metadata` | String, number, boolean or array-of-string values. Values are validated against the metadata key rules of the installation, and free-form keys are accepted unless strict metadata mode is on. |
+| `definition.metadata` | String, number, boolean or array-of-string values on input. Responses always carry an array of strings per key, the `additionalProperties: {type: array, items: string}` shape of the Enterprise API. Values are validated against the metadata key rules of the installation, and free-form keys are accepted unless strict metadata mode is on. |
 | `data[].target` | Path of the item inside the dataset. No leading `/`, no `.`/`..` segments. |
 | `data[].repository` | Source repository. It must exist, must not be a dataset, and must live on the same storage as the dataset. |
-| `data[].ref` | `{"type": "commit", "id": "<commit>"}`. On input, `branch` and `tag` are accepted and resolved to a commit; stored definitions only contain commits. |
-| `data[].type` | `object` or `prefix`. |
+| `data[].ref` | `{"type": "commit", "id": "<commit>"}`. On input, `branch` and `tag` are also accepted and resolved to a commit — an input superset of the Enterprise schema, which only has `commit`; stored definitions only contain commits. |
+| `data[].type` | `object` or `prefix`. `table` and `namespace` items decode (an Enterprise `namespace` is a string) and are answered with `501`, see [Current limitations](#current-limitations). |
 | `data[].object.path` / `data[].prefix.path` | The source path. Prefix paths always end with `/`; an empty prefix is the whole repository. |
-| `publish` | Optional on create: publish the definition as `v1` in the same request. `message` is the version message. |
+| `publish` | Optional on create: it names version `v1`. A create always publishes `v1`; `message` defaults to `Create dataset <name>`. |
 
 Target semantics:
 
@@ -99,9 +101,16 @@ PUT /api/v1/datasets/customer-360
 { "definition": { ... }, "publish": { "message": "v3" } }
 ```
 
-`POST /api/v1/datasets/{dataset}/versions` remains available as an extension: it takes an
-optional `expected_version` (an ETag-like check) and answers `202` with a task when the publish
-is large. `GET /api/v1/datasets/{dataset}/refs/{ref}` returns the dataset at `latest` or `vN`.
+A create needs no `publish` block to produce a version: `POST /api/v1/datasets` always
+publishes `v1` and answers `201` with the `Dataset`. `POST
+/api/v1/datasets/{dataset}/versions` remains available as an extension: it takes an optional
+`expected_version` (an ETag-like check) and answers `202` with a task when the publish is
+large; `?async=true` on the create is the same opt-in for the initial version.
+`GET /api/v1/datasets/{dataset}/refs/{ref}` returns the dataset at `latest` or `vN`.
+
+Refs are `latest` or `v<N>`: that is the documented grammar. A diff also accepts a pull
+request's `source_ref`, `pr/<id>`. The bare `3`, upper-case `V3` and the older `proposal-<id>`
+spellings are rejected with `400` rather than silently accepted.
 
 A `Dataset` is `{"id": ..., "creation_date": <Unix seconds>, "version": N, ...}` and a
 `DatasetVersion` is `{"id": "v3", "author": ..., "creation_date": <Unix seconds>, ...}`; the
@@ -241,15 +250,23 @@ the metadata-key actions `dataset:ListMetadataKeys`, `dataset:ReadMetadataKey`,
 authorised on `arn:lakefs:dataset:::dataset/*`. `dataset:ManageAccess` (grant and revoke consumer
 access) is an extension of this implementation. The legacy plural `datasets:` namespace is still
 accepted when policies are validated, and the managed policies are migrated automatically.
-Whoever creates or publishes a dataset must be able to read every source it attaches
-(`fs:ReadObject` and `fs:ListObjects` on the source repository, per object); a failure names the
-item that could not be read. On a merge the source check runs for the merging principal, because
-the merge publishes the data under their authority.
+Whoever creates or publishes a dataset must be able to read every source it attaches. The check
+matches the documented one and the core API: `fs:ListObjects` on the source **repository**
+(`arn:lakefs:fs:::repository/<src>`) and `fs:ReadObject` on the source **object**
+(`arn:lakefs:fs:::repository/<src>/object/<path>`), authorized per object while the version is
+materialised; a failure names the item and the first path that could not be read. No
+`fs:ReadCommit` is required — this build deliberately relaxes the attach-time check to the
+documented pair. On a merge the source check runs for the merging principal, because the merge
+publishes the data under their authority.
 
 When datasets are configured, the RBAC bootstrap creates the four documented policies on
 `arn:lakefs:dataset:::dataset/*`: `DatasetsFullAccess` (`dataset:*`), `DatasetsReadWriteAll`,
 `DatasetsReadAll` and `DatasetsManageMetadataKeys`, and maps `Admins` to `DatasetsFullAccess`,
 `SuperUsers` and `Developers` to `DatasetsReadWriteAll`, and `Viewers` to `DatasetsReadAll`.
+
+A denied control-plane request answers `auth.authorization_failure_status`, the same setting the
+core API uses: `401` by default, or `403` when the installation asks for it. Clients must accept
+either status for a denial.
 
 ## Metadata keys
 
@@ -264,9 +281,15 @@ PUT    /api/v1/datasets/metadata/{key}
 DELETE /api/v1/datasets/metadata/{key}
 ```
 
-A `PUT` is a full replacement and requires `type`; changing `type` is rejected (`409`). Required
-keys are enforced on every definition write (create, update, publish and pull requests), never
-on existing versions. `GET /api/v1/datasets/config` reports the feature configuration.
+A `PUT` is a full replacement and requires `type`; changing `type` is rejected (`409`). The
+`allowed_values` list of an `enum` key has the documented bounds: 1–256 values, each 1–256
+characters, all distinct. Required keys are enforced on every definition write (create, update,
+publish and pull requests), never on existing versions. `GET /api/v1/datasets/config` reports
+the feature configuration.
+
+Values in responses are always arrays of strings, so a client generated from the Enterprise
+OpenAPI decodes them; on input a scalar is accepted as well (see
+[Definition format](#definition-format)).
 
 ### Access model note
 
@@ -290,7 +313,7 @@ silently behaving like `open`.
 
 ```yaml
 datasets:
-  enabled: true
+  enabled: true                                    # optional override; a namespace prefix alone enables
   # Storage for dataset repositories. Must equal the storage ID of every source repository.
   storage_id: ""                                   # "" = the default single blockstore
   storage_namespace_prefix: "s3://my-bucket/lakefs-datasets"   # required when enabled
@@ -308,9 +331,11 @@ datasets:
 ```
 
 Each key also has the usual environment variable (`LAKEFS_DATASETS_ENABLED`,
-`LAKEFS_DATASETS_STORAGE_NAMESPACE_PREFIX`, `LAKEFS_DATASETS_METADATA_STRICT`, …). An invalid
-`datasets:` section with `enabled: true` fails startup instead of starting a half-configured
-control plane.
+`LAKEFS_DATASETS_STORAGE_NAMESPACE_PREFIX`, `LAKEFS_DATASETS_METADATA_STRICT`, …). Setting only
+`storage_namespace_prefix` is enough: as in the documented configuration, a configured prefix
+enables the feature when `enabled` is unset, while an explicit `enabled: false` keeps it off. An
+invalid `datasets:` section with `enabled: true` fails startup instead of starting a
+half-configured control plane.
 
 The dataset storage must be the same blockstore as the sources: entries reference source
 objects by full physical address, which only that blockstore can serve. Configurations that
@@ -320,20 +345,29 @@ span storage IDs are rejected.
 
 - **Items are `object` and `prefix` only.** Iceberg `table` and `namespace` items are not
   supported, and neither is `catalog.<dataset>.<ref>.<namespace>.<table>` addressing: there is
-  no Iceberg REST catalog in this build. File-based tables (Parquet directories, Delta Lake,
-  Hudi, Iceberg tables read through a Hadoop catalog) can be included as `prefix` items.
-  Iceberg metadata that embeds absolute `s3://…` paths is not portable this way.
+  no Iceberg REST catalog in this build, so those items answer `501`. The gap and the planned
+  OSS Iceberg REST catalog are tracked in
+  [`ICEBERG_CATALOG_PLAN.md`](../ICEBERG_CATALOG_PLAN.md). File-based tables (Parquet
+  directories, Delta Lake, Hudi, Iceberg tables read through a Hadoop catalog) can be included
+  as `prefix` items. Iceberg metadata that embeds absolute `s3://…` paths is not portable this
+  way.
 - **No version deletion or retention policies.** Versions are immutable and kept; a dataset's
   pins are released when the dataset is deleted.
 - **No copy-on-publish ("snapshot") mode.** A dataset is always zero-copy, so it depends on
   the source objects being retained (which is what pins are for).
 - **Single storage only.** A dataset cannot span blockstores with different storage IDs.
-- **The compatibility target is the public Enterprise OpenAPI**
+- **The compatibility target is the public Enterprise OpenAPI, ent-swagger v1.108**
   (`docs.lakefs.io/reference/api/enterprise/v1.108/swagger.yml`): the document format, the
   control-plane paths of this revision, the field names and the `dataset:*` RBAC actions follow
-  it. The deliberate extensions are `GET /datasets/config`, `POST /{dataset}/validate`,
-  `POST /{dataset}/versions` and its asynchronous `202`, `GET /datasets/{dataset}/tasks/{id}`,
-  the `?type=data` diff, and the `dataset:ManageAccess` action.
+  it. The deliberate deviations from that document are:
+  - `GET /datasets/config`;
+  - `POST /{dataset}/validate` (dry run);
+  - `POST /{dataset}/versions` and its asynchronous `202` (`?async=true` on create is the same
+    opt-in for the initial version);
+  - `GET /{dataset}/tasks/{id}`;
+  - `GET|POST /{dataset}/access` and `DELETE /{dataset}/access/{principal_type}/{principal_id}`;
+  - the `?type=data` extension of the diff;
+  - the `dataset:ManageAccess` action, which the RBAC table does not define.
 - **Typed metadata keys are enforced, and manageable over the API** (see
   [Metadata keys](#metadata-keys)); `datasets.metadata.strict` rejects undeclared keys.
 - **Built-in datasets policies are created when datasets are configured.** The RBAC bootstrap

@@ -89,6 +89,25 @@ func TestLoadConfigDisabledIsInert(t *testing.T) {
 	require.False(t, cfg.Enabled)
 }
 
+// TestLoadConfigNamespacePrefixEnables is DOC-16: the documented configuration has no
+// datasets.enabled switch, only a storage namespace prefix, so a configured prefix enables
+// the feature when enabled is unset. An explicit enabled: false still wins.
+func TestLoadConfigNamespacePrefixEnables(t *testing.T) {
+	t.Run("prefix enables when enabled is unset", func(t *testing.T) {
+		useConfig(t, "datasets:\n  storage_namespace_prefix: \"mem://datasets\"\n")
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.True(t, cfg.Enabled)
+	})
+
+	t.Run("explicit false wins", func(t *testing.T) {
+		useConfig(t, "datasets:\n  enabled: false\n  storage_namespace_prefix: \"mem://datasets\"\n")
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.False(t, cfg.Enabled)
+	})
+}
+
 func TestLoadConfigEnvironmentOverrides(t *testing.T) {
 	// viper.UnmarshalKey only decodes the file map; the env vars must still win (design §13).
 	useConfig(t, "datasets:\n  enabled: false\n  max_items: 7\n")

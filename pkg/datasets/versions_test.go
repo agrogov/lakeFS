@@ -35,14 +35,18 @@ func (f *serviceFixture) publishVersion(t *testing.T, name string, req PublishVe
 	return outcome.Version
 }
 
-// createEmptyDataset creates a dataset with no published version, the starting point of the
-// publish tests that build v1..vN explicitly.
-func (f *serviceFixture) createEmptyDataset(t *testing.T, name string, def Definition) {
+// createDatasetV1 creates a dataset and its v1 (DOC-14: every create publishes v1) and returns
+// the version record. It is the starting point of the publish tests, whose explicit publishes
+// therefore produce v2 and later.
+func (f *serviceFixture) createDatasetV1(t *testing.T, name string, def Definition) *VersionRecord {
 	t.Helper()
 	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: name, Definition: def})
 	require.NoError(t, err, "create dataset %s", name)
 	require.Equal(t, DatasetStateActive, view.Record.State)
-	require.Zero(t, view.Record.LatestVersion)
+	require.Equal(t, 1, view.Record.LatestVersion, "create publishes v1")
+	require.NotNil(t, view.Version)
+	require.Equal(t, DefaultCreateMessage(name), view.Version.Message)
+	return view.Version
 }
 
 // commitTo creates the source repository on first use and commits objects onto branch, returning
@@ -92,14 +96,15 @@ func TestPublishVersion_ThreeVersionsPushLatest(t *testing.T) {
 	)
 	f := newServiceFixture(t)
 	commitOne := f.commitTo(t, source, "main", map[string]string{"data/a.parquet": "v1"})
-	f.createEmptyDataset(t, dataset, prefixDefinition(source, commitOne.String(), "data", "data/"))
+	f.createDatasetV1(t, dataset, prefixDefinition(source, commitOne.String(), "data", "data/"))
 
 	commits := map[int]graveler.CommitID{1: commitOne}
 	commits[2] = f.commitTo(t, source, "main", map[string]string{"data/a.parquet": "v2"})
 	commits[3] = f.commitTo(t, source, "main", map[string]string{"data/a.parquet": "v3"})
 
-	heads := make([]string, 0, 3)
-	for version := 1; version <= 3; version++ {
+	// v1 came from the create (DOC-14); the explicit publishes produce v2 and v3.
+	heads := make([]string, 0, 2)
+	for version := 2; version <= 3; version++ {
 		rec := f.publishVersion(t, dataset, PublishVersionRequest{
 			Definition: prefixDefinition(source, commits[version].String(), "data", "data/"),
 			Message:    fmt.Sprintf("version %d", version),
@@ -133,7 +138,6 @@ func TestPublishVersion_ThreeVersionsPushLatest(t *testing.T) {
 	}
 
 	require.NotEqual(t, heads[0], heads[1])
-	require.NotEqual(t, heads[1], heads[2])
 
 	// Older versions keep serving their own data (§7.1).
 	require.Equal(t, []byte("v1"), f.readDatasetObject(t, dataset, VersionTag(1), "data/a.parquet"))
@@ -149,8 +153,8 @@ func TestPublishVersion_ThreeVersionsPushLatest(t *testing.T) {
 		require.False(t, definitionIsZero(version.Definition), "version %d carries its definition", version.Version)
 	}
 
-	// GET /datasets/{ds}/versions/{version} accepts vN, N and latest.
-	for ref, want := range map[string]int{"v2": 2, "2": 2, "latest": 3} {
+	// GET /datasets/{ds}/versions/{version} accepts vN and latest.
+	for ref, want := range map[string]int{"v2": 2, "latest": 3} {
 		version, err := f.svc.GetVersion(f.ctx, f.caller(), dataset, ref)
 		require.NoError(t, err, "get version %q", ref)
 		require.Equal(t, want, version.Version, "get version %q", ref)
@@ -174,7 +178,7 @@ func TestPublishVersion_NoChangesIsConflict(t *testing.T) {
 	commit := f.sourceRepo(t, "src-nochange", map[string]string{"data/a.parquet": "a"})
 	def := prefixDefinition("src-nochange", commit.String(), "data", "data/")
 
-	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def, Publish: true, Message: "v1"})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def, Message: "v1"})
 	require.NoError(t, err)
 
 	_, err = f.svc.PublishVersion(f.ctx, f.caller(), dataset, PublishVersionRequest{Definition: def, Message: "v2"})
@@ -209,7 +213,6 @@ func TestPublishVersion_ExpectedVersion(t *testing.T) {
 	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition("src-etag", first.String(), "data", "data/"),
-		Publish:    true,
 	})
 	require.NoError(t, err)
 
@@ -253,7 +256,6 @@ func TestPublishVersion_ConcurrentPublishesExactlyOneWins(t *testing.T) {
 	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition("src-raced", first.String(), "data", "data/"),
-		Publish:    true,
 	})
 	require.NoError(t, err)
 
@@ -311,7 +313,6 @@ func TestPublishVersion_TakesOverStalePublishingState(t *testing.T) {
 	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition("src-stale", first.String(), "data", "data/"),
-		Publish:    true,
 	})
 	require.NoError(t, err)
 
@@ -359,7 +360,11 @@ func TestPublishVersion_AsyncTaskLifecycle(t *testing.T) {
 		"data/a.parquet": "a",
 		"data/b.parquet": "b",
 	})
-	f.createEmptyDataset(t, dataset, prefixDefinition("src-async", commit.String(), "data", "data/"))
+	f.createDatasetV1(t, dataset, prefixDefinition("src-async", commit.String(), "data", "data/"))
+	second := f.commitTo(t, "src-async", "main", map[string]string{
+		"data/a.parquet": "a2",
+		"data/b.parquet": "b2",
+	})
 
 	// Observe the state machine, and prove the goroutine does not run on the request context.
 	var (
@@ -378,8 +383,8 @@ func TestPublishVersion_AsyncTaskLifecycle(t *testing.T) {
 	}
 
 	outcome, err := f.svc.PublishVersion(requestCtx, f.caller(), dataset, PublishVersionRequest{
-		Definition: prefixDefinition("src-async", commit.String(), "data", "data/"),
-		Message:    "v1",
+		Definition: prefixDefinition("src-async", second.String(), "data", "data/"),
+		Message:    "v2",
 	})
 	require.NoError(t, err)
 	require.True(t, outcome.Accepted(), "a publish above the limit answers 202")
@@ -401,13 +406,13 @@ func TestPublishVersion_AsyncTaskLifecycle(t *testing.T) {
 	task, err := f.svc.GetTask(f.ctx, f.caller(), dataset, outcome.Task.ID)
 	require.NoError(t, err)
 	require.Equal(t, TaskStatusCompleted, task.Status)
-	require.Equal(t, 1, task.Version)
+	require.Equal(t, 2, task.Version)
 	require.Nil(t, task.Error, "a completed task carries no error")
 
 	head := f.datasetRecord(t, dataset)
 	require.Equal(t, DatasetStateActive, head.State)
-	require.Equal(t, 1, head.LatestVersion)
-	tagCommit, err := f.tagCommit(t, dataset, VersionTag(1))
+	require.Equal(t, 2, head.LatestVersion)
+	tagCommit, err := f.tagCommit(t, dataset, VersionTag(2))
 	require.NoError(t, err)
 	require.Equal(t, f.latestHead(t, dataset), tagCommit)
 
@@ -427,12 +432,12 @@ func TestPublishVersion_AsyncFailureIsRolledBack(t *testing.T) {
 		"data/b.parquet": "b",
 	})
 	def := prefixDefinition("src-async-fail", commit.String(), "data", "data/")
-	f.createEmptyDataset(t, dataset, def)
+	f.createDatasetV1(t, dataset, def)
 
 	f.svc.publishFn = func(context.Context, *Materializer, PublishRequest) (*PublishResult, error) {
 		return nil, errors.New("blockstore unavailable")
 	}
-	outcome, err := f.svc.PublishVersion(f.ctx, f.caller(), dataset, PublishVersionRequest{Definition: def, Message: "v1"})
+	outcome, err := f.svc.PublishVersion(f.ctx, f.caller(), dataset, PublishVersionRequest{Definition: def, Message: "v2"})
 	require.NoError(t, err)
 	require.True(t, outcome.Accepted())
 	f.svc.Wait()
@@ -450,10 +455,10 @@ func TestPublishVersion_AsyncFailureIsRolledBack(t *testing.T) {
 
 	head := f.datasetRecord(t, dataset)
 	require.Equal(t, DatasetStateActive, head.State)
-	require.Zero(t, head.LatestVersion)
-	_, err = f.svc.store.GetVersion(f.ctx, dataset, 1)
+	require.Equal(t, 1, head.LatestVersion, "the failed v2 publish did not move the head")
+	_, err = f.svc.store.GetVersion(f.ctx, dataset, 2)
 	require.ErrorIs(t, err, kv.ErrNotFound)
-	_, err = f.tagCommit(t, dataset, VersionTag(1))
+	_, err = f.tagCommit(t, dataset, VersionTag(2))
 	require.ErrorIs(t, err, graveler.ErrNotFound)
 }
 
@@ -467,7 +472,6 @@ func TestPublishVersion_FailedMaterialisationRollsBack(t *testing.T) {
 	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition("src-rollback", first.String(), "data", "data/"),
-		Publish:    true,
 	})
 	require.NoError(t, err)
 	headBefore := f.latestHead(t, dataset)
@@ -519,7 +523,7 @@ func TestPublishVersion_RequiresPermission(t *testing.T) {
 	f := newServiceFixture(t)
 	commit := f.sourceRepo(t, "src-authz", map[string]string{"data/a.parquet": "a"})
 	def := prefixDefinition("src-authz", commit.String(), "data", "data/")
-	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def, Publish: true})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def})
 	require.NoError(t, err)
 
 	f.addUser(t, "watcher")
@@ -548,9 +552,10 @@ func TestVersions_PaginationAndRefs(t *testing.T) {
 	)
 	f := newServiceFixture(t)
 	commit := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "v0"})
-	f.createEmptyDataset(t, dataset, prefixDefinition(source, commit.String(), "data", "data/"))
+	f.createDatasetV1(t, dataset, prefixDefinition(source, commit.String(), "data", "data/"))
 
-	for version := 1; version <= 5; version++ {
+	// v1 came from the create (DOC-14); v2..v5 are explicit publishes.
+	for version := 2; version <= 5; version++ {
 		commit = f.commitTo(t, source, "main", map[string]string{"data/a.parquet": fmt.Sprintf("v%d", version)})
 		rec := f.publishVersion(t, dataset, PublishVersionRequest{
 			Definition: prefixDefinition(source, commit.String(), "data", "data/"),
@@ -600,7 +605,13 @@ func TestVersions_PaginationAndRefs(t *testing.T) {
 	})
 
 	t.Run("dataset without versions", func(t *testing.T) {
-		f.createEmptyDataset(t, "no-versions", prefixDefinition(source, commit.String(), "data", "data/"))
+		// DOC-14 makes an empty dataset unrepresentable through the API; the read path still
+		// has to answer for a record the reconciler left behind before its first version.
+		now := f.svc.now()
+		require.NoError(t, f.svc.store.CreateDataset(f.ctx, &DatasetRecord{
+			Name: "no-versions", CreatedBy: testServiceUser, CreatedAt: now, UpdatedAt: now,
+			State: DatasetStateActive, StorageID: f.svc.cfg.StorageID, StorageNS: "mem://no-versions",
+		}))
 		_, err := f.svc.GetVersion(f.ctx, f.caller(), "no-versions", "latest")
 		require.ErrorIs(t, err, ErrVersionNotFound)
 		result, err := f.svc.ListVersions(f.ctx, f.caller(), "no-versions", "", 0)
@@ -625,8 +636,7 @@ func TestVersions_OutOfLineDefinition(t *testing.T) {
 	f := newServiceFixture(t)
 	commit := f.sourceRepo(t, "src-large", map[string]string{"data/a.parquet": "a"})
 	def := prefixDefinition("src-large", commit.String(), "data", "data/")
-	f.createEmptyDataset(t, dataset, def)
-	version := f.publishVersion(t, dataset, PublishVersionRequest{Definition: def, Message: "v1"})
+	version := f.createDatasetV1(t, dataset, def)
 
 	// Rewrite v1 in the out-of-line form that Store.PutVersion produces above
 	// MaxInlineDefinitionBytes (§5.3).
@@ -659,7 +669,7 @@ func TestVersions_OutOfLineDefinition(t *testing.T) {
 	broken.DefinitionRef = &DefinitionRef{CommitID: stored.CommitID, Path: DefinitionPath + ".missing"}
 	_, err = f.svc.store.PutVersion(f.ctx, broken)
 	require.NoError(t, err)
-	degraded, err := f.svc.GetVersion(f.ctx, f.caller(), dataset, "1")
+	degraded, err := f.svc.GetVersion(f.ctx, f.caller(), dataset, "v1")
 	require.NoError(t, err)
 	require.True(t, definitionIsZero(degraded.Definition))
 	require.Equal(t, stored.CommitID, degraded.CommitID)

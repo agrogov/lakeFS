@@ -199,7 +199,7 @@ func TestDatasetsHTTPValidationErrors(t *testing.T) {
 		def := objectDefinition("handler-src", commit.String(), "reference/countries.csv", "geo/countries.csv")
 		body := createDatasetBody(t, "denied-set", def, true)
 		rec := doRequest(t, handler, http.MethodPost, "", body, weakCred.AccessKeyID, weakCred.SecretAccessKey)
-		require.Equal(t, http.StatusForbidden, rec.Code, "body: %s", rec.Body.String())
+		require.Equal(t, http.StatusUnauthorized, rec.Code, "body: %s", rec.Body.String())
 		message := decodeError(t, rec).Message
 		require.Contains(t, message, "data[0]")
 		require.Contains(t, message, "handler-src")

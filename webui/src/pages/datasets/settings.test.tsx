@@ -141,7 +141,7 @@ describe('DatasetsSettingsPage', () => {
         expect(screen.getByText(/cannot be changed after a metadata key is created/i)).toBeInTheDocument();
     });
 
-    it('never sends the type in an update, because §5.5 forbids changing it', async () => {
+    it('sends the unchanged type in a full-replacement update (DOC-10)', async () => {
         mockWith(['dataset:CreateMetadataKey']);
         renderPage();
 
@@ -169,8 +169,9 @@ describe('DatasetsSettingsPage', () => {
                 (init as RequestInit | undefined)?.method === 'PUT',
         );
         const body = JSON.parse(String((call?.[1] as RequestInit).body));
-        expect(body).not.toHaveProperty('type');
+        // DOC-10: a PUT is a full replacement that requires the (unchanged) type.
         expect(body).toMatchObject({
+            type: 'enum',
             required: false,
             allow_multiple: false,
             allowed_values: ['public', 'internal', 'confidential'],

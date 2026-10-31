@@ -492,7 +492,6 @@ func (s *Service) MergeProposal(ctx context.Context, caller Caller, dataset, id 
 		created, err := s.Create(ctx, caller, CreateRequest{
 			Name:               dataset,
 			Definition:         proposal.Definition,
-			Publish:            true,
 			Message:            message,
 			PreserveProposalID: proposal.ID,
 		})

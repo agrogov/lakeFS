@@ -168,7 +168,7 @@ func TestShowCommand(t *testing.T) {
 		require.Contains(t, out, `"version": 3`)
 	})
 
-	t.Run("invalid version", func(t *testing.T) {
+	t.Run("invalid ref", func(t *testing.T) {
 		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusOK, Body: testVersionBody})
 		_, err := executeCommand(t, "show", "customer-360", "--version", "not-a-ref")
 		require.ErrorContains(t, err, "invalid version")
@@ -181,23 +181,25 @@ func TestShowCommand(t *testing.T) {
 	})
 }
 
-// TestCreateCommand pins the create request of §10.1, including the optional publish envelope.
+// TestCreateCommand pins the create request of §10.1. Every create publishes v1 (DOC-14), so
+// --message is optional and the documented create is synchronous; --async is the extension.
 func TestCreateCommand(t *testing.T) {
 	file := writeDefinitionFile(t, testDefinition)
 
-	t.Run("without publish", func(t *testing.T) {
+	t.Run("publishes v1 by default", func(t *testing.T) {
 		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusCreated, Body: testDatasetBody})
 		mustExecute(t, "create", "customer-360", "--file", file)
 
 		request := fake.OnlyRequest()
 		require.Equal(t, http.MethodPost, request.Method)
 		require.Equal(t, controlPlanePath+"/", request.Path)
+		require.NotContains(t, request.Query, "async", "the documented create is synchronous")
 		requireJSONBody(t, request.Body, `{"name": "customer-360", "definition": `+testDefinition+`}`)
 	})
 
-	t.Run("with publish", func(t *testing.T) {
+	t.Run("with message", func(t *testing.T) {
 		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusCreated, Body: testDatasetBody})
-		mustExecute(t, "create", "customer-360", "--file", file, "--publish", "--message", "initial dataset")
+		mustExecute(t, "create", "customer-360", "--file", file, "--message", "initial dataset")
 
 		request := fake.OnlyRequest()
 		requireJSONBody(t, request.Body,
@@ -223,20 +225,11 @@ func TestCreateCommand(t *testing.T) {
 
 	t.Run("asynchronous publish", func(t *testing.T) {
 		taskBody := `{"id": "task-1", "status": "pending", "created_at": 1767225600000, "updated_at": 1767225600000}`
-		newFakeControlPlane(t, fakeResponse{Status: http.StatusAccepted, Body: taskBody})
-		out := mustExecute(t, "create", "customer-360", "--file", file, "--publish", "--message", "big")
+		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusAccepted, Body: taskBody})
+		out := mustExecute(t, "create", "customer-360", "--file", file, "--async", "--message", "big")
 		require.Contains(t, out, "task-1")
 		require.Contains(t, out, "pending")
-	})
-
-	t.Run("message without publish", func(t *testing.T) {
-		_, err := executeCommand(t, "create", "customer-360", "--file", file, "--message", "nope")
-		require.ErrorContains(t, err, "only used with --publish")
-	})
-
-	t.Run("publish without message", func(t *testing.T) {
-		_, err := executeCommand(t, "create", "customer-360", "--file", file, "--publish")
-		require.ErrorContains(t, err, "requires --message")
+		require.Equal(t, []string{"true"}, fake.OnlyRequest().Query["async"])
 	})
 
 	t.Run("missing file", func(t *testing.T) {
@@ -434,7 +427,7 @@ func TestDiffCommand(t *testing.T) {
 	t.Run("invalid ref", func(t *testing.T) {
 		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusOK, Body: definitionDiffBody})
 		_, err := executeCommand(t, "diff", "customer-360", "v1", "bogus")
-		require.ErrorContains(t, err, "invalid version")
+		require.ErrorContains(t, err, "invalid ref")
 		require.Empty(t, fake.Requests())
 	})
 

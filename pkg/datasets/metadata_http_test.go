@@ -2,7 +2,9 @@ package datasets
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -98,6 +100,57 @@ func TestDatasetsHTTPMetadataKeysCRUD(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, code)
 }
 
+// TestDatasetsHTTPMetadataKeyUpdateBounds is DOC-10: a PUT is a full replacement with a
+// required type, the type stays immutable (409), and allowed_values has the bounds of
+// ent-swagger v1.108 (1..256 values, unique, each 1..256 characters).
+func TestDatasetsHTTPMetadataKeyUpdateBounds(t *testing.T) {
+	handler, accessKey, secret := newControlPlane(t)
+	do := func(method, path, body string) int {
+		return doRequest(t, handler, method, path, body, accessKey, secret).Code
+	}
+	require.Equal(t, http.StatusCreated, do(http.MethodPost, "/metadata", validMetadataKeyBody))
+
+	allowedValuesBody := func(values []string) string {
+		body, err := json.Marshal(apigen.MetadataKeyUpdateRequest{
+			Type:          MetadataTypeEnum,
+			AllowedValues: &values,
+		})
+		require.NoError(t, err)
+		return string(body)
+	}
+
+	tooMany := make([]string, MaxMetadataAllowedValues+1)
+	for i := range tooMany {
+		tooMany[i] = fmt.Sprintf("value-%d", i)
+	}
+	tooLong := make([]string, MaxMetadataAllowedValues)
+	for i := range tooLong {
+		tooLong[i] = strings.Repeat("x", MaxMetadataAllowedValueChars+1)
+	}
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{name: "more than the maximum number of values", body: allowedValuesBody(tooMany), want: http.StatusBadRequest},
+		{name: "a value over the maximum length", body: allowedValuesBody(tooLong[:1]), want: http.StatusBadRequest},
+		{name: "a repeated value", body: allowedValuesBody([]string{"gold", "gold"}), want: http.StatusBadRequest},
+		{name: "missing type", body: `{"required": true}`, want: http.StatusBadRequest},
+		{name: "enum without allowed values", body: `{"type": "enum"}`, want: http.StatusBadRequest},
+		{name: "type change stays forbidden", body: `{"type": "number"}`, want: http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, do(http.MethodPut, "/metadata/classification", tc.body))
+		})
+	}
+
+	// The rejected replacements changed nothing.
+	rec := doRequest(t, handler, http.MethodGet, "/metadata/classification", "", accessKey, secret)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, []string{"public", "internal"}, *decodeMetadataKey(t, rec.Body.Bytes()).AllowedValues)
+}
+
 // TestDatasetsHTTPMetadataKeysDenied: a principal without any dataset:*MetadataKey permission
 // gets 403 on every metadata-key operation, while an unauthenticated call stays 401.
 func TestDatasetsHTTPMetadataKeysDenied(t *testing.T) {
@@ -119,7 +172,7 @@ func TestDatasetsHTTPMetadataKeysDenied(t *testing.T) {
 		{http.MethodDelete, "/metadata/classification", ""},
 	} {
 		rec := doRequest(t, handler, tc.method, tc.path, tc.body, cred.AccessKeyID, cred.SecretAccessKey)
-		require.Equal(t, http.StatusForbidden, rec.Code, "%s %s: %s", tc.method, tc.path, rec.Body.String())
+		require.Equal(t, http.StatusUnauthorized, rec.Code, "%s %s: %s", tc.method, tc.path, rec.Body.String())
 		rec = doRequest(t, handler, tc.method, tc.path, tc.body, "", "")
 		require.Equal(t, http.StatusUnauthorized, rec.Code, "%s %s", tc.method, tc.path)
 	}
@@ -142,9 +195,11 @@ func TestDatasetsHTTPConfig(t *testing.T) {
 
 // TestMetadataIsReservedDatasetName: "metadata" collides with the /metadata routes.
 func TestMetadataIsReservedDatasetName(t *testing.T) {
-	require.True(t, IsReservedName("metadata"))
-	require.True(t, IsReservedName("pulls"))
-	require.False(t, IsReservedName("metadata-keys"))
+	// DOC-18: every fixed top-level route of the documented API is reserved.
+	for _, name := range []string{"config", "metadata", "pulls"} {
+		require.True(t, IsReservedName(name), "%q collides with a control-plane route", name)
+	}
+	require.False(t, IsReservedName("metadata-keys"), "the pre-rename spelling is free again")
 	handler, deps, accessKey, secret := newControlPlaneWithDeps(t)
 	commit := seedHandlerSource(t, deps.Catalog)
 	def := objectDefinition("handler-src", commit.String(), "countries.csv", "geo/countries.csv")

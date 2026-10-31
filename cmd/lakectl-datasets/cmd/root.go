@@ -41,7 +41,7 @@ const (
 	outputFlagName = "output"
 
 	// Flag names of the per-command options.
-	publishFlagName         = "publish"
+	asyncFlagName           = "async"
 	expectedVersionFlagName = "expected-version"
 	waitFlagName            = "wait"
 	dataFlagName            = "data"

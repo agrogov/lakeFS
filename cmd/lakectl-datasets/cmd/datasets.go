@@ -219,8 +219,8 @@ func runShow(cmd *cobra.Command, options showOptions) error {
 type createOptions struct {
 	Dataset string
 	File    string
-	Publish bool
 	Message string
+	Async   bool
 	Output  outputFormat
 }
 
@@ -236,40 +236,35 @@ func parseCreateOptions(cmd *cobra.Command, args []string) (createOptions, error
 	if file == "" {
 		return createOptions{}, invalidArguments("create requires --%s with a definition file", fileFlagName)
 	}
-	publish, err := cmd.Flags().GetBool(publishFlagName)
-	if err != nil {
-		return createOptions{}, err
-	}
 	message, err := cmd.Flags().GetString(messageFlagName)
 	if err != nil {
 		return createOptions{}, err
 	}
-	switch {
-	case publish && message == "":
-		return createOptions{}, invalidArguments("--publish requires --%s", messageFlagName)
-	case !publish && message != "":
-		return createOptions{}, invalidArguments("--%s is only used with --publish", messageFlagName)
+	async, err := cmd.Flags().GetBool(asyncFlagName)
+	if err != nil {
+		return createOptions{}, err
 	}
 	output, err := outputOf(cmd)
 	if err != nil {
 		return createOptions{}, err
 	}
-	return createOptions{Dataset: args[0], File: file, Publish: publish, Message: message, Output: output}, nil
+	return createOptions{Dataset: args[0], File: file, Message: message, Async: async, Output: output}, nil
 }
 
 func createCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "create <dataset> --file definition.json [--publish --message msg]",
+		Use:   "create <dataset> --file definition.json [--message msg] [--async]",
 		Short: "Create a dataset",
-		Long: `Create a dataset and its read-only repository.
+		Long: `Create a dataset, its read-only repository and version v1.
 
-Without --publish the dataset is created empty: it has no version, and the latest ref holds only
-the initial commit. With --publish the definition is published as version v1.
+Every create publishes version v1, as the documented API does; --message names that version and
+defaults to "Create dataset <name>". --async publishes it in the background and prints the task to
+poll (an extension of this build).
 
 --file accepts either a bare dataset definition ({"format_version": 1, "data": [...]}) or the
 definition envelope ({"name": ..., "definition": {...}}); a name inside the envelope must match the
 dataset name on the command line.`,
-		Example: "lakectl datasets create customer-360 --file customer-360.json --publish --message \"initial dataset\"",
+		Example: "lakectl datasets create customer-360 --file customer-360.json --message \"initial dataset\"",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			options, err := parseCreateOptions(cmd, args)
@@ -280,8 +275,8 @@ dataset name on the command line.`,
 		},
 	}
 	definitionReadFlags(cmd)
-	cmd.Flags().Bool(publishFlagName, false, "publish the definition as version v1")
-	cmd.Flags().StringP(messageFlagName, "m", "", "publish message (required with --publish)")
+	cmd.Flags().StringP(messageFlagName, "m", "", "version message (default: Create dataset <name>)")
+	cmd.Flags().Bool(asyncFlagName, false, "publish v1 in the background and print the task")
 	return cmd
 }
 
@@ -294,14 +289,18 @@ func runCreate(cmd *cobra.Command, options createOptions) error {
 		return invalidArguments("definition file is for dataset %q, but the command line names %q", loaded.Name, options.Dataset)
 	}
 	request := apigen.DatasetCreateRequest{Name: options.Dataset, Definition: loaded.Definition}
-	if options.Publish {
+	if options.Message != "" {
 		request.Publish = &apigen.PublishOptions{Message: apiutil.Ptr(options.Message)}
+	}
+	params := &apigen.CreateDatasetParams{}
+	if options.Async {
+		params.Async = apiutil.Ptr(true)
 	}
 	client, err := getClient()
 	if err != nil {
 		return err
 	}
-	resp, err := client.CreateDatasetWithResponse(cmd.Context(), apigen.CreateDatasetJSONRequestBody(request))
+	resp, err := client.CreateDatasetWithResponse(cmd.Context(), params, apigen.CreateDatasetJSONRequestBody(request))
 	if err != nil {
 		return err
 	}
@@ -686,11 +685,11 @@ func parseDiffOptions(cmd *cobra.Command, args []string) (diffOptions, error) {
 	if err != nil {
 		return diffOptions{}, err
 	}
-	left, err := parseVersionRef(args[1])
+	left, err := parseDiffRef(args[1])
 	if err != nil {
 		return diffOptions{}, err
 	}
-	right, err := parseVersionRef(args[2])
+	right, err := parseDiffRef(args[2])
 	if err != nil {
 		return diffOptions{}, err
 	}
@@ -721,7 +720,7 @@ func diffCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "diff <dataset> <left> <right>",
 		Short:   "Diff two dataset refs",
-		Long:    "Compare two refs of a dataset (latest, vN or proposal-<id>), by definition or, with --data, by data.",
+		Long:    "Compare two refs of a dataset (latest, v<N> or a pull request's pr/<id>), by definition or, with --data, by data.",
 		Example: "lakectl datasets diff customer-360 v2 v3 --data",
 		Args:    cobra.ExactArgs(datasetAndRefsArgsCount),
 		RunE: func(cmd *cobra.Command, args []string) error {

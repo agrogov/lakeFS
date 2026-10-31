@@ -12,11 +12,13 @@ import (
 	"github.com/treeverse/lakefs/pkg/permissions"
 )
 
-// statusOf renders err the way the HTTP layer does and returns the status.
+// statusOf renders err the way an installation configured with
+// auth.authorization_failure_status: 403 does, and returns the status. The 401 default is
+// covered by TestDatasetsAuthorizationFailureStatus.
 func statusOf(t *testing.T, err error) (int, string) {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	writeServiceError(rec, httptest.NewRequest(http.MethodPost, "/", nil), err)
+	newServer(nil, nil, http.StatusForbidden).writeServiceError(rec, httptest.NewRequest(http.MethodPost, "/", nil), err)
 	return rec.Code, rec.Body.String()
 }
 
@@ -43,7 +45,7 @@ func TestSourceReadDenyOnSubPath(t *testing.T) {
 		t.Run("create with prefix "+prefix, func(t *testing.T) {
 			name := "denied-create-" + strings.NewReplacer("", "x").Replace("p") + prefix
 			_, err := f.svc.Create(f.ctx, caller, CreateRequest{
-				Name: name, Definition: prefixDefinition("hrsrc", commit.String(), "out", prefix), Publish: true,
+				Name: name, Definition: prefixDefinition("hrsrc", commit.String(), "out", prefix),
 			})
 			require.ErrorIs(t, err, ErrPermissionDenied)
 			if prefix == "" {
@@ -73,7 +75,7 @@ func TestSourceReadDenyOnSubPath(t *testing.T) {
 	t.Run("publish", func(t *testing.T) {
 		admin := f.caller()
 		_, err := f.svc.Create(f.ctx, admin, CreateRequest{
-			Name: "pub-denied", Definition: prefixDefinition("hrsrc", commit.String(), "out", "pub"), Publish: true,
+			Name: "pub-denied", Definition: prefixDefinition("hrsrc", commit.String(), "out", "pub"),
 		})
 		require.NoError(t, err)
 		_, err = f.svc.PublishVersion(f.ctx, caller, "pub-denied", PublishVersionRequest{
@@ -84,7 +86,7 @@ func TestSourceReadDenyOnSubPath(t *testing.T) {
 
 	t.Run("a prefix that avoids the denied paths is allowed", func(t *testing.T) {
 		view, err := f.svc.Create(f.ctx, caller, CreateRequest{
-			Name: "allowed-pub", Definition: prefixDefinition("hrsrc", commit.String(), "out", "pub"), Publish: true,
+			Name: "allowed-pub", Definition: prefixDefinition("hrsrc", commit.String(), "out", "pub"),
 		})
 		require.NoError(t, err)
 		require.NotNil(t, view.Version)
@@ -148,7 +150,6 @@ func TestSourceReadDenyOnSecretSubPath(t *testing.T) {
 			_, err := f.svc.Create(f.ctx, caller, CreateRequest{
 				Name:       tt.dataset,
 				Definition: prefixDefinition("src", commit.String(), "out", tt.prefix),
-				Publish:    true,
 			})
 			require.ErrorIs(t, err, ErrPermissionDenied)
 			require.ErrorIs(t, err, ErrSourceReadDenied,
@@ -173,7 +174,6 @@ func TestSourceReadDenyOnSecretSubPath(t *testing.T) {
 		view, err := f.svc.Create(f.ctx, f.callerFor(user), CreateRequest{
 			Name:       "exfil-allowed",
 			Definition: prefixDefinition("src", commit.String(), "out", "pub"),
-			Publish:    true,
 		})
 		require.NoError(t, err)
 		require.NotNil(t, view.Version)
@@ -202,7 +202,7 @@ func TestSourceReadRepositoryUnreadableLooksLikeMissing(t *testing.T) {
 
 	run := map[string]func(Definition) error{
 		"create": func(def Definition) error {
-			_, err := f.svc.Create(f.ctx, caller, CreateRequest{Name: "sec4-create", Definition: def, Publish: true})
+			_, err := f.svc.Create(f.ctx, caller, CreateRequest{Name: "sec4-create", Definition: def})
 			return err
 		},
 		"validate": func(def Definition) error {

@@ -35,7 +35,7 @@ func (f *serviceFixture) createProposal(t *testing.T, dataset string, req Create
 // createPublishedDataset creates a dataset with version v1 of def and returns the record.
 func (f *serviceFixture) createPublishedDataset(t *testing.T, name string, def Definition) *DatasetView {
 	t.Helper()
-	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: name, Definition: def, Publish: true, Message: "v1"})
+	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: name, Definition: def, Message: "v1"})
 	require.NoError(t, err, "create dataset %s", name)
 	require.Equal(t, 1, view.Record.LatestVersion)
 	return view
@@ -901,7 +901,7 @@ func TestProposalPreviewBranchReuseOnUpdate(t *testing.T) {
 	result, err := f.svc.Diff(f.ctx, f.caller(), DiffRequest{
 		Dataset:  dataset,
 		LeftRef:  RefNameLatest,
-		RightRef: ProposalRefPrefix + proposal.Record.ID,
+		RightRef: PullRequestRef(proposal.Record.ID),
 		Type:     DiffTypeData,
 	})
 	require.NoError(t, err)

@@ -47,12 +47,20 @@ const MetadataFilterPrefix = "metadata."
 type server struct {
 	svc      *Service
 	clientIP *httputil.ClientIPResolver
+	// authzFailureStatus is the status a permission denial is answered with (DOC-17): the
+	// configured auth.authorization_failure_status, defaulting to 401 like the core API.
+	authzFailureStatus int
 }
 
 // newServer wraps a Service in the generated server interface. clientIP may be nil, in which
 // case the safe default of trusting no proxy applies to authorization conditions.
-func newServer(svc *Service, clientIP *httputil.ClientIPResolver) *server {
-	return &server{svc: svc, clientIP: clientIP}
+// authzFailureStatus is the configured auth.authorization_failure_status; a zero value means
+// http.StatusUnauthorized, the core default.
+func newServer(svc *Service, clientIP *httputil.ClientIPResolver, authzFailureStatus int) *server {
+	if authzFailureStatus != http.StatusUnauthorized && authzFailureStatus != http.StatusForbidden {
+		authzFailureStatus = http.StatusUnauthorized
+	}
+	return &server{svc: svc, clientIP: clientIP, authzFailureStatus: authzFailureStatus}
 }
 
 // caller builds the authorization caller of a request (§9.1): the authenticated principal
@@ -70,7 +78,12 @@ func (s *server) caller(r *http.Request) (Caller, error) {
 }
 
 // writeServiceError maps a typed service error to the status codes of §10.4.
-func writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
+//
+// A permission denial is answered with the configured auth.authorization_failure_status
+// (DOC-17): the same setting the core API honours, 401 by default and 403 when the
+// installation asks for it. Hard-coding 403 made a client written against the documented
+// 401-only denial response fail.
+func (s *server) writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
 	var (
 		permission    *PermissionError
 		authorization *AuthorizationError
@@ -79,7 +92,7 @@ func writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
 	)
 	switch {
 	case errors.As(err, &permission):
-		httputil.WriteAPIError(w, r, http.StatusForbidden, permission.Error())
+		httputil.WriteAPIError(w, r, s.authzFailureStatus, permission.Error())
 	case errors.As(err, &authorization):
 		httputil.WriteAPIError(w, r, http.StatusInternalServerError, authorization.Error())
 	case errors.As(err, &validation):
@@ -89,8 +102,8 @@ func writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
 		})
 	case errors.As(err, &source) && errors.Is(source.Err, ErrPermissionDenied):
 		// SEC-3: the caller may not read a source object. It is a permission problem, not a
-		// document problem.
-		httputil.WriteAPIError(w, r, http.StatusForbidden, err.Error())
+		// document problem, and it follows the same configurable status as a dataset denial.
+		httputil.WriteAPIError(w, r, s.authzFailureStatus, err.Error())
 	case errors.As(err, &source):
 		// §5.2 rule 4: a storage-ID mismatch is a deployment problem (422), every other
 		// source problem is a definition problem the client can fix (400).
@@ -175,7 +188,7 @@ func (s *server) ListDatasets(w http.ResponseWriter, r *http.Request, params api
 	}
 	result, err := s.svc.List(r.Context(), caller, req)
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	body := apigen.DatasetList{
@@ -193,23 +206,38 @@ func (s *server) ListDatasets(w http.ResponseWriter, r *http.Request, params api
 	httputil.WriteAPIResponse(w, r, http.StatusOK, body)
 }
 
-func (s *server) CreateDataset(w http.ResponseWriter, r *http.Request, body apigen.CreateDatasetJSONRequestBody) {
+func (s *server) CreateDataset(w http.ResponseWriter, r *http.Request, body apigen.CreateDatasetJSONRequestBody, params apigen.CreateDatasetParams) {
 	caller, err := s.caller(r)
 	if err != nil {
 		writeUnauthenticated(w, r)
 		return
 	}
+	// DOC-14: the create always publishes v1; publish.message only names that version.
+	// The async task is an extension reachable only through the explicit `async=true`.
 	req := CreateRequest{
 		Name:       body.Name,
 		Definition: definitionFromAPI(body.Definition),
-		Publish:    body.Publish != nil,
+		Async:      valueOrZero(params.Async),
 	}
 	if body.Publish != nil && body.Publish.Message != nil {
 		req.Message = *body.Publish.Message
 	}
+	if req.Message == "" {
+		req.Message = DefaultCreateMessage(req.Name)
+	}
+	if req.Async {
+		outcome, err := s.svc.CreateAsync(r.Context(), caller, req)
+		if err != nil {
+			s.writeServiceError(w, r, err)
+			return
+		}
+		logAction(r, "CreateDataset", req.Name, 0)
+		httputil.WriteAPIResponse(w, r, http.StatusAccepted, taskToAPI(outcome.Task))
+		return
+	}
 	view, err := s.svc.Create(r.Context(), caller, req)
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	logAction(r, "CreateDataset", view.Record.Name, view.Record.LatestVersion)
@@ -224,7 +252,7 @@ func (s *server) GetDataset(w http.ResponseWriter, r *http.Request, dataset apig
 	}
 	view, err := s.svc.Get(r.Context(), caller, string(dataset))
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	httputil.WriteAPIResponse(w, r, http.StatusOK, datasetToAPI(view))
@@ -237,7 +265,7 @@ func (s *server) DeleteDataset(w http.ResponseWriter, r *http.Request, dataset a
 		return
 	}
 	if err := s.svc.Delete(r.Context(), caller, string(dataset)); err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	logAction(r, "DeleteDataset", string(dataset), 0)
@@ -252,7 +280,7 @@ func (s *server) ValidateDataset(w http.ResponseWriter, r *http.Request, body ap
 	}
 	result, err := s.svc.Validate(r.Context(), caller, string(dataset), definitionFromAPI(body.Definition))
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	stats := statsToAPI(result.Stats)
@@ -270,7 +298,7 @@ func (s *server) ListAccess(w http.ResponseWriter, r *http.Request, dataset apig
 	}
 	grants, err := s.svc.ListAccess(r.Context(), caller, string(dataset))
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	body := apigen.AccessGrantList{
@@ -294,7 +322,7 @@ func (s *server) GrantAccess(w http.ResponseWriter, r *http.Request, body apigen
 	}
 	grant, err := s.svc.GrantAccess(r.Context(), caller, string(dataset), body.PrincipalType, body.PrincipalId)
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	logAction(r, "GrantAccess", string(dataset), 0)
@@ -308,7 +336,7 @@ func (s *server) RevokeAccess(w http.ResponseWriter, r *http.Request, dataset ap
 		return
 	}
 	if err := s.svc.RevokeAccess(r.Context(), caller, string(dataset), string(principalType), string(principalID)); err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	logAction(r, "RevokeAccess", string(dataset), 0)
@@ -342,7 +370,7 @@ func (s *server) ListMetadataKeys(w http.ResponseWriter, r *http.Request, params
 	result, err := s.svc.ListMetadataKeys(r.Context(), caller, prefix,
 		string(valueOrZero(params.After)), int(valueOrZero(params.Amount)))
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	body := apigen.MetadataKeyList{
@@ -368,7 +396,7 @@ func (s *server) CreateMetadataKey(w http.ResponseWriter, r *http.Request, body 
 	}
 	key, err := s.svc.CreateMetadataKey(r.Context(), caller, metadataKeyFromCreateAPI(apigen.MetadataKeyCreateRequest(body)))
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	logAction(r, ActionCreateMetadataKey, key.Name, 0)
@@ -383,7 +411,7 @@ func (s *server) GetMetadataKey(w http.ResponseWriter, r *http.Request, name api
 	}
 	key, err := s.svc.GetMetadataKey(r.Context(), caller, string(name))
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	httputil.WriteAPIResponse(w, r, http.StatusOK, metadataKeyToAPI(*key))
@@ -397,7 +425,7 @@ func (s *server) UpdateMetadataKey(w http.ResponseWriter, r *http.Request, body 
 	}
 	key, err := s.svc.UpdateMetadataKey(r.Context(), caller, string(name), metadataKeyFromUpdateAPI(string(name), apigen.MetadataKeyUpdateRequest(body)))
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	logAction(r, ActionUpdateMetadataKey, key.Name, 0)
@@ -411,7 +439,7 @@ func (s *server) DeleteMetadataKey(w http.ResponseWriter, r *http.Request, name 
 		return
 	}
 	if err := s.svc.DeleteMetadataKey(r.Context(), caller, string(name)); err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	logAction(r, ActionDeleteMetadataKey, string(name), 0)
@@ -427,7 +455,7 @@ func (s *server) ListVersions(w http.ResponseWriter, r *http.Request, dataset ap
 	result, err := s.svc.ListVersions(r.Context(), caller, string(dataset),
 		string(valueOrZero(params.After)), int(valueOrZero(params.Amount)))
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	body := apigen.DatasetVersionList{
@@ -460,7 +488,7 @@ func (s *server) PublishVersion(w http.ResponseWriter, r *http.Request, body api
 		if writeVersionConflict(w, r, err) {
 			return
 		}
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	// §6.5: a publish above datasets.sync_publish_max_objects answers 202 with the task
@@ -482,7 +510,7 @@ func (s *server) GetVersion(w http.ResponseWriter, r *http.Request, dataset apig
 	}
 	rec, err := s.svc.GetVersion(r.Context(), caller, string(dataset), string(version))
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	httputil.WriteAPIResponse(w, r, http.StatusOK, versionToAPI(rec))
@@ -496,7 +524,7 @@ func (s *server) GetTask(w http.ResponseWriter, r *http.Request, dataset apigen.
 	}
 	task, err := s.svc.GetTask(r.Context(), caller, string(dataset), string(taskID))
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	httputil.WriteAPIResponse(w, r, http.StatusOK, taskToAPI(task))
@@ -526,7 +554,7 @@ func (s *server) DiffRefs(w http.ResponseWriter, r *http.Request, dataset apigen
 	}
 	result, err := s.svc.Diff(r.Context(), caller, req)
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	if result.Type == DiffTypeData {
@@ -550,7 +578,7 @@ func (s *server) UpdateDataset(w http.ResponseWriter, r *http.Request, body apig
 		if writeVersionConflict(w, r, err) {
 			return
 		}
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	logAction(r, "UpdateDataset", string(dataset), view.Record.LatestVersion)
@@ -565,7 +593,7 @@ func (s *server) GetDatasetByRef(w http.ResponseWriter, r *http.Request, dataset
 	}
 	view, err := s.svc.GetByRef(r.Context(), caller, string(dataset), string(ref))
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	httputil.WriteAPIResponse(w, r, http.StatusOK, datasetToAPI(view))
@@ -585,7 +613,7 @@ func (s *server) ListPullRequests(w http.ResponseWriter, r *http.Request, params
 		Amount:  int(valueOrZero(params.Amount)),
 	})
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	httputil.WriteAPIResponse(w, r, http.StatusOK, pullRequestListToAPI(result.PullRequests, result.HasMore, result.NextOffset, result.MaxPerPage))
@@ -600,7 +628,7 @@ func (s *server) ListDatasetPullRequests(w http.ResponseWriter, r *http.Request,
 	result, err := s.svc.ListProposals(r.Context(), caller, string(dataset),
 		string(valueOrZero(params.Status)), string(valueOrZero(params.After)), int(valueOrZero(params.Amount)))
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	views := make([]*ProposalView, 0, len(result.Proposals))
@@ -630,7 +658,7 @@ func (s *server) CreatePullRequest(w http.ResponseWriter, r *http.Request, body 
 	}
 	view, err := s.svc.CreateProposal(r.Context(), caller, string(dataset), req)
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	logAction(r, "CreatePullRequest", string(dataset), 0)
@@ -645,7 +673,7 @@ func (s *server) GetPullRequest(w http.ResponseWriter, r *http.Request, dataset 
 	}
 	view, err := s.svc.GetProposal(r.Context(), caller, string(dataset), string(pullRequest))
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	httputil.WriteAPIResponse(w, r, http.StatusOK, pullRequestToAPI(view))
@@ -667,7 +695,7 @@ func (s *server) UpdatePullRequest(w http.ResponseWriter, r *http.Request, body 
 	}
 	view, err := s.svc.UpdateProposal(r.Context(), caller, string(dataset), string(pullRequest), req)
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	httputil.WriteAPIResponse(w, r, http.StatusOK, pullRequestToAPI(view))
@@ -680,7 +708,7 @@ func (s *server) ClosePullRequest(w http.ResponseWriter, r *http.Request, datase
 		return
 	}
 	if _, err := s.svc.CloseProposal(r.Context(), caller, string(dataset), string(pullRequest)); err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	logAction(r, "ClosePullRequest", string(dataset), 0)
@@ -695,7 +723,7 @@ func (s *server) GetPullRequestDiff(w http.ResponseWriter, r *http.Request, data
 	}
 	view, err := s.svc.GetProposal(r.Context(), caller, string(dataset), string(pullRequest))
 	if err != nil {
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	httputil.WriteAPIResponse(w, r, http.StatusOK, definitionDiffToAPI(view.Diff))
@@ -714,7 +742,7 @@ func (s *server) MergePullRequest(w http.ResponseWriter, r *http.Request, datase
 		if writeVersionConflict(w, r, err) {
 			return
 		}
-		writeServiceError(w, r, err)
+		s.writeServiceError(w, r, err)
 		return
 	}
 	logAction(r, "MergePullRequest", string(dataset), version.Version)
@@ -769,7 +797,7 @@ func definitionStateToAPI(in Definition, statuses []ItemStatus) apigen.DatasetDe
 		out.Description = &description
 	}
 	if in.Metadata != nil {
-		metadata := apigen.DatasetMetadata(in.Metadata)
+		metadata := metadataToAPI(in.Metadata)
 		out.Metadata = &metadata
 	}
 	for i, item := range in.Data {
@@ -787,9 +815,17 @@ func definitionStateToAPI(in Definition, statuses []ItemStatus) apigen.DatasetDe
 }
 
 // definitionFromAPI converts the wire definition into the package model.
+//
+// format_version is set by the server on write (DOC-12): an omitted value, and the zero the
+// generated type carries for an omission, both mean FormatVersion. The spec leaves the field
+// optional, so a client that follows ent-swagger and omits it is accepted.
 func definitionFromAPI(in apigen.DatasetDefinition) Definition {
+	formatVersion := FormatVersion
+	if in.FormatVersion != nil && *in.FormatVersion != 0 {
+		formatVersion = *in.FormatVersion
+	}
 	out := Definition{
-		FormatVersion: in.FormatVersion,
+		FormatVersion: formatVersion,
 		Data:          make([]DataItem, len(in.Data)),
 	}
 	if in.Description != nil {
@@ -806,8 +842,12 @@ func definitionFromAPI(in apigen.DatasetDefinition) Definition {
 
 // definitionToAPI converts the package model into the wire definition.
 func definitionToAPI(in Definition) apigen.DatasetDefinition {
+	formatVersion := in.FormatVersion
+	if formatVersion == 0 {
+		formatVersion = FormatVersion
+	}
 	out := apigen.DatasetDefinition{
-		FormatVersion: in.FormatVersion,
+		FormatVersion: &formatVersion,
 		Data:          make([]apigen.DataItem, len(in.Data)),
 	}
 	if in.Description != "" {
@@ -815,13 +855,44 @@ func definitionToAPI(in Definition) apigen.DatasetDefinition {
 		out.Description = &description
 	}
 	if in.Metadata != nil {
-		metadata := apigen.DatasetMetadata(in.Metadata)
+		metadata := metadataToAPI(in.Metadata)
 		out.Metadata = &metadata
 	}
 	for i, item := range in.Data {
 		out.Data[i] = dataItemToAPI(item)
 	}
 	return out
+}
+
+// metadataToAPI renders metadata in the documented wire shape (DOC-11): every value is an
+// array of strings. The input side accepts both a JSON scalar and an array, because the
+// published docs use scalars; the output side is always arrays, which is the
+// `additionalProperties: {type: array, items: string}` shape of ent-swagger v1.108, so a
+// client generated from that spec decodes the response.
+func metadataToAPI(in map[string]any) apigen.DatasetMetadata {
+	out := make(apigen.DatasetMetadata, len(in))
+	for key, value := range in {
+		out[key] = metadataValueStrings(value)
+	}
+	return out
+}
+
+// metadataValueStrings flattens one metadata value into the string list of the wire format.
+func metadataValueStrings(value any) []string {
+	switch typed := value.(type) {
+	case nil:
+		return []string{}
+	case []string:
+		return append([]string(nil), typed...)
+	case []any:
+		values := make([]string, 0, len(typed))
+		for _, element := range typed {
+			values = append(values, fmt.Sprint(element))
+		}
+		return values
+	default:
+		return []string{fmt.Sprint(typed)}
+	}
 }
 
 // dataItemFromAPI converts one wire data item. The reserved table/namespace descriptors are
@@ -840,6 +911,12 @@ func dataItemFromAPI(in apigen.DataItem) DataItem {
 	if in.Prefix != nil {
 		out.Prefix = &PathSource{Path: in.Prefix.Path}
 	}
+	// DOC-13: ent-swagger declares a namespace item's `namespace` member as a string, so the
+	// generated type is *string and the package model keeps just the name.
+	if in.Namespace != nil {
+		namespace := *in.Namespace
+		out.Namespace = &namespace
+	}
 	return out
 }
 
@@ -856,6 +933,10 @@ func dataItemToAPI(in DataItem) apigen.DataItem {
 	}
 	if in.Prefix != nil {
 		out.Prefix = &apigen.PathSource{Path: in.Prefix.Path}
+	}
+	if in.Namespace != nil {
+		namespace := *in.Namespace
+		out.Namespace = &namespace
 	}
 	return out
 }
@@ -902,17 +983,7 @@ func metadataValues(value *any) *[]string {
 	if value == nil {
 		return nil
 	}
-	values := make([]string, 0, 1)
-	switch typed := (*value).(type) {
-	case []any:
-		for _, element := range typed {
-			values = append(values, fmt.Sprint(element))
-		}
-	case []string:
-		values = append(values, typed...)
-	default:
-		values = append(values, fmt.Sprint(typed))
-	}
+	values := metadataValueStrings(*value)
 	return &values
 }
 

@@ -107,14 +107,14 @@ type TableSrc struct {
 	Name      string `json:"name"`
 }
 
-// NsSrc is the reserved source descriptor of a "namespace" item (Iceberg), for
-// the same reason as TableSrc.
-type NsSrc struct {
-	Name string `json:"name"`
-}
-
 // DataItem maps a source location into the dataset repository (§5.1). Exactly one
 // of Object, Prefix, Table and Namespace is set, matching Type.
+//
+// Namespace is a plain string, not an object: ent-swagger v1.108 declares the
+// `namespace` member of a namespace item as a string, so an Enterprise definition
+// such as {"type": "namespace", "namespace": "analytics"} decodes into this model
+// and reaches validation (which answers it with 501, §1.2) instead of failing the
+// JSON decode with a 400.
 type DataItem struct {
 	Target     string      `json:"target"`
 	Repository string      `json:"repository"`
@@ -123,7 +123,7 @@ type DataItem struct {
 	Object     *PathSource `json:"object,omitempty"`
 	Prefix     *PathSource `json:"prefix,omitempty"`
 	Table      *TableSrc   `json:"table,omitempty"`     // reserved
-	Namespace  *NsSrc      `json:"namespace,omitempty"` // reserved
+	Namespace  *string     `json:"namespace,omitempty"` // reserved: Iceberg namespace name
 }
 
 // Definition is the Enterprise-compatible definition body (§5.1). It carries no

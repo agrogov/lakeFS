@@ -73,21 +73,21 @@ describe('DatasetsListPage', () => {
         vi.unstubAllGlobals();
     });
 
-    it('renders the empty state and hides "Create dataset" without the permission', async () => {
+    it('renders the empty state and hides "Create Dataset" without the permission', async () => {
         renderPage();
 
         expect(await screen.findByText('No datasets yet')).toBeInTheDocument();
-        expect(screen.queryByRole('button', { name: /Create dataset/i })).not.toBeInTheDocument();
-        expect(screen.queryByRole('link', { name: /Create dataset/i })).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: /Create Dataset/i })).not.toBeInTheDocument();
+        expect(screen.queryByRole('link', { name: /Create Dataset/i })).not.toBeInTheDocument();
     });
 
-    it('offers "Create dataset" when the user may create datasets', async () => {
+    it('offers "Create Dataset" when the user may create datasets', async () => {
         canCreate.current = true;
         renderPage();
 
         expect(await screen.findByText('No datasets yet')).toBeInTheDocument();
         // Offered both in the toolbar and in the empty state.
-        expect(screen.getAllByText('Create dataset').length).toBeGreaterThan(0);
+        expect(screen.getAllByText('Create Dataset').length).toBeGreaterThan(0);
     });
 
     it('renders a dataset row with version, objects, size and metadata badges', async () => {

@@ -108,9 +108,14 @@ export const metadataKeyCreateRequest = (form: MetadataKeyFormState): MetadataKe
     return request;
 };
 
-/** The update request of the form: it never carries `type`, which §5.5 forbids changing. */
+/**
+ * The update request of the form. A PUT is a full replacement and requires `type` (DOC-10), so
+ * the current type is sent back unchanged: the server rejects a change with 409, and the type
+ * selector is disabled while editing.
+ */
 export const metadataKeyUpdateRequest = (form: MetadataKeyFormState): MetadataKeyUpdateRequest => {
     const request: MetadataKeyUpdateRequest = {
+        type: form.type,
         required: form.required,
         allow_multiple: form.allowMultiple,
     };

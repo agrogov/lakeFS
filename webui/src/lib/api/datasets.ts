@@ -190,8 +190,11 @@ export interface DataItem {
     prefix?: PathSource;
     /** Reserved for Iceberg `table` items; answered with 501 in this build (§1.2). */
     table?: Record<string, unknown>;
-    /** Reserved for Iceberg `namespace` items; answered with 501 in this build (§1.2). */
-    namespace?: Record<string, unknown>;
+    /**
+     * Reserved for Iceberg `namespace` items; answered with 501 in this build (§1.2).
+     * ent-swagger v1.108 names the namespace as a string (DOC-13).
+     */
+    namespace?: string;
 }
 
 /** Per-item source-resolution status of a published definition (§10.2 DataItemState). */
@@ -210,8 +213,13 @@ export type MetadataScalarValue = string | number | boolean;
 export type MetadataValue = MetadataScalarValue | MetadataScalarValue[];
 
 export interface DatasetDefinition {
-    format_version: 1;
+    /** Set by the server on write (DOC-12): an omitted value is stored as 1. */
+    format_version?: 1;
     description?: string;
+    /**
+     * Input accepts a scalar or an array per key; output is always an array of strings
+     * (DOC-11).
+     */
     metadata?: Record<string, MetadataValue>;
     data: DataItem[];
 }
@@ -445,7 +453,10 @@ export interface PublishOptions {
 export interface DatasetCreateRequest {
     name: string;
     definition: DatasetDefinition;
-    /** Without it the dataset is created empty; with it version `v1` is published (§10.1). */
+    /**
+     * The create always publishes `v1` (DOC-14); this only supplies the version message,
+     * which defaults to `Create dataset <name>`.
+     */
     publish?: PublishOptions;
 }
 
@@ -491,6 +502,8 @@ export interface MetadataKeyCreateRequest {
 }
 
 export interface MetadataKeyUpdateRequest {
+    /** Required: a PUT is a full replacement (DOC-10); changing it answers 409. */
+    type: MetadataKeyType;
     required?: boolean;
     allowed_values?: string[];
     allow_multiple?: boolean;
@@ -543,7 +556,11 @@ class Datasets {
         return datasetsRequest<DatasetList>(`${query}`, { method: 'GET' });
     }
 
-    /** Creates the dataset (and `v1` when `publish` is set). Large ones answer a `Task`. */
+    /**
+     * Creates the dataset and publishes `v1` (DOC-14); `publish.message` only names the
+     * version. The asynchronous answer is the `?async=true` extension, which the UI does not
+     * use; the type still covers it for completeness.
+     */
     async create(request: DatasetCreateRequest): Promise<Dataset | Task> {
         return datasetsRequest<Dataset | Task>('', {
             method: 'POST',
@@ -588,7 +605,7 @@ class Datasets {
         return datasetsRequest<DatasetVersionList>(`/${segment(name)}/versions${query}`, { method: 'GET' });
     }
 
-    /** `version` is `vN`, `N` or `latest`. */
+    /** `version` is `latest` or `v<N>`: the documented ref forms (DOC-19). */
     async getVersion(name: string, version: string | number): Promise<DatasetVersion> {
         return datasetsRequest<DatasetVersion>(`/${segment(name)}/versions/${segment(String(version))}`, {
             method: 'GET',

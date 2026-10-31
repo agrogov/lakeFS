@@ -19,7 +19,7 @@ import { DatasetsGate } from '../../lib/components/datasets/gate';
 export const DATASET_PAGES = [
     { key: 'overview', label: 'Overview', icon: BookIcon },
     { key: 'data', label: 'Data', icon: FileDirectoryIcon },
-    { key: 'versions', label: 'Versions', icon: HistoryIcon },
+    { key: 'versions', label: 'History', icon: HistoryIcon },
     { key: 'compare', label: 'Compare', icon: DiffIcon },
     { key: 'pulls', label: 'Pull Requests', icon: GitPullRequestIcon },
     { key: 'access', label: 'Access', icon: ShieldIcon },

@@ -84,10 +84,23 @@ paths:
       tags: [datasets]
       summary: Create a dataset
       description: |
-        Creates the dataset and its backing repository (§5.1, §6.1). Without `publish` the
-        dataset is created empty (no version; `latest` holds only the initial commit); with
-        `publish` version `v1` is published as well. Large publishes run asynchronously and
-        answer `202` with a task (§6.5).
+        Creates the dataset, its backing repository and version `v1` (§5.1, §6.1): every
+        create publishes a version, as the documentation says. `publish.message` is the v1
+        message and defaults to `Create dataset <name>`. The answer is the created `Dataset`.
+
+        The publish runs in the request by default. `async=true` keeps the undocumented
+        asynchronous behaviour of this build: the publish runs as a task and the answer is
+        `202` with the task to poll at `GET /{dataset}/tasks/{task_id}` (§6.5).
+      parameters:
+        - name: async
+          in: query
+          required: false
+          description: |
+            Publish version `v1` asynchronously and answer `202` with a task instead of
+            waiting. An extension of this build; the documented create is synchronous.
+          schema:
+            type: boolean
+            default: false
       requestBody:
         required: true
         content:
@@ -96,7 +109,7 @@ paths:
               $ref: "#/components/schemas/DatasetCreateRequest"
       responses:
         "201":
-          description: Dataset created (and optionally published)
+          description: Dataset created and version v1 published
           content:
             application/json:
               schema:
@@ -474,7 +487,7 @@ paths:
       tags: [datasets]
       summary: Get a dataset version
       description: |
-        `version` is `vN`, `N` or `latest` (§10.1). Returns the full, resolved definition.
+        `version` is `latest` or `v<N>` (§10.1). Returns the full, resolved definition.
       responses:
         "200":
           description: Version
@@ -968,37 +981,37 @@ components:
       name: version
       in: path
       required: true
-      description: "`vN` or `latest`"
+      description: "`latest` or `v<N>`, the documented ref forms"
       schema:
         type: string
-        pattern: "^(latest|[vV]?[0-9]{1,9})$"
+        pattern: "^(latest|v[0-9]{1,9})$"
 
     Ref:
       name: ref
       in: path
       required: true
-      description: "`vN` or `latest`"
+      description: "`latest` or `v<N>`, the documented ref forms"
       schema:
         type: string
-        pattern: "^(latest|[vV]?[0-9]{1,9})$"
+        pattern: "^(latest|v[0-9]{1,9})$"
 
     LeftRef:
       name: leftRef
       in: path
       required: true
-      description: "`vN`, `latest` or `pr/<id>`"
+      description: "`latest`, `v<N>` or `pr/<id>` (the `source_ref` of a pull request)"
       schema:
         type: string
-        pattern: "^(latest|[vV]?[0-9]{1,9}|pr/[0-9A-Za-z]+|proposal-[0-9A-Za-z]+)$"
+        pattern: "^(latest|v[0-9]{1,9}|pr/[0-9A-Za-z]{1,64})$"
 
     RightRef:
       name: rightRef
       in: path
       required: true
-      description: "`vN`, `latest` or `pr/<id>`"
+      description: "`latest`, `v<N>` or `pr/<id>` (the `source_ref` of a pull request)"
       schema:
         type: string
-        pattern: "^(latest|[vV]?[0-9]{1,9}|pr/[0-9A-Za-z]+|proposal-[0-9A-Za-z]+)$"
+        pattern: "^(latest|v[0-9]{1,9}|pr/[0-9A-Za-z]{1,64})$"
 
     PullRequestID:
       name: pullRequest
@@ -1108,7 +1121,9 @@ components:
     Forbidden:
       description: |
         The caller is missing a required dataset permission, or cannot read one of the source
-        repositories/objects referenced by the definition (§9.3).
+        repositories/objects referenced by the definition (§9.3). This status is configurable:
+        the documented `auth.authorization_failure_status` selects `401` (the default, as in the
+        core API) or `403` for denials, so a client must accept either.
       content:
         application/json:
           schema:
@@ -1201,24 +1216,38 @@ components:
     DatasetMetadata:
       type: object
       description: |
-        Free-form dataset metadata (§5.1): string, number, boolean or array of strings.
-        Values of defined metadata keys are validated against their type (§5.5).
-      additionalProperties: {}
+        Dataset metadata (§5.1). On **input** a value is a JSON scalar (string, number or
+        boolean) or an array of strings, so the examples of the published documentation keep
+        working. On **output** every value is always an array of strings, which is the
+        `additionalProperties: {type: array, items: string}` shape of ent-swagger v1.108, so a
+        client generated from that spec decodes this API. Values of defined metadata keys are
+        validated against their type (§5.5).
+      additionalProperties:
+        oneOf:
+          - type: string
+          - type: number
+          - type: boolean
+          - type: array
+            items:
+              type: string
       maxProperties: 128
       x-go-type: "map[string]interface{}"
 
     DatasetDefinition:
       type: object
       description: |
-        The Enterprise-compatible definition format, `format_version: 1` (§5.1). Stored
-        definitions only contain commit refs; branch and tag refs are resolved on input.
+        The Enterprise-compatible definition format (§5.1). `format_version` is set by the
+        server on write: it may be omitted and is stored as `1`. The data list must not be
+        empty - that rule is enforced by the service so the error carries its usual path and
+        message - and it is sorted by `target` once validated (§5.2). Stored definitions only
+        contain commit refs; branch and tag refs are resolved on input.
       required:
-        - format_version
         - data
       properties:
         format_version:
           type: integer
           enum: [1]
+          description: Set by the server on write; omitted means 1
         description:
           type: string
           maxLength: 4096
@@ -1226,9 +1255,8 @@ components:
           $ref: "#/components/schemas/DatasetMetadata"
         data:
           type: array
-          minItems: 1
           maxItems: 10000
-          description: Sorted by `target` once validated (§5.2)
+          description: Must not be empty; sorted by `target` once validated (§5.2)
           items:
             $ref: "#/components/schemas/DataItem"
 
@@ -1283,7 +1311,11 @@ components:
         table:
           $ref: "#/components/schemas/TableSource"
         namespace:
-          $ref: "#/components/schemas/NamespaceSource"
+          type: string
+          description: |
+            Iceberg namespace name. ent-swagger v1.108 declares `namespace` as a string, so an
+            Enterprise definition decodes; this build still answers the item with `501` (§1.2,
+            ICEBERG_CATALOG_PLAN.md).
 
     SourceRef:
       type: object
@@ -1317,11 +1349,6 @@ components:
     TableSource:
       type: object
       description: Reserved for Iceberg `table` items; answered with `501` in this build (§1.2)
-      additionalProperties: {}
-
-    NamespaceSource:
-      type: object
-      description: Reserved for Iceberg `namespace` items; answered with `501` in this build (§1.2)
       additionalProperties: {}
 
     Dataset:
@@ -1901,8 +1928,9 @@ components:
     DatasetCreateRequest:
       type: object
       description: |
-        Definition envelope used by create (§5.1, §10.1). Without `publish` the dataset is
-        created empty; with `publish` version `v1` is published right away.
+        Definition envelope used by create (§5.1, §10.1). The create always publishes version
+        `v1`; `publish` only carries the version message, which defaults to
+        `Create dataset <name>`.
       required:
         - name
         - definition
@@ -1935,6 +1963,9 @@ components:
               maxLength: 4096
     PublishOptions:
       type: object
+      description: |
+        Publish instruction of a create. The create always publishes `v1`; this only supplies
+        the version message, which defaults to `Create dataset <name>`.
       properties:
         message:
           type: string

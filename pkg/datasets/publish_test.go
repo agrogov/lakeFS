@@ -520,7 +520,6 @@ func TestPublish_PostCommitPutVersionRetryKeepsPins(t *testing.T) {
 	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition("src-post-commit", first.String(), "data", "data/"),
-		Publish:    true,
 	})
 	require.NoError(t, err)
 
@@ -563,7 +562,6 @@ func TestPublish_PostCommitPutVersionFailureLeavesPublishingForReconciler(t *tes
 	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition("src-post-reconcile", first.String(), "data", "data/"),
-		Publish:    true,
 	})
 	require.NoError(t, err)
 
@@ -619,7 +617,6 @@ func TestPublish_StalePendingAdoptsCommittedTag(t *testing.T) {
 	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition("src-adopt", first.String(), "data", "data/"),
-		Publish:    true,
 	})
 	require.NoError(t, err)
 
@@ -687,7 +684,6 @@ func TestPublish_CancelledContextAfterCommitStillAdvancesHead(t *testing.T) {
 	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition("src-post-cancel", first.String(), "data", "data/"),
-		Publish:    true,
 	})
 	require.NoError(t, err)
 
@@ -764,7 +760,6 @@ func TestPublish_HeartbeatRefreshesTheRecord(t *testing.T) {
 	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition(source, first.String(), "data", "data/"),
-		Publish:    true,
 		Message:    "v1",
 	})
 	require.NoError(t, err)
@@ -839,7 +834,6 @@ func TestPublish_ReconcilerRollbackAbortsTheRunningPublish(t *testing.T) {
 	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition(source, first.String(), "data", "data/"),
-		Publish:    true,
 		Message:    "v1",
 	})
 	require.NoError(t, err)
@@ -915,7 +909,6 @@ func TestPublish_HeartbeatCancelsOnLostOwnership(t *testing.T) {
 	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition(source, first.String(), "data", "data/"),
-		Publish:    true,
 		Message:    "v1",
 	})
 	require.NoError(t, err)
@@ -987,7 +980,6 @@ func TestReconcile_DoesNotRollBackAHeartbeatingPublish(t *testing.T) {
 	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition(source, first.String(), "data", "data/"),
-		Publish:    true,
 		Message:    "v1",
 	})
 	require.NoError(t, err)

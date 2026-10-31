@@ -94,7 +94,13 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 		return fmt.Errorf("datasets: build auth middleware: %w", err)
 	}
 
-	datasetsRouter, err := NewRouter(authMiddleware, newServer(svc, newClientIPResolver(deps)), cfg.MaxRequestBody)
+	// DOC-17: a permission denial answers the configured auth.authorization_failure_status,
+	// exactly like the core Controller. Zero (unset) means the core default, 401.
+	authzFailureStatus := http.StatusUnauthorized
+	if baseAuthCfg != nil && baseAuthCfg.AuthorizationFailureStatus != 0 {
+		authzFailureStatus = baseAuthCfg.AuthorizationFailureStatus
+	}
+	datasetsRouter, err := NewRouter(authMiddleware, newServer(svc, newClientIPResolver(deps), authzFailureStatus), cfg.MaxRequestBody)
 	if err != nil {
 		return err
 	}

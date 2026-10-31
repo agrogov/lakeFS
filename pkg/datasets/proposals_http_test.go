@@ -316,9 +316,9 @@ func TestDatasetsHTTPProposalSourceDenied(t *testing.T) {
 
 	rec = doRequest(t, handler, http.MethodPost, "/http-authz/pulls",
 		proposalCreateBody(t, "denied", def, ""), weakCred.AccessKeyID, weakCred.SecretAccessKey)
-	require.Equal(t, http.StatusForbidden, rec.Code, "body: %s", rec.Body.String())
+	require.Equal(t, http.StatusUnauthorized, rec.Code, "body: %s", rec.Body.String())
 	message := decodeError(t, rec).Message
-	require.Contains(t, message, "data[0]", "the 403 names the item (§9.3)")
+	require.Contains(t, message, "data[0]", "the denial names the item (§9.3)")
 	require.Contains(t, message, "handler-src")
 
 	// The admin opens a proposal with a different definition; the weak principal is not the
@@ -328,7 +328,7 @@ func TestDatasetsHTTPProposalSourceDenied(t *testing.T) {
 		objectDefinition("handler-src", commit.String(), "reference/countries-2.csv", "geo/countries.csv"))
 	rec = doRequest(t, handler, http.MethodPost, "/http-authz/pulls/"+proposal.Id+"/merge", "",
 		weakCred.AccessKeyID, weakCred.SecretAccessKey)
-	require.Equal(t, http.StatusForbidden, rec.Code, "body: %s", rec.Body.String())
+	require.Equal(t, http.StatusUnauthorized, rec.Code, "body: %s", rec.Body.String())
 	require.Contains(t, decodeError(t, rec).Message, "handler-src")
 
 	// The proposal is still open, so it was not merged by the refusal.

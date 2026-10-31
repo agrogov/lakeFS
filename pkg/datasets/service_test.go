@@ -160,46 +160,52 @@ func withMetadata(def Definition, metadata map[string]any) Definition {
 	return def
 }
 
-func TestServiceCreateWithoutPublish(t *testing.T) {
+// TestServiceCreateAlwaysPublishesV1 is DOC-14: a create has no "empty dataset" mode. It also
+// pins the repository setup that used to be the whole point of a create without a publish.
+func TestServiceCreateAlwaysPublishesV1(t *testing.T) {
 	f := newServiceFixture(t)
 	commit := f.sourceRepo(t, "src", map[string]string{"data/customers/a.parquet": "a"})
 	def := prefixDefinition("src", commit.String(), "customers", "data/customers/")
 
-	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "empty-set", Definition: def})
+	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "v1-set", Definition: def})
 	require.NoError(t, err)
-	require.Equal(t, "empty-set", view.Record.Name)
+	require.Equal(t, "v1-set", view.Record.Name)
 	require.Equal(t, DatasetStateActive, view.Record.State)
-	require.Zero(t, view.Record.LatestVersion, "no publish means no version")
-	require.Nil(t, view.Version)
+	require.Equal(t, 1, view.Record.LatestVersion, "every create publishes v1")
+	require.NotNil(t, view.Version)
+	require.Equal(t, 1, view.Version.Version)
+	require.Equal(t, DefaultCreateMessage("v1-set"), view.Version.Message,
+		"the default message names the dataset")
 
-	versions, err := f.svc.store.ListVersions(f.ctx, "empty-set")
+	versions, err := f.svc.store.ListVersions(f.ctx, "v1-set")
 	require.NoError(t, err)
-	require.Empty(t, versions)
+	require.Len(t, versions, 1)
+	require.Equal(t, 1, versions[0].Version)
 
 	// §6.1: the backing repository is read-only, defaults to "latest" and carries the
 	// dataset metadata markers.
-	repo, err := f.cat.GetRepository(f.ctx, "empty-set")
+	repo, err := f.cat.GetRepository(f.ctx, "v1-set")
 	require.NoError(t, err)
 	require.True(t, repo.ReadOnly)
 	require.Equal(t, DefaultBranch, repo.DefaultBranch)
-	require.Contains(t, repo.StorageNamespace, "mem://datasets/empty-set-")
-	require.NotEqual(t, "mem://datasets/empty-set", repo.StorageNamespace, "the ULID suffix is required")
+	require.Contains(t, repo.StorageNamespace, "mem://datasets/v1-set-")
+	require.NotEqual(t, "mem://datasets/v1-set", repo.StorageNamespace, "the ULID suffix is required")
 
-	metadata, err := f.cat.GetRepositoryMetadata(f.ctx, "empty-set")
+	metadata, err := f.cat.GetRepositoryMetadata(f.ctx, "v1-set")
 	require.NoError(t, err)
 	require.Equal(t, "true", metadata[RepositoryMetadataIsDatasetKey])
 	require.Equal(t, "1", metadata[RepositoryMetadataFormatKey])
 
 	// §9.4: the immutability guard exists and is attached to the base groups.
-	policy, err := f.authService.GetPolicy(f.ctx, ImmutabilityPolicyName("empty-set"))
+	policy, err := f.authService.GetPolicy(f.ctx, ImmutabilityPolicyName("v1-set"))
 	require.NoError(t, err)
-	require.Equal(t, ImmutabilityPolicyName("empty-set"), policy.DisplayName)
+	require.Equal(t, ImmutabilityPolicyName("v1-set"), policy.DisplayName)
 
 	// §9.5 note: the aggregate read policy lists the new dataset.
 	allRead, err := f.authService.GetPolicy(f.ctx, DatasetsAllReadPolicyName)
 	require.NoError(t, err)
-	require.Contains(t, statementResources(allRead.Statement), permissions.RepoArn("empty-set"))
-	require.Contains(t, statementResources(allRead.Statement), DatasetArn("empty-set"))
+	require.Contains(t, statementResources(allRead.Statement), permissions.RepoArn("v1-set"))
+	require.Contains(t, statementResources(allRead.Statement), DatasetArn("v1-set"))
 }
 
 func TestServiceCreateWithPublish(t *testing.T) {
@@ -214,7 +220,6 @@ func TestServiceCreateWithPublish(t *testing.T) {
 	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       "customer-360",
 		Definition: def,
-		Publish:    true,
 		Message:    "initial dataset",
 	})
 	require.NoError(t, err)
@@ -277,7 +282,7 @@ func TestServiceGet(t *testing.T) {
 	f := newServiceFixture(t)
 	commit := f.sourceRepo(t, "src", map[string]string{"a.txt": "a"})
 	def := objectDefinition("src", commit.String(), "a.txt", "a.txt")
-	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "get-set", Definition: def, Publish: true})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "get-set", Definition: def})
 	require.NoError(t, err)
 
 	view, err := f.svc.Get(f.ctx, f.caller(), "get-set")
@@ -317,7 +322,7 @@ func TestServiceList(t *testing.T) {
 	} {
 		def := withMetadata(base, ds.metadata)
 		def.Description = "dataset " + ds.name
-		_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: ds.name, Definition: def, Publish: true})
+		_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: ds.name, Definition: def})
 		require.NoError(t, err)
 	}
 
@@ -424,7 +429,7 @@ func TestServiceDeleteReleasesPinsAndPolicies(t *testing.T) {
 	f := newServiceFixture(t)
 	commit := f.sourceRepo(t, "src", map[string]string{"data/a.txt": "alpha"})
 	def := prefixDefinition("src", commit.String(), "a", "data/")
-	created, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "gone-set", Definition: def, Publish: true})
+	created, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "gone-set", Definition: def})
 	require.NoError(t, err)
 
 	f.addUser(t, "consumer")
@@ -488,7 +493,7 @@ func TestServiceDeleteReleasesPinsAndPolicies(t *testing.T) {
 	})
 
 	t.Run("name can be reused", func(t *testing.T) {
-		view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "gone-set", Definition: def, Publish: true})
+		view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "gone-set", Definition: def})
 		require.NoError(t, err)
 		require.Equal(t, 1, view.Record.LatestVersion)
 		require.NotEqual(t, oldNamespace, view.Record.StorageNS, "a re-created dataset gets a fresh storage namespace")
@@ -514,7 +519,6 @@ func TestServiceDeleteRejectsLivePublish(t *testing.T) {
 	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition("src-delete-publish", commit.String(), "data", "data/"),
-		Publish:    true,
 	})
 	require.NoError(t, err)
 
@@ -552,7 +556,7 @@ func TestServiceCreateFailureRollsBackInline(t *testing.T) {
 	f.svc.publishFn = func(context.Context, *Materializer, PublishRequest) (*PublishResult, error) {
 		return nil, errors.New("metarange write failed")
 	}
-	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def, Publish: true})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def})
 	require.Error(t, err)
 
 	_, _, err = f.svc.store.GetDataset(f.ctx, dataset)
@@ -563,7 +567,7 @@ func TestServiceCreateFailureRollsBackInline(t *testing.T) {
 	require.ErrorIs(t, err, auth.ErrNotFound, "the guard of a failed create is removed")
 
 	f.svc.publishFn = publishWithMaterializer
-	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def, Publish: true})
+	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def})
 	require.NoError(t, err)
 	require.Equal(t, 1, view.Record.LatestVersion)
 }
@@ -587,7 +591,6 @@ func TestServiceInjectedClock(t *testing.T) {
 	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition(source, commit.String(), "data", "data/"),
-		Publish:    true,
 		Message:    "v1",
 	})
 	require.NoError(t, err)
@@ -800,7 +803,7 @@ func TestServiceAccessGrantRoundTrip(t *testing.T) {
 	f := newServiceFixture(t)
 	commit := f.sourceRepo(t, "src", map[string]string{"a.txt": "a"})
 	def := objectDefinition("src", commit.String(), "a.txt", "a.txt")
-	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "shared-set", Definition: def, Publish: true})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "shared-set", Definition: def})
 	require.NoError(t, err)
 
 	f.addUser(t, "alice")
@@ -897,9 +900,9 @@ func TestServiceDatasetsAllReadMembership(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, statementResources(policy.Statement), DatasetArn("first-set"))
 
-	_, err = f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "first-set", Definition: def, Publish: true})
+	_, err = f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "first-set", Definition: def})
 	require.NoError(t, err)
-	_, err = f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "second-set", Definition: def, Publish: true})
+	_, err = f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "second-set", Definition: def})
 	require.NoError(t, err)
 
 	policy, err = f.authService.GetPolicy(f.ctx, DatasetsAllReadPolicyName)
@@ -932,7 +935,8 @@ func policyNames(policies []*model.Policy) []string {
 func TestRollbackCreate_ModifiedRecordIsStillRemoved(t *testing.T) {
 	const dataset = "rollback-modified"
 	f := newServiceFixture(t)
-	def := prefixDefinition("src-rollback", "main", "data", "data/")
+	commit := f.sourceRepo(t, "src-rollback", map[string]string{"data/a.parquet": "a"})
+	def := prefixDefinition("src-rollback", commit.String(), "data", "data/")
 	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def})
 	require.NoError(t, err)
 	stale := view.Record
@@ -963,7 +967,8 @@ func TestCreate_AllReadPolicyFailureStillReturnsDataset(t *testing.T) {
 	const dataset = "policy-fails"
 	f := newServiceFixture(t)
 	f.svc.authService = failingAllReadAuth{Service: f.svc.authService}
-	def := prefixDefinition("src-policy", "main", "data", "data/")
+	commit := f.sourceRepo(t, "src-policy", map[string]string{"data/a.parquet": "a"})
+	def := prefixDefinition("src-policy", commit.String(), "data", "data/")
 
 	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def})
 	require.NoError(t, err)

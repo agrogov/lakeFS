@@ -169,7 +169,7 @@ const DatasetVersionsPage: FC = () => {
     return (
         <div className="dataset-versions-page">
             <div className="d-flex align-items-center mb-3">
-                <h5 className="mb-0">Versions</h5>
+                <h5 className="mb-0">History</h5>
                 <span className="text-muted small ms-2">
                     {entries.length} version{entries.length === 1 ? '' : 's'}, newest first
                 </span>

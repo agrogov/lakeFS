@@ -16,6 +16,7 @@ import (
 	"github.com/treeverse/lakefs/contrib/auth/acl"
 	"github.com/treeverse/lakefs/pkg/api"
 	"github.com/treeverse/lakefs/pkg/auth/model"
+	"github.com/treeverse/lakefs/pkg/config"
 	"github.com/treeverse/lakefs/pkg/datasets/apigen"
 )
 
@@ -84,9 +85,21 @@ func newControlPlaneWithDeps(t *testing.T) (*chi.Mux, cmdpkg.ServerDeps, string,
 // configuration section, for tests that need a different sync_publish_max_objects and so on.
 func newControlPlaneWithConfig(t *testing.T, datasetsConfig string) (*chi.Mux, cmdpkg.ServerDeps, string, string) {
 	t.Helper()
+	return newControlPlaneWithConfigAndAuthzStatus(t, datasetsConfig, 0)
+}
+
+// newControlPlaneWithConfigAndAuthzStatus additionally sets
+// auth.authorization_failure_status, for the DOC-17 tests. Zero keeps the core default (401).
+func newControlPlaneWithConfigAndAuthzStatus(t *testing.T, datasetsConfig string, authzFailureStatus int) (*chi.Mux, cmdpkg.ServerDeps, string, string) {
+	t.Helper()
 	useConfig(t, datasetsConfig)
 
 	deps := testDeps(t)
+	if authzFailureStatus != 0 {
+		deps.Config = &config.ConfigImpl{
+			Auth: config.Auth{BaseAuth: config.BaseAuth{AuthorizationFailureStatus: authzFailureStatus}},
+		}
+	}
 	ctx := t.Context()
 	_, err := deps.AuthService.CreateUser(ctx, &model.User{Username: testUsername})
 	require.NoError(t, err)
@@ -230,7 +243,7 @@ func TestGeneratedDefinitionTypes(t *testing.T) {
 	var def apigen.DatasetDefinition
 	require.NoError(t, json.Unmarshal([]byte(enterpriseDefinition), &def))
 
-	require.Equal(t, 1, def.FormatVersion)
+	require.Equal(t, 1, derefInt(def.FormatVersion))
 	require.NotNil(t, def.Description)
 	require.Equal(t, "Curated customer view for analytics", *def.Description)
 	require.Len(t, def.Data, 2)
@@ -420,7 +433,7 @@ func validCreateBodyWithItemType(itemType string) string {
 // because no principal can be authenticated.
 func TestNewRouterWithoutAuthMiddleware(t *testing.T) {
 	// A server with no service is enough: requireUser answers 401 before any handler runs.
-	handler, err := NewRouter(nil, newServer(nil, nil), DefaultMaxRequestBody)
+	handler, err := NewRouter(nil, newServer(nil, nil, 0), DefaultMaxRequestBody)
 	require.NoError(t, err)
 
 	// NewRouter returns the sub-router; the validator resolves paths through the spec server
@@ -537,7 +550,7 @@ func TestDatasetsSpecBounds(t *testing.T) {
 	t.Run("description over maxLength", func(t *testing.T) {
 		tooLong := strings.Repeat("x", 4097)
 		body := marshalBody(t, apigen.DatasetValidateRequest{Definition: apigen.DatasetDefinition{
-			FormatVersion: 1,
+			FormatVersion: ptr(1),
 			Description:   &tooLong,
 		}})
 		rec := doRequest(t, handler, http.MethodPost, "/bounds-set/validate", body, accessKey, secret)
@@ -548,7 +561,7 @@ func TestDatasetsSpecBounds(t *testing.T) {
 	t.Run("path over maxLength", func(t *testing.T) {
 		tooLong := strings.Repeat("x", 1025)
 		def := apigen.DatasetDefinition{
-			FormatVersion: 1,
+			FormatVersion: ptr(1),
 			Data: []apigen.DataItem{{
 				Target:     "t",
 				Repository: "src",

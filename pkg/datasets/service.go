@@ -282,18 +282,41 @@ func (s *Service) Config() *Config { return s.cfg }
 
 // CreateRequest is the input of Service.Create: the §5.1 envelope without its name (which
 // travels separately, because it is also the URL/record key).
+//
+// Every create publishes version v1 (DOC-14): the documented API has no empty dataset, and
+// "every create or update produces the next version". Message only supplies the v1 commit
+// message; an empty one becomes DefaultCreateMessage(name).
 type CreateRequest struct {
 	Name       string
 	Definition Definition
-	// Publish requests version v1 as part of the create (§10.1). Without it the dataset is
-	// created empty: repository and record only, no version.
-	Publish bool
-	// Message is the v1 commit message when Publish is set.
+	// Async runs the v1 publish as a background task and returns its TaskRecord instead of
+	// the created dataset (§6.5). It is an extension of this build, reachable only through
+	// the explicit `?async=true` query parameter.
+	Async bool
+	// Message is the v1 commit message. Empty means DefaultCreateMessage(name).
 	Message string
 	// PreserveProposalID is the pull request a create-on-merge must not delete: a create
 	// removes leftover control-plane records of the name (BUG-7), and the merge still has
 	// to close this pull request record afterwards. Internal to the service.
 	PreserveProposalID string
+}
+
+// DefaultCreateMessage is the v1 commit message of a create that supplies none (DOC-14).
+func DefaultCreateMessage(name string) string {
+	return "Create dataset " + name
+}
+
+// CreateOutcome is the result of a create: the created dataset for the documented
+// synchronous create, or the task of the initial publish when async was requested.
+type CreateOutcome struct {
+	View *DatasetView
+	Task *TaskRecord
+}
+
+// Accepted reports whether the create answered with an asynchronous task instead of a
+// dataset (POST /datasets?async=true).
+func (o *CreateOutcome) Accepted() bool {
+	return o != nil && o.Task != nil
 }
 
 // DatasetView is one dataset as the API returns it: the head record plus the record of the
@@ -382,8 +405,34 @@ func (s *Service) withItemStatuses(ctx context.Context, caller Caller, view *Dat
 	return view, nil
 }
 
-// Create creates the dataset repository and its control-plane record, and publishes version
-// v1 when req.Publish is set (§6.1, §6.2, §10.1).
+// Create creates the dataset and publishes version v1 in the request (§6.1, §6.2, §10.1),
+// returning the created dataset. This is the documented create: every create produces a
+// version (DOC-14).
+func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) (*DatasetView, error) {
+	req.Async = false
+	outcome, err := s.create(ctx, caller, req)
+	if err != nil {
+		return nil, err
+	}
+	if outcome.Accepted() {
+		// Unreachable: Async is cleared above. Failing loudly beats returning a dataset
+		// whose version is still being published.
+		return nil, fmt.Errorf("%w: dataset %q", ErrPublishNotSynchronous, req.Name)
+	}
+	return outcome.View, nil
+}
+
+// CreateAsync creates the dataset and publishes version v1 as a background task, returning
+// the task the client polls at GET /{dataset}/tasks/{task_id}. It is the `?async=true`
+// extension of the documented create; the dataset record is already in state publishing when
+// this returns, so a second publish is a 409 immediately.
+func (s *Service) CreateAsync(ctx context.Context, caller Caller, req CreateRequest) (*CreateOutcome, error) {
+	req.Async = true
+	return s.create(ctx, caller, req)
+}
+
+// create is the common body of Create and CreateAsync. It creates the dataset repository
+// and its control-plane record, then publishes version v1 either in the request or as a task.
 //
 // The dataset is materialised as a read-only repository with the dataset's name and the
 // default branch "latest" (§4.2, §6.1); its storage namespace is
@@ -391,7 +440,7 @@ func (s *Service) withItemStatuses(ctx context.Context, caller Caller, view *Dat
 // even if the old storage namespace still holds objects. Repository metadata marks the
 // repository as a dataset (lakefs.dataset=true, lakefs.dataset.format=1) and the per-dataset
 // immutability deny policy of §9.4 is attached before any version is published.
-func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) (*DatasetView, error) {
+func (s *Service) create(ctx context.Context, caller Caller, req CreateRequest) (*CreateOutcome, error) {
 	// §9.1: creating a dataset needs dataset:CreateDataset on the (future) dataset ARN.
 	if err := s.authorizer.CheckDataset(ctx, caller, ActionCreateDataset, req.Name); err != nil {
 		return nil, err
@@ -399,29 +448,27 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 	if problems := ValidateName(req.Name); len(problems) > 0 {
 		return nil, &ValidationError{Problems: problems}
 	}
+	if req.Message == "" {
+		req.Message = DefaultCreateMessage(req.Name)
+	}
 
 	// §5.2 rules 1-3 and 6 are checked for every create; the catalog-dependent rules are
-	// only needed when a definition is actually attached to a version.
+	// checked on the definition that is about to become v1.
 	def := req.Definition
 	if err := s.validateDefinition(ctx, &def); err != nil {
 		return nil, err
 	}
 
-	var resolved *Definition
-	if req.Publish {
-		var err error
-		// §9.3: the creator must be able to read every source they attach.
-		resolved, ctx, err = s.resolveAuthorized(ctx, caller, &def)
-		if err != nil {
-			return nil, err
-		}
-		// §5.2 rule 5, before anything is created: an object item whose key is not at
-		// its commit, or an empty prefix item, must fail the create instead of leaving
-		// a half-created dataset behind. The same walk estimates the version's
-		// footprint, which is what the publish of §6.5 is sized against.
-		if _, err := s.sourceStats(ctx, resolved); err != nil {
-			return nil, err
-		}
+	// §9.3: the creator must be able to read every source they attach.
+	resolved, ctx, err := s.resolveAuthorized(ctx, caller, &def)
+	if err != nil {
+		return nil, err
+	}
+	// §5.2 rule 5, before anything is created: an object item whose key is not at
+	// its commit, or an empty prefix item, must fail the create instead of leaving
+	// a half-created dataset behind. The same walk sizes the version's footprint.
+	if _, err := s.sourceStats(ctx, resolved); err != nil {
+		return nil, err
 	}
 
 	// §10.4: a name taken by a repository or by another dataset is a 409.
@@ -484,55 +531,83 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 		return nil, err
 	}
 
-	current := rec
-	var version *VersionRecord
-	if req.Publish {
-		version, err = s.publish(ctx, current, *resolved, req.Message, caller.Username, "")
+	// DOC-14: async is an explicit opt-in. Otherwise the v1 publish runs in the request, so
+	// the 201 can carry the version.
+	if req.Async {
+		publishing, err := s.beginInitialPublish(ctx, rec)
 		if err != nil {
-			if committed, ok := asCommitExists(err); ok {
-				// The commit exists: leaving the record for the reconciler is the only safe
-				// outcome (BUG-2); deleting the repository would destroy the version.
-				s.leavePending(ctx, req.Name, committed.version)
-				return nil, err
-			}
 			s.rollbackCreate(ctx, rec)
 			return nil, err
 		}
+		outcome, err := s.startAsyncPublish(ctx, publishing, *resolved,
+			PublishVersionRequest{Message: req.Message}, caller.Username)
+		if err != nil {
+			s.rollbackCreate(ctx, rec)
+			return nil, err
+		}
+		s.ensureAllReadPolicyBestEffort(ctx, req.Name)
+		return &CreateOutcome{Task: outcome.Task}, nil
 	}
 
-	var active *DatasetRecord
-	if version != nil {
-		active, err = s.advanceDataset(ctx, current, version.Version)
-		if err != nil {
-			// The version is committed; never delete its repository. Leave the record
-			// pending so the reconciler completes it from the tag (BUG-2).
-			s.leavePending(ctx, req.Name, version.Version)
+	version, err := s.publish(ctx, rec, *resolved, req.Message, caller.Username, "")
+	if err != nil {
+		if committed, ok := asCommitExists(err); ok {
+			// The commit exists: leaving the record for the reconciler is the only safe
+			// outcome (BUG-2); deleting the repository would destroy the version.
+			s.leavePending(ctx, req.Name, committed.version)
 			return nil, err
 		}
-	} else {
-		next := *current
-		next.State = DatasetStateActive
-		next.PendingVersion = 0
-		next.UpdatedAt = s.now()
-		if err := s.store.PutDatasetIf(ctx, &next, current, nil); err != nil {
-			s.rollbackCreate(ctx, rec)
-			if errors.Is(err, kv.ErrPredicateFailed) {
-				return nil, fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, req.Name)
-			}
-			return nil, err
-		}
-		active = &next
+		s.rollbackCreate(ctx, rec)
+		return nil, err
+	}
+
+	active, err := s.advanceDataset(ctx, rec, version.Version)
+	if err != nil {
+		// The version is committed; never delete its repository. Leave the record
+		// pending so the reconciler completes it from the tag (BUG-2).
+		s.leavePending(ctx, req.Name, version.Version)
+		return nil, err
 	}
 
 	// §9.5 note: the aggregate read policy lists every dataset repository and must follow
 	// create/delete.
-	// The dataset is already active here; a failure only delays the policy, which the
-	// reconciler converges, so it must not fail the create.
+	s.ensureAllReadPolicyBestEffort(ctx, req.Name)
+	view, err := s.withItemStatuses(ctx, caller, &DatasetView{Record: active, Version: version})
+	if err != nil {
+		return nil, err
+	}
+	return &CreateOutcome{View: view}, nil
+}
+
+// beginInitialPublish CASes a just-created record to publishing(PendingVersion=1), which is
+// the state startAsyncPublish and the reconciler need. It never runs for the synchronous
+// create, which publishes from the creating record directly.
+func (s *Service) beginInitialPublish(ctx context.Context, rec *DatasetRecord) (*DatasetRecord, error) {
+	current, predicate, err := s.store.GetDataset(ctx, rec.Name)
+	if err != nil {
+		return nil, err
+	}
+	next := *current
+	next.State = DatasetStatePublishing
+	next.PendingVersion = 1
+	next.UpdatedAt = s.now()
+	if err := s.store.PutDatasetIf(ctx, &next, current, predicate); err != nil {
+		if errors.Is(err, kv.ErrPredicateFailed) {
+			return nil, fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, rec.Name)
+		}
+		return nil, err
+	}
+	return &next, nil
+}
+
+// ensureAllReadPolicyBestEffort converges the aggregate read policy of §9.5 after a create.
+// The dataset exists at this point, so a failure only delays the policy until the next
+// reconciler pass and must not fail the already-created dataset.
+func (s *Service) ensureAllReadPolicyBestEffort(ctx context.Context, dataset string) {
 	if err := s.ensureAllReadPolicy(ctx); err != nil {
-		logging.FromContext(ctx).WithError(err).WithField("dataset", req.Name).
+		logging.FromContext(ctx).WithError(err).WithField("dataset", dataset).
 			Warn("datasets: dataset created but the all-read policy was not updated; the reconciler will converge it")
 	}
-	return s.withItemStatuses(ctx, caller, &DatasetView{Record: active, Version: version})
 }
 
 // rollbackCreate undoes a create that failed before its first commit (BUG-10): the
@@ -1487,7 +1562,7 @@ func (s *Service) ListVersions(ctx context.Context, caller Caller, name, after s
 
 	start := 0
 	if after != "" {
-		version, err := parseVersionNumber(after)
+		version, err := parseVersionCursor(after)
 		if err != nil {
 			return nil, &ValidationError{Problems: []Problem{{Path: "after", Message: err.Error()}}}
 		}
@@ -1605,11 +1680,11 @@ func (s *Service) readDefinitionObject(ctx context.Context, dataset, commitID, p
 	return &doc.Definition, nil
 }
 
-// resolveVersionRef turns the {version} path parameter of §10.1 ("vN", "N" or "latest")
-// into a version number.
+// resolveVersionRef turns the {version} path parameter of §10.1 ("latest" or "v<N>",
+// DOC-19) into a version number.
 func resolveVersionRef(rec *DatasetRecord, ref string) (int, error) {
 	trimmed := strings.TrimSpace(ref)
-	if trimmed == "" || strings.EqualFold(trimmed, "latest") {
+	if trimmed == "latest" {
 		if rec.LatestVersion <= 0 {
 			return 0, fmt.Errorf("%w: dataset %q has no published version", ErrVersionNotFound, rec.Name)
 		}
@@ -1622,16 +1697,34 @@ func resolveVersionRef(rec *DatasetRecord, ref string) (int, error) {
 	return version, nil
 }
 
-// parseVersionNumber accepts the two spellings a version reference may have (§10.1): the
-// tag form "v3" and the bare number "3".
+// parseVersionCursor parses the `after` pagination cursor of a version list. It is a bare
+// version number, not a ref: the cursor is generated by NextOffset and is not part of the
+// documented ref grammar, so DOC-19's `v<N>`-only rule does not apply to it.
+func parseVersionCursor(after string) (int, error) {
+	version, err := strconv.Atoi(strings.TrimSpace(after))
+	if err != nil || version < 1 {
+		return 0, fmt.Errorf("%w: pagination cursor must be a positive version number, got %q",
+			ErrInvalidVersionRef, after)
+	}
+	return version, nil
+}
+
+// parseVersionNumber accepts the documented version spelling of §10.1: the tag form "v3".
+// The bare "3" and upper-case "V3" aliases are deliberately not accepted (DOC-19): they are
+// not part of the documented ref grammar, and the request spec rejects them before a handler
+// runs; keeping them here would let an internal caller depend on a private dialect.
 func parseVersionNumber(ref string) (int, error) {
 	trimmed := strings.TrimSpace(ref)
-	if len(trimmed) > 1 && (trimmed[0] == 'v' || trimmed[0] == 'V') {
-		trimmed = trimmed[1:]
+	if len(trimmed) < 2 || trimmed[0] != 'v' {
+		return 0, fmt.Errorf("%w: must be v<N> or latest, got %q", ErrInvalidVersionRef, ref)
 	}
-	version, err := strconv.Atoi(trimmed)
+	digits := trimmed[1:]
+	if len(digits) > 9 {
+		return 0, fmt.Errorf("%w: must be v<N> or latest, got %q", ErrInvalidVersionRef, ref)
+	}
+	version, err := strconv.Atoi(digits)
 	if err != nil || version < 1 {
-		return 0, fmt.Errorf("%w: must be vN, N or latest, got %q", ErrInvalidVersionRef, ref)
+		return 0, fmt.Errorf("%w: must be v<N> or latest, got %q", ErrInvalidVersionRef, ref)
 	}
 	return version, nil
 }
