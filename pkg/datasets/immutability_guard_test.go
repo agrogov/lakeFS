@@ -177,3 +177,38 @@ type stubAuthService struct{ auth.Service }
 func (*stubAuthService) Authorize(context.Context, *auth.AuthorizationRequest) (*auth.AuthorizationResponse, error) {
 	return &auth.AuthorizationResponse{Allowed: true}, nil
 }
+
+// TestCreateInvalidatesGuardedRepos: Create drops the guard's cached dataset names, so a new
+// dataset repository is guarded from its first write instead of after the cache TTL.
+func TestCreateInvalidatesGuardedRepos(t *testing.T) {
+	f := newServiceFixture(t)
+	store := NewStore(f.kvStore)
+	repos := newDatasetRepoSet(func(ctx context.Context) ([]string, error) {
+		recs, err := store.ListDatasets(ctx)
+		if err != nil {
+			return nil, err
+		}
+		names := make([]string, 0, len(recs))
+		for _, rec := range recs {
+			names = append(names, rec.Name)
+		}
+		return names, nil
+	}, time.Hour, time.Now)
+	svc, err := NewService(f.cfg, f.kvStore, f.cat, NewImmutabilityAuthService(f.authService, repos))
+	require.NoError(t, err)
+
+	guarded, err := repos.Contains(f.ctx, "guarded-on-create")
+	require.NoError(t, err)
+	require.False(t, guarded)
+
+	commit := f.sourceRepo(t, "src-guarded-on-create", map[string]string{"data/a.csv": "a"})
+	_, err = svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       "guarded-on-create",
+		Definition: prefixDefinition("src-guarded-on-create", commit.String(), "data", "data/"),
+		Message:    "v1",
+	})
+	require.NoError(t, err)
+	guarded, err = repos.Contains(f.ctx, "guarded-on-create")
+	require.NoError(t, err)
+	require.True(t, guarded, "the cached set must not hide the new dataset for its TTL")
+}

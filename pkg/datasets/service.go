@@ -497,6 +497,9 @@ func (s *Service) create(ctx context.Context, caller Caller, req CreateRequest) 
 		}
 		return nil, err
 	}
+	// The SEC-2 guard caches the dataset names for a couple of seconds; drop this node's copy,
+	// so the new dataset repository is guarded from its first write rather than after the TTL.
+	s.invalidateGuardedRepos()
 
 	// BUG-7: a delete that crashed before it removed the version (or proposal, task, grant)
 	// records of this name leaves them behind, because finishDelete deletes the dataset record

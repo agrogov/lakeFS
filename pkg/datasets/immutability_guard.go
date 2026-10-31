@@ -114,6 +114,15 @@ func (s *DatasetRepoSet) Invalidate() {
 	s.mu.Unlock()
 }
 
+// invalidateGuardedRepos drops the cached dataset names of the SEC-2 guard, when the service's
+// auth service is the guard (cmd/lakefs-sso wraps it so). Other nodes keep their copy until its
+// TTL (datasetRepoCacheTTL) runs out.
+func (s *Service) invalidateGuardedRepos() {
+	if guard, ok := s.authService.(*ImmutabilityAuthService); ok && guard.repos != nil {
+		guard.repos.Invalidate()
+	}
+}
+
 // immutableActionSet is immutabilityDeniedActions as a set.
 var immutableActionSet = func() map[string]struct{} {
 	m := make(map[string]struct{}, len(immutabilityDeniedActions))
