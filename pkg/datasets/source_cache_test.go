@@ -139,6 +139,52 @@ func TestSourceReadCacheDenyIsNotLeakedByAnAllowedNeighbour(t *testing.T) {
 	require.ErrorIs(t, reader.CheckObject(ctx, src, "secret/e.csv"), ErrSourceReadDenied)
 }
 
+// TestSourceReadCacheExactResourceIsNotAPrefix: a policy resource without a wildcard names one
+// object, not the paths that start with it. Its decision is never shared with a longer sibling in
+// either direction - neither an exact Deny bypassed by a cached neighbour, nor an exact Allow
+// extended to one.
+func TestSourceReadCacheExactResourceIsNotAPrefix(t *testing.T) {
+	const src = "src"
+	t.Run("exact deny after a longer sibling", func(t *testing.T) {
+		_, authz, user := newCountingAuthzFixture(t, permissions.ObjectArn(src, "salaries.csv"))
+		reader := authz.SourceReader(Caller{Username: user})
+		ctx := t.Context()
+		require.NoError(t, reader.CheckObject(ctx, src, "salaries.csv.old"))
+		require.ErrorIs(t, reader.CheckObject(ctx, src, "salaries.csv"), ErrSourceReadDenied)
+	})
+	t.Run("exact deny before a longer sibling", func(t *testing.T) {
+		_, authz, user := newCountingAuthzFixture(t, permissions.ObjectArn(src, "salaries.csv"))
+		reader := authz.SourceReader(Caller{Username: user})
+		ctx := t.Context()
+		require.ErrorIs(t, reader.CheckObject(ctx, src, "salaries.csv"), ErrSourceReadDenied)
+		require.NoError(t, reader.CheckObject(ctx, src, "salaries.csv.old"))
+	})
+
+	exactAllow := func(t *testing.T) (*SourceReader, context.Context) {
+		t.Helper()
+		const user = "reader"
+		f := newAuthzFixture(t)
+		f.user(t, user)
+		f.policy(t, "allow-one", model.Statements{{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{permissions.ReadObjectAction},
+			Resource: permissions.ObjectArn(src, "x.csv"),
+		}})
+		f.attachToUser(t, "allow-one", user)
+		return f.authz.SourceReader(Caller{Username: user}), t.Context()
+	}
+	t.Run("exact allow before a longer sibling", func(t *testing.T) {
+		reader, ctx := exactAllow(t)
+		require.NoError(t, reader.CheckObject(ctx, src, "x.csv"))
+		require.ErrorIs(t, reader.CheckObject(ctx, src, "x.csv.secret"), ErrSourceReadDenied)
+	})
+	t.Run("exact allow after a longer sibling", func(t *testing.T) {
+		reader, ctx := exactAllow(t)
+		require.ErrorIs(t, reader.CheckObject(ctx, src, "x.csv.secret"), ErrSourceReadDenied)
+		require.NoError(t, reader.CheckObject(ctx, src, "x.csv"))
+	})
+}
+
 // TestSourceReadCacheExactFallback: a policy set the cache cannot analyse into prefixes costs one
 // authorization per distinct path, never fewer; only the exact ARN is remembered.
 func TestSourceReadCacheExactFallback(t *testing.T) {
@@ -226,8 +272,9 @@ func TestPolicyPrefixes(t *testing.T) {
 				`"arn:lakefs:fs:::repository/src/object/${user}/*"]`,
 		},
 	}}}
-	prefixes, ok := policyPrefixes(policies, "alice")
+	prefixes, exact, ok := policyPrefixes(policies, "alice")
 	require.True(t, ok)
+	require.Empty(t, exact)
 	require.ElementsMatch(t, []string{
 		"arn:lakefs:fs:::repository/src/object/",
 		"arn:lakefs:fs:::repository/src/object/secret/",
@@ -242,7 +289,7 @@ func TestPolicyPrefixes(t *testing.T) {
 	} {
 		t.Run(resource, func(t *testing.T) {
 			t.Parallel()
-			_, ok := policyPrefixes([]*model.Policy{{Statement: model.Statements{{
+			_, _, ok := policyPrefixes([]*model.Policy{{Statement: model.Statements{{
 				Effect:   model.StatementEffectAllow,
 				Action:   []string{"fs:*"},
 				Resource: resource,

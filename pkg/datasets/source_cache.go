@@ -19,6 +19,11 @@ package datasets
 // ('?', or literal text after a '*') matches some paths under a prefix and not others; such a
 // policy set disables prefix keys, and the cache then only remembers exact ARNs.
 //
+// A resource with no wildcard at all matches exactly one ARN, not the paths under it, so it never
+// contributes a prefix key: "object/x.csv" says nothing about "object/x.csv.old". An ARN equal to
+// such a resource is keyed by itself instead, in a key space of its own, so its decision is never
+// shared with - nor borrowed from - the longer ARNs that start with it.
+//
 // The policy set is enumerated once per SourceReader, and a SourceReader is built per operation, so
 // a policy written while an operation is running cannot be picked up in the middle of it: the cache
 // key is (policy set, path prefix), never just the path prefix.
@@ -64,10 +69,13 @@ type sourceReadCache struct {
 
 	mu     sync.Mutex
 	loaded bool
-	// prefixes holds the literal prefix of every resource of the policy set. A non-nil slice -
-	// including an empty one, which means "no policy matches anything" - enables prefix keys;
-	// nil means the set could not be analysed and keys are exact ARNs.
-	prefixes  []string
+	// prefixes holds the literal prefix of every wildcard resource of the policy set. A non-nil
+	// slice - including an empty one, which means "no policy matches anything" - enables prefix
+	// keys; nil means the set could not be analysed and keys are exact ARNs.
+	prefixes []string
+	// exact holds every resource of the policy set that has no wildcard: an ARN equal to one is
+	// keyed by itself (exactKeyPrefix + ARN), never by a prefix.
+	exact     map[string]struct{}
 	decisions map[string]sourceDecision
 }
 
@@ -81,15 +89,23 @@ func newSourceReadCache(lister EffectivePoliciesLister, user string) *sourceRead
 	}
 }
 
+// exactKeyPrefix marks a cache key that stands for one ARN only. No ARN starts with a NUL, so an
+// exact key never equals a prefix key.
+const exactKeyPrefix = "\x00"
+
 // key returns the cache key of the object ARN arn: the longest literal policy prefix that is a
-// prefix of arn, or arn itself when the policy set cannot be analysed. The first call enumerates
-// the policy set; the result is kept for the lifetime of the cache, i.e. for one operation.
+// prefix of arn, or arn itself when the policy set cannot be analysed or names arn exactly. The
+// first call enumerates the policy set; the result is kept for the lifetime of the cache, i.e. for
+// one operation.
 func (c *sourceReadCache) key(ctx context.Context, arn string) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.load(ctx)
 	if c.prefixes == nil {
-		return arn
+		return exactKeyPrefix + arn
+	}
+	if _, ok := c.exact[arn]; ok {
+		return exactKeyPrefix + arn
 	}
 	key := ""
 	for _, prefix := range c.prefixes {
@@ -114,11 +130,15 @@ func (c *sourceReadCache) load(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	prefixes, ok := policyPrefixes(policies, c.user)
+	prefixes, exact, ok := policyPrefixes(policies, c.user)
 	if !ok {
 		return
 	}
 	c.prefixes = prefixes
+	c.exact = make(map[string]struct{}, len(exact))
+	for _, resource := range exact {
+		c.exact[resource] = struct{}{}
+	}
 }
 
 // get returns the cached decision of key.
@@ -136,12 +156,14 @@ func (c *sourceReadCache) put(key string, decision sourceDecision) {
 	c.decisions[key] = decision
 }
 
-// policyPrefixes returns the literal prefix of every resource of every statement of policies, with
-// the ${user} placeholder of pkg/auth already interpolated. It reports false when the set cannot be
-// analysed into prefixes, which keeps the caller on exact-ARN caching: a resource that is not a
-// valid policy resource list, or whose wildcard part is not a run of '*' characters.
-func policyPrefixes(policies []*model.Policy, user string) ([]string, bool) {
-	prefixes := make([]string, 0, len(policies))
+// policyPrefixes returns the literal prefix of every wildcard resource of every statement of
+// policies, and every resource that has no wildcard at all, with the ${user} placeholder of
+// pkg/auth already interpolated. It reports false when the set cannot be analysed into prefixes,
+// which keeps the caller on exact-ARN caching: a resource that is not a valid policy resource list,
+// or whose wildcard part is not a run of '*' characters.
+func policyPrefixes(policies []*model.Policy, user string) (prefixes, exact []string, ok bool) {
+	prefixes = make([]string, 0, len(policies))
+	exact = make([]string, 0)
 	for _, policy := range policies {
 		if policy == nil {
 			continue
@@ -149,20 +171,25 @@ func policyPrefixes(policies []*model.Policy, user string) ([]string, bool) {
 		for _, statement := range policy.Statement {
 			resources, err := auth.ParsePolicyResourceAsList(statement.Resource)
 			if err != nil {
-				return nil, false
+				return nil, nil, false
 			}
 			for _, resource := range resources {
 				// pkg/auth interpolates ${user} before it matches a resource (interpolateUser).
 				resource = strings.ReplaceAll(resource, "${user}", user)
 				literal, wildcard := splitResourceWildcard(resource)
-				if strings.Trim(wildcard, "*") != "" {
-					return nil, false
+				switch {
+				case wildcard == "":
+					// Matches this one ARN only; it is no prefix of anything (SEC-3).
+					exact = append(exact, literal)
+				case strings.Trim(wildcard, "*") != "":
+					return nil, nil, false
+				default:
+					prefixes = append(prefixes, literal)
 				}
-				prefixes = append(prefixes, literal)
 			}
 		}
 	}
-	return prefixes, true
+	return prefixes, exact, true
 }
 
 // splitResourceWildcard splits a policy resource glob at its first wildcard character.
