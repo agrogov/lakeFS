@@ -7,6 +7,7 @@ package datasets
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -708,4 +709,315 @@ func TestPublish_CancelledContextAfterCommitStillAdvancesHead(t *testing.T) {
 	head := f.datasetRecord(t, dataset)
 	require.Equal(t, DatasetStateActive, head.State)
 	require.Equal(t, 2, head.LatestVersion)
+}
+
+// fakeClock is a manually advanced clock, safe for concurrent use: in the BUG-3 tests the
+// publish under test reads the time from its own goroutine while the test moves it forward.
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+// Now is the clock function installed on the service.
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+// Advance moves the clock forward by d.
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+// installClock replaces the service clock (and with it the pin manager's and the KV store's)
+// so staleness can be driven without sleeping.
+func (f *serviceFixture) installClock(start time.Time) *fakeClock {
+	clock := &fakeClock{now: start}
+	f.svc.setClock(clock.Now)
+	return clock
+}
+
+// installFakeTicker replaces the publish heartbeat's periodic trigger with a channel the test
+// sends on, so a heartbeat runs exactly when the test says it does.
+func (f *serviceFixture) installFakeTicker() chan time.Time {
+	ticks := make(chan time.Time, 8)
+	f.svc.newTicker = func(time.Duration) (<-chan time.Time, func()) { return ticks, func() {} }
+	return ticks
+}
+
+// TestPublish_HeartbeatRefreshesTheRecord covers the first half of BUG-3: while a publish
+// materialises, every tick CAS-refreshes UpdatedAt, so a publish that outlives
+// datasets.publish_timeout never looks stale and finishes normally.
+func TestPublish_HeartbeatRefreshesTheRecord(t *testing.T) {
+	const (
+		dataset = "heartbeat-refresh"
+		source  = "src-heartbeat-refresh"
+	)
+	f := newServiceFixture(t)
+	clock := f.installClock(time.Date(2032, 1, 2, 3, 4, 5, 0, time.UTC))
+	ticks := f.installFakeTicker()
+
+	first := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition(source, first.String(), "data", "data/"),
+		Publish:    true,
+		Message:    "v1",
+	})
+	require.NoError(t, err)
+	second := f.commitTo(t, source, "main", map[string]string{"data/a.parquet": "b"})
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	realPublish := f.svc.publishFn
+	var once sync.Once
+	f.svc.publishFn = func(ctx context.Context, materializer *Materializer, req PublishRequest) (*PublishResult, error) {
+		once.Do(func() { close(entered) })
+		<-release
+		return realPublish(ctx, materializer, req)
+	}
+
+	errs := make(chan error, 1)
+	go func() {
+		_, err := f.svc.PublishVersion(f.ctx, f.caller(), dataset, PublishVersionRequest{
+			Definition: prefixDefinition(source, second.String(), "data", "data/"),
+			Message:    "v2",
+		})
+		errs <- err
+	}()
+	<-entered
+
+	// A heartbeat one half-timeout later moves UpdatedAt even though the record is still
+	// publishing: that is what stops the reconciler (and a second publish) from treating a long
+	// materialisation as a crashed one.
+	started, _, err := f.svc.store.GetDataset(f.ctx, dataset)
+	require.NoError(t, err)
+	require.Equal(t, DatasetStatePublishing, started.State)
+	require.Equal(t, 2, started.PendingVersion)
+
+	clock.Advance(f.cfg.PublishTimeout / 2)
+	ticks <- clock.Now()
+	require.Eventually(t, func() bool {
+		rec, _, err := f.svc.store.GetDataset(f.ctx, dataset)
+		return err == nil && rec.UpdatedAt.After(started.UpdatedAt)
+	}, 30*time.Second, 5*time.Millisecond, "the heartbeat CAS-refreshes UpdatedAt")
+
+	heartbeat := f.datasetRecord(t, dataset)
+	require.Equal(t, DatasetStatePublishing, heartbeat.State, "the heartbeat only moves UpdatedAt")
+	require.Equal(t, 2, heartbeat.PendingVersion)
+	require.Equal(t, 1, heartbeat.LatestVersion)
+
+	close(release)
+	select {
+	case err := <-errs:
+		require.NoError(t, err, "the heartbeat does not disturb a publish that is alive")
+	case <-time.After(30 * time.Second):
+		t.Fatal("the publish did not finish")
+	}
+
+	head := f.datasetRecord(t, dataset)
+	require.Equal(t, DatasetStateActive, head.State)
+	require.Equal(t, 2, head.LatestVersion)
+}
+
+// TestPublish_ReconcilerRollbackAbortsTheRunningPublish covers the second half of BUG-3: a
+// publish that outlives datasets.publish_timeout without refreshing its record is rolled back by
+// the reconciler, and the original materialisation then aborts instead of committing on top of
+// the rollback. The pins of the versions that really exist survive.
+func TestPublish_ReconcilerRollbackAbortsTheRunningPublish(t *testing.T) {
+	const (
+		dataset = "slow-publish"
+		source  = "src-slow-publish"
+	)
+	f := newServiceFixture(t)
+	clock := f.installClock(time.Date(2032, 2, 3, 4, 5, 6, 0, time.UTC))
+
+	first := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition(source, first.String(), "data", "data/"),
+		Publish:    true,
+		Message:    "v1",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, view.Record.LatestVersion)
+	second := f.commitTo(t, source, "main", map[string]string{"data/a.parquet": "b"})
+
+	// Hold the publish inside its materialisation: the record says publishing(v2) and the pins
+	// of v2 are taken, which is exactly the state a long publish is in.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	realPublish := f.svc.publishFn
+	var once sync.Once
+	f.svc.publishFn = func(ctx context.Context, materializer *Materializer, req PublishRequest) (*PublishResult, error) {
+		once.Do(func() { close(entered) })
+		<-release
+		return realPublish(ctx, materializer, req)
+	}
+
+	errs := make(chan error, 1)
+	go func() {
+		_, err := f.svc.PublishVersion(f.ctx, f.caller(), dataset, PublishVersionRequest{
+			Definition: prefixDefinition(source, second.String(), "data", "data/"),
+			Message:    "v2",
+		})
+		errs <- err
+	}()
+	<-entered
+
+	// No heartbeat for publish_timeout: the pass may roll the record back.
+	clock.Advance(f.cfg.PublishTimeout + time.Minute)
+	report := f.reconcile(t)
+	require.Equal(t, 1, report.StatesRepaired, "the stale publish is rolled back")
+
+	head := f.datasetRecord(t, dataset)
+	require.Equal(t, DatasetStateActive, head.State)
+	require.Equal(t, 1, head.LatestVersion)
+	require.Zero(t, head.PendingVersion)
+
+	close(release)
+	select {
+	case err := <-errs:
+		require.Error(t, err, "the original publish aborts instead of committing")
+		require.ErrorIs(t, err, ErrDatasetConflict)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the original publish did not finish")
+	}
+
+	// Nothing was committed by the aborted attempt...
+	_, err = f.tagCommit(t, dataset, VersionTag(2))
+	require.True(t, isNotFound(err), "the aborted publish created no v2 tag")
+	require.Equal(t, view.Version.CommitID, f.latestHead(t, dataset), "latest still points at v1")
+	_, err = f.svc.store.GetVersion(f.ctx, dataset, 2)
+	require.Error(t, err, "the aborted publish wrote no version record")
+
+	// ... and the pins of the version that does exist are intact.
+	require.True(t, datasetPinsInclude(t, f, dataset, 1), "the pins of v1 survive")
+	require.False(t, datasetPinsInclude(t, f, dataset, 2))
+}
+
+// TestPublish_HeartbeatCancelsOnLostOwnership is the heartbeat reaction of BUG-3: when the
+// refresh CAS fails, the publish context is cancelled and the materialisation stops instead of
+// writing into a dataset that a rollback now owns.
+func TestPublish_HeartbeatCancelsOnLostOwnership(t *testing.T) {
+	const (
+		dataset = "heartbeat-cancel"
+		source  = "src-heartbeat-cancel"
+	)
+	f := newServiceFixture(t)
+	clock := f.installClock(time.Date(2032, 3, 4, 5, 6, 7, 0, time.UTC))
+	ticks := f.installFakeTicker()
+
+	first := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition(source, first.String(), "data", "data/"),
+		Publish:    true,
+		Message:    "v1",
+	})
+	require.NoError(t, err)
+	second := f.commitTo(t, source, "main", map[string]string{"data/a.parquet": "b"})
+
+	entered := make(chan struct{})
+	stopped := make(chan error, 1)
+	var once sync.Once
+	f.svc.publishFn = func(ctx context.Context, _ *Materializer, _ PublishRequest) (*PublishResult, error) {
+		once.Do(func() { close(entered) })
+		select {
+		case <-ctx.Done():
+			stopped <- ctx.Err()
+			return nil, ctx.Err()
+		case <-time.After(30 * time.Second):
+			err := errors.New("the publish context was never cancelled")
+			stopped <- err
+			return nil, err
+		}
+	}
+
+	errs := make(chan error, 1)
+	go func() {
+		_, err := f.svc.PublishVersion(f.ctx, f.caller(), dataset, PublishVersionRequest{
+			Definition: prefixDefinition(source, second.String(), "data", "data/"),
+			Message:    "v2",
+		})
+		errs <- err
+	}()
+	<-entered
+
+	clock.Advance(f.cfg.PublishTimeout + time.Minute)
+	report := f.reconcile(t)
+	require.Equal(t, 1, report.StatesRepaired)
+
+	// The next heartbeat finds a record that is no longer this attempt's and cancels the publish.
+	ticks <- clock.Now()
+	select {
+	case err := <-stopped:
+		require.ErrorIs(t, err, context.Canceled, "the heartbeat cancels the publish context")
+	case <-time.After(30 * time.Second):
+		t.Fatal("the heartbeat did not cancel the publish")
+	}
+	select {
+	case err := <-errs:
+		require.Error(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the publish did not return")
+	}
+
+	require.Equal(t, 1, f.datasetRecord(t, dataset).LatestVersion)
+	_, err = f.tagCommit(t, dataset, VersionTag(2))
+	require.True(t, isNotFound(err), "the cancelled publish created no v2 tag")
+	require.True(t, datasetPinsInclude(t, f, dataset, 1), "the pins of v1 survive")
+}
+
+// TestReconcile_DoesNotRollBackAHeartbeatingPublish covers the reconciler half of BUG-3: a
+// record a pass listed as stale, but whose owner refreshed it before the rollback, belongs to a
+// live publish and is left alone - in particular its pins are not released.
+func TestReconcile_DoesNotRollBackAHeartbeatingPublish(t *testing.T) {
+	const (
+		dataset = "heartbeating"
+		source  = "src-heartbeating"
+	)
+	f := newServiceFixture(t)
+	clock := f.installClock(time.Date(2032, 4, 5, 6, 7, 8, 0, time.UTC))
+
+	first := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition(source, first.String(), "data", "data/"),
+		Publish:    true,
+		Message:    "v1",
+	})
+	require.NoError(t, err)
+
+	// A publish of v2 is in flight: its pins are taken and the record says publishing(v2). It
+	// was last refreshed more than publish_timeout ago, so the pass lists it as stale.
+	def := prefixDefinition(source, first.String(), "data", "data/")
+	_, err = f.svc.pins.Acquire(f.ctx, def, PinReference(dataset, 2))
+	require.NoError(t, err)
+	f.leaveInTransientState(t, dataset, DatasetStatePublishing, 2)
+	require.True(t, datasetPinsInclude(t, f, dataset, 2))
+
+	reconciler := f.reconcilerFor()
+	reconciler.afterListDatasets = func() {
+		// The owner's heartbeat lands after the pass listed the record but before the rollback.
+		live, predicate, err := f.svc.store.GetDataset(f.ctx, dataset)
+		require.NoError(t, err)
+		beat := *live
+		beat.UpdatedAt = clock.Now()
+		require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &beat, live, predicate))
+	}
+	report, err := reconciler.Reconcile(f.ctx)
+	require.NoError(t, err)
+	require.NotNil(t, report)
+	require.Zero(t, report.StatesRepaired, "a heartbeating publish is not rolled back")
+
+	head := f.datasetRecord(t, dataset)
+	require.Equal(t, DatasetStatePublishing, head.State)
+	require.Equal(t, 2, head.PendingVersion)
+	require.Equal(t, 1, head.LatestVersion)
+	require.True(t, head.UpdatedAt.Equal(clock.Now()))
+	require.True(t, datasetPinsInclude(t, f, dataset, 2), "the pins of the live publish are not released")
 }

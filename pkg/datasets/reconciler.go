@@ -560,8 +560,14 @@ func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, 
 	if rec.State == DatasetStateCreating {
 		if _, err := r.catalog.GetRepository(ctx, dataset); isNotFound(err) {
 			// rec came from ListDatasets, which returns values without their predicate: a
-			// nil predicate makes DeleteDataset compare against a fresh read.
-			if err := r.store.DeleteDataset(ctx, dataset, rec, nil); err != nil && !errors.Is(err, kv.ErrPredicateFailed) {
+			// nil predicate makes DeleteDataset compare against a fresh read. A record that
+			// changed since the pass listed it belongs to a live owner (BUG-3), so the
+			// delete loses the race and the record is left alone.
+			err := r.store.DeleteDataset(ctx, dataset, rec, nil)
+			if errors.Is(err, kv.ErrPredicateFailed) {
+				return nil
+			}
+			if err != nil {
 				return err
 			}
 			report.StatesRepaired++
@@ -569,15 +575,21 @@ func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, 
 			return nil
 		}
 	}
-	if err := r.pins.ReleaseVersion(ctx, dataset, version); err != nil {
-		return fmt.Errorf("datasets: release pins of %s@v%d: %w", dataset, version, err)
+
+	// BUG-3: the rollback is gated on a fresh read and a CAS. A publish whose owner is still
+	// heartbeating has moved UpdatedAt since this pass listed the record; it is alive, its
+	// commit may still land, and rolling it back - in particular releasing its pins - would
+	// leave a committed version unpinned.
+	rolledBack, err := r.rollbackInterrupted(ctx, rec, version)
+	if err != nil {
+		return err
 	}
-	next := *rec
-	next.State = DatasetStateActive
-	next.PendingVersion = 0
-	next.UpdatedAt = r.now()
-	if err := r.store.PutDatasetIf(ctx, &next, rec, nil); err != nil {
-		return fmt.Errorf("datasets: roll %q back to active: %w", dataset, err)
+	if !rolledBack {
+		r.log.WithFields(logging.Fields{
+			"dataset": dataset,
+			"version": version,
+		}).Info("datasets: skipped the rollback of a publish whose owner is still active")
+		return nil
 	}
 	report.StatesRepaired++
 	r.log.WithFields(logging.Fields{
@@ -585,6 +597,47 @@ func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, 
 		"version": version,
 	}).Warn("datasets: rolled an interrupted publish back to active")
 	return nil
+}
+
+// rollbackInterrupted returns a stale transient record to active and releases the pins of the
+// version it was publishing. It reports whether it won the rollback.
+//
+// The order is the one BUG-3 needs: re-read the record, re-check that it is still stale, win
+// the CAS and only then release the pins. A heartbeat (service.heartbeatPublish) that lands
+// before the CAS makes the CAS fail, so the reconciler never undoes a live publish; and
+// because the pins are released after the record was won, a rollback that loses the race cannot
+// strip the GC protection of a commit that is about to be written. A release that fails after
+// the CAS leaves pins behind, which over-retains source data - safe, and the next pass removes
+// the orphan (§14: never under-retain).
+func (r *Reconciler) rollbackInterrupted(ctx context.Context, rec *DatasetRecord, version int) (bool, error) {
+	current, predicate, err := r.store.GetDataset(ctx, rec.Name)
+	if errors.Is(err, kv.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if current.State != rec.State || current.PendingVersion != rec.PendingVersion {
+		// Another writer (the owner, a takeover or the next pass) already moved the record.
+		return false, nil
+	}
+	if !r.stale(current) {
+		return false, nil
+	}
+	next := *current
+	next.State = DatasetStateActive
+	next.PendingVersion = 0
+	next.UpdatedAt = r.now()
+	if err := r.store.PutDatasetIf(ctx, &next, current, predicate); err != nil {
+		if errors.Is(err, kv.ErrPredicateFailed) {
+			return false, nil
+		}
+		return false, fmt.Errorf("datasets: roll %q back to active: %w", rec.Name, err)
+	}
+	if err := r.pins.ReleaseVersion(ctx, rec.Name, version); err != nil {
+		return true, fmt.Errorf("datasets: release pins of %s@v%d: %w", rec.Name, version, err)
+	}
+	return true, nil
 }
 
 // completeVersion rebuilds the missing VersionRecord of a committed version from the

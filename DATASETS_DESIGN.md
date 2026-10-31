@@ -382,10 +382,17 @@ record keeps only a `definition_ref` (dataset repo commit + path) instead of the
 - Versions are dense integers starting at 1. `latest` = `LatestVersion`.
 - Publish uses optimistic concurrency on `datasets/<name>`:
   1. Read the `DatasetRecord` (`predicate = returned value`).
-  2. Require `State == "active"` or the `pending` state to be stale (> `publish_timeout`, default 30m).
+  2. Require `State == "active"` or the `pending` state to be stale (> `publish_timeout`, default 30m). A stale
+     `publishing(N)` whose tag `vN` already points at a commit carrying `dataset.version=N` is adopted through the
+     reconciler's `completeVersion` instead of publishing N again.
   3. `SetIf` to `State="publishing", PendingVersion=N+1`. On `kv.ErrPredicateFailed` → `409 Conflict`.
-  4. Materialise (§6). On success, write `VersionRecord` then `SetIf` `LatestVersion=N+1, State="active"`.
-  5. On failure, `SetIf` back to `active` (best effort; the reconciler fixes leftovers).
+  4. Materialise (§6). While it runs the owner CAS-refreshes `UpdatedAt` every `publish_timeout/3`; the same CAS runs
+     once more immediately before the commit and the tag, so an attempt that lost the record never commits, and a
+     lost refresh cancels the publish context.
+  5. On success, write `VersionRecord` then `SetIf` `LatestVersion=N+1, State="active"`, retrying both with backoff.
+  6. On failure before the commit, `SetIf` back to `active` (best effort; the reconciler fixes leftovers). A failure
+     after the commit or the tag never rolls back and never releases pins: the record is left in
+     `publishing(PendingVersion=N)` for the reconciler.
 - The client may pass `expected_version` (like an ETag). Mismatch → `409` with `latest_version` in the body.
 - A dataset repo tag `vN` and the `VersionRecord` are the two sources of truth. On disagreement the reconciler (§12.3)
   trusts the tag and rebuilds the record from `_dataset/definition.json`.
@@ -476,9 +483,11 @@ Publish(ctx, name, def, message, publisher, expectedVersion):
   3. authorizeSources(publisher, resolved)                            // §9.3
   4. CAS DatasetRecord → publishing, PendingVersion = N+1             // §5.4
   5. pinSources(resolved, name, N+1)                                  // §8, BEFORE writing data
+     heartbeat: CAS DatasetRecord.UpdatedAt every publish_timeout/3          // §5.4
   6. it := newMergeIterator(resolved) + definition.json entry
   7. mrID := Store.WriteMetaRangeByIterator(ctx, dsRepo, it, WithForce(true))
   8. if N > 0 and mrID == version[N].MetaRangeID → abort 409 "no changes"
+     heartbeat again: the last ownership CAS, immediately before step 9 and 10
   9. commit := Catalog.Commit(ctx, name, "latest", message, publisher,
          metadata{dataset.version: N+1, dataset.proposal: id?}, nil, &mrID, false, WithForce(true))
  10. Catalog.CreateTag(ctx, name, "v<N+1>", commit.Reference, WithForce(true))
@@ -966,7 +975,9 @@ crashed node only blocks the others until its lease expires:
 1. Datasets stuck in `creating`/`publishing`/`deleting` longer than `publish_timeout` → resume or roll back:
    - if tag `vN` exists → write the missing `VersionRecord` from `_dataset/definition.json`, mark `active`;
    - else if `latest` HEAD has `dataset.version = N` → create the tag, then as above;
-   - else → release the pins added for N and mark `active`.
+   - else → roll back: `SetIf` the record back to `active` and only then release the pins added for N. The record is
+     re-read and re-checked for staleness first, and the CAS fails if the owner refreshed `UpdatedAt` in the meantime,
+     so a publish that is still heartbeating is never undone.
    A `deleting` record is finished instead of resumed: the repository, the pins, the policies/grants and the
    control-plane records are removed, because every delete step tolerates not-found (§6.6).
 2. Pins: every `(repo, commit)` referenced by a version has its pin branch; recreate if missing (log at WARN, metric

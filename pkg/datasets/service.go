@@ -115,7 +115,17 @@ func (e *VersionConflictError) latestVersion() int { return e.LatestVersion }
 const (
 	publishWriteRetries = 5
 	publishWriteBackoff = 10 * time.Millisecond
+
+	// publishHeartbeatDivisor is how many times per datasets.publish_timeout a live publish
+	// refreshes its record: three, so a heartbeat lost to a slow KV write is still followed
+	// by two more before the record can look stale (BUG-3).
+	publishHeartbeatDivisor = 3
 )
+
+// tickerFunc builds the periodic trigger of the publish heartbeat and returns a stop
+// function. Production uses time.NewTicker; tests install a channel so a fake clock can
+// advance the heartbeat without sleeping.
+type tickerFunc func(interval time.Duration) (<-chan time.Time, func())
 
 // commitExistsError marks a publish that failed after the version commit was written. The
 // caller must not release pins or roll the record back; the record is left in a transient
@@ -181,6 +191,11 @@ type Service struct {
 	// inject a failure between the commit and the record, the window BUG-2 covers.
 	putVersionFn func(ctx context.Context, rec VersionRecord) (*VersionRecord, error)
 
+	// newTicker builds the periodic trigger of the publish heartbeat (BUG-3): a live publish
+	// CAS-refreshes its record every publish_timeout/3. It is a field so a fake clock can
+	// drive the heartbeat without sleeping, the way now drives staleness.
+	newTicker tickerFunc
+
 	// bgCtx bounds asynchronous publishes (§6.5). It is deliberately *not* a request
 	// context: an accepted publish must finish (or fail on its own) even when the client
 	// disconnects. wg lets tests and shutdown wait for those goroutines.
@@ -219,7 +234,11 @@ func NewService(cfg *Config, kvs kv.Store, cat *catalog.Catalog, authService aut
 		pins:         NewPins(store, cat),
 		newULID:      newULID,
 		publishFn:    publishWithMaterializer,
-		bgCtx:        context.Background(),
+		newTicker: func(interval time.Duration) (<-chan time.Time, func()) {
+			ticker := time.NewTicker(interval)
+			return ticker.C, ticker.Stop
+		},
+		bgCtx: context.Background(),
 	}
 	svc.setClock(time.Now)
 	svc.putVersionFn = svc.store.PutVersion
@@ -776,9 +795,16 @@ func (o *PublishOutcome) Accepted() bool { return o != nil && o.Task != nil }
 //	11   write the VersionRecord, then CAS the record to State="active", LatestVersion=N;
 //	12   emit the audit log line of §12.4.
 //
-// A failure anywhere after step 4 is rolled back with a best-effort CAS to "active" and
-// the pin references this attempt added are released, so a failed publish leaves the
-// dataset exactly as it was: no version record, no tag, latest unchanged (§5.4 step 5).
+// A failure before step 6 is rolled back with a best-effort CAS to "active" and the pin
+// references this attempt added are released, so a failed publish leaves the dataset exactly as
+// it was: no version record, no tag, latest unchanged (§5.4 step 5). A failure at or after the
+// commit never rolls back and never releases pins: the record is left in
+// publishing(PendingVersion=N) for the reconciler to finish from the tag (§5.4, §12.3).
+//
+// While steps 6-10 run the owner refreshes the record every datasets.publish_timeout/3 and
+// re-verifies its ownership with the same CAS immediately before the commit and the tag, so a
+// publish that outlives the timeout is never taken over or rolled back underneath itself
+// (BUG-3). Losing that CAS cancels the publish.
 //
 // Above datasets.sync_publish_max_objects the materialisation moves to a goroutine bound
 // to the service's own context and the outcome is a TaskRecord (§6.5); the record was
@@ -1052,17 +1078,40 @@ func (s *Service) pausePublishWrite(ctx context.Context, attempt int) {
 // rollbackPublish is the best-effort CAS back to "active" of §5.4 step 5. It never masks
 // cause: a rollback that itself fails is logged and the reconciler (§12.3 item 1) finishes
 // the job from the record left in "publishing".
+//
+// The CAS is taken against a fresh read rather than against the record the attempt started
+// with, because the heartbeat of BUG-3 moved UpdatedAt in between. A record that is no longer
+// this attempt's (deleting, active, or publishing another version) is left alone: somebody
+// else already decided what it should be.
 func (s *Service) rollbackPublish(ctx context.Context, publishing *DatasetRecord, cause error) error {
-	next := *publishing
-	next.State = DatasetStateActive
-	next.PendingVersion = 0
-	next.UpdatedAt = s.now()
-	if err := s.store.PutDatasetIf(ctx, &next, publishing, nil); err != nil {
-		logging.FromContext(ctx).WithError(err).WithFields(logging.Fields{
-			"dataset":         publishing.Name,
-			"pending_version": publishing.PendingVersion,
-		}).Warn("datasets: could not roll a failed publish back to active; the reconciler will")
+	ctx, cancel := detachedWriteContext(ctx)
+	defer cancel()
+	for attempt := 0; attempt < publishWriteRetries; attempt++ {
+		current, predicate, err := s.store.GetDataset(ctx, publishing.Name)
+		if errors.Is(err, kv.ErrNotFound) {
+			return cause
+		}
+		if err != nil {
+			s.pausePublishWrite(ctx, attempt)
+			continue
+		}
+		if !ownsPublish(current, publishing, publishing.PendingVersion) {
+			return cause
+		}
+		next := *current
+		next.State = DatasetStateActive
+		next.PendingVersion = 0
+		next.UpdatedAt = s.now()
+		if err := s.store.PutDatasetIf(ctx, &next, current, predicate); err == nil {
+			return cause
+		} else if !errors.Is(err, kv.ErrPredicateFailed) {
+			s.pausePublishWrite(ctx, attempt)
+		}
 	}
+	logging.FromContext(ctx).WithFields(logging.Fields{
+		"dataset":         publishing.Name,
+		"pending_version": publishing.PendingVersion,
+	}).Warn("datasets: could not roll a failed publish back to active; the reconciler will")
 	return cause
 }
 
@@ -1723,11 +1772,14 @@ func (s *Service) publish(ctx context.Context, rec *DatasetRecord, def Definitio
 		Previous:   previous,
 	}
 
-	// BUG-9: the publish owner re-checks its ownership before the commit. A delete that
-	// CASed the record to "deleting" must win, and the pins are released because nothing
-	// has been committed yet.
-	if rec.State == DatasetStatePublishing {
-		if err := s.ensurePublishOwnership(ctx, rec, version); err != nil {
+	// BUG-9/BUG-3: when the publish owns a transient record, re-check its ownership before
+	// anything is written. A delete that CASed the record to "deleting", a stale takeover or a
+	// reconciler rollback must win, and the pins are released because nothing has been
+	// committed yet. The check is a CAS that also refreshes the record, so it is the first
+	// heartbeat of the publish. A caller that drives the primitive on an active record (the
+	// diff fixture, the primitive's own tests) has no state machine to guard.
+	if publishInTransientState(rec) {
+		if err := s.heartbeatPublish(ctx, rec, version); err != nil {
 			return nil, errors.Join(err, s.pins.Release(ctx, def, ref))
 		}
 	}
@@ -1738,7 +1790,19 @@ func (s *Service) publish(ctx context.Context, rec *DatasetRecord, def Definitio
 	if err != nil {
 		return nil, errors.Join(err, s.pins.Release(ctx, def, ref))
 	}
-	result, err := s.publishFn(ctx, materializer, req)
+
+	// BUG-3: materialising can outlast datasets.publish_timeout. While it runs, the record
+	// is refreshed every publish_timeout/3 so the reconciler and a second publish never see a
+	// live attempt as stale, and the same CAS runs once more inside the materialisation,
+	// immediately before the commit and the tag.
+	if publishInTransientState(rec) {
+		req.BeforeCommit = func(commitCtx context.Context) error {
+			return s.heartbeatPublish(commitCtx, rec, version)
+		}
+	}
+	publishCtx, stopHeartbeat := s.startPublishHeartbeat(ctx, rec, version)
+	result, err := s.publishFn(publishCtx, materializer, req)
+	stopHeartbeat()
 	if err != nil {
 		// A tag failure can happen after the commit was written. Detect that case before
 		// releasing anything: after the commit exists the pins must stay and the record is
@@ -1767,11 +1831,20 @@ func (s *Service) publish(ctx context.Context, rec *DatasetRecord, def Definitio
 	return stored, nil
 }
 
-// ensurePublishOwnership verifies, right before the commit, that this attempt still owns the
-// publishing record: a concurrent delete has moved it to "deleting", or a stale takeover is
-// publishing another version (BUG-9).
-func (s *Service) ensurePublishOwnership(ctx context.Context, rec *DatasetRecord, version int) error {
-	current, _, err := s.store.GetDataset(ctx, rec.Name)
+// heartbeatPublish refreshes UpdatedAt of the record this attempt owns, conditioned on the
+// record as it is read now (BUG-3):
+//
+//   - the CAS is the ownership check. A concurrent delete ("deleting"), a stale takeover
+//     publishing another version, or a reconciler rollback back to "active" all fail it, so an
+//     attempt that lost the state machine never commits on top of it (BUG-9);
+//   - the refreshed UpdatedAt is the heartbeat. A publish that materialises for longer than
+//     datasets.publish_timeout keeps its record younger than the timeout, so neither the
+//     reconciler nor a second publish treats it as crashed.
+//
+// It is called once before the materialisation starts, every publish_timeout/3 while it runs,
+// and once more immediately before the commit and the tag (PublishRequest.BeforeCommit).
+func (s *Service) heartbeatPublish(ctx context.Context, rec *DatasetRecord, version int) error {
+	current, predicate, err := s.store.GetDataset(ctx, rec.Name)
 	if errors.Is(err, kv.ErrNotFound) {
 		return fmt.Errorf("%w: dataset %q was deleted", ErrPublishInProgress, rec.Name)
 	}
@@ -1781,11 +1854,104 @@ func (s *Service) ensurePublishOwnership(ctx context.Context, rec *DatasetRecord
 	switch {
 	case current.State == DatasetStateDeleting:
 		return fmt.Errorf("%w: dataset %q is being deleted", ErrPublishInProgress, rec.Name)
-	case current.State != DatasetStatePublishing || current.PendingVersion != version:
+	case !ownsPublish(current, rec, version):
 		return fmt.Errorf("%w: dataset %q is no longer publishing version %d",
 			ErrDatasetConflict, rec.Name, version)
 	}
+	next := *current
+	next.UpdatedAt = s.now()
+	if err := s.store.PutDatasetIf(ctx, &next, current, predicate); err != nil {
+		if errors.Is(err, kv.ErrPredicateFailed) {
+			return fmt.Errorf("%w: dataset %q changed while publishing version %d",
+				ErrDatasetConflict, rec.Name, version)
+		}
+		return err
+	}
 	return nil
+}
+
+// publishInTransientState reports whether rec is a record the publish state machine owns: the
+// "creating" of a create that publishes v1, or the "publishing(PendingVersion=N)" of a publish.
+// A caller that drives the primitive on an active record has no state machine to guard, so it
+// gets no heartbeat and no ownership CAS.
+func publishInTransientState(rec *DatasetRecord) bool {
+	return rec != nil && (rec.State == DatasetStatePublishing || rec.State == DatasetStateCreating)
+}
+
+// ownsPublish reports whether current is still the transient state attempt owns: the
+// "publishing(PendingVersion=N)" of a publish, or the "creating" of the create that publishes
+// its first version.
+func ownsPublish(current, attempt *DatasetRecord, version int) bool {
+	if current.State != attempt.State {
+		return false
+	}
+	switch current.State {
+	case DatasetStatePublishing:
+		return current.PendingVersion == version
+	case DatasetStateCreating:
+		return true
+	default:
+		return false
+	}
+}
+
+// heartbeatInterval is the period of the publish heartbeat: datasets.publish_timeout/3, so
+// three refreshes fit in one timeout and a single slow write cannot make a live publish look
+// crashed (BUG-3).
+func (s *Service) heartbeatInterval() time.Duration {
+	timeout := s.cfg.PublishTimeout
+	if timeout <= 0 {
+		timeout = DefaultPublishTimeout
+	}
+	interval := timeout / publishHeartbeatDivisor
+	if interval <= 0 {
+		interval = time.Second
+	}
+	return interval
+}
+
+// startPublishHeartbeat refreshes the publishing record every heartbeatInterval while the
+// materialisation runs (BUG-3) and returns a context for it. When a refresh fails the record
+// is no longer this attempt's - it was taken over, rolled back or deleted - so the returned
+// context is cancelled: the materialisation stops instead of writing into a dataset that
+// another writer now owns.
+//
+// The returned stop function ends the heartbeat and cancels the context; the caller invokes it
+// as soon as the materialisation returns, before the post-commit writes.
+func (s *Service) startPublishHeartbeat(ctx context.Context, rec *DatasetRecord, version int) (context.Context, func()) {
+	if !publishInTransientState(rec) {
+		return ctx, func() {}
+	}
+	ticks, stopTicker := s.newTicker(s.heartbeatInterval())
+	publishCtx, cancel := context.WithCancel(ctx)
+	stopped := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stopped:
+				return
+			case <-publishCtx.Done():
+				return
+			case <-ticks:
+				if err := s.heartbeatPublish(publishCtx, rec, version); err != nil {
+					logging.FromContext(publishCtx).WithError(err).WithFields(logging.Fields{
+						"dataset": rec.Name,
+						"version": version,
+					}).Warn("datasets: lost the publishing record; cancelling the publish")
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return publishCtx, func() {
+		cancel()
+		close(stopped)
+		stopTicker()
+		<-done
+	}
 }
 
 // putVersionWithRetry writes the VersionRecord that follows a committed version, retrying

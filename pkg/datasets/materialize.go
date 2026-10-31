@@ -164,6 +164,13 @@ type PublishRequest struct {
 	// Previous describes the version this publish supersedes, for the no-op check of
 	// §6.2 step 8. Leave it zero when publishing the first version.
 	Previous PreviousVersion
+
+	// BeforeCommit, when set, runs after the metarange is written and immediately before the
+	// commit (and therefore before the tag of Publish). The service uses it to re-verify, with
+	// a CAS, that the attempt still owns the dataset record right before the commit becomes
+	// durable (BUG-3): a publish that was taken over or rolled back must not commit. A nil
+	// hook is a caller with no record to guard (a proposal preview, a test of the primitive).
+	BeforeCommit func(ctx context.Context) error
 }
 
 // PreviousVersion is the version a publish supersedes. Callers that cannot supply
@@ -413,6 +420,14 @@ func (m *Materializer) materialize(ctx context.Context, req PublishRequest, bran
 	// definition was already rejected above.
 	if req.Previous.MetaRangeID != "" && req.Previous.MetaRangeID == *metaRangeID {
 		return nil, fmt.Errorf("datasets: %s version %d: %w", req.Dataset, req.Version, ErrNoChanges)
+	}
+
+	// BUG-3: the caller's last chance to prove it still owns the publish, taken after every
+	// read of the sources and before the commit and the tag become durable.
+	if req.BeforeCommit != nil {
+		if err := req.BeforeCommit(ctx); err != nil {
+			return nil, err
+		}
 	}
 
 	// §6.2 step 9.
