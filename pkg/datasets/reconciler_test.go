@@ -269,6 +269,107 @@ func TestReconcile_RemovesOrphanPin(t *testing.T) {
 	require.ErrorIs(t, err, graveler.ErrBranchNotFound, "the orphan pin branch was removed")
 }
 
+// TestReconcile_OrphanCleanupKeepsConcurrentlyCreatedPin is BUG-4: a dataset created and published
+// in the window between the pass's dataset list and its pin list must not have its pins removed as
+// orphans. The hook plays the concurrent writer.
+func TestReconcile_OrphanCleanupKeepsConcurrentlyCreatedPin(t *testing.T) {
+	const (
+		dataset = "late-dataset"
+		source  = "src-late-dataset"
+	)
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+	def := objectDefinition(source, commit.String(), "data", "data/a.parquet")
+
+	r := f.reconcilerFor()
+	r.afterListDatasets = func() {
+		now := f.svc.now().UTC()
+		require.NoError(t, f.svc.store.CreateDataset(f.ctx, &DatasetRecord{
+			Name:      dataset,
+			CreatedBy: testServiceUser,
+			CreatedAt: now,
+			State:     DatasetStateActive,
+			UpdatedAt: now,
+		}))
+		_, err := f.svc.pins.Acquire(f.ctx, def, PinReference(dataset, 1))
+		require.NoError(t, err)
+	}
+
+	report, err := r.Reconcile(f.ctx)
+	require.NoError(t, err)
+	require.NotNil(t, report)
+	require.Zero(t, report.PinsRemoved, "a pin created during the pass is not an orphan")
+
+	pin, _, err := f.svc.store.GetPin(f.ctx, source, commit.String())
+	require.NoError(t, err, "the pin of the dataset created during the pass must survive")
+	require.Equal(t, []string{PinReference(dataset, 1)}, pin.References)
+	_, err = f.cat.GetBranchReference(f.ctx, source, PinBranch(commit.String()))
+	require.NoError(t, err, "its pin branch must survive too")
+}
+
+// TestReconcile_OrphanCleanupRechecksDatasetExistence is the other half of BUG-4: a pin in the
+// pass's snapshot whose reference names a dataset created after the dataset snapshot must not be
+// removed. The sweep has to ask the store about each reference, not trust the snapshot.
+func TestReconcile_OrphanCleanupRechecksDatasetExistence(t *testing.T) {
+	const (
+		dataset = "very-late-dataset"
+		source  = "src-very-late-dataset"
+	)
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+	_, err := f.svc.pins.Acquire(f.ctx, objectDefinition(source, commit.String(), "data", "data/a.parquet"),
+		PinReference(dataset, 1))
+	require.NoError(t, err)
+
+	r := f.reconcilerFor()
+	r.afterListDatasets = func() {
+		now := f.svc.now().UTC()
+		require.NoError(t, f.svc.store.CreateDataset(f.ctx, &DatasetRecord{
+			Name:      dataset,
+			CreatedBy: testServiceUser,
+			CreatedAt: now,
+			State:     DatasetStateActive,
+			UpdatedAt: now,
+		}))
+	}
+
+	report, err := r.Reconcile(f.ctx)
+	require.NoError(t, err)
+	require.NotNil(t, report)
+	require.Zero(t, report.PinsRemoved, "the pin belongs to a dataset that exists by the time it is deleted")
+
+	_, _, err = f.svc.store.GetPin(f.ctx, source, commit.String())
+	require.NoError(t, err, "the pin of the concurrently created dataset must survive")
+	_, err = f.cat.GetBranchReference(f.ctx, source, PinBranch(commit.String()))
+	require.NoError(t, err)
+}
+
+// TestReconcile_RecreatesDeletedPinRecord is BUG-5: the ensure-pins step derives the expected pins
+// from the version definitions, so a lost pin record is re-created, not only a deleted branch.
+func TestReconcile_RecreatesDeletedPinRecord(t *testing.T) {
+	const (
+		dataset = "lost-pin-record"
+		source  = "src-lost-pin-record"
+	)
+	f := newServiceFixture(t)
+	_, sourceCommit := f.publishFirstVersion(t, dataset, source)
+
+	// The record is gone but the branch survived: a crash between the two steps of an interrupted
+	// Acquire, or a lost KV write.
+	require.NoError(t, f.svc.store.DeletePin(f.ctx, source, sourceCommit.String()))
+	_, _, err := f.svc.store.GetPin(f.ctx, source, sourceCommit.String())
+	require.ErrorIs(t, err, kv.ErrNotFound)
+
+	report := f.reconcile(t)
+	require.Zero(t, report.Errors)
+
+	pin, _, err := f.svc.store.GetPin(f.ctx, source, sourceCommit.String())
+	require.NoError(t, err, "the pin record of the published version was re-created")
+	require.Equal(t, []string{PinReference(dataset, 1)}, pin.References)
+	_, err = f.cat.GetBranchReference(f.ctx, source, PinBranch(sourceCommit.String()))
+	require.NoError(t, err, "the existing pin branch was left in place")
+}
+
 // TestReconcile_ReattachesDetachedPolicies is §12.3 item 3: the immutability guard and the managed
 // consumer read policy are re-created and re-attached when they were detached by hand (§9.4, §9.2).
 func TestReconcile_ReattachesDetachedPolicies(t *testing.T) {

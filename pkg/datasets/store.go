@@ -732,6 +732,35 @@ func (s *Store) deleteIf(ctx context.Context, key []byte, predicate kv.Predicate
 	return s.delete(ctx, key)
 }
 
+// deleteIfUnchanged removes key only if its stored value is still expected, compared in
+// canonical encoding (see canonicalValue). It is the delete form of setIfUnchanged: the
+// caller has just written expected and must not delete a value that a concurrent writer
+// replaced in between. A missing key is already deleted and is not an error; a changed
+// value is reported as kv.ErrPredicateFailed and the record is left alone.
+func (s *Store) deleteIfUnchanged(ctx context.Context, key, expected []byte, canon func([]byte) ([]byte, error)) error {
+	res, err := s.store.Get(ctx, []byte(PartitionKey), key)
+	if errors.Is(err, kv.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	current, err := canon(res.Value)
+	if err != nil {
+		return err
+	}
+	want, err := canon(expected)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(current, want) {
+		return kv.ErrPredicateFailed
+	}
+	// Delete under the predicate that guarded the value just compared, so a writer that
+	// lands between the read and the delete keeps its record.
+	return s.deleteIf(ctx, key, res.Predicate)
+}
+
 // datasetValue encodes a dataset record as stored. It is what PutDatasetIf and
 // DeleteDataset compare a nil predicate against; it is never itself used as a
 // kv.Predicate.
@@ -1143,6 +1172,19 @@ func (s *Store) DeletePin(ctx context.Context, repository, commitID string) erro
 	return s.delete(ctx, key)
 }
 
+// DeletePinIf removes the pin record of (repository, commit) only if it is still the record
+// that predicate guards, the kv.Predicate that GetPin returned for it. A record a concurrent
+// AddPinReference changed is left untouched and kv.ErrPredicateFailed is returned, so
+// orphan cleanup never deletes a pin that just gained a reference (BUG-4). Deleting a
+// missing pin is not an error. Like DeletePin it does not delete the hidden pin branch.
+func (s *Store) DeletePinIf(ctx context.Context, repository, commitID string, predicate kv.Predicate) error {
+	key, err := pinKey(repository, commitID)
+	if err != nil {
+		return err
+	}
+	return s.deleteIf(ctx, key, predicate)
+}
+
 // AddPinReference adds ref - a PinReference value, "<dataset>@v<n>" - to the pin of
 // (repository, commit) and returns the resulting record. It creates the pin when
 // there is none, and adding a reference twice is a no-op.
@@ -1196,10 +1238,11 @@ func (s *Store) AddPinReference(ctx context.Context, repository, commitID, ref s
 // caller also removes the hidden pin branch. Removing a reference that is not there,
 // or from a pin that does not exist, is a no-op and reports false.
 //
-// The empty set is written with a compare-and-swap before the record is deleted, so a
-// writer that read the pin before this removal can no longer land on top of it. A
-// writer that lands in the microsecond between that write and the delete is repaired
-// by the reconciler, which recreates pins a version still references (§12.3).
+// The empty set is written with a compare-and-swap before the record is deleted, and the
+// delete itself is conditioned on that empty-set value: a concurrent AddPinReference that
+// lands in between replaces the value and keeps its pin (BUG-5), and the removal is retried
+// instead of dropping the new reference. If the pin is gone on the retry, the removal has
+// already happened and the branch is kept.
 func (s *Store) RemovePinReference(ctx context.Context, repository, commitID, ref string) (deleted bool, err error) {
 	if err := checkSegment("pin reference", ref); err != nil {
 		return false, err
@@ -1238,7 +1281,11 @@ func (s *Store) RemovePinReference(ctx context.Context, repository, commitID, re
 		if len(remaining) > 0 {
 			return false, nil
 		}
-		if err := s.delete(ctx, key); err != nil {
+		err = s.deleteIfUnchanged(ctx, key, value, canonicalValue[PinRecord])
+		if errors.Is(err, kv.ErrPredicateFailed) {
+			continue // a reference landed on the empty set; re-read and retry
+		}
+		if err != nil {
 			return false, err
 		}
 		return true, nil

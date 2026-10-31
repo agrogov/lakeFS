@@ -188,6 +188,11 @@ type Reconciler struct {
 	// onPass is a test hook invoked once a pass owns the lease and before it repairs
 	// anything. It is nil in production.
 	onPass func()
+
+	// afterListDatasets is a test hook invoked after the pass has read the dataset records
+	// and before it removes orphan pins. It is nil in production; the BUG-4 tests use it to
+	// create a dataset and a pin inside the window the pass used to race.
+	afterListDatasets func()
 }
 
 // NewReconciler builds the reconciler of svc, using the service's configuration, store,
@@ -341,12 +346,28 @@ func (r *ReconcileReport) log(log logging.Logger) {
 // repair is the pass itself, without the lease. The caller must hold the lease.
 func (r *Reconciler) repair(ctx context.Context) *ReconcileReport {
 	report := &ReconcileReport{}
+
+	// Pins are listed BEFORE datasets (BUG-4): the pin scan is the older snapshot, so a pin a
+	// dataset created by this pass's window gets is never in this pass's snapshot and can never
+	// be mistaken for an orphan from it. removeOrphanPins still re-checks existence before it
+	// deletes anything.
+	pins, err := r.store.listAllPins(ctx)
+	if err != nil {
+		report.Errors++
+		dsMetrics.reconcileErrors.Inc()
+		r.log.WithError(err).Warn("datasets: cannot list pins for a reconcile pass; skipping orphan-pin cleanup")
+		pins = nil
+	}
+
 	records, err := r.store.ListDatasets(ctx)
 	if err != nil {
 		report.Errors++
 		dsMetrics.reconcileErrors.Inc()
 		r.log.WithError(err).Warn("datasets: cannot list datasets for a reconcile pass")
 		return report
+	}
+	if r.afterListDatasets != nil {
+		r.afterListDatasets()
 	}
 	report.Datasets = len(records)
 	dsMetrics.datasetsTotal.Set(float64(len(records)))
@@ -375,10 +396,8 @@ func (r *Reconciler) repair(ctx context.Context) *ReconcileReport {
 		r.log.WithError(err).Warn("datasets: could not repair the installation-wide policies")
 	}
 
-	if err := r.removeOrphanPins(ctx, records, report); err != nil {
-		report.Errors++
-		dsMetrics.reconcileErrors.Inc()
-		r.log.WithError(err).Warn("datasets: could not remove orphan pins")
+	if pins != nil {
+		r.removeOrphanPins(ctx, pins, report)
 	}
 	return report
 }
@@ -418,8 +437,8 @@ func (r *Reconciler) repairDataset(ctx context.Context, rec *DatasetRecord, repo
 		return nil
 	}
 
-	// §12.3 item 2: every pinned source has its pin branch.
-	recreated, missing, err := r.pins.EnsureDatasetPins(ctx, rec.Name)
+	// §12.3 item 2: every published version holds the pins its definition names.
+	recreated, missing, err := r.ensureDatasetPins(ctx, rec.Name)
 	if len(recreated) > 0 {
 		report.PinsRecreated += len(recreated)
 		dsMetrics.pinsRecreated.Add(float64(len(recreated)))
@@ -439,6 +458,45 @@ func (r *Reconciler) repairDataset(ctx context.Context, rec *DatasetRecord, repo
 
 	// §12.3 item 4: degraded marking follows source reachability.
 	return r.reconcileDegraded(ctx, rec, len(missing) > 0, report)
+}
+
+// ensureDatasetPins is §12.3 item 2, derived from the version records rather than from the pin
+// records it repairs (BUG-5). Every published version's definition names the (source repository,
+// commit) pairs its data lives at, so it is the authority on the pins that version must hold. A
+// pin record that was lost is therefore re-created, not only a pin branch that was deleted, and
+// no reference is invented: the reference is exactly PinReference(dataset, version).
+//
+// It reports the branches it re-created and the sources whose repository has been deleted, so the
+// caller can mark the dataset degraded (§12.3 item 4). Repairs are independent: one unreadable
+// definition does not stop the repair of the other versions, and the next pass retries.
+func (r *Reconciler) ensureDatasetPins(ctx context.Context, dataset string) (recreated, missing []PinnedSource, err error) {
+	versions, err := r.store.ListVersions(ctx, dataset)
+	if err != nil {
+		return nil, nil, err
+	}
+	var errs []error
+	for _, version := range versions {
+		if ctx.Err() != nil {
+			return recreated, missing, ctx.Err()
+		}
+		def, err := r.svc.versionDefinition(ctx, version)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("datasets: definition of %s v%d: %w", dataset, version.Version, err))
+			continue
+		}
+		sources, err := PinSources(*def)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("datasets: pins of %s v%d: %w", dataset, version.Version, err))
+			continue
+		}
+		created, gone, err := r.pins.ensureSources(ctx, sources, PinReference(dataset, version.Version))
+		recreated = append(recreated, created...)
+		missing = append(missing, gone...)
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return recreated, missing, errors.Join(errs...)
 }
 
 // stale reports whether a transient record has been left alone for longer than
@@ -786,60 +844,94 @@ func (r *Reconciler) reconcileDegraded(ctx context.Context, rec *DatasetRecord, 
 // (§12.3 item 2). A pin is an orphan when its reference set is empty, or when every
 // reference names a dataset that no longer exists; a pin held by a dataset that is still
 // being published is left alone, because §12.3 item 1 owns that record.
-func (r *Reconciler) removeOrphanPins(ctx context.Context, records []*DatasetRecord, report *ReconcileReport) error {
-	pins, err := r.store.listAllPins(ctx)
-	if err != nil {
-		return err
-	}
+//
+// pins is the snapshot taken at the start of the pass, before the dataset list. That snapshot
+// alone is not proof of an orphan (BUG-4): a dataset can be created and published while the
+// pass runs. Before deleting anything, the pin is re-read and every dataset its references name
+// is looked up in the store; the record is then deleted with a compare-and-swap on the predicate
+// of the record just read, and the branch only after that delete succeeded. A pin that gained a
+// dataset or a reference in the meantime therefore survives.
+func (r *Reconciler) removeOrphanPins(ctx context.Context, pins []*PinRecord, report *ReconcileReport) {
 	dsMetrics.pinsTotal.Set(float64(len(pins)))
 
-	known := make(map[string]struct{}, len(records))
-	for _, rec := range records {
-		if rec != nil {
-			known[rec.Name] = struct{}{}
-		}
-	}
-	for _, pin := range pins {
+	for _, listed := range pins {
 		if ctx.Err() != nil {
-			return nil
+			return
 		}
-		if !pinIsOrphan(pin, known) {
+		if listed == nil {
 			continue
 		}
-		src := PinnedSource{Repository: pin.Repository, CommitID: pin.CommitID}
+		src := PinnedSource{Repository: listed.Repository, CommitID: listed.CommitID}
+
+		// Re-read: the listing is a snapshot, and a concurrent Acquire may have added a
+		// reference (or a concurrent pass may have removed the record) since.
+		pin, predicate, err := r.store.GetPin(ctx, listed.Repository, listed.CommitID)
+		switch {
+		case errors.Is(err, kv.ErrNotFound):
+			continue // already deleted; its branch is re-checked by its own deleter
+		case err != nil:
+			report.Errors++
+			dsMetrics.reconcileErrors.Inc()
+			r.log.WithError(err).WithField("pin", src.String()).Warn("datasets: could not re-read a pin before orphan cleanup")
+			continue
+		}
+
+		orphan, err := r.pinIsOrphan(ctx, pin)
+		if err != nil {
+			report.Errors++
+			dsMetrics.reconcileErrors.Inc()
+			r.log.WithError(err).WithField("pin", src.String()).Warn("datasets: could not re-check a pin before orphan cleanup")
+			continue
+		}
+		if !orphan {
+			continue
+		}
+
+		if err := r.store.DeletePinIf(ctx, pin.Repository, pin.CommitID, predicate); err != nil {
+			if errors.Is(err, kv.ErrPredicateFailed) || errors.Is(err, kv.ErrNotFound) {
+				continue // the pin changed under us; the new record is not ours to delete
+			}
+			report.Errors++
+			dsMetrics.reconcileErrors.Inc()
+			r.log.WithError(err).WithField("pin", src.String()).Warn("datasets: could not delete an orphan pin record")
+			continue
+		}
 		if err := r.pins.deletePinBranch(ctx, src); err != nil {
 			report.Errors++
 			dsMetrics.reconcileErrors.Inc()
 			r.log.WithError(err).WithField("pin", src.String()).Warn("datasets: could not delete an orphan pin branch")
 			continue
 		}
-		if err := r.store.DeletePin(ctx, pin.Repository, pin.CommitID); err != nil && !errors.Is(err, kv.ErrNotFound) {
-			report.Errors++
-			dsMetrics.reconcileErrors.Inc()
-			r.log.WithError(err).WithField("pin", src.String()).Warn("datasets: could not delete an orphan pin record")
-			continue
-		}
 		report.PinsRemoved++
 		r.log.WithField("pin", src.String()).Info("datasets: removed an orphan GC pin")
 	}
-	return nil
 }
 
-// pinIsOrphan reports whether no existing dataset references pin.
-func pinIsOrphan(pin *PinRecord, known map[string]struct{}) bool {
+// pinIsOrphan reports whether no dataset in the store references pin. It asks the store about
+// every name in the reference set rather than trusting the pass's dataset snapshot (BUG-4): a
+// dataset created after that snapshot is exactly the race an orphan sweep must not lose.
+func (r *Reconciler) pinIsOrphan(ctx context.Context, pin *PinRecord) (bool, error) {
 	if pin == nil || len(pin.References) == 0 {
-		return true
+		return true, nil
 	}
 	for _, ref := range pin.References {
 		name, ok := datasetOfPinReference(ref)
 		if !ok {
 			continue // an unparseable reference is not evidence of an orphan
 		}
-		if _, exists := known[name]; exists {
-			return false
+		_, _, err := r.store.GetDataset(ctx, name)
+		switch {
+		case err == nil:
+			return false, nil
+		case errors.Is(err, kv.ErrNotFound):
+			continue
+		default:
+			// A store error (or a reference that is not a valid dataset name) is not proof of
+			// an orphan: fail closed and leave the pin for the next pass.
+			return false, err
 		}
 	}
-	return true
+	return true, nil
 }
 
 // datasetOfPinReference splits a "<dataset>@v<n>" memo (PinReference) into the dataset name.
