@@ -123,6 +123,21 @@ func TestParseVersionRef(t *testing.T) {
 	}
 }
 
+// TestRefPatternsMatchTheSpec pins the CLI ref patterns to api/datasets.yml (CLI-4): the version
+// commands copy the VersionRef parameter and the diff command copies LeftRef/RightRef, so a
+// pattern change in the spec has to reach the CLI as well.
+func TestRefPatternsMatchTheSpec(t *testing.T) {
+	// The documented patterns, verbatim from api/datasets.yml VersionRef and LeftRef/RightRef.
+	const (
+		specVersionRef = "^(latest|v[0-9]{1,9})$"
+		specDiffRef    = "^(latest|v[0-9]{1,9}|pr/[0-9A-Za-z]{1,64})$"
+	)
+	require.Equal(t, specVersionRef, versionRefPatternSource)
+	require.Equal(t, specDiffRef, diffRefPatternSource)
+	require.Equal(t, specVersionRef, versionRefPattern.String())
+	require.Equal(t, specDiffRef, diffRefPattern.String())
+}
+
 // TestParseDiffRef pins the diff refs of api/datasets.yml (DOC-19): latest, v<N>, pr/<id>.
 func TestParseDiffRef(t *testing.T) {
 	tests := []struct {

@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 
 	"github.com/spf13/cobra"
 	"github.com/treeverse/lakefs/pkg/api/apiutil"
@@ -235,6 +237,7 @@ func runAccessRevoke(cmd *cobra.Command, options accessGrantOptions) error {
 		apigen.DatasetName(options.Dataset),
 		apigen.PrincipalType(options.PrincipalType),
 		apigen.PrincipalID(options.PrincipalID),
+		pathUnescapeEditor,
 	)
 	if err != nil {
 		return err
@@ -242,10 +245,32 @@ func runAccessRevoke(cmd *cobra.Command, options accessGrantOptions) error {
 	if err := checkResponse(resp.HTTPResponse, resp.Body, http.StatusNoContent); err != nil {
 		return err
 	}
-	if options.Output != outputJSON {
-		fmt.Fprintf(cmd.OutOrStdout(), "Revoked %s %q access to dataset %q.\n",
-			options.PrincipalType, options.PrincipalID, options.Dataset)
+	if options.Output == outputJSON {
+		// The response body is a 204, so the command prints the result itself (CLI-8).
+		return printJSONResult(cmd.OutOrStdout(), revokedResult{
+			Revoked:       options.PrincipalType + "/" + options.PrincipalID,
+			Dataset:       options.Dataset,
+			PrincipalType: options.PrincipalType,
+			PrincipalID:   options.PrincipalID,
+		})
 	}
+	fmt.Fprintf(cmd.OutOrStdout(), "Revoked %s %q access to dataset %q.\n",
+		options.PrincipalType, options.PrincipalID, options.Dataset)
+	return nil
+}
+
+// pathUnescapeEditor fixes the escaping of the request path. principal_id is the only free-form
+// path parameter of the control plane, and the generated client escapes it before it becomes the
+// URL's Path, which Go then escapes again: "a b" travels as "a%2520b" and the server looks up the
+// principal "a%20b" (CLI-7). Unescaping the path makes Go escape it exactly once; a value that is
+// not a single valid escape sequence is left alone.
+func pathUnescapeEditor(_ context.Context, req *http.Request) error {
+	unescaped, err := url.PathUnescape(req.URL.Path)
+	if err != nil {
+		return nil
+	}
+	req.URL.Path = unescaped
+	req.URL.RawPath = ""
 	return nil
 }
 

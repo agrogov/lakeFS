@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -44,6 +45,7 @@ const (
 	asyncFlagName           = "async"
 	expectedVersionFlagName = "expected-version"
 	waitFlagName            = "wait"
+	timeoutFlagName         = "timeout"
 	dataFlagName            = "data"
 	statusFlagName          = "status"
 	titleFlagName           = "title"
@@ -74,9 +76,11 @@ const (
 	outputJSON outputFormat = "json"
 )
 
-// taskStatusCompleted and taskStatusFailed are the terminal states of an asynchronous task
-// (§10.2, §6.5).
+// The states of an asynchronous task (§10.2, §6.5): pending and running are transient, completed
+// and failed are terminal. Anything else is a protocol violation (CLI-3).
 const (
+	taskStatusPending   = "pending"
+	taskStatusRunning   = "running"
 	taskStatusCompleted = "completed"
 	taskStatusFailed    = "failed"
 )
@@ -87,16 +91,35 @@ var taskPollInterval = 2 * time.Second
 
 // newAPIClient builds the datasets control-plane client from the transport lakectl configured
 // (endpoint, credentials provider, retry policy, User-Agent), so `lakectl-datasets` talks to the
-// server exactly like `lakectl` does. It is a variable so tests can point the commands at an
-// httptest server.
+// server exactly like `lakectl` does. The retry policy is narrowed to GET and HEAD: replaying a
+// publish POST after a lost response would create a duplicate version (CLI-2). It is a variable
+// so tests can point the commands at an httptest server.
 var newAPIClient = func() (*apigen.ClientWithResponses, error) {
-	server, doer, editors := lakectlcmd.APIClientTransport()
+	server, doer, editors := lakectlcmd.APIClientTransportWithRetry(datasetsRetryPolicy)
 	opts := make([]apigen.ClientOption, 0, len(editors)+1)
 	opts = append(opts, apigen.WithHTTPClient(doer))
 	for _, editor := range editors {
 		opts = append(opts, apigen.WithRequestEditorFn(apigen.RequestEditorFn(editor)))
 	}
-	return apigen.NewClientWithResponses(strings.TrimSuffix(server, "/")+controlPlanePath, opts...)
+	baseURL, err := controlPlaneURL(server)
+	if err != nil {
+		return nil, err
+	}
+	return apigen.NewClientWithResponses(baseURL, opts...)
+}
+
+// controlPlaneURL derives the datasets control-plane base URL from the configured endpoint. The
+// endpoint is the lakeFS server URL lakectl parsed, so the path is extended on the parsed URL
+// (keeping a custom endpoint path, a trailing slash or a query) rather than on the raw string
+// (CLI-9).
+func controlPlaneURL(endpoint string) (string, error) {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("invalid server endpoint %q: %w", endpoint, err)
+	}
+	parsed.Path = strings.TrimSuffix(parsed.Path, "/") + controlPlanePath
+	parsed.RawPath = ""
+	return parsed.String(), nil
 }
 
 // NewRoot returns the `datasets` command. It carries no PersistentPreRun of its own: when it runs
@@ -115,8 +138,18 @@ read with the regular lakeFS paths:
   lakectl fs ls  lakefs://<dataset>/v3/customers/
   lakectl fs cat lakefs://<dataset>/latest/reference/countries.csv
 
-The commands below cover the control plane only: definitions, versions, diffs, proposals,
-dataset access and metadata keys.`,
+The commands below cover the control plane only: definitions, versions, diffs, pull requests,
+dataset access and metadata keys.
+
+Flag order: lakectl's global flags (--config, --log-format, ...) must come before the command
+name, because lakectl selects the plugin executable and passes it only the arguments after
+"datasets". The plugin's own flags come after the command they belong to:
+
+  lakectl --config ~/.lakectl.yaml datasets list    # global flag, seen by lakectl
+  lakectl datasets list --prefix customer -o json   # plugin flags
+
+The endpoint from the lakectl configuration is the lakeFS server URL: the plugin appends
+/api/v1/datasets to it, so a server mounted under a custom path keeps that path.`,
 		SilenceUsage: true,
 	}
 	root.PersistentFlags().StringP(outputFlagName, "o", string(outputTable), "output format: table or json")
@@ -183,20 +216,21 @@ func parsePaginationOptions(cmd *cobra.Command) (paginationOptions, error) {
 }
 
 // parseMetadataFilters parses the repeatable `--metadata key=value` flag into the
-// `metadata.<key>=<value>` filters of §10.1.
-func parseMetadataFilters(cmd *cobra.Command) (map[string]string, error) {
+// `metadata.<key>=<value>` filters of §10.1. A key may be repeated, and every value of that key
+// is kept and sent (CLI-6): `--metadata tier=gold --metadata tier=silver` filters on both.
+func parseMetadataFilters(cmd *cobra.Command) (map[string][]string, error) {
 	pairs, err := cmd.Flags().GetStringArray(metadataFlagName)
 	if err != nil {
 		return nil, err
 	}
-	filters := make(map[string]string, len(pairs))
+	filters := make(map[string][]string, len(pairs))
 	for _, pair := range pairs {
 		key, value, found := strings.Cut(pair, "=")
 		key = strings.TrimSpace(key)
 		if !found || key == "" {
 			return nil, invalidArguments("--%s expects key=value, got %q", metadataFlagName, pair)
 		}
-		filters[key] = value
+		filters[key] = append(filters[key], value)
 	}
 	return filters, nil
 }
@@ -204,14 +238,16 @@ func parseMetadataFilters(cmd *cobra.Command) (map[string]string, error) {
 // metadataFilterEditor adds the `metadata.<key>=<value>` query parameters of §10.1 to a request.
 // OpenAPI 3.0 cannot declare dynamic query parameter names, so the generated client leaves them
 // out and the command adds them itself.
-func metadataFilterEditor(filters map[string]string) apigen.RequestEditorFn {
+func metadataFilterEditor(filters map[string][]string) apigen.RequestEditorFn {
 	if len(filters) == 0 {
 		return nil
 	}
 	return func(_ context.Context, req *http.Request) error {
 		query := req.URL.Query()
-		for key, value := range filters {
-			query.Add(metadataFilterPrefix+key, value)
+		for key, values := range filters {
+			for _, value := range values {
+				query.Add(metadataFilterPrefix+key, value)
+			}
 		}
 		req.URL.RawQuery = query.Encode()
 		return nil
@@ -234,6 +270,9 @@ var (
 	ErrInvalidResponse = errors.New("invalid response")
 	// ErrTaskFailed marks an asynchronous publish task that ended in failure (§6.5).
 	ErrTaskFailed = errors.New("dataset task failed")
+	// ErrTaskTimeout marks an asynchronous publish task that did not reach a terminal state
+	// within --timeout (§6.5).
+	ErrTaskTimeout = errors.New("dataset task timed out")
 )
 
 // commandError is a user-facing command error with a category.
@@ -261,6 +300,11 @@ func invalidResponse(format string, args ...any) error {
 // taskFailed builds the error for a failed publish task.
 func taskFailed(format string, args ...any) error {
 	return &commandError{category: ErrTaskFailed, message: fmt.Sprintf(format, args...)}
+}
+
+// taskTimedOut builds the error for a publish task that outlived --timeout.
+func taskTimedOut(format string, args ...any) error {
+	return &commandError{category: ErrTaskTimeout, message: fmt.Sprintf(format, args...)}
 }
 
 // errorDetail is one validation problem of §10.4.

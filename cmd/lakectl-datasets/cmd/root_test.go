@@ -141,6 +141,42 @@ func TestAPIClientPath(t *testing.T) {
 	require.Equal(t, "/api/v1/datasets", controlPlanePath)
 }
 
+// TestControlPlaneURL pins CLI-9: the base URL is derived from the parsed server URL, so a custom
+// endpoint path or a trailing slash survives instead of being pasted onto a trimmed string.
+func TestControlPlaneURL(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		want     string
+	}{
+		{endpoint: "http://localhost:8000", want: "http://localhost:8000/api/v1/datasets"},
+		{endpoint: "http://localhost:8000/", want: "http://localhost:8000/api/v1/datasets"},
+		{endpoint: "https://lakefs.example.com/lakefs", want: "https://lakefs.example.com/lakefs/api/v1/datasets"},
+		{endpoint: "https://lakefs.example.com/lakefs/", want: "https://lakefs.example.com/lakefs/api/v1/datasets"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got, err := controlPlaneURL(tt.endpoint)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+
+	t.Run("invalid endpoint", func(t *testing.T) {
+		_, err := controlPlaneURL("://not-a-url")
+		require.ErrorContains(t, err, "invalid server endpoint")
+	})
+}
+
+// TestRootHelpDocumentsFlagOrder pins the help text CLI-9 asks for: lakectl's global flags must
+// come before the command name, because the plugin only receives what follows it.
+func TestRootHelpDocumentsFlagOrder(t *testing.T) {
+	root := NewRoot()
+	require.Contains(t, root.Long, "must come before the command")
+	require.Contains(t, root.Long, "lakectl --config ~/.lakectl.yaml datasets list")
+	require.Contains(t, root.Long, "lakectl datasets list --prefix customer -o json")
+	require.Contains(t, root.Long, controlPlanePath)
+}
+
 // TestPluginArgumentsShape pins how the plugin is invoked: lakectl strips the plugin name, so
 // `lakectl datasets list --prefix customer` runs `lakectl-datasets list --prefix customer`, and
 // main re-inserts the command name in front of those arguments for lakectl's root. This tree is

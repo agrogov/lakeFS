@@ -153,7 +153,8 @@ func parseMetadataKeyCreateOptions(cmd *cobra.Command, args []string) (metadataK
 	}
 	switch {
 	case keyType == "enum" && len(allowedValues) == 0:
-		return metadataKeyCreateOptions{}, invalidResponse("an enum metadata key requires at least one --allowed-values entry")
+		// A missing flag is a command-line problem, not a bad server answer (CLI-5).
+		return metadataKeyCreateOptions{}, invalidArguments("an enum metadata key requires at least one --allowed-values entry")
 	case keyType != "enum" && len(allowedValues) > 0:
 		return metadataKeyCreateOptions{}, invalidArguments("--allowed-values is only allowed for %q keys, not %q", "enum", keyType)
 	}
@@ -295,9 +296,11 @@ func runMetadataKeysDelete(cmd *cobra.Command, options metadataKeyDeleteOptions)
 	if err := checkResponse(resp.HTTPResponse, resp.Body, http.StatusNoContent); err != nil {
 		return err
 	}
-	if options.Output != outputJSON {
-		fmt.Fprintf(cmd.OutOrStdout(), "Metadata key %q deleted.\n", options.Name)
+	if options.Output == outputJSON {
+		// The response body is a 204, so the command prints the result itself (CLI-8).
+		return printJSONResult(cmd.OutOrStdout(), deletedResult{Deleted: options.Name})
 	}
+	fmt.Fprintf(cmd.OutOrStdout(), "Metadata key %q deleted.\n", options.Name)
 	return nil
 }
 

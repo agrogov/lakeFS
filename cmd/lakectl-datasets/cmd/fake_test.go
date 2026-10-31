@@ -18,10 +18,13 @@ import (
 // recordedRequest is one request the commands issued, as the fake control plane saw it.
 type recordedRequest struct {
 	Method string
-	Path   string
-	Query  map[string][]string
-	Header http.Header
-	Body   []byte
+	// Path is the decoded path the server routed on; RequestURI is what travelled on the wire, so a
+	// test can tell single from double escaping (CLI-7).
+	Path       string
+	RequestURI string
+	Query      map[string][]string
+	Header     http.Header
+	Body       []byte
 }
 
 // fakeResponse is one canned answer of the fake control plane.
@@ -64,11 +67,12 @@ func (f *fakeControlPlane) handle(w http.ResponseWriter, r *http.Request) {
 
 	f.mu.Lock()
 	f.requests = append(f.requests, recordedRequest{
-		Method: r.Method,
-		Path:   r.URL.Path,
-		Query:  r.URL.Query(),
-		Header: r.Header.Clone(),
-		Body:   body,
+		Method:     r.Method,
+		Path:       r.URL.Path,
+		RequestURI: r.RequestURI,
+		Query:      r.URL.Query(),
+		Header:     r.Header.Clone(),
+		Body:       body,
 	})
 	response := f.responses[len(f.responses)-1]
 	if len(f.requests) <= len(f.responses) {
@@ -104,14 +108,23 @@ func (f *fakeControlPlane) OnlyRequest() recordedRequest {
 // lakectl configuration the client factory would read.
 func executeCommand(t *testing.T, args ...string) (string, error) {
 	t.Helper()
+	out, _, err := executeCommandStreams(t, args...)
+	return out, err
+}
+
+// executeCommandStreams is executeCommand with the two streams kept apart, for the commands that
+// write to stderr on purpose: the delete preamble and cancel message (CLI-1) must not pollute the
+// stdout a -o json consumer parses.
+func executeCommandStreams(t *testing.T, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
 	root := NewRoot()
-	var out bytes.Buffer
-	root.SetOut(&out)
-	root.SetErr(&out)
+	var stdoutBuffer, stderrBuffer bytes.Buffer
+	root.SetOut(&stdoutBuffer)
+	root.SetErr(&stderrBuffer)
 	root.SetIn(bytes.NewReader(nil))
 	root.SetArgs(args)
-	err := root.Execute()
-	return out.String(), err
+	err = root.Execute()
+	return stdoutBuffer.String(), stderrBuffer.String(), err
 }
 
 // mustExecute runs the command tree and fails the test when the command fails.

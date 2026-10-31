@@ -43,6 +43,32 @@ func printJSONBody(w io.Writer, body []byte) error {
 	return err
 }
 
+// deletedResult is the -o json result of a command that deleted a named object. Commands whose
+// request answers 204 have no body to print, so they describe their own result instead of
+// printing nothing (CLI-8).
+type deletedResult struct {
+	Deleted string `json:"deleted"`
+}
+
+// revokedResult is the -o json result of `datasets access revoke`.
+type revokedResult struct {
+	Revoked       string `json:"revoked"`
+	Dataset       string `json:"dataset"`
+	PrincipalType string `json:"principal_type"`
+	PrincipalID   string `json:"principal_id"`
+}
+
+// printJSONResult writes a command result as indented JSON, with the trailing newline the other
+// JSON outputs have.
+func printJSONResult(w io.Writer, result any) error {
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(result); err != nil {
+		return fmt.Errorf("could not encode the JSON result: %w", err)
+	}
+	return nil
+}
+
 // printField writes one "Label: value" line, the shape lakectl uses for show commands.
 func printField(w io.Writer, label string, value any) {
 	fmt.Fprintf(w, "%s: %v\n", label, value)

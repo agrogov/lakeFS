@@ -12,13 +12,22 @@ import (
 	"github.com/treeverse/lakefs/pkg/datasets/apigen"
 )
 
-// The ref patterns of the spec (api/datasets.yml, DOC-19). A version read accepts `latest`
-// and `v<N>`; a diff also accepts the `source_ref` of a pull request, `pr/<id>`. The bare
-// `3`, upper-case `V3` and old `proposal-<id>` forms are not documented and are rejected
-// here exactly as the server rejects them.
+// The ref patterns of the spec (api/datasets.yml, DOC-19), copied per command so the CLI accepts
+// exactly what the server accepts. `show --version` sends a VersionRef, which is latest or v<N>;
+// `diff` sends a LeftRef and a RightRef, which also take a pull request's source_ref, pr/<id>.
+// The bare 3, the upper-case V3 and the old proposal-<id> forms are not documented and are
+// rejected here too.
+//
+// The sources are named so a test can pin them to the spec: a pattern that drifts from
+// api/datasets.yml turns a working command into a client-side rejection (CLI-4).
+const (
+	versionRefPatternSource = "^(latest|v[0-9]{1,9})$"
+	diffRefPatternSource    = "^(latest|v[0-9]{1,9}|pr/[0-9A-Za-z]{1,64})$"
+)
+
 var (
-	versionRefPattern = regexp.MustCompile(`^(latest|v[0-9]{1,9})$`)
-	diffRefPattern    = regexp.MustCompile(`^(latest|v[0-9]{1,9}|pr/[0-9A-Za-z]{1,64})$`)
+	versionRefPattern = regexp.MustCompile(versionRefPatternSource)
+	diffRefPattern    = regexp.MustCompile(diffRefPatternSource)
 )
 
 // loadedDefinition is the result of reading a -f definition file.
