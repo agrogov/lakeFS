@@ -60,6 +60,11 @@ var (
 	// ErrNoAuthorizer it is a programming error, never a reason to skip pinning: skipping would
 	// let the source repository's GC delete objects a dataset serves.
 	ErrPinsUnavailable = errors.New("datasets: pin manager requires a store and a catalog")
+
+	// ErrPinBranchUnstable reports a pin branch that could not be kept in place because it kept
+	// being deleted by a concurrent release (BUG-5). The reference is still recorded, so the next
+	// repair pass or the next Acquire re-creates the branch.
+	ErrPinBranchUnstable = errors.New("pin branch keeps being deleted under a concurrent release")
 )
 
 // PinBranch returns the pin branch name of commitID, §8.2: _lakefs_ds_pin_<commit-id>.
@@ -308,10 +313,12 @@ func (p *Pins) Ensure(ctx context.Context, def Definition, ref string) (recreate
 	return p.ensureSources(ctx, sources, ref)
 }
 
-// EnsureDatasetPins is the reconciler-side form of Ensure (§12.3 item 2): it walks the pin records
-// that reference dataset, re-creates every missing pin branch and reports the sources whose
-// repository has been deleted. It needs no definition, so it also repairs pins of a version whose
-// definition is stored as a DefinitionRef, and it is the hook a repair pass calls.
+// EnsureDatasetPins is the definition-free form of Ensure: it walks the pin records that reference
+// dataset, re-creates every missing pin branch and reports the sources whose repository has been
+// deleted. It cannot re-create a pin record that is gone (nothing in the record set names it), so
+// the reconciler derives its pins from the version definitions instead (Reconciler.ensureDatasetPins,
+// BUG-5); this form stays useful when only the records are authoritative and, unlike Ensure, it
+// needs no read of a version's definition.
 func (p *Pins) EnsureDatasetPins(ctx context.Context, dataset string) (recreated, missing []PinnedSource, err error) {
 	if err := p.available(); err != nil {
 		return nil, nil, err
@@ -577,6 +584,13 @@ func (p *Pins) pin(ctx context.Context, src PinnedSource, ref string) (bool, err
 	if _, err := p.store.AddPinReference(ctx, src.Repository, src.CommitID, ref); err != nil {
 		return false, fmt.Errorf("datasets: reference %s in pin %s: %w", ref, src, err)
 	}
+	// A concurrent Release can delete the record and then the branch between the ensureBranch above
+	// and this write. Verify the branch again before reporting the reference held: §8.2 forbids a
+	// reference that claims protection while the branch is missing, and the branch is what actually
+	// retains the commit. verifyPinBranch also re-creates a branch that vanished.
+	if err := p.verifyPinBranch(ctx, src); err != nil {
+		return false, fmt.Errorf("datasets: verify pin branch %s after referencing %s: %w", src, ref, err)
+	}
 	return true, nil
 }
 
@@ -635,22 +649,38 @@ func (p *Pins) ensureBranch(ctx context.Context, src PinnedSource) (bool, error)
 }
 
 // verifyPinBranch checks that an existing pin branch still points at the pinned commit.
+//
+// A branch that vanished between the create attempt and this read is re-created and verified
+// again instead of being reported as healthy (BUG-5): the reference set says the commit must
+// stay protected, and a concurrent Release deletes the record and the branch together, so a
+// missing branch here means the protection must be rebuilt rather than assumed.
 func (p *Pins) verifyPinBranch(ctx context.Context, src PinnedSource) error {
 	branch := PinBranch(src.CommitID)
-	commitID, err := p.catalog.GetBranchReference(ctx, src.Repository, branch)
-	switch {
-	case errors.Is(err, graveler.ErrBranchNotFound):
-		// The branch disappeared between the create attempt and this read (a concurrent delete).
-		// The reference set still says the commit must be protected, and the next Ensure recreates
-		// the branch, so this is not a conflict.
+	for attempt := 0; attempt < pinCASRetries; attempt++ {
+		commitID, err := p.catalog.GetBranchReference(ctx, src.Repository, branch)
+		switch {
+		case errors.Is(err, graveler.ErrBranchNotFound):
+			// The branch disappeared between the create attempt and this read (a concurrent
+			// release). Re-create it and verify the branch that is now there.
+			_, createErr := p.catalog.CreateBranch(ctx, src.Repository, branch, src.CommitID,
+				graveler.WithHidden(true), graveler.WithForce(true))
+			switch {
+			case createErr == nil:
+				return nil // a branch created from src.CommitID points at it
+			case errors.Is(createErr, graveler.ErrBranchExists):
+				continue // another writer re-created it; verify that one
+			default:
+				return fmt.Errorf("datasets: re-create pin branch %s/%s: %w", src.Repository, branch, createErr)
+			}
+		case err != nil:
+			return fmt.Errorf("datasets: get pin branch %s/%s: %w", src.Repository, branch, err)
+		case commitID != src.CommitID:
+			return fmt.Errorf("%w: %s/%s points at %s, expected %s",
+				ErrPinBranchConflict, src.Repository, branch, commitID, src.CommitID)
+		}
 		return nil
-	case err != nil:
-		return fmt.Errorf("datasets: get pin branch %s/%s: %w", src.Repository, branch, err)
-	case commitID != src.CommitID:
-		return fmt.Errorf("%w: %s/%s points at %s, expected %s",
-			ErrPinBranchConflict, src.Repository, branch, commitID, src.CommitID)
 	}
-	return nil
+	return fmt.Errorf("%w: %s/%s", ErrPinBranchUnstable, src.Repository, branch)
 }
 
 // releaseSources removes ref from each pin in sources, deleting the pin branch whenever the
@@ -679,6 +709,11 @@ func (p *Pins) releaseSource(ctx context.Context, src PinnedSource, ref string) 
 
 // deletePinBranch removes a pin branch whose reference set is empty. A branch or repository that is
 // already gone is not an error: deletes and release must converge (§6.6).
+//
+// Deleting a branch is not enough to end a pin: a concurrent Acquire may have added a reference
+// after the caller decided the pin was an orphan (BUG-5). The record is the authority (§8.2), so
+// when one exists after the delete the branch is re-established instead of leaving a reference that
+// claims protection without it.
 func (p *Pins) deletePinBranch(ctx context.Context, src PinnedSource) error {
 	err := p.catalog.DeleteBranch(ctx, src.Repository, PinBranch(src.CommitID), graveler.WithForce(true))
 	switch {
@@ -688,13 +723,32 @@ func (p *Pins) deletePinBranch(ctx context.Context, src PinnedSource) error {
 			"commit_id":  src.CommitID,
 			"pin_branch": PinBranch(src.CommitID),
 		}).Info("datasets: deleted orphaned GC pin branch")
+	case errors.Is(err, graveler.ErrRepositoryNotFound), errors.Is(err, graveler.ErrRepositoryInDeletion):
+		// The pins died with the repository (§8.2 risks): there is no branch to keep in step.
 		return nil
-	case errors.Is(err, graveler.ErrBranchNotFound), errors.Is(err, graveler.ErrRepositoryNotFound),
-		errors.Is(err, graveler.ErrRepositoryInDeletion):
-		return nil
+	case errors.Is(err, graveler.ErrBranchNotFound):
+		// Already gone; the record check below still applies.
 	default:
 		return fmt.Errorf("datasets: delete pin branch %s/%s: %w", src.Repository, PinBranch(src.CommitID), err)
 	}
+	if _, _, err := p.store.GetPin(ctx, src.Repository, src.CommitID); err != nil {
+		if errors.Is(err, kv.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("datasets: re-read pin %s after deleting its branch: %w", src, err)
+	}
+	if _, err := p.ensureBranch(ctx, src); err != nil {
+		if errors.Is(err, graveler.ErrRepositoryNotFound) || errors.Is(err, graveler.ErrRepositoryInDeletion) {
+			return nil
+		}
+		return fmt.Errorf("datasets: re-establish pin branch %s after a concurrent reference: %w", src, err)
+	}
+	logging.FromContext(ctx).WithFields(logging.Fields{
+		"repository": src.Repository,
+		"commit_id":  src.CommitID,
+		"pin_branch": PinBranch(src.CommitID),
+	}).Warn("datasets: re-created a pin branch; a reference landed while it was being deleted")
+	return nil
 }
 
 // sourcesOfPins maps pin records to the sources they protect, sorted and deduplicated.
@@ -833,7 +887,13 @@ func (s *Store) RemovePinReferences(ctx context.Context, repository, commitID st
 		if len(remaining) > 0 {
 			return false, nil
 		}
-		if err := s.delete(ctx, key); err != nil {
+		// Delete conditioned on the empty-set value just written: a concurrent AddPinReference
+		// that landed in between replaced it and keeps its pin (BUG-5).
+		err = s.deleteIfUnchanged(ctx, key, value, canonicalValue[PinRecord])
+		if errors.Is(err, kv.ErrPredicateFailed) {
+			continue // a reference landed on the empty set; re-read and retry
+		}
+		if err != nil {
 			return false, err
 		}
 		return true, nil
