@@ -12,6 +12,7 @@ package datasets
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -937,5 +938,34 @@ func TestProposalConcurrentCloseAndMerge(t *testing.T) {
 		require.Equal(t, merged.Version, final.MergedVersion)
 	} else {
 		require.Equal(t, ProposalStatusClosed, final.Status)
+	}
+}
+
+// TestUpdateProposalAuthorizesBeforeLoading is SEC-7: a caller without dataset:UpdateDataset
+// gets the same 403 for a real proposal, an unknown proposal id and an unknown dataset, so the
+// endpoint is not an oracle for proposal ids or for dataset existence.
+func TestUpdateProposalAuthorizesBeforeLoading(t *testing.T) {
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, "src-sec7", map[string]string{"data/a.txt": "alpha"})
+	def := prefixDefinition("src-sec7", commit.String(), "data", "data/")
+	f.createPublishedDataset(t, "sec7-set", def)
+	proposal := f.createProposal(t, "sec7-set", CreateProposalRequest{Definition: def, Title: "tighten the definition"})
+
+	f.addUser(t, "proposal-outsider")
+	caller := f.callerFor("proposal-outsider")
+	title := "changed"
+
+	for name, target := range map[string]struct{ dataset, id string }{
+		"existing proposal": {"sec7-set", proposal.Record.ID},
+		"unknown proposal":  {"sec7-set", "01Jnosuchproposal000000000"},
+		"unknown dataset":   {"no-such-set", "01Jnosuchproposal000000000"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := f.svc.UpdateProposal(f.ctx, caller, target.dataset, target.id, UpdateProposalRequest{Title: &title})
+			require.ErrorIs(t, err, ErrPermissionDenied)
+			status, body := statusOf(t, err)
+			require.Equal(t, http.StatusForbidden, status)
+			require.NotContains(t, body, "not found", "the answer must not disclose whether the record exists")
+		})
 	}
 }

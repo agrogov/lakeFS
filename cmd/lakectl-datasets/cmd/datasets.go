@@ -478,7 +478,7 @@ func waitForTask(cmd *cobra.Command, client *apigen.ClientWithResponses, dataset
 		case taskStatusCompleted:
 			return task, resp.Body, nil
 		case taskStatusFailed:
-			return nil, nil, taskFailed("publish task %s failed: %s", taskID, derefString(task.Error))
+			return nil, nil, taskFailed("publish task %s failed: %s", taskID, formatTaskError(task.Error))
 		}
 		select {
 		case <-cmd.Context().Done():

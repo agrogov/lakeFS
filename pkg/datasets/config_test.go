@@ -38,6 +38,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 	require.Equal(t, AccessModelOpen, cfg.AccessModel)
 	require.Empty(t, cfg.ImmutableGuardGroups)
 	require.False(t, cfg.Metadata.Strict)
+	require.Equal(t, DefaultMaxRequestBody, cfg.MaxRequestBody, "SEC-5: 4 MiB by default")
 }
 
 func TestLoadConfigValid(t *testing.T) {
@@ -58,6 +59,7 @@ datasets:
     - DatasetPublishers
   metadata:
     strict: true
+  max_request_body: 1048576
 `)
 
 	cfg, err := LoadConfig()
@@ -74,6 +76,7 @@ datasets:
 	require.Equal(t, AccessModelOpen, cfg.AccessModel)
 	require.Equal(t, []string{"DatasetAdmins", "DatasetPublishers"}, cfg.ImmutableGuardGroups)
 	require.True(t, cfg.Metadata.Strict)
+	require.Equal(t, int64(1<<20), cfg.MaxRequestBody)
 }
 
 // TestLoadConfigDisabledIsInert checks that the storage checks only apply when the service is
@@ -167,6 +170,11 @@ func TestLoadConfigValidationErrors(t *testing.T) {
 			name:    "non-positive merge_fan_in",
 			yaml:    "datasets:\n  merge_fan_in: -64\n",
 			wantErr: "merge_fan_in must be positive",
+		},
+		{
+			name:    "negative max_request_body",
+			yaml:    "datasets:\n  max_request_body: -1\n",
+			wantErr: "max_request_body must not be negative",
 		},
 		{
 			name:    "unknown access_model",

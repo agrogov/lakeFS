@@ -37,6 +37,12 @@ const (
 	DefaultMergeFanIn            = 64
 	DefaultPublishTimeout        = 30 * time.Minute
 	DefaultReconcileInterval     = 10 * time.Minute
+
+	// DefaultMaxRequestBody is the default of the datasets.max_request_body setting: the
+	// largest control-plane request body the server reads, 4 MiB (SEC-5). A definition of
+	// datasets.max_items items is far below it; the limit exists so that no request can make
+	// the server buffer an arbitrary amount of memory.
+	DefaultMaxRequestBody int64 = 4 << 20
 )
 
 // ErrInvalidConfig is wrapped by every configuration validation error, so callers can tell a
@@ -86,6 +92,11 @@ type Config struct {
 	// ReconcileInterval is the period of the background repair loop.
 	ReconcileInterval time.Duration `mapstructure:"reconcile_interval"`
 
+	// MaxRequestBody is the largest control-plane request body the server reads, in bytes
+	// (SEC-5). It bounds http.MaxBytesReader in front of the request validator, so a client
+	// cannot make the server buffer an arbitrary amount of memory.
+	MaxRequestBody int64 `mapstructure:"max_request_body"`
+
 	// AccessModel is "open" or "strict" (DATASETS_DESIGN.md §9.6).
 	AccessModel string `mapstructure:"access_model"`
 
@@ -128,6 +139,7 @@ func (c *Config) applyViperOverrides() {
 		accessModelKey          = ConfigKey + ".access_model"
 		immutableGuardGroupsKey = ConfigKey + ".immutable_guard_groups"
 		metadataStrictKey       = ConfigKey + ".metadata.strict"
+		maxRequestBodyKey       = ConfigKey + ".max_request_body"
 	)
 	if viper.IsSet(enabledKey) {
 		c.Enabled = viper.GetBool(enabledKey)
@@ -165,6 +177,9 @@ func (c *Config) applyViperOverrides() {
 	if viper.IsSet(metadataStrictKey) {
 		c.Metadata.Strict = viper.GetBool(metadataStrictKey)
 	}
+	if viper.IsSet(maxRequestBodyKey) {
+		c.MaxRequestBody = viper.GetInt64(maxRequestBodyKey)
+	}
 
 	// DOC-16: the public documentation has no datasets.enabled switch, only a storage namespace
 	// prefix. A configured namespace therefore enables the feature when enabled is unset; an
@@ -194,6 +209,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.AccessModel == "" {
 		c.AccessModel = AccessModelOpen
+	}
+	if c.MaxRequestBody == 0 {
+		c.MaxRequestBody = DefaultMaxRequestBody
 	}
 }
 
@@ -232,6 +250,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MergeFanIn <= 0 {
 		return fmt.Errorf("%w: merge_fan_in must be positive, got %d", ErrInvalidConfig, c.MergeFanIn)
+	}
+	if c.MaxRequestBody < 0 {
+		return fmt.Errorf("%w: max_request_body must not be negative, got %d", ErrInvalidConfig, c.MaxRequestBody)
 	}
 	switch c.AccessModel {
 	case AccessModelOpen:

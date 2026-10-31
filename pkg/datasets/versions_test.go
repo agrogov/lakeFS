@@ -402,7 +402,7 @@ func TestPublishVersion_AsyncTaskLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, TaskStatusCompleted, task.Status)
 	require.Equal(t, 1, task.Version)
-	require.Empty(t, task.Error)
+	require.Nil(t, task.Error, "a completed task carries no error")
 
 	head := f.datasetRecord(t, dataset)
 	require.Equal(t, DatasetStateActive, head.State)
@@ -440,7 +440,12 @@ func TestPublishVersion_AsyncFailureIsRolledBack(t *testing.T) {
 	task, err := f.svc.GetTask(f.ctx, f.caller(), dataset, outcome.Task.ID)
 	require.NoError(t, err)
 	require.Equal(t, TaskStatusFailed, task.Status)
-	require.Contains(t, task.Error, "blockstore unavailable")
+	// SEC-8: the task record is readable by every dataset reader, so it carries a sanitised
+	// {code, message} and never the raw error, which can name block and physical addresses.
+	require.NotNil(t, task.Error)
+	require.Equal(t, TaskErrorCodePublishFailed, task.Error.Code)
+	require.NotEmpty(t, task.Error.Message)
+	require.NotContains(t, task.Error.Message, "blockstore unavailable")
 	require.Zero(t, task.Version)
 
 	head := f.datasetRecord(t, dataset)
@@ -735,3 +740,29 @@ func versionNumbers(versions []*VersionRecord) []int {
 }
 
 func ptr[T any](value T) *T { return &value }
+
+// TestTaskErrorForIsSanitised is SEC-8: the sanitised task error carries a stable code and a
+// fixed message, never text derived from the failure, whatever internal path it names.
+func TestTaskErrorForIsSanitised(t *testing.T) {
+	const internal = "s3://bucket/_lakefs/data/3f2a/objects/0001/part.parquet"
+	for _, tt := range []struct {
+		name string
+		err  error
+		code string
+	}{
+		{"permission denied", fmt.Errorf("%w: user u may not read x", ErrPermissionDenied), TaskErrorCodePermissionDenied},
+		{"source read denied", fmt.Errorf("%w: %s", ErrSourceReadDenied, internal), TaskErrorCodePermissionDenied},
+		{"missing source repository", fmt.Errorf("%w: %s", ErrSourceRepositoryNotFound, internal), TaskErrorCodeSourceUnavailable},
+		{"missing source key", fmt.Errorf("%w: %s", ErrSourceKeyNotFound, internal), TaskErrorCodeSourceUnavailable},
+		{"anything else", errors.New("blockstore unavailable reading " + internal), TaskErrorCodePublishFailed},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := taskErrorFor(tt.err)
+			require.Equal(t, tt.code, got.Code)
+			require.NotEmpty(t, got.Message)
+			require.NotContains(t, got.Message, internal)
+			require.NotContains(t, got.Message, "s3://")
+			require.NotContains(t, got.Message, "blockstore")
+		})
+	}
+}

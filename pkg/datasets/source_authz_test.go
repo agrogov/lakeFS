@@ -192,6 +192,14 @@ func TestSourceReadRepositoryUnreadableLooksLikeMissing(t *testing.T) {
 	existing := prefixDefinition("hiddenrepo", commit.String(), "out", "")
 	missing := prefixDefinition("ghostrepo", commit.String(), "out", "")
 
+	// A dataset the caller may read and update, plus a proposal on it, so the publish and
+	// proposal paths reach their own source resolution: every one of them must answer the
+	// fs:ReadRepository 403 before the resolver can say anything about the source repository.
+	targetCommit := f.sourceRepo(t, "sec4-public", map[string]string{"public.txt": "public"})
+	publicDef := objectDefinition("sec4-public", targetCommit.String(), "public.txt", "public.txt")
+	f.createPublishedDataset(t, "sec4-target", publicDef)
+	proposal := f.createProposal(t, "sec4-target", CreateProposalRequest{Definition: publicDef, Title: "public"})
+
 	run := map[string]func(Definition) error{
 		"create": func(def Definition) error {
 			_, err := f.svc.Create(f.ctx, caller, CreateRequest{Name: "sec4-create", Definition: def, Publish: true})
@@ -199,6 +207,18 @@ func TestSourceReadRepositoryUnreadableLooksLikeMissing(t *testing.T) {
 		},
 		"validate": func(def Definition) error {
 			_, err := f.svc.Validate(f.ctx, caller, "sec4-validate", def)
+			return err
+		},
+		"publish": func(def Definition) error {
+			_, err := f.svc.PublishVersion(f.ctx, caller, "sec4-target", PublishVersionRequest{Definition: def, Sync: true})
+			return err
+		},
+		"create proposal": func(def Definition) error {
+			_, err := f.svc.CreateProposal(f.ctx, caller, "sec4-target", CreateProposalRequest{Definition: def, Title: "t"})
+			return err
+		},
+		"update proposal": func(def Definition) error {
+			_, err := f.svc.UpdateProposal(f.ctx, caller, "sec4-target", proposal.Record.ID, UpdateProposalRequest{Definition: &def})
 			return err
 		},
 	}

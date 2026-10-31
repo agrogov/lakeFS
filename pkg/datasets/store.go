@@ -235,14 +235,43 @@ type GrantRecord struct {
 // (§12.3 item 1). Unlike a DatasetRecord or a VersionRecord it is mutable (pending ->
 // running -> completed|failed), so it is written with a plain Set.
 type TaskRecord struct {
-	ID        string    `json:"id"`      // ULID
-	Dataset   string    `json:"dataset"` //
-	Kind      string    `json:"kind"`    // publish
-	Status    string    `json:"status"`  // pending | running | completed | failed
-	Version   int       `json:"version,omitempty"`
-	Error     string    `json:"error,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID      string `json:"id"`      // ULID
+	Dataset string `json:"dataset"` //
+	Kind    string `json:"kind"`    // publish
+	Status  string `json:"status"`  // pending | running | completed | failed
+	Version int    `json:"version,omitempty"`
+	// Error is the sanitised failure of a failed task (SEC-8). It is never the raw error:
+	// this record is readable by every holder of dataset:ReadDataset, and a raw error carries
+	// block and physical addresses. The full error goes to the server log.
+	Error     *TaskError `json:"error,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
+}
+
+// TaskError codes (§10.1 Task, SEC-8). They are stable identifiers a client may switch on; the
+// message is a fixed, server-authored sentence, not text derived from an error.
+const (
+	// TaskErrorCodePublishFailed is a publish that failed for an unspecified reason.
+	TaskErrorCodePublishFailed = "publish_failed"
+	// TaskErrorCodePermissionDenied is a publish the caller was not allowed to complete.
+	TaskErrorCodePermissionDenied = "permission_denied"
+	// TaskErrorCodeSourceUnavailable is a publish whose sources are no longer readable.
+	TaskErrorCodeSourceUnavailable = "source_unavailable"
+)
+
+// TaskError is the sanitised failure of an asynchronous task (SEC-8): a code and a fixed
+// message. The raw error is logged server-side, never stored on the record.
+type TaskError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// Error implements error, so a TaskError can be logged or compared like one.
+func (e *TaskError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Code + ": " + e.Message
 }
 
 // PinRecord is the GC pin of one (source repository, commit) pair, stored at

@@ -241,6 +241,7 @@ datasets:
   storage_id: ""                                   # "" = the default single blockstore
   storage_namespace_prefix: "s3://my-bucket/lakefs-datasets"   # required when enabled
   max_items: 1000                                  # data items per definition
+  max_request_body: 4MiB                           # largest control-plane request body (413 above it)
   allow_empty_items: false                         # allow prefix items matching no object
   sync_publish_max_objects: 100000                 # bigger publishes run async (202 + task)
   merge_fan_in: 64                                 # per-item iterators merged in one pass

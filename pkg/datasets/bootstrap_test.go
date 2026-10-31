@@ -184,31 +184,54 @@ func TestBootstrapIsIdempotent(t *testing.T) {
 	require.Equal(t, ts, policy.CreatedAt)
 }
 
-// TestBootstrapDoesNotOverwriteEditedPolicies pins the RBAC bootstrap promise (pkg/auth/setup):
-// an edited built-in policy is left alone, so a restart does not undo an administrator's change.
-func TestBootstrapDoesNotOverwriteEditedPolicies(t *testing.T) {
+// TestBootstrapRewritesEditedPolicies is SEC-6: a managed policy whose statements do not match
+// the built-in ones is rewritten, because its name is predictable and a pre-created or edited
+// policy would otherwise silently grant (or remove) rights on every dataset.
+func TestBootstrapRewritesEditedPolicies(t *testing.T) {
 	t.Parallel()
 	f := newAuthzFixture(t)
 	ts := time.Date(2026, 10, 28, 10, 0, 0, 0, time.UTC)
 	ctx := t.Context()
 	require.NoError(t, Bootstrap(ctx, f.svc, ts))
 
-	edited := &model.Policy{
+	// Someone with auth:WritePolicy but no datasets rights pre-created or edited the read-all
+	// policy into an fs:* grant.
+	tampered := &model.Policy{
 		CreatedAt:   ts,
 		DisplayName: DatasetsReadAllPolicyName,
 		Statement: model.Statements{{
 			Effect:   model.StatementEffectAllow,
-			Action:   []string{ActionListDatasets},
+			Action:   []string{"fs:*"},
 			Resource: permissions.All,
 		}},
 	}
-	require.NoError(t, f.svc.WritePolicy(ctx, edited, true))
+	require.NoError(t, f.svc.WritePolicy(ctx, tampered, true))
 
 	require.NoError(t, Bootstrap(ctx, f.svc, ts.Add(time.Hour)))
 
 	got, err := f.svc.GetPolicy(ctx, DatasetsReadAllPolicyName)
 	require.NoError(t, err)
-	require.True(t, statementsEqual(edited.Statement, got.Statement), "bootstrap must not overwrite an edited built-in policy")
+	require.True(t, statementsEqual(datasetsReadAllPolicy(ts).Statement, got.Statement),
+		"bootstrap must rewrite a managed policy whose statements do not match")
+	require.NotContains(t, statementActions(got.Statement), "fs:*")
+
+	// A second run is a no-op: the managed statements already match.
+	before, _, err := f.svc.ListPolicies(ctx, &model.PaginationParams{Amount: -1})
+	require.NoError(t, err)
+	require.NoError(t, Bootstrap(ctx, f.svc, ts.Add(2*time.Hour)))
+	after, _, err := f.svc.ListPolicies(ctx, &model.PaginationParams{Amount: -1})
+	require.NoError(t, err)
+	require.Equal(t, len(before), len(after))
+}
+
+// statementActions flattens the actions of statements, for assertions that a tampered action
+// is gone.
+func statementActions(statements model.Statements) []string {
+	var actions []string
+	for _, statement := range statements {
+		actions = append(actions, statement.Action...)
+	}
+	return actions
 }
 
 // TestDatasetsAllReadPolicy pins the managed policy of the §9.5 note: three data-plane statements

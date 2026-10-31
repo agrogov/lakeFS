@@ -8,6 +8,7 @@ package datasets
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,13 +100,27 @@ func TestDatasetsHTTPCreateGetDelete(t *testing.T) {
 		require.Equal(t, http.StatusConflict, rec.Code, "body: %s", rec.Body.String())
 	})
 
-	t.Run("repository name is 409", func(t *testing.T) {
+	t.Run("repository name is 409 without disclosing the repository", func(t *testing.T) {
+		// SEC-7: a plain repository and a dataset share the name namespace, and the answer
+		// must not tell a caller who cannot read the repository that it exists. The response
+		// therefore says only that the name is unavailable, and it is indistinguishable from
+		// the dataset-name clash above.
 		_, err := deps.Catalog.CreateRepository(t.Context(), "handler-repo", "", "mem://handler-repo-ns", "main", false)
 		require.NoError(t, err)
 		body := createDatasetBody(t, "handler-repo", def, false)
 		rec := doRequest(t, handler, http.MethodPost, "", body, accessKey, secret)
 		require.Equal(t, http.StatusConflict, rec.Code, "body: %s", rec.Body.String())
-		require.Contains(t, decodeError(t, rec).Message, "repository")
+		message := decodeError(t, rec).Message
+		require.Contains(t, message, ErrNameTaken.Error())
+		require.NotContains(t, message, "repository")
+		require.NotContains(t, message, "dataset")
+
+		duplicate := doRequest(t, handler, http.MethodPost, "", create, accessKey, secret)
+		require.Equal(t, http.StatusConflict, duplicate.Code, "body: %s", duplicate.Body.String())
+		require.Equal(t,
+			strings.ReplaceAll(decodeError(t, duplicate).Message, "handler-set", "NAME"),
+			strings.ReplaceAll(message, "handler-repo", "NAME"),
+			"a dataset clash and a repository clash are the same answer")
 	})
 
 	t.Run("list with metadata filter", func(t *testing.T) {

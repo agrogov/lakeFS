@@ -8,6 +8,7 @@ package datasets
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"testing"
@@ -260,11 +261,15 @@ func TestServiceCreateDuplicateName(t *testing.T) {
 	})
 
 	t.Run("repository", func(t *testing.T) {
+		// SEC-7: the answer is the same generic 409 for a dataset and for a plain repository,
+		// so it never confirms that a repository the caller cannot read exists.
 		_, err := f.cat.CreateRepository(f.ctx, "repo-taken", "", "mem://repo-taken-ns", "main", false)
 		require.NoError(t, err)
 		_, err = f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "repo-taken", Definition: def})
 		require.ErrorIs(t, err, ErrNameTaken)
-		require.Contains(t, err.Error(), "repository")
+		require.NotContains(t, err.Error(), "repository")
+		require.NotContains(t, err.Error(), "dataset")
+		require.Equal(t, "name unavailable: \"repo-taken\"", err.Error())
 	})
 }
 
@@ -964,4 +969,124 @@ func TestCreate_AllReadPolicyFailureStillReturnsDataset(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, DatasetStateActive, view.Record.State)
 	require.Equal(t, DatasetStateActive, f.datasetRecord(t, dataset).State)
+}
+
+// TestEffectiveAmountClamps is SEC-5: pagination has no "everything" value. A non-positive
+// amount is the default page size and an oversized one is clamped, so a client can never make
+// the server build an unbounded page.
+func TestEffectiveAmountClamps(t *testing.T) {
+	for _, tt := range []struct {
+		amount int
+		want   int
+	}{
+		{-1, DefaultListAmount},
+		{-1000, DefaultListAmount},
+		{0, DefaultListAmount},
+		{1, 1},
+		{MaxListAmount, MaxListAmount},
+		{MaxListAmount + 1, MaxListAmount},
+		{1 << 20, MaxListAmount},
+	} {
+		require.Equal(t, tt.want, effectiveAmount(tt.amount), "effectiveAmount(%d)", tt.amount)
+	}
+}
+
+// TestServiceListNegativeAmountIsDefaultPage is the SEC-5 test of the review: amount=-1 used to
+// mean "everything"; it now returns a default-sized page and reports has_more.
+func TestServiceListNegativeAmountIsDefaultPage(t *testing.T) {
+	f := newServiceFixture(t)
+	// Records without a version are enough: List only reads a version for LatestVersion > 0, so
+	// seeding the store keeps this a pagination test rather than a create test.
+	for i := 0; i <= DefaultListAmount; i++ {
+		name := fmt.Sprintf("bulk-set-%03d", i)
+		err := f.svc.store.CreateDataset(f.ctx, &DatasetRecord{
+			Name:      name,
+			CreatedBy: testServiceUser,
+			CreatedAt: f.ts,
+			UpdatedAt: f.ts,
+			State:     DatasetStateActive,
+			StorageID: f.cfg.StorageID,
+		})
+		require.NoError(t, err, "seed %s", name)
+	}
+
+	result, err := f.svc.List(f.ctx, f.caller(), ListRequest{Amount: -1})
+	require.NoError(t, err)
+	require.Len(t, result.Datasets, DefaultListAmount, "amount=-1 is the default page, not everything")
+	require.True(t, result.HasMore)
+	require.Equal(t, DefaultListAmount, result.MaxPerPage)
+	require.NotEmpty(t, result.NextOffset)
+
+	// The next page exists and is reachable through the cursor.
+	next, err := f.svc.List(f.ctx, f.caller(), ListRequest{Amount: -1, After: result.NextOffset})
+	require.NoError(t, err)
+	require.NotEmpty(t, next.Datasets)
+	require.False(t, next.HasMore)
+}
+
+// TestServiceRewritesPreCreatedManagedPolicies is SEC-6: the per-dataset managed policies have
+// predictable names, so one can be pre-created by a principal that may write policies but holds
+// no datasets permission. The service must compare the statements and rewrite a mismatch
+// instead of trusting the existing policy.
+func TestServiceRewritesPreCreatedManagedPolicies(t *testing.T) {
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, "src-squat", map[string]string{"a.txt": "a"})
+	def := objectDefinition("src-squat", commit.String(), "a.txt", "a.txt")
+
+	t.Run("consumer read policy", func(t *testing.T) {
+		const dataset = "squatted-read"
+		// The squat: fs:* on * under the name GrantAccess manages.
+		require.NoError(t, f.authService.WritePolicy(f.ctx, &model.Policy{
+			CreatedAt:   f.ts,
+			DisplayName: ConsumerReadPolicyName(dataset),
+			Statement: model.Statements{{
+				Effect:   model.StatementEffectAllow,
+				Action:   []string{"fs:*"},
+				Resource: permissions.All,
+			}},
+		}, false))
+
+		_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def})
+		require.NoError(t, err)
+		f.addUser(t, "squatted-reader")
+		grant, err := f.svc.GrantAccess(f.ctx, f.caller(), dataset, PrincipalTypeUser, "squatted-reader")
+		require.NoError(t, err)
+		require.Equal(t, ConsumerReadPolicyName(dataset), grant.PolicyName)
+
+		policy, err := f.authService.GetPolicy(f.ctx, ConsumerReadPolicyName(dataset))
+		require.NoError(t, err)
+		require.True(t, statementsEqual(ConsumerReadPolicy(dataset, f.svc.now()).Statement, policy.Statement),
+			"the managed read policy is rewritten to the managed statements")
+		require.NotContains(t, statementActions(policy.Statement), "fs:*")
+
+		// The grant the user actually holds is the managed one: reading the dataset control
+		// plane is allowed, blanket fs:* is not part of it any more.
+		resp, err := f.authService.Authorize(f.ctx, &auth.AuthorizationRequest{
+			Username:            "squatted-reader",
+			RequiredPermissions: DatasetPermission(ActionReadDataset, dataset),
+		})
+		require.NoError(t, err)
+		require.True(t, resp.Allowed)
+	})
+
+	t.Run("immutability guard", func(t *testing.T) {
+		const dataset = "squatted-guard"
+		// The squat: an empty guard, which would make every write to the dataset repository pass.
+		require.NoError(t, f.authService.WritePolicy(f.ctx, &model.Policy{
+			CreatedAt:   f.ts,
+			DisplayName: ImmutabilityPolicyName(dataset),
+			Statement:   model.Statements{},
+		}, false))
+
+		_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def})
+		require.NoError(t, err)
+
+		policy, err := f.authService.GetPolicy(f.ctx, ImmutabilityPolicyName(dataset))
+		require.NoError(t, err)
+		require.True(t, statementsEqual(ImmutabilityPolicy(dataset, f.svc.now()).Statement, policy.Statement),
+			"the empty guard is rewritten to the managed deny statements")
+		for _, statement := range policy.Statement {
+			require.Equal(t, model.StatementEffectDeny, statement.Effect, "the guard only denies")
+		}
+	})
 }

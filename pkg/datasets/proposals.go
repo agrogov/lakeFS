@@ -184,7 +184,7 @@ func (s *Service) ListProposals(ctx context.Context, caller Caller, dataset, sta
 		page = append(page, proposal)
 	}
 
-	amount = effectiveAmount(amount, len(page))
+	amount = effectiveAmount(amount)
 	hasMore := len(page) > amount
 	if hasMore {
 		page = page[:amount]
@@ -300,15 +300,18 @@ func (s *Service) GetProposal(ctx context.Context, caller Caller, dataset, id st
 // Authorization (§10.1): opening, updating and closing a proposal all need
 // dataset:UpdateDataset on the dataset. The docs do not define a separate proposal action.
 func (s *Service) UpdateProposal(ctx context.Context, caller Caller, dataset, id string, req UpdateProposalRequest) (*ProposalView, error) {
+	// SEC-7: authorize before anything is loaded, so the answer for a dataset or proposal the
+	// caller may not write is the same 403 whatever exists behind it - never a 404 that tells a
+	// caller without dataset:UpdateDataset that a proposal id is real.
+	if err := s.authorizeProposalWrite(ctx, caller, dataset, ""); err != nil {
+		return nil, err
+	}
 	rec, err := s.loadDataset(ctx, dataset)
 	if err != nil {
 		return nil, err
 	}
 	proposal, err := s.loadProposal(ctx, dataset, id)
 	if err != nil {
-		return nil, err
-	}
-	if err := s.authorizeProposalWrite(ctx, caller, dataset, proposal.Author); err != nil {
 		return nil, err
 	}
 	if proposal.Status != ProposalStatusOpen {

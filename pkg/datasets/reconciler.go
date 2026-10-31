@@ -680,11 +680,14 @@ func (r *Reconciler) settleInterruptedTasks(ctx context.Context, dataset string,
 		if completed {
 			next.Status = TaskStatusCompleted
 			next.Version = version
-			next.Error = ""
+			next.Error = nil
 		} else {
 			next.Status = TaskStatusFailed
 			next.Version = 0
-			next.Error = cause
+			// SEC-8: the task record is readable by every dataset reader, so a failure is the
+			// sanitised {code, message}. cause is the fixed sentence of
+			// interruptedPublishCause, not text derived from an error.
+			next.Error = &TaskError{Code: TaskErrorCodePublishFailed, Message: cause}
 		}
 		if err := r.store.PutTask(ctx, &next); err != nil {
 			errs = append(errs, err)
@@ -995,21 +998,34 @@ func (r *Reconciler) finishDelete(ctx context.Context, rec *DatasetRecord, repor
 func (r *Reconciler) ensureDatasetPolicies(ctx context.Context, dataset string, report *ReconcileReport) error {
 	// Immutability guard (§9.4). Written before the first version, so it must exist for
 	// every dataset record, including one created empty.
+	//
+	// SEC-6: existence is not enough. The managed name is predictable, so the statements are
+	// compared with the ones this pass would write; ensureImmutabilityGuard rewrites a mismatch
+	// and logs it, and the report says the policy was repaired.
 	immutabilityName := ImmutabilityPolicyName(dataset)
-	_, policyErr := r.svc.authService.GetPolicy(ctx, immutabilityName)
+	existingGuard, policyErr := r.svc.authService.GetPolicy(ctx, immutabilityName)
 	missingPolicy := errors.Is(policyErr, auth.ErrNotFound)
 	if policyErr != nil && !missingPolicy {
 		return fmt.Errorf("datasets: read policy %s: %w", immutabilityName, policyErr)
 	}
+	tamperedGuard := policyErr == nil &&
+		!statementsEqual(existingGuard.Statement, ImmutabilityPolicy(dataset, r.now()).Statement)
 	if err := r.svc.ensureImmutabilityGuard(ctx, dataset); err != nil {
 		return err
 	}
-	if missingPolicy {
+	switch {
+	case missingPolicy:
 		report.PoliciesReattached++
 		r.log.WithFields(logging.Fields{
 			"dataset": dataset,
 			"policy":  immutabilityName,
 		}).Warn("datasets: re-created a missing immutability guard")
+	case tamperedGuard:
+		report.PoliciesReattached++
+		r.log.WithFields(logging.Fields{
+			"dataset": dataset,
+			"policy":  immutabilityName,
+		}).Warn("datasets: rewrote an immutability guard whose statements did not match")
 	}
 
 	// Consumer read policy (§9.2): only datasets with grants have one; re-attach it to the
@@ -1022,20 +1038,31 @@ func (r *Reconciler) ensureDatasetPolicies(ctx context.Context, dataset string, 
 		return nil
 	}
 	consumerName := ConsumerReadPolicyName(dataset)
-	_, policyErr = r.svc.authService.GetPolicy(ctx, consumerName)
+	existingConsumer, policyErr := r.svc.authService.GetPolicy(ctx, consumerName)
 	missingPolicy = errors.Is(policyErr, auth.ErrNotFound)
 	if policyErr != nil && !missingPolicy {
 		return fmt.Errorf("datasets: read policy %s: %w", consumerName, policyErr)
 	}
+	// SEC-6: the managed read policy is the grant, so its statements must be the managed ones.
+	// A pre-created "dataset-<name>-read" with fs:* on * is rewritten here, not trusted.
+	tamperedConsumer := policyErr == nil &&
+		!statementsEqual(existingConsumer.Statement, ConsumerReadPolicy(dataset, r.now()).Statement)
 	if err := r.svc.ensureConsumerPolicy(ctx, dataset); err != nil {
 		return err
 	}
-	if missingPolicy {
+	switch {
+	case missingPolicy:
 		report.PoliciesReattached++
 		r.log.WithFields(logging.Fields{
 			"dataset": dataset,
 			"policy":  consumerName,
 		}).Warn("datasets: re-created a missing consumer read policy")
+	case tamperedConsumer:
+		report.PoliciesReattached++
+		r.log.WithFields(logging.Fields{
+			"dataset": dataset,
+			"policy":  consumerName,
+		}).Warn("datasets: rewrote a consumer read policy whose statements did not match")
 	}
 	for _, grant := range grants {
 		var attachErr error
@@ -1067,6 +1094,20 @@ func (r *Reconciler) ensureDatasetPolicies(ctx context.Context, dataset string, 
 // ensureInstallationPolicies keeps the installation-wide managed policies in step with the
 // dataset set and re-attaches them to their groups (§9.5 note, §12.3 item 3).
 func (r *Reconciler) ensureInstallationPolicies(ctx context.Context, names []string, report *ReconcileReport) error {
+	// SEC-6: the built-in policies are managed too. Their names are predictable, so one could
+	// be pre-created or edited by hand; ensureManagedPolicy compares the statements with the
+	// ones this pass would write, rewrites a mismatch and logs a warning.
+	for _, policy := range builtinDatasetPolicies(r.now()) {
+		rewritten, err := ensureManagedPolicy(ctx, r.svc.authService, policy)
+		if err != nil {
+			return err
+		}
+		if rewritten {
+			report.PoliciesReattached++
+			r.log.WithField("policy", policy.DisplayName).
+				Warn("datasets: rewrote a built-in policy whose statements did not match")
+		}
+	}
 	// DOC-1: rewrite managed policies still written with the legacy plural namespace.
 	if migrated, err := MigrateLegacyManagedPolicies(ctx, r.svc.authService); err != nil {
 		return err

@@ -3,9 +3,11 @@ package datasets
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -415,7 +417,7 @@ func validCreateBodyWithItemType(itemType string) string {
 // because no principal can be authenticated.
 func TestNewRouterWithoutAuthMiddleware(t *testing.T) {
 	// A server with no service is enough: requireUser answers 401 before any handler runs.
-	handler, err := NewRouter(nil, newServer(nil, nil))
+	handler, err := NewRouter(nil, newServer(nil, nil), DefaultMaxRequestBody)
 	require.NoError(t, err)
 
 	// NewRouter returns the sub-router; the validator resolves paths through the spec server
@@ -458,5 +460,102 @@ func TestDatasetsUnknownRoute404And405(t *testing.T) {
 	t.Run("unsupported method on a parametrised path", func(t *testing.T) {
 		rec := doRequest(t, handler, http.MethodPatch, "/customer-360", "", accessKey, secret)
 		require.Equal(t, http.StatusNotFound, rec.Code, "body: %s", rec.Body.String())
+	})
+}
+
+// oversizedBody is a large body that records whether anything read it, so a test can assert
+// that a rejected request was never buffered.
+type oversizedBody struct {
+	read      atomic.Bool
+	remaining int64
+}
+
+func (b *oversizedBody) Read(p []byte) (int, error) {
+	b.read.Store(true)
+	if b.remaining <= 0 {
+		return 0, io.EOF
+	}
+	n := int64(len(p))
+	if n > b.remaining {
+		n = b.remaining
+	}
+	for i := int64(0); i < n; i++ {
+		p[i] = ' '
+	}
+	b.remaining -= n
+	return int(n), nil
+}
+
+func (b *oversizedBody) Close() error { return nil }
+
+// TestDatasetsRequestBodyLimit is SEC-5: authentication and the authenticated-user requirement
+// run before the body is read, and an authenticated body over datasets.max_request_body is
+// answered 413 instead of being buffered.
+func TestDatasetsRequestBodyLimit(t *testing.T) {
+	t.Run("unauthenticated oversized POST is 401 without reading the body", func(t *testing.T) {
+		handler, _, _ := newControlPlane(t)
+		body := &oversizedBody{remaining: 10 << 20}
+		req := httptest.NewRequest(http.MethodPost, APIBasePath+"/customer-360/versions", nil)
+		req.Body = body
+		req.ContentLength = body.remaining
+		req.Header.Set("Content-Type", "application/json")
+
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		require.Equal(t, http.StatusUnauthorized, rec.Code, "body: %s", rec.Body.String())
+		require.JSONEq(t, `{"message":"`+ErrAuthenticationRequired.Error()+`"}`, rec.Body.String())
+		require.False(t, body.read.Load(), "the 401 must not read the body")
+	})
+
+	t.Run("authenticated body over the limit is 413", func(t *testing.T) {
+		handler, _, accessKey, secret := newControlPlaneWithConfig(t,
+			"datasets:\n  enabled: true\n  storage_namespace_prefix: \"mem://datasets\"\n  max_request_body: 1024\n")
+
+		rec := doRequest(t, handler, http.MethodPost, "", strings.Repeat(" ", 2048), accessKey, secret)
+		require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code, "body: %s", rec.Body.String())
+		require.Contains(t, decodeError(t, rec).Message, "exceeds")
+	})
+
+	t.Run("a small body still reaches the validator", func(t *testing.T) {
+		handler, _, accessKey, secret := newControlPlaneWithConfig(t,
+			"datasets:\n  enabled: true\n  storage_namespace_prefix: \"mem://datasets\"\n  max_request_body: 1024\n")
+
+		rec := doRequest(t, handler, http.MethodPost, "/any-set/versions", `{"message": "x"}`, accessKey, secret)
+		require.Equal(t, http.StatusBadRequest, rec.Code, "the limit must not turn a small body into a 413: %s", rec.Body.String())
+	})
+}
+
+// TestDatasetsSpecBounds is SEC-5: the spec bounds of api/datasets.yml are enforced by the
+// request validator, so an oversized string never reaches a handler (and never a KV record).
+func TestDatasetsSpecBounds(t *testing.T) {
+	handler, accessKey, secret := newControlPlane(t)
+
+	t.Run("description over maxLength", func(t *testing.T) {
+		tooLong := strings.Repeat("x", 4097)
+		body := marshalBody(t, apigen.DatasetValidateRequest{Definition: apigen.DatasetDefinition{
+			FormatVersion: 1,
+			Description:   &tooLong,
+		}})
+		rec := doRequest(t, handler, http.MethodPost, "/bounds-set/validate", body, accessKey, secret)
+		require.Equal(t, http.StatusBadRequest, rec.Code, "body: %s", rec.Body.String())
+		require.Contains(t, rec.Body.String(), "description")
+	})
+
+	t.Run("path over maxLength", func(t *testing.T) {
+		tooLong := strings.Repeat("x", 1025)
+		def := apigen.DatasetDefinition{
+			FormatVersion: 1,
+			Data: []apigen.DataItem{{
+				Target:     "t",
+				Repository: "src",
+				Ref:        apigen.SourceRef{Type: "commit", Id: "0123456789abcdef0123456789abcdef01234567"},
+				Type:       "prefix",
+				Prefix:     &apigen.PathSource{Path: tooLong},
+			}},
+		}
+		rec := doRequest(t, handler, http.MethodPost, "/bounds-set/validate", marshalBody(t, apigen.DatasetValidateRequest{Definition: def}), accessKey, secret)
+		require.Equal(t, http.StatusBadRequest, rec.Code, "body: %s", rec.Body.String())
+		require.Contains(t, rec.Body.String(), "path")
 	})
 }

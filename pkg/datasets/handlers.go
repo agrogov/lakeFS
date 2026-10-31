@@ -24,7 +24,6 @@ package datasets
 
 import (
 	"errors"
-	"fmt"
 	"net/http"
 
 	"github.com/treeverse/lakefs/pkg/auth"
@@ -33,10 +32,6 @@ import (
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/logging"
 )
-
-// ErrNotImplemented is wrapped by every datasets control-plane handler that has no business
-// logic yet. The HTTP answer is always 501 with the datasets error body (§10.4).
-var ErrNotImplemented = errors.New("not implemented")
 
 // MetadataFilterPrefix is the query-parameter prefix of the metadata filters of
 // GET /datasets (§10.1): metadata.<key>=<value>.
@@ -57,12 +52,6 @@ type server struct {
 // case the safe default of trusting no proxy applies to authorization conditions.
 func newServer(svc *Service, clientIP *httputil.ClientIPResolver) *server {
 	return &server{svc: svc, clientIP: clientIP}
-}
-
-// notImplemented writes the 501 answer for an operation that a later phase implements.
-func notImplemented(w http.ResponseWriter, r *http.Request, operation string) {
-	httputil.WriteAPIError(w, r, http.StatusNotImplemented,
-		fmt.Errorf("%w: %s", ErrNotImplemented, operation))
 }
 
 // caller builds the authorization caller of a request (§9.1): the authenticated principal
@@ -866,9 +855,10 @@ func taskToAPI(rec *TaskRecord) apigen.Task {
 		version := rec.Version
 		out.Version = &version
 	}
-	if rec.Error != "" {
-		message := rec.Error
-		out.Error = &message
+	if rec.Error != nil {
+		// SEC-8: the record already holds only the sanitised code and message; the API never
+		// adds a raw error.
+		out.Error = &apigen.TaskError{Code: rec.Error.Code, Message: rec.Error.Message}
 	}
 	return out
 }

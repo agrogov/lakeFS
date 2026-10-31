@@ -94,7 +94,7 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 		return fmt.Errorf("datasets: build auth middleware: %w", err)
 	}
 
-	datasetsRouter, err := NewRouter(authMiddleware, newServer(svc, newClientIPResolver(deps)))
+	datasetsRouter, err := NewRouter(authMiddleware, newServer(svc, newClientIPResolver(deps)), cfg.MaxRequestBody)
 	if err != nil {
 		return err
 	}
@@ -126,16 +126,20 @@ func newClientIPResolver(deps cmdpkg.ServerDeps) *httputil.ClientIPResolver {
 // NewRouter builds the datasets sub-router. It is mounted at APIBasePath by RoutesBuilder, so
 // the routes registered by the generated server are relative to that mount point.
 //
-// The middleware stack mirrors the core API (pkg/api/serve.go): request validation first, then
-// authentication. The validator answers a malformed request with the datasets error shape
-// (§10.4) before any handler runs; the authenticated-user requirement after it answers 401,
-// so no control-plane route is reachable without a principal (DATASETS_DESIGN.md §4.5).
+// The middleware stack is ordered the way §4.5 and SEC-5 require, and the order is not
+// interchangeable: authentication first (api.GenericAuthMiddleware), then the
+// authenticated-user requirement (401 before anything else happens), then the request-body
+// limit (SEC-5: http.MaxBytesReader with datasets.max_request_body), and only then the
+// spec validator. A request with no principal is therefore answered 401 without its body
+// being read, and a malformed body is only parsed for an authenticated caller.
+//
+// maxRequestBody is the limit in bytes; a non-positive value means DefaultMaxRequestBody.
 //
 // authMiddleware is a parameter (rather than built here) so the router can be exercised without
 // a full auth service - without one nothing can authenticate, so every route answers 401.
 // server is a parameter so the service can be replaced in tests and so later phases can add
 // operations without touching the routing.
-func NewRouter(authMiddleware func(http.Handler) http.Handler, server apigen.ServerInterface) (http.Handler, error) {
+func NewRouter(authMiddleware func(http.Handler) http.Handler, server apigen.ServerInterface, maxRequestBody int64) (http.Handler, error) {
 	swagger, err := apigen.GetSwagger()
 	if err != nil {
 		return nil, fmt.Errorf("datasets: load control-plane spec: %w", err)
@@ -146,13 +150,34 @@ func NewRouter(authMiddleware func(http.Handler) http.Handler, server apigen.Ser
 	}
 
 	router := chi.NewRouter()
-	router.Use(validator)
 	if authMiddleware != nil {
 		router.Use(authMiddleware)
 	}
 	router.Use(requireUser)
+	router.Use(maxRequestBodyBytes(maxRequestBody))
+	router.Use(validator)
 	apigen.HandlerFromMux(server, router)
 	return router, nil
+}
+
+// maxRequestBodyBytes bounds the request body the rest of the stack may read (SEC-5).
+//
+// It wraps the body in http.MaxBytesReader, so the validator and the handlers see a read
+// error as soon as the limit is exceeded: nothing buffers more than limit bytes. The
+// validator turns that error into a 413 (writeValidationError). A non-positive limit means
+// DefaultMaxRequestBody, so a zero Config built in a test cannot silently disable the limit.
+func maxRequestBodyBytes(limit int64) func(http.Handler) http.Handler {
+	if limit <= 0 {
+		limit = DefaultMaxRequestBody
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Body != nil {
+				r.Body = http.MaxBytesReader(w, r.Body, limit)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // requireUser rejects requests that carry no authenticated principal. It runs after
@@ -266,11 +291,18 @@ func routeErrorStatus(err error) int {
 }
 
 // writeValidationError maps a validation failure to a status code and the datasets error body
-// (§10.4): 400 for a malformed request or body, 401 for a missing security requirement, 500
-// otherwise.
+// (§10.4): 400 for a malformed request or body, 401 for a missing security requirement, 413 for
+// a body over datasets.max_request_body (SEC-5), 500 otherwise.
 func writeValidationError(w http.ResponseWriter, r *http.Request, err error) {
 	var reqErr *openapi3filter.RequestError
 	var secErr *openapi3filter.SecurityRequirementsError
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		writeErrorResponse(w, r, http.StatusRequestEntityTooLarge, errorResponse{
+			Message: fmt.Sprintf("request body exceeds the server limit of %d bytes", maxBytesErr.Limit),
+		})
+		return
+	}
 	switch {
 	case errors.As(err, &reqErr):
 		writeErrorResponse(w, r, http.StatusBadRequest, errorResponse{

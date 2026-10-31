@@ -56,6 +56,15 @@ func derefString(value *string) string {
 	return *value
 }
 
+// formatTaskError renders the sanitised failure of a task (SEC-8), or "" when there is none.
+// The server never sends the raw error, so there is nothing more to print.
+func formatTaskError(failure *apigen.TaskError) string {
+	if failure == nil {
+		return ""
+	}
+	return failure.Code + ": " + failure.Message
+}
+
 // derefInt returns the pointed-to integer, or 0 for a nil pointer.
 func derefInt(value *int) int {
 	if value == nil {
@@ -205,7 +214,7 @@ func printTask(cmd *cobra.Command, dataset string, task apigen.Task) {
 	if task.Version != nil {
 		printField(out, "Version", formatVersion(derefInt(task.Version)))
 	}
-	if failure := derefString(task.Error); failure != "" {
+	if failure := formatTaskError(task.Error); failure != "" {
 		printField(out, "Error", failure)
 	}
 	fmt.Fprintf(out, "\nThe publish runs in the background; check it with:\n  lakectl %s show %s\n", CommandName, dataset)

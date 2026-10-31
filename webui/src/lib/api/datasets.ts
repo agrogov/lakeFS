@@ -352,12 +352,23 @@ export interface MetadataKeyList {
 
 export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed';
 
+export type TaskErrorCode = 'publish_failed' | 'permission_denied' | 'source_unavailable';
+
+/**
+ * Sanitised failure of a failed task (SEC-8): a stable code and a fixed message. The raw error
+ * stays in the server log, so it is never rendered from here.
+ */
+export interface TaskError {
+    code: TaskErrorCode;
+    message: string;
+}
+
 /** Status of an asynchronous publish (§6.5, §10.1). */
 export interface Task {
     id: string;
     status: TaskStatus;
     version?: number;
-    error?: string;
+    error?: TaskError;
     /** Unix epoch milliseconds. */
     created_at: number;
     /** Unix epoch milliseconds. */

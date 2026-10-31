@@ -50,9 +50,11 @@ var (
 	// ErrDatasetNotFound reports an unknown dataset (404).
 	ErrDatasetNotFound = errors.New("dataset not found")
 
-	// ErrNameTaken reports a name already used by a dataset or by a repository (409). A
-	// dataset is a repository (§4.2), so both share one namespace.
-	ErrNameTaken = errors.New("name is already taken")
+	// ErrNameTaken reports that the requested dataset name cannot be used (409). A dataset is
+	// a repository (§4.2), so both share one namespace. The answer is deliberately generic
+	// (SEC-7): saying whether the name is held by a dataset or by a plain repository would
+	// tell a caller who may read no repository that a repository they cannot see exists.
+	ErrNameTaken = errors.New("name unavailable")
 
 	// ErrDatasetConflict reports a lost optimistic-concurrency race: the dataset record
 	// changed between the read and the conditional write (409, §5.4).
@@ -361,7 +363,7 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 	}
 	if err := s.store.CreateDataset(ctx, rec); err != nil {
 		if errors.Is(err, kv.ErrPredicateFailed) {
-			return nil, fmt.Errorf("%w: dataset %q already exists", ErrNameTaken, req.Name)
+			return nil, fmt.Errorf("%w: %q", ErrNameTaken, req.Name)
 		}
 		return nil, err
 	}
@@ -379,7 +381,7 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 	if _, err := s.catalog.CreateRepository(ctx, req.Name, s.cfg.StorageID, ns, DefaultBranch, true); err != nil {
 		_ = s.store.DeleteDataset(ctx, req.Name, rec, nil)
 		if errors.Is(err, graveler.ErrNotUnique) || errors.Is(err, kv.ErrPredicateFailed) {
-			return nil, fmt.Errorf("%w: repository %q already exists", ErrNameTaken, req.Name)
+			return nil, fmt.Errorf("%w: %q", ErrNameTaken, req.Name)
 		}
 		return nil, fmt.Errorf("datasets: create repository %q: %w", req.Name, err)
 	}
@@ -415,7 +417,7 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 		}
 	}
 
-	active := current
+	var active *DatasetRecord
 	if version != nil {
 		active, err = s.advanceDataset(ctx, current, version.Version)
 		if err != nil {
@@ -653,7 +655,7 @@ func (s *Service) List(ctx context.Context, caller Caller, req ListRequest) (*Li
 		filtered = append(filtered, view)
 	}
 
-	amount := effectiveAmount(req.Amount, len(filtered))
+	amount := effectiveAmount(req.Amount)
 
 	// filtered preserves the name order of store.ListDatasets, so a cursor is a name.
 	start := sort.Search(len(filtered), func(i int) bool {
@@ -1222,18 +1224,50 @@ func (s *Service) runAsyncPublish(publishing *DatasetRecord, def Definition, req
 	})
 	version, err := s.runPublish(ctx, publishing, def, req, publisher)
 	if err != nil {
+		// SEC-8: the task record is readable by any holder of dataset:ReadDataset, so it
+		// carries only the sanitised {code, message}; the full error - with block and physical
+		// addresses - goes to the server log.
+		logging.FromContext(ctx).WithError(err).WithFields(logging.Fields{
+			"dataset": publishing.Name,
+			"task":    taskID,
+		}).Error("datasets: asynchronous publish failed")
+		sanitized := taskErrorFor(err)
 		s.updateTask(ctx, publishing.Name, taskID, func(task *TaskRecord) {
 			task.Status = TaskStatusFailed
 			task.Version = 0
-			task.Error = err.Error()
+			task.Error = sanitized
 		})
 		return
 	}
 	s.updateTask(ctx, publishing.Name, taskID, func(task *TaskRecord) {
 		task.Status = TaskStatusCompleted
 		task.Version = version.Version
-		task.Error = ""
+		task.Error = nil
 	})
+}
+
+// taskErrorFor turns the failure of an asynchronous publish into the sanitised TaskError of
+// SEC-8: a stable code and a fixed message, never text derived from err. The caller logs err
+// itself; keeping the two apart is what stops a task read from disclosing storage internals.
+func taskErrorFor(err error) *TaskError {
+	switch {
+	case errors.Is(err, ErrPermissionDenied), errors.Is(err, ErrSourceReadDenied):
+		return &TaskError{
+			Code:    TaskErrorCodePermissionDenied,
+			Message: "the publish was denied by the source authorization check",
+		}
+	case errors.Is(err, ErrSourceRepositoryNotFound), errors.Is(err, ErrSourceRefNotFound),
+		errors.Is(err, ErrSourceKeyNotFound), isNotFound(err):
+		return &TaskError{
+			Code:    TaskErrorCodeSourceUnavailable,
+			Message: "a source repository, ref or object of the definition is no longer available",
+		}
+	default:
+		return &TaskError{
+			Code:    TaskErrorCodePublishFailed,
+			Message: "the publish failed; the server log has the details",
+		}
+	}
 }
 
 // updateTask applies mutate to the stored task and writes it back (pending -> running ->
@@ -1331,7 +1365,7 @@ func (s *Service) ListVersions(ctx context.Context, caller Caller, name, after s
 		page = append(page, version)
 	}
 
-	amount = effectiveAmount(amount, len(page))
+	amount = effectiveAmount(amount)
 	hasMore := len(page) > amount
 	if hasMore {
 		page = page[:amount]
@@ -1461,14 +1495,15 @@ func parseVersionNumber(ref string) (int, error) {
 	return version, nil
 }
 
-// effectiveAmount applies the pagination rules of the control plane (§10.2 Pagination):
-// -1 means "everything", 0 means the default page size, and the result never exceeds
-// MaxListAmount.
-func effectiveAmount(amount, available int) int {
+// effectiveAmount applies the pagination rules of the control plane (§10.2 Pagination): a
+// non-positive amount means the default page size, and the result never exceeds MaxListAmount.
+//
+// There is no "give me everything" value (SEC-5): a client asking for -1 - the old meaning of
+// "all" - gets the default page and has to follow has_more/next_offset like everyone else. A
+// list that is never paginated is an unbounded read on a large installation.
+func effectiveAmount(amount int) int {
 	switch {
-	case amount < 0:
-		return available
-	case amount == 0:
+	case amount <= 0:
 		return DefaultListAmount
 	case amount > MaxListAmount:
 		return MaxListAmount
@@ -1610,7 +1645,7 @@ func (s *Service) ListMetadataKeys(ctx context.Context, caller Caller, prefix, a
 		filtered = append(filtered, key)
 	}
 
-	pageAmount := effectiveAmount(amount, len(filtered))
+	pageAmount := effectiveAmount(amount)
 	start := sort.Search(len(filtered), func(i int) bool { return filtered[i].Name > after })
 	page := filtered[start:]
 	hasMore := len(page) > pageAmount
@@ -1757,14 +1792,19 @@ func (s *Service) storageNamespace(name string, now time.Time) (string, error) {
 }
 
 // checkNameAvailable rejects a name used by a dataset or by any repository (§10.4 409).
+//
+// Both clashes return the same generic ErrNameTaken (SEC-7): the endpoint runs for a caller who
+// may hold no repository read permission at all, and a message that says "repository" or
+// "dataset" would confirm the existence of a repository the caller cannot see. The caller
+// learns that the name is unavailable, and nothing else.
 func (s *Service) checkNameAvailable(ctx context.Context, name string) error {
 	if _, _, err := s.store.GetDataset(ctx, name); err == nil {
-		return fmt.Errorf("%w: dataset %q already exists", ErrNameTaken, name)
+		return fmt.Errorf("%w: %q", ErrNameTaken, name)
 	} else if !errors.Is(err, kv.ErrNotFound) {
 		return err
 	}
 	if _, err := s.catalog.GetRepository(ctx, name); err == nil {
-		return fmt.Errorf("%w: repository %q already exists", ErrNameTaken, name)
+		return fmt.Errorf("%w: %q", ErrNameTaken, name)
 	} else if !isNotFound(err) {
 		return err
 	}
@@ -2185,9 +2225,13 @@ func (s *Service) ensureAllReadPolicy(ctx context.Context) error {
 // ensureImmutabilityGuard writes and attaches the per-dataset deny policy of §9.4. It runs
 // before the first version is published, so a guarded principal can never force a write to
 // the dataset repository.
+//
+// The policy name is predictable, so an existing policy is compared against the managed
+// statements and rewritten when it differs (SEC-6): a pre-created, empty
+// "dataset-<name>-immutable" would otherwise make the guard a no-op for that dataset.
 func (s *Service) ensureImmutabilityGuard(ctx context.Context, dataset string) error {
 	policy := ImmutabilityPolicy(dataset, s.now())
-	if err := s.authService.WritePolicy(ctx, policy, false); err != nil && !errors.Is(err, auth.ErrAlreadyExists) {
+	if _, err := ensureManagedPolicy(ctx, s.authService, policy); err != nil {
 		return fmt.Errorf("datasets: write policy %s: %w", policy.DisplayName, err)
 	}
 	for _, group := range ImmutabilityGuardGroups(s.cfg.ImmutableGuardGroups) {
@@ -2247,19 +2291,17 @@ func (s *Service) dropAccessGrants(ctx context.Context, dataset string) []error 
 	return errs
 }
 
-// ensureConsumerPolicy creates the managed read policy of a dataset when it is missing
-// (§9.2). An existing policy is left untouched: it is machine-managed, but rewriting it on
-// every grant would hide an administrator's edit instead of surfacing it.
+// ensureConsumerPolicy creates the managed read policy of a dataset when it is missing and
+// rewrites it when its statements differ (§9.2, SEC-6).
+//
+// The policy name is predictable ("dataset-<name>-read"), so a principal that may write
+// policies but holds no datasets permission could pre-create it as fs:* on * and every later
+// grant would leak the dataset and its sources. Comparing the statements and overwriting a
+// mismatch closes that hole; the reconciler runs the same comparison on every pass.
 func (s *Service) ensureConsumerPolicy(ctx context.Context, dataset string) error {
-	name := ConsumerReadPolicyName(dataset)
-	if _, err := s.authService.GetPolicy(ctx, name); err == nil {
-		return nil
-	} else if !errors.Is(err, auth.ErrNotFound) {
-		return fmt.Errorf("datasets: get policy %s: %w", name, err)
-	}
-	err := s.authService.WritePolicy(ctx, ConsumerReadPolicy(dataset, s.now()), false)
-	if err != nil && !errors.Is(err, auth.ErrAlreadyExists) {
-		return fmt.Errorf("datasets: write policy %s: %w", name, err)
+	policy := ConsumerReadPolicy(dataset, s.now())
+	if _, err := ensureManagedPolicy(ctx, s.authService, policy); err != nil {
+		return fmt.Errorf("datasets: write policy %s: %w", policy.DisplayName, err)
 	}
 	return nil
 }

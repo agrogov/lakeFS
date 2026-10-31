@@ -177,6 +177,8 @@ func TestEnsureRBACBaseGroupsDatasetsEnabled(t *testing.T) {
 		}}, policy.Statement, "policy %s", name)
 	}
 
+	// SEC-9: only Admins get DatasetsFullAccess; SuperUsers get DatasetsReadWriteAll, so a
+	// superuser does not silently inherit dataset:ManageAccess or dataset:DeleteDataset.
 	expectedAttachments := map[string][]string{
 		setup.AdminsGroup:     {"FSFullAccess", "CatalogReadWriteAll", "AuthFullAccess", "RepoManagementFullAccess", setup.DatasetsFullAccessPolicy},
 		setup.SuperUsersGroup: {"FSFullAccess", "PRReadWriteAll", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll", setup.DatasetsReadWriteAllPolicy},

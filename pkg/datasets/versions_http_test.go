@@ -211,7 +211,8 @@ func TestDatasetsHTTPAsyncPublish(t *testing.T) {
 		require.True(t, time.Now().Before(deadline), "the asynchronous publish did not finish in time")
 		time.Sleep(10 * time.Millisecond)
 	}
-	require.Equal(t, TaskStatusCompleted, final.Status, "task error: %s", deref(final.Error))
+	require.Equal(t, TaskStatusCompleted, final.Status, "task error: %v", final.Error)
+	require.Nil(t, final.Error, "a completed task carries no error")
 	require.NotNil(t, final.Version)
 	require.Equal(t, 1, *final.Version)
 

@@ -313,7 +313,8 @@ func TestPublishCommand(t *testing.T) {
 	})
 
 	t.Run("failed publish task", func(t *testing.T) {
-		taskFailedBody := `{"id": "task-9", "status": "failed", "error": "source repository is gone", "created_at": 1767225600000, "updated_at": 1767225600000}`
+		// SEC-8: a failed task carries the sanitised {code, message}, never the raw error.
+		taskFailedBody := `{"id": "task-9", "status": "failed", "error": {"code": "source_unavailable", "message": "a source repository is gone"}, "created_at": 1767225600000, "updated_at": 1767225600000}`
 		newFakeControlPlane(t,
 			fakeResponse{Status: http.StatusAccepted, Body: `{"id": "task-9", "status": "pending", "created_at": 1, "updated_at": 1}`},
 			fakeResponse{Status: http.StatusOK, Body: taskFailedBody},

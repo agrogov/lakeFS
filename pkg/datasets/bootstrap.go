@@ -13,6 +13,7 @@ package datasets
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sort"
 	"strings"
@@ -382,6 +383,19 @@ func mergeMigration(original, migrated []string, changed bool) ([]string, bool) 
 	return original, changed
 }
 
+// builtinDatasetPolicies is the installation-wide policy set of §9.5 plus the §8.2
+// datasets-pins-protect deny policy, as Bootstrap creates it and the reconciler re-ensures it.
+// The list is one function so the two callers cannot drift apart (SEC-6).
+func builtinDatasetPolicies(ts time.Time) []*model.Policy {
+	return []*model.Policy{
+		datasetsFullAccessPolicy(ts),
+		datasetsReadWriteAllPolicy(ts),
+		datasetsReadAllPolicy(ts),
+		datasetsManageMetadataKeysPolicy(ts),
+		PinsProtectPolicy(ts),
+	}
+}
+
 // BootstrapConfig holds the optional inputs of Bootstrap.
 type BootstrapConfig struct {
 	// Datasets are the datasets that exist right now. They seed the managed datasets-all-read
@@ -439,16 +453,16 @@ func WithPinsProtectGroups(groups []string) BootstrapOption {
 //
 // Bootstrap is idempotent: it is safe to run on every startup.
 //
-//   - Policies and groups are created with "create if absent" semantics and auth.ErrAlreadyExists
-//     is treated as success, so a second run creates nothing. Existing built-in policies are
-//     never overwritten: an installation that edited DatasetsReadAll keeps its edit, and the
-//     reconciler reports drift instead of fighting the administrator (the RBAC bootstrap in
-//     pkg/auth/setup makes the same promise).
+//   - Policies are created when absent and rewritten when their statements differ from the
+//     built-in ones (SEC-6: a pre-created "dataset-foo-read" with fs:* must not survive), and a
+//     rewrite is logged as a warning. Groups are created with "create if absent" semantics and
+//     auth.ErrAlreadyExists is treated as success, so a second run changes nothing that already
+//     matches.
 //   - Attachments likewise tolerate auth.ErrAlreadyExists, so re-running re-creates attachments
 //     that were detached by hand - including the datasets-all-read attachment - without
 //     duplicating anything.
-//   - The one exception is datasets-all-read, which is machine-managed: it is rewritten only when
-//     its statement set differs from the current dataset list (see EnsureDatasetsAllReadPolicy).
+//   - datasets-all-read is machine-managed in the same sense: it is rewritten when its statement
+//     set differs from the current dataset list (see EnsureDatasetsAllReadPolicy).
 //
 // Because nothing here is a no-op that depends on ordering, a partially failed run can simply be
 // retried.
@@ -468,13 +482,7 @@ func Bootstrap(ctx context.Context, authService auth.Service, ts time.Time, opts
 		return err
 	}
 
-	if err := createDatasetPolicies(ctx, authService, []*model.Policy{
-		datasetsFullAccessPolicy(ts),
-		datasetsReadWriteAllPolicy(ts),
-		datasetsReadAllPolicy(ts),
-		datasetsManageMetadataKeysPolicy(ts),
-		PinsProtectPolicy(ts),
-	}); err != nil {
+	if err := createDatasetPolicies(ctx, authService, builtinDatasetPolicies(ts)); err != nil {
 		return err
 	}
 
@@ -524,15 +532,52 @@ func attachPinsProtectPolicy(ctx context.Context, authService auth.Service, extr
 	return nil
 }
 
-// createDatasetPolicies writes every policy that does not exist yet, ignoring auth.ErrAlreadyExists.
+// createDatasetPolicies creates every managed policy that does not exist yet and rewrites the
+// ones whose statements differ from policy.Statement (SEC-6).
 func createDatasetPolicies(ctx context.Context, authService auth.Service, policies []*model.Policy) error {
 	for _, policy := range policies {
-		err := authService.WritePolicy(ctx, policy, false /* create only */)
-		if err != nil && !errors.Is(err, auth.ErrAlreadyExists) {
+		if _, err := ensureManagedPolicy(ctx, authService, policy); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// ensureManagedPolicy makes the managed policy exist with exactly its statements: it creates it
+// when it is missing and rewrites it when the statements differ. It reports whether an existing
+// policy was rewritten.
+//
+// A managed policy name is predictable ("dataset-<name>-read", "dataset-<name>-immutable",
+// "datasets-*"), so without this check a principal that may write policies but holds no
+// datasets permission could pre-create "dataset-foo-read" with fs:* on * - or the immutability
+// guard with no statements - and every later grant or publish would inherit it (SEC-6). The
+// reconciler calls this on every pass, so a hand-edited managed policy is repaired rather than
+// trusted.
+//
+// Comparison ignores an empty Conditions map versus nil (see statementsEqual), so a policy that
+// merely round-tripped through the KV encoding is not rewritten on every startup.
+func ensureManagedPolicy(ctx context.Context, authService auth.Service, policy *model.Policy) (bool, error) {
+	existing, err := authService.GetPolicy(ctx, policy.DisplayName)
+	switch {
+	case err == nil:
+		if statementsEqual(existing.Statement, policy.Statement) {
+			return false, nil
+		}
+		if err := authService.WritePolicy(ctx, policy, true /* update */); err != nil {
+			return false, fmt.Errorf("datasets: rewrite managed policy %s: %w", policy.DisplayName, err)
+		}
+		logging.FromContext(ctx).WithField("policy", policy.DisplayName).
+			Warn("datasets: rewrote a managed policy whose statements did not match")
+		return true, nil
+	case errors.Is(err, auth.ErrNotFound):
+		err := authService.WritePolicy(ctx, policy, false /* create */)
+		if err != nil && !errors.Is(err, auth.ErrAlreadyExists) {
+			return false, err
+		}
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
 // createDatasetGroups creates every group that does not exist yet, ignoring auth.ErrAlreadyExists.
