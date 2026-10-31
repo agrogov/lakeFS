@@ -217,15 +217,23 @@ func NewService(cfg *Config, kvs kv.Store, cat *catalog.Catalog, authService aut
 		resolver:     &Resolver{Catalog: cat, StorageID: graveler.StorageID(cfg.StorageID)},
 		materializer: &Materializer{Catalog: cat, RequireSourceAuthz: true},
 		pins:         NewPins(store, cat),
-		now:          time.Now,
 		newULID:      newULID,
 		publishFn:    publishWithMaterializer,
 		bgCtx:        context.Background(),
 	}
-	svc.store.now = svc.now
-	svc.pins.now = svc.now
+	svc.setClock(time.Now)
 	svc.putVersionFn = svc.store.PutVersion
 	return svc, nil
+}
+
+// setClock installs clock on the service and on the components that write timestamps of
+// their own: the KV store (the reconcile lease) and the pin manager. NewReconciler reads
+// svc.now when it is built, so a reconciler created after setClock uses the same clock.
+// NewService installs the wall clock; tests replace it to drive staleness without sleeping.
+func (s *Service) setClock(clock func() time.Time) {
+	s.now = clock
+	s.store.now = clock
+	s.pins.now = clock
 }
 
 // publishWithMaterializer is the production publishFn: the materialisation primitive of

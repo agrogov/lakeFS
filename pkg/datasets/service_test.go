@@ -7,7 +7,6 @@ package datasets
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"sort"
@@ -564,39 +563,83 @@ func TestServiceCreateFailureRollsBackInline(t *testing.T) {
 	require.Equal(t, 1, view.Record.LatestVersion)
 }
 
-// TestServiceInjectedClock pins BUG-13: the pin manager and the reconcile lease use the
-// service clock, not time.Now, so fake-clock tests can drive staleness.
+// TestServiceInjectedClock pins BUG-13: publish timestamps, the pin manager's record timestamps
+// and the reconcile lease all follow the service clock instead of time.Now, so fake-clock tests
+// can drive staleness without sleeping.
 func TestServiceInjectedClock(t *testing.T) {
-	const dataset = "clocked"
-	f := newServiceFixture(t)
-	commit := f.sourceRepo(t, "src-clocked", map[string]string{"data/a.parquet": "a"})
-	f.createEmptyDataset(t, dataset, prefixDefinition("src-clocked", commit.String(), "data", "data/"))
-
+	const (
+		dataset = "clocked"
+		source  = "src-clocked"
+	)
 	fixed := time.Date(2031, 3, 4, 5, 6, 7, 0, time.UTC)
-	f.svc.now = func() time.Time { return fixed }
-	f.svc.store.now = f.svc.now
-	f.svc.pins.now = f.svc.now
+	now := fixed
+	f := newServiceFixture(t)
+	f.svc.setClock(func() time.Time { return now })
 
-	current := f.datasetRecord(t, dataset)
-	degraded := *current
-	degraded.State = DatasetStateDegraded
-	degraded.UpdatedAt = fixed.Add(-time.Hour)
-	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &degraded, current, nil))
+	// The create publishes v1: both the dataset record and the version record must use the
+	// injected clock, not the wall clock.
+	commit := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition(source, commit.String(), "data", "data/"),
+		Publish:    true,
+		Message:    "v1",
+	})
+	require.NoError(t, err)
+	require.True(t, view.Record.CreatedAt.Equal(fixed), "create writes the injected clock")
+	require.True(t, view.Record.UpdatedAt.Equal(fixed), "publish writes the injected clock")
+	require.NotNil(t, view.Version)
+	require.True(t, view.Version.PublishedAt.Equal(fixed), "the version timestamp uses the injected clock")
+	require.True(t, datasetPinsInclude(t, f, dataset, 1), "v1 pins its source")
+
+	// A later publish uses the advanced fake clock for its timestamps.
+	now = fixed.Add(90 * time.Minute)
+	second := f.commitObjects(t, source, "main", testObject{key: "data/a.parquet", content: []byte("b")})
+	outcome, err := f.svc.PublishVersion(f.ctx, f.caller(), dataset, PublishVersionRequest{
+		Definition: prefixDefinition(source, second.String(), "data", "data/"),
+		Message:    "v2",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, outcome.Version)
+	require.True(t, outcome.Version.PublishedAt.Equal(now), "v2 uses the advanced injected clock")
+	require.True(t, f.datasetRecord(t, dataset).UpdatedAt.Equal(now), "the head uses the advanced injected clock")
+	require.True(t, datasetPinsInclude(t, f, dataset, 2), "v2 pins its source")
+
+	// The pin manager's own record writes (markDegraded and ClearDatasetDegraded) use the
+	// same clock.
+	now = fixed.Add(2 * time.Hour)
+	marked, err := f.svc.pins.markDegraded(f.ctx, dataset)
+	require.NoError(t, err)
+	require.True(t, marked)
+	require.True(t, f.datasetRecord(t, dataset).UpdatedAt.Equal(now), "markDegraded writes the injected clock")
+
+	now = fixed.Add(3 * time.Hour)
 	cleared, err := f.svc.pins.ClearDatasetDegraded(f.ctx, dataset)
 	require.NoError(t, err)
 	require.True(t, cleared)
-	require.True(t, f.datasetRecord(t, dataset).UpdatedAt.Equal(fixed),
-		"the pin manager writes the injected clock")
+	require.True(t, f.datasetRecord(t, dataset).UpdatedAt.Equal(now), "ClearDatasetDegraded writes the injected clock")
 
+	// The reconcile lease is stamped and expires on the injected clock.
+	now = fixed.Add(4 * time.Hour)
 	acquired, err := f.svc.store.AcquireLease(f.ctx, "clocked-owner", time.Minute)
 	require.NoError(t, err)
 	require.True(t, acquired)
-	res, err := f.kvStore.Get(f.ctx, []byte(PartitionKey), []byte(ReconcileLeaseKey))
+	lease, _, err := f.svc.store.GetLease(f.ctx)
 	require.NoError(t, err)
-	var lease leaseRecord
-	require.NoError(t, json.Unmarshal(res.Value, &lease))
-	require.True(t, lease.ExpiresAt.Equal(fixed.Add(time.Minute)),
-		"the reconcile lease uses the injected clock")
+	require.True(t, lease.ExpiresAt.Equal(now.Add(time.Minute)), "the lease expiry uses the injected clock")
+
+	acquired, err = f.svc.store.AcquireLease(f.ctx, "other-owner", time.Minute)
+	require.NoError(t, err)
+	require.False(t, acquired, "a live lease is not taken over")
+
+	now = now.Add(time.Minute + time.Second)
+	acquired, err = f.svc.store.AcquireLease(f.ctx, "other-owner", time.Minute)
+	require.NoError(t, err)
+	require.True(t, acquired, "the lease expires on the injected clock")
+	lease, _, err = f.svc.store.GetLease(f.ctx)
+	require.NoError(t, err)
+	require.Equal(t, "other-owner", lease.Owner)
+	require.True(t, lease.ExpiresAt.Equal(now.Add(time.Minute)))
 }
 
 func TestServiceValidateReportsEveryProblem(t *testing.T) {
