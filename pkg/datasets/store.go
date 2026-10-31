@@ -275,6 +275,13 @@ type Store struct {
 	// now is the clock used for records owned by the store (the reconcile lease);
 	// production uses the wall clock and tests replace it through the service.
 	now func() time.Time
+
+	// putProposalFn and deleteVersionFn are test hooks, nil in production: they let a
+	// test inject the one write that fails in the window a repair covers - the proposal
+	// write that follows a merge (BUG-8) and a step of finishDelete (BUG-7) - without a
+	// second KV implementation. Each falls through to the real write when nil.
+	putProposalFn   func(ctx context.Context, rec, previous *ProposalRecord) error
+	deleteVersionFn func(ctx context.Context, dataset string, version int) error
 }
 
 // NewStore returns a Store backed by kvs. The Store does not own kvs and never
@@ -413,6 +420,14 @@ func taskKey(dataset, id string) ([]byte, error) {
 		return nil, err
 	}
 	return []byte(kv.FormatPath(taskKeyPrefix, dataset, id)), nil
+}
+
+// tasksPrefix returns the key prefix of every task of dataset.
+func tasksPrefix(dataset string) ([]byte, error) {
+	if err := checkDatasetName(dataset); err != nil {
+		return nil, err
+	}
+	return []byte(kv.FormatPath(taskKeyPrefix, dataset, "")), nil
 }
 
 // checkDatasetName rejects every name that §5.2 rule 1 would reject, including the
@@ -869,6 +884,14 @@ func (s *Store) GetVersion(ctx context.Context, dataset string, version int) (*V
 // Version records are immutable while they exist; this is only called when the dataset
 // itself is deleted.
 func (s *Store) DeleteVersion(ctx context.Context, dataset string, version int) error {
+	if s.deleteVersionFn != nil {
+		return s.deleteVersionFn(ctx, dataset, version)
+	}
+	return s.deleteVersion(ctx, dataset, version)
+}
+
+// deleteVersion is the real DeleteVersion, the fall-through of the injection point.
+func (s *Store) deleteVersion(ctx context.Context, dataset string, version int) error {
 	key, err := versionKey(dataset, version)
 	if err != nil {
 		return err
@@ -927,6 +950,14 @@ func (s *Store) GetProposal(ctx context.Context, dataset, id string) (*ProposalR
 // kv.ErrPredicateFailed is returned unchanged when the caller lost the race. The
 // predicate handed to SetIf comes from kv.Get (see setIfUnchanged).
 func (s *Store) PutProposalIf(ctx context.Context, rec, previous *ProposalRecord) error {
+	if s.putProposalFn != nil {
+		return s.putProposalFn(ctx, rec, previous)
+	}
+	return s.putProposalIf(ctx, rec, previous)
+}
+
+// putProposalIf is the real PutProposalIf, the fall-through of the injection point.
+func (s *Store) putProposalIf(ctx context.Context, rec, previous *ProposalRecord) error {
 	if rec == nil {
 		return fmt.Errorf("datasets: %w", ErrNilRecord)
 	}
@@ -1445,6 +1476,45 @@ func (s *Store) PutTask(ctx context.Context, rec *TaskRecord) error {
 		return fmt.Errorf("datasets: encode task record %q: %w", rec.ID, err)
 	}
 	return s.put(ctx, key, value)
+}
+
+// ListTasks returns every task record of dataset, newest first. An unknown dataset yields
+// an empty slice and no error. It is what finishDelete uses to remove the tasks of a
+// deleted dataset and what repairInterrupted uses to settle the task of a publish that
+// crashed (BUG-11).
+func (s *Store) ListTasks(ctx context.Context, dataset string) ([]*TaskRecord, error) {
+	prefix, err := tasksPrefix(dataset)
+	if err != nil {
+		return nil, err
+	}
+	tasks := make([]*TaskRecord, 0)
+	err = s.scanPrefix(ctx, prefix, func(key, value []byte) error {
+		rec, err := decodeRecord[TaskRecord]("task record", key, value)
+		if err != nil {
+			return err
+		}
+		tasks = append(tasks, rec)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(tasks, func(i, j int) bool {
+		if !tasks[i].CreatedAt.Equal(tasks[j].CreatedAt) {
+			return tasks[i].CreatedAt.After(tasks[j].CreatedAt)
+		}
+		return tasks[i].ID > tasks[j].ID // ULIDs: descending is newest first
+	})
+	return tasks, nil
+}
+
+// DeleteTask removes one task record; deleting a missing task is not an error.
+func (s *Store) DeleteTask(ctx context.Context, dataset, id string) error {
+	key, err := taskKey(dataset, id)
+	if err != nil {
+		return err
+	}
+	return s.delete(ctx, key)
 }
 
 // ListGrants returns every grant of dataset, ordered by principal type then

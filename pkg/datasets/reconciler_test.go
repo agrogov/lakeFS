@@ -11,6 +11,7 @@ package datasets
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -600,6 +601,307 @@ func TestDatasetMetrics_RegistrationIsIdempotent(t *testing.T) {
 	} {
 		require.Contains(t, names, want)
 	}
+}
+
+// TestReconcile_CancelledPassReturnsPromptly covers BUG-6: a pass runs on the caller's context,
+// so a shutdown stops it between datasets instead of letting it hold the lease until every
+// record was repaired.
+func TestReconcile_CancelledPassReturnsPromptly(t *testing.T) {
+	const (
+		first  = "cancel-pass-a"
+		second = "cancel-pass-b"
+	)
+	f := newServiceFixture(t)
+	_, _ = f.publishFirstVersion(t, first, "src-cancel-pass-a")
+	_, _ = f.publishFirstVersion(t, second, "src-cancel-pass-b")
+
+	ctx, cancel := context.WithCancel(f.ctx)
+	defer cancel()
+
+	r := f.reconcilerFor()
+	var repaired []string
+	r.onDatasetRepaired = func(dataset string) {
+		repaired = append(repaired, dataset)
+		cancel() // the server shuts down in the middle of the pass
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Reconcile(ctx)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a cancelled pass did not return promptly")
+	}
+	require.Equal(t, []string{first}, repaired, "the pass stopped after the first dataset")
+
+	// The lease was still handed back: the release runs on a context that survives cancellation.
+	acquired, err := f.svc.store.AcquireLease(f.ctx, "next-node", time.Minute)
+	require.NoError(t, err)
+	require.True(t, acquired, "a cancelled pass releases the reconcile lease")
+}
+
+// TestReconcile_LeaseExpiryStopsThePass covers the other half of BUG-6: the lease is renewed with
+// a CAS between datasets, and a pass whose lease expired and was taken over aborts instead of
+// repairing with a lease it no longer holds.
+func TestReconcile_LeaseExpiryStopsThePass(t *testing.T) {
+	const (
+		first  = "lease-pass-a"
+		second = "lease-pass-b"
+	)
+	f := newServiceFixture(t)
+	_, _ = f.publishFirstVersion(t, first, "src-lease-pass-a")
+	_, _ = f.publishFirstVersion(t, second, "src-lease-pass-b")
+
+	now := f.svc.now()
+	f.svc.setClock(func() time.Time { return now })
+
+	r := f.reconcilerFor()
+	r.timeout = time.Minute
+	r.leaseTTL = time.Minute
+
+	var repaired []string
+	r.onDatasetRepaired = func(dataset string) {
+		repaired = append(repaired, dataset)
+		if len(repaired) > 1 {
+			return
+		}
+		// The pass outlives its lease; another node takes the repair over.
+		now = now.Add(2 * time.Minute)
+		acquired, err := f.svc.store.AcquireLease(f.ctx, "other-node", time.Minute)
+		require.NoError(t, err)
+		require.True(t, acquired, "the expired lease is taken over")
+	}
+
+	report, err := r.Reconcile(f.ctx)
+	require.NoError(t, err)
+	require.NotNil(t, report)
+	require.Equal(t, 2, report.Datasets)
+	require.Equal(t, []string{first}, repaired, "the pass aborted before the second dataset")
+
+	lease, _, err := f.svc.store.GetLease(f.ctx)
+	require.NoError(t, err)
+	require.Equal(t, "other-node", lease.Owner, "an aborted pass does not release another node's lease")
+}
+
+// TestReconcile_DeleteKeepsTheRecordUntilEveryRecordIsGone covers BUG-7: a delete removes the
+// versions, proposals, tasks and grants before the dataset record, so a failure leaves the
+// record in "deleting" (which drives the retry) instead of forgetting the dataset with its
+// records still there. The re-create then publishes v1 cleanly.
+func TestReconcile_DeleteKeepsTheRecordUntilEveryRecordIsGone(t *testing.T) {
+	const (
+		dataset = "delete-order"
+		source  = "src-delete-order"
+	)
+	f := newServiceFixture(t)
+	_, commit := f.publishFirstVersion(t, dataset, source)
+
+	// An accepted asynchronous publish left its task behind.
+	now := f.svc.now()
+	require.NoError(t, f.svc.store.PutTask(f.ctx, &TaskRecord{
+		ID:        "01J9Z6Q1AATASK0000000000",
+		Dataset:   dataset,
+		Kind:      TaskKindPublish,
+		Status:    TaskStatusRunning,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}))
+	f.leaveInTransientState(t, dataset, DatasetStateDeleting, 0)
+
+	// Inject a failure of one step of the delete sequence.
+	realDeleteVersion := f.svc.store.deleteVersion
+	f.svc.store.deleteVersionFn = func(context.Context, string, int) error {
+		return errors.New("injected DeleteVersion failure")
+	}
+	report, err := f.reconcilerFor().Reconcile(f.ctx)
+	require.NoError(t, err)
+	require.NotNil(t, report)
+	require.Positive(t, report.Errors, "the failed step is counted by the pass")
+	require.Equal(t, DatasetStateDeleting, f.datasetRecord(t, dataset).State,
+		"the record stays deleting, so the next pass retries the delete")
+	_, err = f.svc.store.GetVersion(f.ctx, dataset, 1)
+	require.NoError(t, err, "the version record is not left behind without its dataset record")
+
+	// Without the failure the next pass finishes the delete and only then forgets the record.
+	f.svc.store.deleteVersionFn = realDeleteVersion
+	report = f.reconcile(t)
+	require.Equal(t, 1, report.StatesRepaired)
+	_, _, err = f.svc.store.GetDataset(f.ctx, dataset)
+	require.ErrorIs(t, err, kv.ErrNotFound)
+	versions, err := f.svc.store.ListVersions(f.ctx, dataset)
+	require.NoError(t, err)
+	require.Empty(t, versions)
+	tasks, err := f.svc.store.ListTasks(f.ctx, dataset)
+	require.NoError(t, err)
+	require.Empty(t, tasks, "the tasks of the dataset are deleted with it")
+
+	// The re-create publishes v1 cleanly instead of colliding on a stale version record.
+	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition(source, commit.String(), "data", "data/"),
+		Publish:    true,
+		Message:    "v1 again",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, view.Record.LatestVersion)
+	require.NotNil(t, view.Version)
+	require.Equal(t, view.Version.CommitID, f.latestHead(t, dataset))
+}
+
+// TestCreate_CleansUpLeftoverVersionRecord covers the Create half of BUG-7: a crashed delete that
+// removed the dataset record but left its v1 record behind must not make the re-created dataset
+// unpublishable. Version records are immutable, so v1 would collide forever.
+func TestCreate_CleansUpLeftoverVersionRecord(t *testing.T) {
+	const (
+		dataset = "leftover-version"
+		source  = "src-leftover-version"
+	)
+	f := newServiceFixture(t)
+	view, sourceCommit := f.publishFirstVersion(t, dataset, source)
+	require.NotNil(t, view.Version)
+	staleCommit := view.Version.CommitID
+
+	// Simulate the old ordering: the repository and the dataset record are gone, v1 is not.
+	require.NoError(t, f.cat.DeleteRepository(f.ctx, dataset, graveler.WithForce(true)))
+	require.NoError(t, f.svc.store.DeleteDataset(f.ctx, dataset, nil, nil))
+	_, err := f.svc.store.GetVersion(f.ctx, dataset, 1)
+	require.NoError(t, err, "the stale v1 record survived the crashed delete")
+
+	recreated, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition(source, sourceCommit.String(), "data", "data/"),
+		Publish:    true,
+		Message:    "v1",
+	})
+	require.NoError(t, err, "Create cleans the leftover version record and publishes v1")
+	require.Equal(t, 1, recreated.Record.LatestVersion)
+	stored, err := f.svc.store.GetVersion(f.ctx, dataset, 1)
+	require.NoError(t, err)
+	require.Equal(t, recreated.Version.CommitID, stored.CommitID)
+	require.NotEqual(t, staleCommit, stored.CommitID, "v1 is the new version, not the stale record")
+}
+
+// TestReconcile_RepairsAFailedProposalMerge covers BUG-8: a merge publishes the version and then
+// marks the proposal merged; a failure in the second step leaves an open proposal whose version
+// exists. The next pass derives the merge from the version's commit metadata and removes the
+// preview branch a failed merge would otherwise leak.
+func TestReconcile_RepairsAFailedProposalMerge(t *testing.T) {
+	const (
+		dataset = "proposal-repair"
+		source  = "src-proposal-repair"
+	)
+	f := newServiceFixture(t)
+	first := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+	f.createPublishedDataset(t, dataset, prefixDefinition(source, first.String(), "data", "data/"))
+
+	second := f.commitTo(t, source, "main", map[string]string{"data/a.parquet": "b"})
+	proposal := f.createProposal(t, dataset, CreateProposalRequest{
+		Definition: prefixDefinition(source, second.String(), "data", "data/"),
+		Title:      "b",
+	})
+
+	// Inject the failure: the publish succeeds, the proposal write does not.
+	realPutProposal := f.svc.store.putProposalIf
+	failed := false
+	f.svc.store.putProposalFn = func(ctx context.Context, rec, previous *ProposalRecord) error {
+		if !failed && rec.Status == ProposalStatusMerged {
+			failed = true
+			return errors.New("injected PutProposal failure")
+		}
+		return realPutProposal(ctx, rec, previous)
+	}
+	_, err := f.svc.MergeProposal(f.ctx, f.caller(), dataset, proposal.Record.ID, MergeProposalRequest{})
+	require.Error(t, err)
+	require.True(t, failed)
+	require.Equal(t, 2, f.datasetRecord(t, dataset).LatestVersion, "the version was published")
+	require.Equal(t, ProposalStatusOpen, f.proposalRecord(t, dataset, proposal.Record.ID).Status)
+	require.Contains(t, f.hiddenBranchNames(t, dataset), proposal.Record.PreviewBranch,
+		"the preview branch of the failed merge is still there")
+
+	// The reconciler repairs the record from the version's commit metadata.
+	f.svc.store.putProposalFn = nil
+	report := f.reconcile(t)
+	require.Positive(t, report.StatesRepaired)
+	merged := f.proposalRecord(t, dataset, proposal.Record.ID)
+	require.Equal(t, ProposalStatusMerged, merged.Status)
+	require.Equal(t, 2, merged.MergedVersion)
+	require.NotNil(t, merged.ClosedAt)
+	f.requireBranchGone(t, dataset, proposal.Record.PreviewBranch)
+
+	// The repair is idempotent.
+	again := f.reconcile(t)
+	require.Zero(t, again.StatesRepaired)
+	require.Zero(t, again.Errors)
+}
+
+// TestReconcile_SettlesInterruptedPublishTasks covers BUG-11: an accepted publish leaves a
+// pending or running task record, and a crashed node never writes its outcome, so the repair
+// pass settles it - completed when the version exists, failed when the publish was rolled back.
+func TestReconcile_SettlesInterruptedPublishTasks(t *testing.T) {
+	const taskID = "01J9Z6Q1BBTASK0000000000"
+
+	t.Run("a rolled-back publish fails its task", func(t *testing.T) {
+		const (
+			dataset = "task-rollback"
+			source  = "src-task-rollback"
+		)
+		f := newServiceFixture(t)
+		commit := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+		f.createEmptyDataset(t, dataset, prefixDefinition(source, commit.String(), "data", "data/"))
+		now := f.svc.now()
+		require.NoError(t, f.svc.store.PutTask(f.ctx, &TaskRecord{
+			ID: taskID, Dataset: dataset, Kind: TaskKindPublish, Status: TaskStatusRunning,
+			CreatedAt: now, UpdatedAt: now,
+		}))
+		f.leaveInTransientState(t, dataset, DatasetStatePublishing, 1)
+
+		report := f.reconcile(t)
+		require.Equal(t, 1, report.StatesRepaired)
+
+		task, err := f.svc.store.GetTask(f.ctx, dataset, taskID)
+		require.NoError(t, err)
+		require.Equal(t, TaskStatusFailed, task.Status)
+		require.Zero(t, task.Version)
+		require.NotEmpty(t, task.Error)
+		require.Equal(t, DatasetStateActive, f.datasetRecord(t, dataset).State)
+	})
+
+	t.Run("a completed version completes its task", func(t *testing.T) {
+		const (
+			dataset = "task-completed"
+			source  = "src-task-completed"
+		)
+		f := newServiceFixture(t)
+		_, _ = f.publishFirstVersion(t, dataset, source)
+		second := f.commitTo(t, source, "main", map[string]string{"data/a.parquet": "b"})
+		version := f.publishVersion(t, dataset, PublishVersionRequest{
+			Definition: prefixDefinition(source, second.String(), "data", "data/"),
+			Message:    "v2",
+		})
+		require.Equal(t, 2, version.Version)
+
+		// Simulate the crash: the tag and the commit exist, the version record and the task
+		// outcome do not.
+		require.NoError(t, f.svc.store.DeleteVersion(f.ctx, dataset, 2))
+		now := f.svc.now()
+		require.NoError(t, f.svc.store.PutTask(f.ctx, &TaskRecord{
+			ID: taskID, Dataset: dataset, Kind: TaskKindPublish, Status: TaskStatusRunning,
+			CreatedAt: now, UpdatedAt: now,
+		}))
+		f.leaveInTransientState(t, dataset, DatasetStatePublishing, 2)
+
+		report := f.reconcile(t)
+		require.Equal(t, 1, report.VersionsRebuilt)
+
+		task, err := f.svc.store.GetTask(f.ctx, dataset, taskID)
+		require.NoError(t, err)
+		require.Equal(t, TaskStatusCompleted, task.Status)
+		require.Equal(t, 2, task.Version)
+		require.Empty(t, task.Error)
+	})
 }
 
 // --- helpers ---

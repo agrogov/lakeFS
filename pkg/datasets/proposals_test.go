@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -881,4 +882,60 @@ func TestProposalPreviewBranchReuseOnUpdate(t *testing.T) {
 	require.NoError(t, f.svc.store.DeleteProposal(f.ctx, dataset, proposal.Record.ID))
 	_, err = f.svc.store.GetProposal(f.ctx, dataset, proposal.Record.ID)
 	require.True(t, errors.Is(err, kv.ErrNotFound))
+}
+
+// TestProposalConcurrentCloseAndMerge covers BUG-8 end to end: closing and merging the same
+// proposal race on its record, and exactly one of the two wins - the CAS of PutProposalIf is
+// what makes the final state one of the two, never a mix, and it is what makes every other
+// proposal write in the service conditional on the record it read.
+func TestProposalConcurrentCloseAndMerge(t *testing.T) {
+	const (
+		dataset = "proposal-close-vs-merge"
+		source  = "src-proposal-close-vs-merge"
+	)
+	f := newServiceFixture(t)
+	first := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+	f.createPublishedDataset(t, dataset, prefixDefinition(source, first.String(), "data", "data/"))
+
+	second := f.commitTo(t, source, "main", map[string]string{"data/a.parquet": "b"})
+	proposal := f.createProposal(t, dataset, CreateProposalRequest{
+		Definition: prefixDefinition(source, second.String(), "data", "data/"),
+		Title:      "b",
+	})
+
+	var (
+		wg       sync.WaitGroup
+		closeErr error
+		mergeErr error
+		merged   *VersionRecord
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, closeErr = f.svc.UpdateProposal(f.ctx, f.caller(), dataset, proposal.Record.ID,
+			UpdateProposalRequest{Status: ProposalStatusClosed})
+	}()
+	go func() {
+		defer wg.Done()
+		merged, mergeErr = f.svc.MergeProposal(f.ctx, f.caller(), dataset, proposal.Record.ID, MergeProposalRequest{})
+	}()
+	wg.Wait()
+
+	wins := 0
+	if closeErr == nil {
+		wins++
+	}
+	if mergeErr == nil {
+		wins++
+	}
+	require.Equal(t, 1, wins, "exactly one of close and merge wins: close=%v merge=%v", closeErr, mergeErr)
+
+	final := f.proposalRecord(t, dataset, proposal.Record.ID)
+	if mergeErr == nil {
+		require.NotNil(t, merged)
+		require.Equal(t, ProposalStatusMerged, final.Status)
+		require.Equal(t, merged.Version, final.MergedVersion)
+	} else {
+		require.Equal(t, ProposalStatusClosed, final.Status)
+	}
 }

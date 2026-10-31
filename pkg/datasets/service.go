@@ -366,6 +366,15 @@ func (s *Service) Create(ctx context.Context, caller Caller, req CreateRequest) 
 		return nil, err
 	}
 
+	// BUG-7: a delete that crashed before it removed the version (or proposal, task, grant)
+	// records of this name leaves them behind, because finishDelete deletes the dataset record
+	// last. They belong to the dataset that is gone; remove them before the repository exists so
+	// v1 does not collide with a stale v1 record.
+	if err := s.cleanupLeftoverRecords(ctx, req.Name); err != nil {
+		s.rollbackCreate(ctx, rec)
+		return nil, err
+	}
+
 	// §6.1: the dataset repository is read-only and defaults to the "latest" branch.
 	if _, err := s.catalog.CreateRepository(ctx, req.Name, s.cfg.StorageID, ns, DefaultBranch, true); err != nil {
 		_ = s.store.DeleteDataset(ctx, req.Name, rec, nil)
@@ -500,6 +509,45 @@ func (s *Service) leavePending(ctx context.Context, dataset string, version int)
 	}
 }
 
+// cleanupLeftoverRecords removes the control-plane records of a previous dataset with the same
+// name that a crashed delete left behind (BUG-7).
+//
+// finishDelete deletes the dataset record last, so leftover records mean the previous delete of
+// this name did not finish. They must not survive into the new dataset: publishing v1 on top of
+// a stale v1 VersionRecord fails forever (version records are immutable), and the old proposals,
+// tasks and grants would be visible under the new dataset. The records are removed before the
+// dataset repository is created, while this create provably owns the name.
+func (s *Service) cleanupLeftoverRecords(ctx context.Context, dataset string) error {
+	versions, err := s.store.ListVersions(ctx, dataset)
+	if err != nil {
+		return err
+	}
+	for _, version := range versions {
+		if err := s.store.DeleteVersion(ctx, dataset, version.Version); err != nil && !isNotFound(err) {
+			return fmt.Errorf("datasets: remove leftover version %d of %q: %w", version.Version, dataset, err)
+		}
+	}
+	proposals, err := s.store.ListProposals(ctx, dataset)
+	if err != nil {
+		return err
+	}
+	for _, proposal := range proposals {
+		if err := s.store.DeleteProposal(ctx, dataset, proposal.ID); err != nil && !isNotFound(err) {
+			return fmt.Errorf("datasets: remove leftover proposal %s of %q: %w", proposal.ID, dataset, err)
+		}
+	}
+	tasks, err := s.store.ListTasks(ctx, dataset)
+	if err != nil {
+		return err
+	}
+	for _, task := range tasks {
+		if err := s.store.DeleteTask(ctx, dataset, task.ID); err != nil && !isNotFound(err) {
+			return fmt.Errorf("datasets: remove leftover task %s of %q: %w", task.ID, dataset, err)
+		}
+	}
+	return errors.Join(s.dropAccessGrants(ctx, dataset)...)
+}
+
 // Get returns a dataset and the record of its latest version (§10.1). A dataset without a
 // published version (created without publish) is returned with a nil Version.
 func (s *Service) Get(ctx context.Context, caller Caller, name string) (*DatasetView, error) {
@@ -624,7 +672,8 @@ func (s *Service) List(ctx context.Context, caller Caller, req ListRequest) (*Li
 }
 
 // Delete removes a dataset: the repository, the pins of every version, the policies and
-// grants, the proposals, the version records and the head record (§6.6).
+// grants, the proposals, the tasks, the version records and the head record (§6.6). The head
+// record is deleted last, after everything it refers to is gone (BUG-7).
 //
 // Every step tolerates "not found", so a delete that was already in progress can simply be
 // retried and the reconciler can finish a crashed one (§6.6, §12.3): the record is moved to
@@ -687,6 +736,17 @@ func (s *Service) Delete(ctx context.Context, caller Caller, name string) error 
 	} else {
 		for _, proposal := range proposals {
 			if err := s.store.DeleteProposal(ctx, name, proposal.ID); err != nil && !isNotFound(err) {
+				errs = append(errs, err)
+			}
+		}
+	}
+	// BUG-11: the task records of the dataset go with it, so a task id cannot be polled after
+	// the delete and a re-created dataset does not inherit the old tasks.
+	if tasks, err := s.store.ListTasks(ctx, name); err != nil {
+		errs = append(errs, err)
+	} else {
+		for _, task := range tasks {
+			if err := s.store.DeleteTask(ctx, name, task.ID); err != nil && !isNotFound(err) {
 				errs = append(errs, err)
 			}
 		}
