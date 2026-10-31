@@ -210,6 +210,10 @@ type ProposalRecord struct {
 	ClosedAt      *time.Time `json:"closed_at,omitempty"`
 	MergedVersion int        `json:"merged_version,omitempty"`
 	PreviewBranch string     `json:"preview_branch"` // "_proposal-<id>" in the dataset repository
+	// CreatesDataset marks a pull request opened before its dataset existed: merging it creates
+	// the dataset (§5.6). It is cleared when the pull request is updated against an existing
+	// dataset, which turns it into an ordinary pull request of that dataset.
+	CreatesDataset bool `json:"creates_dataset,omitempty"`
 }
 
 // GrantRecord is the KV mirror of a dataset access grant, stored at

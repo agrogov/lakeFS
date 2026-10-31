@@ -677,6 +677,11 @@ func (s *Service) leavePending(ctx context.Context, dataset string, version int)
 // a stale v1 VersionRecord fails forever (version records are immutable), and the old proposals,
 // tasks and grants would be visible under the new dataset. The records are removed before the
 // dataset repository is created, while this create provably owns the name.
+//
+// An open pull request opened to create the dataset (ProposalRecord.CreatesDataset) is not a
+// leftover: it was made for this name, not for a deleted dataset, and the docs make it conflicted
+// once the name is taken (DOC-8). It is kept, so its author sees the conflict and can update it
+// onto the new dataset instead of finding it gone.
 func (s *Service) cleanupLeftoverRecords(ctx context.Context, dataset, preserveProposalID string) error {
 	versions, err := s.store.ListVersions(ctx, dataset)
 	if err != nil {
@@ -692,7 +697,7 @@ func (s *Service) cleanupLeftoverRecords(ctx context.Context, dataset, preserveP
 		return err
 	}
 	for _, proposal := range proposals {
-		if proposal.ID == preserveProposalID {
+		if proposal.ID == preserveProposalID || (proposal.Status == ProposalStatusOpen && proposal.CreatesDataset) {
 			continue
 		}
 		if err := s.store.DeleteProposal(ctx, dataset, proposal.ID); err != nil && !isNotFound(err) {

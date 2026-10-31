@@ -136,8 +136,9 @@ type ProposalView struct {
 	// Stale reports BaseVersion != LatestVersion: the pull request must be updated before
 	// it can be merged (§5.6).
 	Stale bool
-	// Conflicted reports that this pull request targets a dataset that does not exist and
-	// whose name is not available any more. Merging it answers 409.
+	// Conflicted reports that this pull request would create its dataset and the name is not
+	// available any more - a dataset or a repository took it after the pull request was opened.
+	// Merging it answers 409.
 	Conflicted bool
 	Diff       *DefinitionDiff
 	DataDiff   *DataDiff
@@ -150,7 +151,10 @@ type ProposalListResult struct {
 	NextOffset string
 	MaxPerPage int
 	// LatestVersion and Conflicted are the derived fields every row of this dataset shares.
+	// Conflicted applies to the open rows that create the dataset: every open row when the
+	// dataset does not exist (Exists false), else the rows with ProposalRecord.CreatesDataset.
 	LatestVersion int
+	Exists        bool
 	Conflicted    bool
 }
 
@@ -243,14 +247,14 @@ func (s *Service) ListProposals(ctx context.Context, caller Caller, dataset, sta
 		}
 	}
 	latest := latestVersionOf(rec)
-	conflicted := rec == nil && s.nameUnavailable(ctx, dataset)
 	return &ProposalListResult{
 		Proposals:     page,
 		HasMore:       hasMore,
 		NextOffset:    next,
 		MaxPerPage:    amount,
 		LatestVersion: latest,
-		Conflicted:    conflicted,
+		Exists:        rec != nil,
+		Conflicted:    rec != nil || s.nameUnavailable(ctx, dataset),
 	}, nil
 }
 
@@ -329,6 +333,8 @@ func (s *Service) CreateProposal(ctx context.Context, caller Caller, dataset str
 		Author:      caller.Username,
 		Status:      ProposalStatusOpen,
 		CreatedAt:   now,
+		// A pull request opened before its dataset exists creates it on merge (§5.6).
+		CreatesDataset: rec == nil,
 	}
 
 	// A dataset that does not exist yet has no repository to materialise a preview on;
@@ -452,6 +458,11 @@ func (s *Service) UpdateProposal(ctx context.Context, caller Caller, dataset, id
 	// merge right after an update never has to rebase (and never silently picks newer data).
 	updated.BaseVersion = latestVersionOf(rec)
 	if rec != nil {
+		// A pull request opened to create the dataset, whose dataset was created another way in
+		// the meantime (it was conflicted), becomes an ordinary pull request of that dataset:
+		// the update is its rebase onto the dataset that now exists.
+		updated.CreatesDataset = false
+		updated.PreviewBranch = previewBranchOf(&updated)
 		if err := s.materializePreview(ctx, rec, &updated, caller.Username); err != nil {
 			return nil, err
 		}
@@ -535,6 +546,14 @@ func (s *Service) MergeProposal(ctx context.Context, caller Caller, dataset, id 
 			return nil, fmt.Errorf("%w: proposal %s of dataset %s", ErrProposalNotSynchronous, id, dataset)
 		}
 		return s.markProposalMerged(ctx, dataset, proposal, created.Version)
+	}
+
+	// The pull request was opened to create the dataset, and the dataset was created another
+	// way in the meantime: the name is taken, which is the conflicted case. Updating the pull
+	// request rebases it onto the dataset that now exists (UpdateProposal).
+	if proposal.CreatesDataset {
+		return nil, fmt.Errorf("%w: dataset %q was created after pull request %s was opened to create it; update the pull request first",
+			ErrDatasetConflict, dataset, id)
 	}
 
 	// §5.6: merging requires base_version == latest_version.
@@ -648,6 +667,21 @@ func latestVersionOf(rec *DatasetRecord) int {
 	return rec.LatestVersion
 }
 
+// proposalConflicted reports whether proposal is an open pull request that would create its
+// dataset while the name is no longer available: the dataset was created another way (rec is not
+// nil), or a repository took the name.
+func (s *Service) proposalConflicted(ctx context.Context, rec *DatasetRecord, proposal *ProposalRecord) bool {
+	if proposal.Status != ProposalStatusOpen {
+		return false
+	}
+	if rec != nil {
+		return proposal.CreatesDataset
+	}
+	// Without a dataset every open pull request creates it on merge, including one written
+	// before CreatesDataset existed.
+	return s.nameUnavailable(ctx, proposal.Dataset)
+}
+
 // nameUnavailable reports whether name is taken by a dataset or by a repository, i.e. whether
 // a pull request that would create the dataset is conflicted. A failure to look the name up is
 // reported as not-conflicted: the merge is where the authoritative answer is produced.
@@ -736,7 +770,7 @@ func (s *Service) ListAllPullRequests(ctx context.Context, caller Caller, filter
 			Record:        proposal,
 			LatestVersion: latestVersionOf(rec),
 			Stale:         proposal.Status == ProposalStatusOpen && latestVersionOf(rec) != proposal.BaseVersion,
-			Conflicted:    proposal.Status == ProposalStatusOpen && rec == nil && s.nameUnavailable(ctx, proposal.Dataset),
+			Conflicted:    s.proposalConflicted(ctx, rec, proposal),
 		})
 	}
 
@@ -879,7 +913,7 @@ func (s *Service) proposalView(ctx context.Context, rec *DatasetRecord, proposal
 		Record:        proposal,
 		LatestVersion: latestVersion,
 		Stale:         proposal.Status == ProposalStatusOpen && latestVersion != proposal.BaseVersion,
-		Conflicted:    proposal.Status == ProposalStatusOpen && rec == nil && s.nameUnavailable(ctx, proposal.Dataset),
+		Conflicted:    s.proposalConflicted(ctx, rec, proposal),
 	}
 	// A pull request of a dataset that does not exist yet has no repository to diff
 	// against; its definition is still returned, without a diff.

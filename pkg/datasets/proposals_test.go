@@ -671,6 +671,48 @@ func TestProposalListAndNotFound(t *testing.T) {
 		_, err = f.svc.MergeProposal(f.ctx, f.caller(), name, opened.Record.ID, MergeProposalRequest{})
 		require.ErrorIs(t, err, ErrDatasetConflict, "merging a conflicted pull request answers 409")
 	})
+
+	t.Run("direct create keeps a pull request opened to create the dataset", func(t *testing.T) {
+		const name = "created-directly"
+		opened, err := f.svc.CreateProposal(f.ctx, f.caller(), name, CreateProposalRequest{
+			Definition: prefixDefinition(source, commit.String(), "data", "data/"),
+			Title:      "create it through review",
+		})
+		require.NoError(t, err)
+		require.True(t, opened.Record.CreatesDataset)
+
+		// The dataset is created directly instead of through the pull request.
+		f.createPublishedDataset(t, name, prefixDefinition(source, commit.String(), "data", "data/"))
+
+		view, err := f.svc.GetProposal(f.ctx, f.caller(), name, opened.Record.ID)
+		require.NoError(t, err, "a direct create must not delete the pull request (DOC-8)")
+		require.True(t, view.Conflicted, "the name is taken by the directly created dataset")
+		list, err := f.svc.ListProposals(f.ctx, f.caller(), name, "", "", 0)
+		require.NoError(t, err)
+		require.Len(t, list.Proposals, 1)
+		require.True(t, list.Exists)
+		require.True(t, list.Conflicted)
+		all, err := f.svc.ListAllPullRequests(f.ctx, f.caller(), PullRequestFilter{Dataset: name})
+		require.NoError(t, err)
+		require.Len(t, all.PullRequests, 1)
+		require.True(t, all.PullRequests[0].Conflicted)
+
+		_, err = f.svc.MergeProposal(f.ctx, f.caller(), name, opened.Record.ID, MergeProposalRequest{})
+		require.ErrorIs(t, err, ErrDatasetConflict, "merging a conflicted pull request answers 409")
+
+		// Updating the pull request rebases it onto the dataset that now exists.
+		updated, err := f.svc.UpdateProposal(f.ctx, f.caller(), name, opened.Record.ID, UpdateProposalRequest{
+			Definition: ptr(prefixDefinition(source, commit.String(), "rebased", "data/")),
+		})
+		require.NoError(t, err)
+		require.False(t, updated.Record.CreatesDataset)
+		require.False(t, updated.Conflicted)
+		require.Equal(t, 1, updated.Record.BaseVersion)
+		require.NotEmpty(t, updated.Record.PreviewBranch)
+		version, err := f.svc.MergeProposal(f.ctx, f.caller(), name, opened.Record.ID, MergeProposalRequest{})
+		require.NoError(t, err)
+		require.Equal(t, 2, version.Version)
+	})
 }
 
 // TestProposalUpdateRequiresProposalAction checks the authorization split of §10.1: the

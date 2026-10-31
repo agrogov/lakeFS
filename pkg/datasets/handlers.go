@@ -640,7 +640,7 @@ func (s *server) ListDatasetPullRequests(w http.ResponseWriter, r *http.Request,
 			Record:        record,
 			LatestVersion: result.LatestVersion,
 			Stale:         record.Status == ProposalStatusOpen && result.LatestVersion != record.BaseVersion,
-			Conflicted:    record.Status == ProposalStatusOpen && result.Conflicted,
+			Conflicted:    record.Status == ProposalStatusOpen && (record.CreatesDataset || !result.Exists) && result.Conflicted,
 		})
 	}
 	httputil.WriteAPIResponse(w, r, http.StatusOK, pullRequestListToAPI(views, result.HasMore, result.NextOffset, result.MaxPerPage))
