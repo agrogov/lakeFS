@@ -82,7 +82,10 @@ const VersionEntry: FC<{ entry: VersionTimelineEntry; datasetId: string; latest:
     return (
         <div className="dataset-version-entry" data-testid={`dataset-version-${ref}`}>
             <div className="dataset-version-marker">
-                <Badge bg={versionNumber(version) === latest ? 'primary' : 'secondary'} className="dataset-version-badge">
+                <Badge
+                    bg={versionNumber(version) === latest ? 'primary' : 'secondary'}
+                    className="dataset-version-badge"
+                >
                     {ref}
                 </Badge>
             </div>
@@ -107,8 +110,8 @@ const VersionEntry: FC<{ entry: VersionTimelineEntry; datasetId: string; latest:
                     <div className="d-flex flex-wrap align-items-center gap-2 mt-2">
                         <CountsBadges counts={counts} />
                         <span className="text-muted small">
-                            {(version.commit_id ?? '').substring(0, 12)} · {version.stats?.objects.toLocaleString() ?? 0}{' '}
-                            objects
+                            {(version.commit_id ?? '').substring(0, 12)} ·{' '}
+                            {version.stats?.objects.toLocaleString() ?? 0} objects
                         </span>
                         <div className="ms-auto d-flex gap-2">
                             <Link
@@ -176,7 +179,12 @@ const DatasetVersionsPage: FC = () => {
             </div>
             <div className="dataset-versions-timeline">
                 {entries.map((entry) => (
-                    <VersionEntry key={versionNumber(entry.version)} entry={entry} datasetId={datasetId} latest={latest} />
+                    <VersionEntry
+                        key={versionNumber(entry.version)}
+                        entry={entry}
+                        datasetId={datasetId}
+                        latest={latest}
+                    />
                 ))}
             </div>
         </div>

@@ -189,8 +189,7 @@ describe('DatasetProposalPage', () => {
 
         await waitFor(() => expect(screen.queryByTestId('dataset-proposal-conflict')).not.toBeInTheDocument());
         const patch = fetchMock.mock.calls.filter(
-            ([url, init]) =>
-                String(url).endsWith('/pulls/p1') && (init as RequestInit | undefined)?.method === 'PATCH',
+            ([url, init]) => String(url).endsWith('/pulls/p1') && (init as RequestInit | undefined)?.method === 'PATCH',
         );
         expect(patch).toHaveLength(1);
     });

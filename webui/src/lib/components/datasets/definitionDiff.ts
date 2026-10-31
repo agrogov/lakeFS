@@ -64,8 +64,7 @@ export const diffDefinitionItems = (
 };
 
 /** One metadata value as the string list the diff schema reports (§10.2 MetadataChange). */
-const metadataValues = (value: MetadataValue): string[] =>
-    Array.isArray(value) ? value.map(String) : [String(value)];
+const metadataValues = (value: MetadataValue): string[] => (Array.isArray(value) ? value.map(String) : [String(value)]);
 
 /** Metadata changes between two definitions, sorted by key. */
 export const diffDefinitionMetadata = (left: DatasetDefinition, right: DatasetDefinition): MetadataChange[] => {

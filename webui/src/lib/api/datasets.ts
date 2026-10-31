@@ -765,7 +765,9 @@ class Datasets {
 
     // --- metadata keys ------------------------------------------------------
 
-    async listMetadataKeys(params: { prefix?: string; after?: string; amount?: number } = {}): Promise<MetadataKeyList> {
+    async listMetadataKeys(
+        params: { prefix?: string; after?: string; amount?: number } = {},
+    ): Promise<MetadataKeyList> {
         const query = buildQuery({
             prefix: params.prefix,
             after: params.after,

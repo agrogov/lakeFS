@@ -165,8 +165,7 @@ describe('DatasetsSettingsPage', () => {
 
         const call = fetchMock.mock.calls.find(
             ([url, init]) =>
-                String(url).includes('/metadata/classification') &&
-                (init as RequestInit | undefined)?.method === 'PUT',
+                String(url).includes('/metadata/classification') && (init as RequestInit | undefined)?.method === 'PUT',
         );
         const body = JSON.parse(String((call?.[1] as RequestInit).body));
         // DOC-10: a PUT is a full replacement that requires the (unchanged) type.

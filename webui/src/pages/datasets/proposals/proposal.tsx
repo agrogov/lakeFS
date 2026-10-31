@@ -101,7 +101,9 @@ const ProposalHeader: FC<{ datasetId: string; proposal: Proposal }> = ({ dataset
             {proposal.description && <p className="text-muted mt-2 mb-0">{proposal.description}</p>}
             <div className="text-muted small mt-2 dataset-proposal-origin">
                 Opened by <strong>{proposal.author}</strong>{' '}
-                <span title={dayjs.unix(proposal.creation_date).toISOString()}>{dayjs.unix(proposal.creation_date).fromNow()}</span>
+                <span title={dayjs.unix(proposal.creation_date).toISOString()}>
+                    {dayjs.unix(proposal.creation_date).fromNow()}
+                </span>
                 <span className="mx-2">&middot;</span>
                 Based on <code>v{proposal.base_version}</code>
                 {proposal.status === 'merged' && proposal.merged_version !== undefined && (

@@ -92,10 +92,7 @@ describe('DatasetProposalsAllPage', () => {
         renderPage();
 
         await screen.findByTestId('dataset-proposal-row-b-open');
-        expect(screen.getByRole('link', { name: 'beta open' })).toHaveAttribute(
-            'href',
-            '/datasets/beta/pulls/b-open',
-        );
+        expect(screen.getByRole('link', { name: 'beta open' })).toHaveAttribute('href', '/datasets/beta/pulls/b-open');
     });
 
     it('refilters across all datasets when a status is selected', async () => {
