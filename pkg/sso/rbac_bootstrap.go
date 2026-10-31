@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/spf13/viper"
 	"github.com/treeverse/lakefs/contrib/auth/acl"
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/model"
@@ -29,7 +30,11 @@ const (
 	//
 	// Version 3: SuperUsers gained the PRReadWriteAll attachment, so a Super keeps pull-request
 	// write access after `rbac-migrate` moves it out of the ACL Supers group (GAP-06).
-	RBACBootstrapVersion = 3
+	//
+	// Version 4: the template gained the four documented datasets policies
+	// (DatasetsFullAccess, DatasetsReadWriteAll, DatasetsReadAll, DatasetsManageMetadataKeys)
+	// and the documented group mapping when datasets is configured (DOC-3, SEC-9).
+	RBACBootstrapVersion = 4
 
 	// RBACBootstrapVersionKeyName is the name of the record, inside the "auth" KV partition,
 	// that holds the last successfully applied RBAC template version. It is recorded through
@@ -81,7 +86,8 @@ func EnsureRBACBase(ctx context.Context, svc auth.Service, store kv.Store, logge
 		return nil
 	}
 
-	if err := setup.EnsureRBACBaseGroups(ctx, svc, time.Now()); err != nil {
+	if err := setup.EnsureRBACBaseGroups(ctx, svc, time.Now(),
+		setup.WithDatasetsEnabled(datasetsConfigured())); err != nil {
 		return fmt.Errorf("ensure rbac base groups: %w", err)
 	}
 
@@ -95,6 +101,24 @@ func EnsureRBACBase(ctx context.Context, svc auth.Service, store kv.Store, logge
 		"previousVersion": applied,
 	}).Info("rbac: base template applied")
 	return nil
+}
+
+// datasetsConfigured reports whether the datasets feature is enabled, using the same rule as
+// pkg/datasets.LoadConfig: an explicit datasets.enabled wins, and an unset flag follows the
+// documented storage_namespace_prefix (DOC-16). The RBAC template then creates and attaches the
+// four built-in datasets policies whenever datasets is configured (DOC-3).
+//
+// MUST mirror datasets.LoadConfig / Config.applyViperOverrides (pkg/datasets/config.go). It
+// cannot call a shared helper: pkg/datasets imports pkg/sso, so importing it here is a cycle.
+func datasetsConfigured() bool {
+	const (
+		enabledKey   = "datasets.enabled"
+		namespaceKey = "datasets.storage_namespace_prefix"
+	)
+	if viper.IsSet(enabledKey) {
+		return viper.GetBool(enabledKey)
+	}
+	return viper.GetString(namespaceKey) != ""
 }
 
 // rbacBootstrapVersion reads the applied template version. A missing key means "never

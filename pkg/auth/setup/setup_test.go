@@ -16,7 +16,6 @@ import (
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/kv/kvtest"
 	"github.com/treeverse/lakefs/pkg/logging"
-	"github.com/treeverse/lakefs/pkg/permissions"
 )
 
 func SetupService(t *testing.T, secret string) (*auth.BasicAuthService, kv.Store) {
@@ -111,7 +110,13 @@ func TestEnsureRBACBasePoliciesDatasetsDisabled(t *testing.T) {
 func requireNoDatasetsPolicies(t *testing.T, ctx context.Context, authService auth.Service) {
 	t.Helper()
 
-	for _, name := range []string{setup.DatasetsFullAccessPolicy, setup.DatasetsReadAllPolicy} {
+	names := []string{
+		setup.DatasetsFullAccessPolicy,
+		setup.DatasetsReadWriteAllPolicy,
+		setup.DatasetsReadAllPolicy,
+		setup.DatasetsManageMetadataKeysPolicy,
+	}
+	for _, name := range names {
 		_, err := authService.GetPolicy(ctx, name)
 		require.ErrorIs(t, err, auth.ErrNotFound, "policy %s must not be created when the datasets feature is off", name)
 	}
@@ -119,16 +124,18 @@ func requireNoDatasetsPolicies(t *testing.T, ctx context.Context, authService au
 	policies, _, err := authService.ListPolicies(ctx, &model.PaginationParams{Amount: 100})
 	require.NoError(t, err)
 	for _, policy := range policies {
-		require.NotEqual(t, setup.DatasetsFullAccessPolicy, policy.DisplayName)
-		require.NotEqual(t, setup.DatasetsReadAllPolicy, policy.DisplayName)
+		for _, name := range names {
+			require.NotEqual(t, name, policy.DisplayName)
+		}
 	}
 
 	for _, groupName := range []string{setup.AdminsGroup, setup.SuperUsersGroup, setup.DevelopersGroup, setup.ViewersGroup} {
 		attached, _, err := authService.ListGroupPolicies(ctx, groupName, &model.PaginationParams{Amount: 100})
 		require.NoError(t, err)
 		for _, policy := range attached {
-			require.NotEqual(t, setup.DatasetsFullAccessPolicy, policy.DisplayName)
-			require.NotEqual(t, setup.DatasetsReadAllPolicy, policy.DisplayName)
+			for _, name := range names {
+				require.NotEqual(t, name, policy.DisplayName)
+			}
 		}
 	}
 }
@@ -141,29 +148,39 @@ func TestEnsureRBACBaseGroupsDatasetsEnabled(t *testing.T) {
 
 	require.NoError(t, setup.EnsureRBACBaseGroups(ctx, authService, ts, setup.WithDatasetsEnabled(true)))
 
-	// Policies are created with the datasets actions and the ARN service prefix is plural.
-	full, err := authService.GetPolicy(ctx, setup.DatasetsFullAccessPolicy)
-	require.NoError(t, err)
-	require.Equal(t, model.Statements{{
-		Action:    []string{"datasets:*"},
-		Resource:  permissions.All,
-		Effect:    model.StatementEffectAllow,
-		Condition: map[string]map[string][]string{},
-	}}, full.Statement)
-
-	read, err := authService.GetPolicy(ctx, setup.DatasetsReadAllPolicy)
-	require.NoError(t, err)
-	require.Equal(t, model.Statements{{
-		Action:    []string{"datasets:List*", "datasets:Read*"},
-		Resource:  permissions.All,
-		Effect:    model.StatementEffectAllow,
-		Condition: map[string]map[string][]string{},
-	}}, read.Statement)
+	// Policies are created with the singular dataset actions, the documented resource and the
+	// exact action lists of the public RBAC table.
+	const policyResource = "arn:lakefs:dataset:::dataset/*"
+	for name, wantActions := range map[string][]string{
+		setup.DatasetsFullAccessPolicy: {"dataset:*"},
+		setup.DatasetsReadWriteAllPolicy: {
+			"dataset:ListDatasets", "dataset:ReadDataset", "dataset:CreateDataset",
+			"dataset:UpdateDataset", "dataset:DeleteDataset",
+			"dataset:ListMetadataKeys", "dataset:ReadMetadataKey",
+		},
+		setup.DatasetsReadAllPolicy: {
+			"dataset:ListDatasets", "dataset:ReadDataset",
+			"dataset:ListMetadataKeys", "dataset:ReadMetadataKey",
+		},
+		setup.DatasetsManageMetadataKeysPolicy: {
+			"dataset:ListMetadataKeys", "dataset:ReadMetadataKey", "dataset:CreateMetadataKey",
+			"dataset:UpdateMetadataKey", "dataset:DeleteMetadataKey",
+		},
+	} {
+		policy, err := authService.GetPolicy(ctx, name)
+		require.NoErrorf(t, err, "policy %s", name)
+		require.Equal(t, model.Statements{{
+			Action:    wantActions,
+			Resource:  policyResource,
+			Effect:    model.StatementEffectAllow,
+			Condition: map[string]map[string][]string{},
+		}}, policy.Statement, "policy %s", name)
+	}
 
 	expectedAttachments := map[string][]string{
 		setup.AdminsGroup:     {"FSFullAccess", "CatalogReadWriteAll", "AuthFullAccess", "RepoManagementFullAccess", setup.DatasetsFullAccessPolicy},
-		setup.SuperUsersGroup: {"FSFullAccess", "PRReadWriteAll", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll", setup.DatasetsFullAccessPolicy},
-		setup.DevelopersGroup: {"FSReadWriteAll", "PRReadWriteAll", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll", setup.DatasetsReadAllPolicy},
+		setup.SuperUsersGroup: {"FSFullAccess", "PRReadWriteAll", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll", setup.DatasetsReadWriteAllPolicy},
+		setup.DevelopersGroup: {"FSReadWriteAll", "PRReadWriteAll", "CatalogReadWriteAll", "AuthManageOwnCredentials", "RepoManagementReadAll", setup.DatasetsReadWriteAllPolicy},
 		setup.ViewersGroup:    {"FSReadAll", "CatalogReadAll", "AuthManageOwnCredentials", setup.DatasetsReadAllPolicy},
 	}
 	for groupName, expectedPolicies := range expectedAttachments {
@@ -192,10 +209,15 @@ func TestEnsureRBACBasePoliciesDatasetsEnabled(t *testing.T) {
 
 	require.NoError(t, setup.CreateRBACBasePolicies(ctx, authService, time.Now(), setup.WithDatasetsEnabled(true)))
 
-	_, err := authService.GetPolicy(ctx, setup.DatasetsFullAccessPolicy)
-	require.NoError(t, err)
-	_, err = authService.GetPolicy(ctx, setup.DatasetsReadAllPolicy)
-	require.NoError(t, err)
+	for _, name := range []string{
+		setup.DatasetsFullAccessPolicy,
+		setup.DatasetsReadWriteAllPolicy,
+		setup.DatasetsReadAllPolicy,
+		setup.DatasetsManageMetadataKeysPolicy,
+	} {
+		_, err := authService.GetPolicy(ctx, name)
+		require.NoErrorf(t, err, "policy %s", name)
+	}
 }
 
 func TestAddAdminUser(t *testing.T) {

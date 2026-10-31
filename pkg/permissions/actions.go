@@ -99,15 +99,17 @@ var serviceSet = map[string]struct{}{
 	"branches":  {},
 	"pr":        {},
 	"catalog":   {},
-	// Datasets control-plane actions (pkg/datasets/authz.go). The service name is plural on purpose: resources
-	// are arn:lakefs:datasets:::dataset/<name> (see DATASETS_DESIGN.md §9.1, RBAC_DESIGN.md §5.4).
+	// Dataset control-plane actions (pkg/datasets/authz.go). Resources are
+	// arn:lakefs:dataset:::dataset/<name>, matching the public RBAC documentation.
 	//
-	// TODO(datasets): the action *constants* live in pkg/datasets/authz.go by design (DATASETS_DESIGN.md §4.4),
-	// so they are intentionally absent from this file. The codegen for actions.gen.go only extracts constants
-	// declared here, therefore permissions.Actions - the action picker of the policy editor - does not offer any
-	// datasets:* action, and IsValidAction accepts them by service prefix alone. When the datasets feature lands,
-	// either declare the action constants in this file so `go generate ./...` includes them, or extend
-	// codegen/main.go to read pkg/datasets/authz.go as well; then drop the guard test in actions_test.go.
+	// The action *constants* live in pkg/datasets/authz.go by design (DATASETS_DESIGN.md §4.4),
+	// so they are intentionally absent from this file. The codegen for actions.gen.go only extracts
+	// constants declared here, therefore permissions.Actions - the action picker of the policy
+	// editor - does not offer any dataset:* action, and IsValidAction accepts them by service
+	// prefix alone.
+	"dataset": {},
+	// "datasets" is the deprecated plural alias. It is kept so that policies written before the
+	// rename still validate; it grants nothing by itself.
 	"datasets": {},
 }
 

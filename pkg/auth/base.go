@@ -98,19 +98,18 @@ var statementByName = map[string]model.Statement{
 		},
 		Effect: model.StatementEffectAllow,
 	},
-	// DatasetsRead and DatasetsFull cover the datasets control plane (pkg/datasets). Resources are
-	// arn:lakefs:datasets:::dataset/<name> and arn:lakefs:datasets:::metadata-key/<key> - the service name is
-	// plural, matching DATASETS_DESIGN.md §9.1 rather than the enterprise `dataset:` singular (RBAC_DESIGN.md §5.4).
+	// DatasetsRead and DatasetsFull cover the dataset control plane (pkg/datasets). Resources are
+	// arn:lakefs:dataset:::dataset/<name>, matching the public RBAC documentation.
 	"DatasetsRead": {
 		Action: []string{
-			"datasets:List*",
-			"datasets:Read*",
+			"dataset:List*",
+			"dataset:Read*",
 		},
 		Effect: model.StatementEffectAllow,
 	},
 	"DatasetsFull": {
 		Action: []string{
-			"datasets:*",
+			"dataset:*",
 		},
 		Effect: model.StatementEffectAllow,
 	},
