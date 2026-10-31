@@ -2,6 +2,7 @@ package datasets
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,17 @@ import (
 
 // fsRepositoryArnPrefix is the ARN prefix of every repository-scoped fs resource.
 var fsRepositoryArnPrefix = permissions.RepoArn("")
+
+// catalogRepositoryArnPrefix is the ARN prefix of every repository-scoped catalog resource
+// (ICEBERG_CATALOG_PLAN.md §7.2). Catalog ARNs carry the repository as the first path segment
+// after the resource kind: namespace/<repo>/<ns>, table/<repo>/<ns>/<table> and
+// view/<repo>/<ns>/<view>.
+const catalogRepositoryArnPrefix = "arn:lakefs:catalog:::"
+
+// errNoDatasetRepoSet is returned by Authorize when the guard was built without a name set. It
+// is a failure to decide, never an allow: the immutability guarantee must not depend on the
+// caller having wired the set correctly.
+var errNoDatasetRepoSet = errors.New("datasets: no dataset repository set configured for the immutability guard")
 
 // datasetRepoCacheTTL bounds how stale the dataset-repository name set may be. The set is
 // refreshed lazily - only when a denied action on a repository is being authorized - so
@@ -180,15 +192,33 @@ func (s *ImmutabilityAuthService) leafForbidden(ctx context.Context, p permissio
 	if !ok {
 		return false, nil
 	}
+	if s.repos == nil {
+		return false, errNoDatasetRepoSet
+	}
 	return s.repos.Contains(ctx, repo)
 }
 
-// repositoryOfArn returns the repository an fs resource ARN belongs to.
+// repositoryOfArn returns the repository an fs or catalog resource ARN belongs to. Catalog
+// actions are included because immutabilityDeniedActions covers the catalog writes of
+// ICEBERG_CATALOG_PLAN.md §7.2; an fs-only parser would silently leave them unguarded.
 func repositoryOfArn(resource string) (string, bool) {
-	rest, ok := strings.CutPrefix(resource, fsRepositoryArnPrefix)
-	if !ok || rest == "" {
+	if rest, ok := strings.CutPrefix(resource, fsRepositoryArnPrefix); ok {
+		repo, _, _ := strings.Cut(rest, "/")
+		return repo, repo != ""
+	}
+	rest, ok := strings.CutPrefix(resource, catalogRepositoryArnPrefix)
+	if !ok {
 		return "", false
 	}
-	repo, _, _ := strings.Cut(rest, "/")
-	return repo, repo != ""
+	kind, tail, ok := strings.Cut(rest, "/")
+	if !ok {
+		return "", false
+	}
+	switch kind {
+	case "namespace", "table", "view":
+		repo, _, _ := strings.Cut(tail, "/")
+		return repo, repo != ""
+	default:
+		return "", false
+	}
 }
