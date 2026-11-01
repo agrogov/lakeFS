@@ -13,14 +13,10 @@ jobs:
         uses: actions/checkout@v6
         with:
           # The guard fails closed on a shallow clone, so it needs complete history.
+          # Nothing is fetched from upstream: a BSL commit that became part of this
+          # fork's history is in origin's own history, so the complete checkout holds
+          # it, and its absence from a complete clone is conclusive.
           fetch-depth: 0
-      - name: Fetch upstream history
-        run: |
-          # 358544dd7 (the BSL 1.1 relicense) only exists in the treeverse history,
-          # not in this fork's origin. A plain, non-shallow fetch of upstream master
-          # keeps the clone unshallow and lets the guard compute the ancestry for
-          # real instead of concluding it from an absent object.
-          git fetch --no-tags https://github.com/treeverse/lakeFS.git master
       - name: Check licence base (self-test + guard)
         run: make check-license-base
 
