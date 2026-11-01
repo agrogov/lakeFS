@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/block/mem"
 	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/graveler"
@@ -260,6 +261,194 @@ func TestItemIterator_ConvertsAddresses(t *testing.T) {
 	require.Equal(t, catalog.Entry_FULL, full.AddressType)
 	require.Equal(t, fullEntryBefore.PhysicalAddress, full.Address, "a full address is passed through verbatim")
 	require.Equal(t, etagOf(fullContent), full.ETag)
+}
+
+// TestMaterialize_RejectsSourceKeyOnReservedDefinitionPath is the §6.4 regression for m7 of
+// CODE_REVIEW_DATASETS.md. A prefix item with the root target maps every source key into the
+// dataset key space unchanged, so a source repository that happens to hold the reserved
+// _dataset/definition.json key produces the same dataset key as the synthetic definition
+// entry of §6.4. The merge would fail such a publish with ErrDuplicateKey ("duplicate or
+// out-of-order key in materialised dataset"), which reads like an internal bug and says
+// nothing about the source key: the item must instead be rejected as a *ValidationError that
+// names the item and the reserved path, before the definition object or any metarange entry
+// is written.
+func TestMaterialize_RejectsSourceKeyOnReservedDefinitionPath(t *testing.T) {
+	const source = "reserved-key-source"
+	f := newDatasetFixture(t)
+	f.createRepository(t, source, "main", false)
+
+	reserved := []byte(`{"dataset":"not-a-definition"}`)
+	// The first commit holds the reserved key at the repository root next to ordinary data; the
+	// second adds the same key below a source prefix. Commits are cumulative, so a whole-repo
+	// item over either commit sees a reserved root key.
+	rootCommit := f.commitObjects(t, source, "main",
+		testObject{key: DefinitionPath, content: reserved},
+		testObject{key: "customers/c1.parquet", content: []byte("c1")},
+	)
+	subCommit := f.commitObjects(t, source, "main",
+		testObject{key: "sub/" + DefinitionPath, content: reserved},
+		testObject{key: "sub/customers/c2.parquet", content: []byte("c2")},
+	)
+
+	prefixItem := func(commit graveler.CommitID, prefix string) DataItem {
+		return DataItem{
+			Repository: source,
+			Ref:        SourceRef{Type: RefTypeCommit, ID: commit.String()},
+			Type:       ItemTypePrefix, Prefix: &PathSource{Path: prefix},
+		}
+	}
+
+	failing := []struct {
+		name    string
+		dataset string
+		item    DataItem
+		// wantSourceKey is the source key the message must name.
+		wantSourceKey string
+	}{
+		{
+			// The empty prefix is the whole repository (§5.2), so the reserved key maps onto
+			// itself.
+			name:          "whole source repository at the root target",
+			dataset:       "reserved-root",
+			item:          prefixItem(rootCommit, ""),
+			wantSourceKey: DefinitionPath,
+		},
+		{
+			// A non-empty prefix still maps into the root target unchanged, so the colliding
+			// source key is the prefix plus the reserved path.
+			name:          "source prefix that holds the reserved key",
+			dataset:       "reserved-prefix",
+			item:          prefixItem(subCommit, "sub/"),
+			wantSourceKey: "sub/" + DefinitionPath,
+		},
+	}
+	for _, tc := range failing {
+		t.Run(tc.name, func(t *testing.T) {
+			f.createRepository(t, tc.dataset, DefaultBranch, true)
+			// The repository's creation commit, which a rejected publish must leave alone.
+			headBefore, err := f.cat.GetBranchReference(f.ctx, tc.dataset, DefaultBranch)
+			require.NoError(t, err)
+			def := resolvedDefinition(t, f, Definition{
+				FormatVersion: FormatVersion,
+				Data:          []DataItem{tc.item},
+			})
+
+			_, err = (&Materializer{Catalog: f.cat}).Publish(f.ctx, PublishRequest{
+				Dataset:    tc.dataset,
+				Version:    1,
+				Definition: def,
+				Message:    "must be rejected",
+				Publisher:  "tester",
+			})
+			var validation *ValidationError
+			require.ErrorAs(t, err, &validation, "a reserved source key is a definition problem, not a merge failure")
+			require.NotErrorIs(t, err, ErrDuplicateKey,
+				"the collision must not surface as the merge's duplicate-key error")
+			require.Len(t, validation.Problems, 1)
+			problem := validation.Problems[0]
+			require.Equal(t, itemPath(0, ""), problem.Path, "the problem names the offending item")
+			require.Contains(t, problem.Message, DefinitionPath, "the problem names the reserved path")
+			require.Contains(t, problem.Message, tc.wantSourceKey, "the problem names the offending source key")
+
+			// Nothing was written: no version tag, no commit on the dataset branch and no
+			// definition object in the dataset namespace (§6.2 step 6).
+			_, err = f.cat.GetTag(f.ctx, tc.dataset, VersionTag(1))
+			require.Error(t, err, "a rejected publish creates no version tag")
+			headAfter, err := f.cat.GetBranchReference(f.ctx, tc.dataset, DefaultBranch)
+			require.NoError(t, err)
+			require.Equal(t, headBefore, headAfter, "a rejected publish commits nothing on the dataset branch")
+			dsRec := f.repositoryRecord(t, tc.dataset)
+			_, err = f.cat.BlockAdapter.Get(f.ctx, block.ObjectPointer{
+				StorageID:        dsRec.StorageID.String(),
+				StorageNamespace: dsRec.StorageNamespace.String(),
+				Identifier:       definitionObjectKey("", 1),
+				IdentifierType:   block.IdentifierTypeRelative,
+			})
+			require.ErrorIs(t, err, mem.ErrNoDataForKey,
+				"the rejected publish must not upload the definition object")
+		})
+	}
+
+	// The check must not over-reject: a root-target prefix item over a source that holds no
+	// reserved key publishes fine, and a reserved-looking key below the item's source prefix
+	// is just data.
+	t.Run("source without the reserved key", func(t *testing.T) {
+		const dataset = "reserved-clean"
+		const cleanSource = "reserved-key-clean-source"
+		f.createRepository(t, cleanSource, "main", false)
+		f.createRepository(t, dataset, DefaultBranch, true)
+		cleanRepoCommit := f.commitObjects(t, cleanSource, "main",
+			testObject{key: "other/c3.parquet", content: []byte("c3")},
+		)
+		def := resolvedDefinition(t, f, Definition{
+			FormatVersion: FormatVersion,
+			Data: []DataItem{{
+				Repository: cleanSource,
+				Ref:        SourceRef{Type: RefTypeCommit, ID: cleanRepoCommit.String()},
+				Type:       ItemTypePrefix, Prefix: &PathSource{Path: ""},
+			}},
+		})
+		publish(t, f, PublishRequest{
+			Dataset:    dataset,
+			Version:    1,
+			Definition: def,
+			Message:    "no reserved key in the source",
+			Publisher:  "tester",
+		})
+		require.Equal(t, []string{DefinitionPath, "other/c3.parquet"}, f.listPaths(t, dataset, DefaultBranch))
+	})
+
+	t.Run("reserved path below a source prefix is just data", func(t *testing.T) {
+		const dataset = "reserved-subtree"
+		f.createRepository(t, dataset, DefaultBranch, true)
+		item := prefixItem(subCommit, "sub/")
+		item.Target = "data"
+		def := resolvedDefinition(t, f, Definition{
+			FormatVersion: FormatVersion,
+			Data:          []DataItem{item},
+		})
+		publish(t, f, PublishRequest{
+			Dataset:    dataset,
+			Version:    1,
+			Definition: def,
+			Message:    "the source prefix is not the repository root",
+			Publisher:  "tester",
+		})
+		require.Equal(t, []string{
+			DefinitionPath,
+			"data/" + DefinitionPath,
+			"data/customers/c2.parquet",
+		}, f.listPaths(t, dataset, DefaultBranch))
+	})
+}
+
+// TestOpenItems_RejectsObjectItemOnReservedDefinitionPath pins the primitive's own guard: an
+// object item's only output key is its target, so a target on the reserved path would replace
+// the synthetic definition entry of §6.4. Validation rejects that target first (§5.2), so this
+// test drives openItems directly, the way a caller that skipped validation would.
+func TestOpenItems_RejectsObjectItemOnReservedDefinitionPath(t *testing.T) {
+	const source = "reserved-object-source"
+	f := newDatasetFixture(t)
+	f.createRepository(t, source, "main", false)
+	commit := f.commitObjects(t, source, "main",
+		testObject{key: "customers/c1.parquet", content: []byte("c1")},
+	)
+
+	def := Definition{FormatVersion: FormatVersion, Data: []DataItem{{
+		Target:     DefinitionPath,
+		Repository: source,
+		Ref:        SourceRef{Type: RefTypeCommit, ID: commit.String()},
+		Type:       ItemTypeObject, Object: &PathSource{Path: "customers/c1.parquet"},
+	}}}
+	require.Error(t, Validate(&def, ValidateOptions{}), "validation rejects the reserved target first")
+
+	items, err := (&Materializer{Catalog: f.cat}).openItems(f.ctx, def)
+	require.Nil(t, items)
+	var validation *ValidationError
+	require.ErrorAs(t, err, &validation)
+	require.Len(t, validation.Problems, 1)
+	require.Equal(t, itemPath(0, ""), validation.Problems[0].Path, "the problem names the offending item")
+	require.Contains(t, validation.Problems[0].Message, DefinitionPath, "the problem names the reserved path")
 }
 
 // TestConvertEntryAddress is the §6.3 address table, including the deprecated by-prefix

@@ -71,8 +71,10 @@ const (
 var (
 	// ErrDuplicateKey reports two sources producing the same dataset key, or a source
 	// whose entries are not strictly increasing. Targets are validated not to overlap
-	// (§5.2 rule 3), so this can only be a bug or a corrupted source, and it fails the
-	// publish instead of silently dropping an entry (§6.4).
+	// (§5.2 rule 3) and a source key that would land on the reserved definition entry is
+	// rejected earlier as a *ValidationError (checkReservedKey, §6.4), so this can only be
+	// a bug or a corrupted source, and it fails the publish instead of silently dropping an
+	// entry (§6.4).
 	ErrDuplicateKey = errors.New("duplicate or out-of-order key in materialised dataset")
 
 	// ErrNoChanges reports a publish that would reproduce the previous version
@@ -564,8 +566,9 @@ func (m *Materializer) putDefinition(ctx context.Context, dsRepo *graveler.Repos
 	return &singleRecordIterator{key: graveler.Key(DefinitionPath), value: value}, nil
 }
 
-// openItems opens one source iterator per data item, in definition order (§6.3). On
-// error, the iterators that were already opened are closed again.
+// openItems opens one source iterator per data item, in definition order (§6.3), and refuses
+// an item whose source holds a key that maps onto the reserved definition entry (§6.4,
+// checkReservedKey). On error, the iterators that were already opened are closed again.
 //
 // §6.5 limits how many per-item iterators may be open at once (datasets.merge_fan_in,
 // default 64) and prescribes merging in two passes with WriteRange above that. This
@@ -626,6 +629,15 @@ func (m *Materializer) openItem(ctx context.Context, index int, item *DataItem) 
 	if err != nil {
 		return nil, err
 	}
+	// §6.4: an item that maps a source key onto DefinitionPath would collide with the
+	// synthetic definition entry the merge adds. Rejecting it here - after the authz gate of
+	// openSource, before putDefinition uploads the definition object and before the merge
+	// writes a single metarange entry - keeps the failure a definition problem that names
+	// the item, instead of the merge's internal ErrDuplicateKey.
+	if err := m.checkReservedKey(ctx, stream); err != nil {
+		src.Close()
+		return nil, err
+	}
 	return &itemIterator{stream: stream, src: src, adapter: m.Catalog.BlockAdapter}, nil
 }
 
@@ -677,6 +689,63 @@ func (m *Materializer) openSource(ctx context.Context, stream *itemStream) (grav
 // ErrSourceAuthzMissing reports a source read attempted without the caller's authorization
 // check on the context. It is a programming error and fails the operation (SEC-3).
 var ErrSourceAuthzMissing = errors.New("datasets: source read without a per-object authorization check")
+
+// checkReservedKey fails an item that would map a source key onto DefinitionPath, the
+// dataset-repository key of the synthetic definition entry (§6.4).
+//
+// A prefix item with the root target (§5.2: the empty target) maps its source keys into the
+// dataset key space unchanged, so a source repository that happens to hold the reserved
+// _dataset/definition.json key produces the same dataset key as the synthetic entry. Left to
+// the merge, the strict key-increase assertion would fail the publish with ErrDuplicateKey,
+// which reads like an internal bug and says nothing about the source key that caused it; here
+// it is a definition problem that names the item and the reserved path, reported before the
+// definition object is uploaded and before any metarange entry is written.
+//
+// The check is exact, not a guess: reservedSourceKey names the only source key that can land
+// on the reserved path, so one catalog read decides it. That read is authorized like any other
+// source read (SEC-3), so a caller who may not read the key gets the denial rather than a hint
+// that it exists.
+func (m *Materializer) checkReservedKey(ctx context.Context, stream *itemStream) error {
+	sourceKey, possible := stream.reservedSourceKey()
+	if !possible {
+		return nil
+	}
+	if stream.object {
+		// An object item's output key is its target, so the entry would replace the synthetic
+		// one whether or not the source key has any siblings; openSource has already
+		// established that the source key exists.
+		return reservedKeyProblem(stream, sourceKey)
+	}
+	if reader := sourceReaderFrom(ctx); reader != nil {
+		if err := checkSourceObject(ctx, reader, stream, sourceKey); err != nil {
+			return err
+		}
+	}
+	_, err := m.Catalog.Store.Get(ctx, stream.repository, graveler.Ref(stream.commitID), graveler.Key(sourceKey))
+	switch {
+	case err == nil:
+		return reservedKeyProblem(stream, sourceKey)
+	case errors.Is(err, graveler.ErrNotFound):
+		// The source does not hold the reserved key, so this item cannot collide with the
+		// synthetic definition entry.
+		return nil
+	default:
+		return fmt.Errorf("datasets: %s: check reserved key %q in %s/%s: %w",
+			itemPath(stream.index, ""), sourceKey, stream.repository.RepositoryID, stream.commitID, err)
+	}
+}
+
+// reservedKeyProblem is the *ValidationError rejecting an item whose source holds a key the
+// dataset reserves for its own definition entry (§6.4). It names the item, the offending
+// source key and the reserved path, so the client can fix the definition - by narrowing the
+// source prefix or by moving the target off the repository root.
+func reservedKeyProblem(stream *itemStream, sourceKey string) error {
+	return &ValidationError{Problems: []Problem{{
+		Path: itemPath(stream.index, ""),
+		Message: fmt.Sprintf("source key %q maps onto %q, which the service reserves for the dataset definition",
+			sourceKey, DefinitionPath),
+	}}}
+}
 
 // checkSourceObject authorizes the read of one source key, mapping a denial to the SourceError
 // that names the item and the first denied path (SEC-3). It is the authoritative source-read
@@ -789,6 +858,35 @@ func (s *itemStream) datasetKey(sourceKey string) string {
 		return rel
 	}
 	return s.target + "/" + rel
+}
+
+// reservedSourceKey returns the one source key this item would map onto DefinitionPath, the
+// dataset-repository key of the synthetic definition entry (§6.4), and reports whether the
+// item can reach that path at all. checkReservedKey uses it to decide a collision exactly,
+// without enumerating the source.
+//
+// datasetKey makes the answer exact:
+//
+//   - an object item produces its target and nothing else, so it reaches the reserved path
+//     only when its target is that path - which validation rejects as a reserved target
+//     (§5.2), so this branch is the primitive's own guard for a caller that skipped
+//     validation;
+//   - a prefix item always emits "<target>/<relative key>", so it can only reach the reserved
+//     path when its target is the repository root (§5.2: the empty target). Its keys then map
+//     unchanged, and "sourceKey + DefinitionPath" is the single source key that lands on the
+//     reserved path (for the whole-repository item - the empty source prefix - that key is
+//     DefinitionPath itself);
+//   - any other prefix target would have to make "<target>/" a prefix of the reserved path,
+//     that is be the reserved _dataset directory itself, which validation rejects as a target.
+func (s *itemStream) reservedSourceKey() (string, bool) {
+	switch {
+	case s.object:
+		return s.sourceKey, s.target == DefinitionPath
+	case s.target == RootTarget:
+		return s.sourceKey + DefinitionPath, true
+	default:
+		return "", false
+	}
 }
 
 // sourceSeekKey maps a dataset key back into the item's source key space, for
