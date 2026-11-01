@@ -33,20 +33,26 @@ const catalogRepositoryArnPrefix = "arn:lakefs:catalog:::"
 // caller having wired the set correctly.
 var errNoDatasetRepoSet = errors.New("datasets: no dataset repository set configured for the immutability guard")
 
+// errDatasetRepoSetNotLoaded is returned when the set is asked to decide before any load ever
+// completed. Like errNoDatasetRepoSet it is a failure to decide, never an allow.
+var errDatasetRepoSetNotLoaded = errors.New("datasets: dataset repository set was never loaded")
+
 // datasetRepoCacheTTL bounds how stale the dataset-repository name set may be. The set is
 // refreshed lazily - only when a denied action on a repository is being authorized - so
 // ordinary read traffic never touches the KV store.
 const datasetRepoCacheTTL = 2 * time.Second
 
+// serviceCallerKey is the context key of the service-caller marker, and it is deliberately
+// unexported. The marker only ever exempts a caller from the SEC-2 guard, and the guard's value
+// is that a caller cannot switch it off, so nothing outside this package may build it: no
+// exported helper sets it, and its only builder (withServiceCaller) lives in
+// immutability_guard_test.go.
+//
+// Production does not build it either, because it does not need to. The datasets service writes
+// the dataset repository with ReadOnly + force and never routes those writes through Authorize
+// (DATASETS_DESIGN.md §4.6, §9.4), so the only bypass the design sanctions is the force flag
+// itself, not a context value.
 type serviceCallerKey struct{}
-
-// WithServiceCaller marks ctx as belonging to the datasets service itself, which the
-// immutability guard lets through. The service normally writes through the catalog and never
-// calls Authorize for its own repository writes (§4.6); the marker exists for the cases where
-// it does.
-func WithServiceCaller(ctx context.Context) context.Context {
-	return context.WithValue(ctx, serviceCallerKey{}, true)
-}
 
 func isServiceCaller(ctx context.Context) bool {
 	v, _ := ctx.Value(serviceCallerKey{}).(bool)
@@ -54,15 +60,43 @@ func isServiceCaller(ctx context.Context) bool {
 }
 
 // DatasetRepoSet is a cached set of dataset repository names, refreshed from a loader.
+//
+// Contains sits on the authorization path of every write in the installation: every object
+// write, commit, branch and repository mutation that names an immutability-denied action asks
+// this set whether the repository is a dataset. It must therefore neither hold a lock across
+// the loader - in production a full scan of the datasets/ KV partition (Store.ListDatasets) -
+// nor turn a KV hiccup into an authorization error, because either one would stall or fail
+// writes to unrelated repositories.
+//
+// Hence: the loader runs outside s.mu and only its result is swapped in under it, and a
+// single-flight gate lets one goroutine reload while the rest wait for that one reload instead
+// of starting scans of their own.
 type DatasetRepoSet struct {
 	load func(ctx context.Context) ([]string, error)
 	ttl  time.Duration
 	now  func() time.Time
 
-	mu      sync.Mutex
-	names   map[string]struct{}
+	mu sync.Mutex
+	// names is the most recent successfully loaded set. It is replaced, never mutated in place.
+	names map[string]struct{}
+	// fetched is the time of the last load attempt, successful or not. Counting failed attempts
+	// against the TTL keeps a slow or failing store from being hit on every authorization.
 	fetched time.Time
-	loaded  bool
+	// loaded reports that a load succeeded at least once, so names is meaningful. It survives
+	// Invalidate: the last known set is what a failed refresh falls back to.
+	loaded bool
+	// stale asks the next Contains to reload before the TTL runs out (Invalidate). It is
+	// cleared by the attempt it asked for, successful or not.
+	stale bool
+	// generation counts Invalidate calls, so a load that was already running when one landed
+	// does not clear the flag: its scan may predate the record the invalidation is about.
+	generation uint64
+	// lastErr is the error of the last failed load. It is only answered while nothing was ever
+	// loaded: then the guard has no set to compare against and must fail closed.
+	lastErr error
+	// refreshing is non-nil while a load runs and is closed when its result is visible. Callers
+	// that find it set wait for it rather than reload.
+	refreshing chan struct{}
 }
 
 // NewDatasetRepoSet builds a set that lists dataset names from the datasets KV partition.
@@ -86,31 +120,101 @@ func newDatasetRepoSet(load func(context.Context) ([]string, error), ttl time.Du
 }
 
 // Contains reports whether repo is a dataset repository. When the refresh fails it falls back to
-// the last known set; with no known set at all it returns the error, so the caller fails closed.
+// the last known set; with no known set at all it returns an error, so the caller fails closed.
 func (s *DatasetRepoSet) Contains(ctx context.Context, repo string) (bool, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.loaded || s.now().Sub(s.fetched) >= s.ttl {
-		names, err := s.load(ctx)
-		switch {
-		case err == nil:
-			set := make(map[string]struct{}, len(names))
-			for _, n := range names {
-				set[n] = struct{}{}
-			}
-			s.names, s.fetched, s.loaded = set, s.now(), true
-		case !s.loaded:
-			return false, err
+	if s.fresh() {
+		ok, err := s.cached(repo)
+		s.mu.Unlock()
+		return ok, err
+	}
+	done := s.refreshing
+	leader := done == nil
+	if leader {
+		// Single flight: the caller that got here first reloads, everyone else joins its load.
+		done = make(chan struct{})
+		s.refreshing = done
+	}
+	s.mu.Unlock()
+
+	if leader {
+		s.refresh(ctx, done)
+	} else {
+		// No lock is held while waiting, so a burst of authorizations queues on the one scan
+		// (bounded by its duration) instead of serialising behind a global mutex.
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return false, ctx.Err()
 		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cached(repo)
+}
+
+// refresh runs the loader outside s.mu and swaps its result in under it. Only the goroutine that
+// won the single-flight gate calls it; it closes done once the new state is visible, so the
+// waiters in Contains answer from the same load.
+func (s *DatasetRepoSet) refresh(ctx context.Context, done chan struct{}) {
+	s.mu.Lock()
+	generation := s.generation
+	s.mu.Unlock()
+
+	names, err := s.load(ctx)
+
+	s.mu.Lock()
+	s.fetched = s.now()
+	if s.generation == generation {
+		// No Invalidate landed while the load ran, so this attempt is the one that was owed and
+		// its result is not known to be incomplete.
+		s.stale = false
+	}
+	if err != nil {
+		// Failed refresh: keep the last known set, if any. A KV hiccup must not fail every write
+		// in the installation, and the attempt counts against the TTL, so the store is retried
+		// on the next TTL rather than on every authorization.
+		s.lastErr = err
+	} else {
+		set := make(map[string]struct{}, len(names))
+		for _, n := range names {
+			set[n] = struct{}{}
+		}
+		s.names, s.loaded, s.lastErr = set, true, nil
+	}
+	s.refreshing = nil
+	s.mu.Unlock()
+	close(done)
+}
+
+// fresh reports whether the cached set may answer without a load: no invalidation is pending and
+// the TTL has not run out since the last attempt. The zero fetched time makes the first call
+// load.
+func (s *DatasetRepoSet) fresh() bool {
+	return !s.stale && s.now().Sub(s.fetched) < s.ttl
+}
+
+// cached answers repo from the current set. With no successful load ever it returns the loader's
+// error instead of a set, so a guard that cannot name the dataset repositories refuses to decide
+// rather than allowing the write.
+func (s *DatasetRepoSet) cached(repo string) (bool, error) {
+	if !s.loaded {
+		if s.lastErr != nil {
+			return false, s.lastErr
+		}
+		return false, errDatasetRepoSetNotLoaded
 	}
 	_, ok := s.names[repo]
 	return ok, nil
 }
 
-// Invalidate forces the next Contains to reload.
+// Invalidate forces the next Contains to reload while keeping the last known set: if that reload
+// fails, the set still answers instead of failing every authorization in the installation.
 func (s *DatasetRepoSet) Invalidate() {
 	s.mu.Lock()
-	s.loaded = false
+	s.stale = true
+	s.generation++
 	s.mu.Unlock()
 }
 
@@ -145,7 +249,9 @@ func NewImmutabilityAuthService(inner auth.Service, repos *DatasetRepoSet) *Immu
 	return &ImmutabilityAuthService{Service: inner, repos: repos}
 }
 
-// Authorize implements auth.Service.
+// Authorize implements auth.Service. There is no context in which a caller can switch the guard
+// off: the service-caller marker (see serviceCallerKey) is unexported and built only by the
+// package's tests, and production relies on the force flag of §4.6/§9.4 instead.
 func (s *ImmutabilityAuthService) Authorize(ctx context.Context, req *auth.AuthorizationRequest) (*auth.AuthorizationResponse, error) {
 	if req == nil || isServiceCaller(ctx) {
 		return s.Service.Authorize(ctx, req)

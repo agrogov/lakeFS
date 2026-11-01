@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +13,15 @@ import (
 	"github.com/treeverse/lakefs/pkg/auth/model"
 	"github.com/treeverse/lakefs/pkg/permissions"
 )
+
+// withServiceCaller marks ctx as belonging to the datasets service itself, which the immutability
+// guard lets through. It is unexported and lives in the test file on purpose: the guard's value is
+// that a caller cannot switch it off, so the marker must not be buildable outside this package
+// (see serviceCallerKey). Production does not need it - the service writes with ReadOnly + force
+// and never routes its own writes through Authorize (DATASETS_DESIGN.md §4.6, §9.4).
+func withServiceCaller(ctx context.Context) context.Context {
+	return context.WithValue(ctx, serviceCallerKey{}, true)
+}
 
 // TestImmutabilityAuthServiceDeniesRegardlessOfGroups is the SEC-2 test: a custom group with
 // FSFullAccess and a user with a directly attached fs:* policy are both refused every write
@@ -58,8 +68,8 @@ func TestImmutabilityAuthServiceDeniesRegardlessOfGroups(t *testing.T) {
 		read := permissions.Node{Permission: permissions.Permission{Action: permissions.ReadObjectAction, Resource: permissions.ObjectArn("foo", "x")}}
 		require.NoError(t, authz.Check(t.Context(), caller, read, ""))
 
-		// The datasets service itself is exempt.
-		svcCtx := WithServiceCaller(t.Context())
+		// The datasets service itself is exempt; only in-package test code can build that marker.
+		svcCtx := withServiceCaller(t.Context())
 		node := permissions.Node{Permission: permissions.Permission{Action: permissions.WriteObjectAction, Resource: permissions.ObjectArn("foo", "x")}}
 		require.NoError(t, authz.Check(svcCtx, caller, node, ""))
 	}
@@ -160,6 +170,13 @@ func TestDatasetRepoSetCacheAndFailClosed(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok, "stale set used when the refresh fails")
 
+	// A failed attempt counts against the TTL: the failing store is not hit again on every
+	// authorization, and the last known set keeps answering meanwhile.
+	ok, err = set.Contains(t.Context(), "b")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, 3, calls)
+
 	cold := newDatasetRepoSet(func(context.Context) ([]string, error) { return nil, errors.New("kv down") }, time.Second, time.Now)
 	_, err = cold.Contains(t.Context(), "a")
 	require.Error(t, err)
@@ -211,4 +228,182 @@ func TestCreateInvalidatesGuardedRepos(t *testing.T) {
 	guarded, err = repos.Contains(f.ctx, "guarded-on-create")
 	require.NoError(t, err)
 	require.True(t, guarded, "the cached set must not hide the new dataset for its TTL")
+}
+
+// TestDatasetRepoSetInvalidateServesLastKnownSet covers the window after a dataset create: the
+// invalidation owes a reload, but when that reload fails the set still answers from the names it
+// has, so a KV hiccup does not fail every write in the installation. Recovery happens on the next
+// TTL, and a set that never loaded still fails closed (TestDatasetRepoSetCacheAndFailClosed).
+func TestDatasetRepoSetInvalidateServesLastKnownSet(t *testing.T) {
+	now := time.Unix(2000, 0)
+	names := []string{"a"}
+	var failing bool
+	calls := 0
+	set := newDatasetRepoSet(func(context.Context) ([]string, error) {
+		calls++
+		if failing {
+			return nil, errors.New("kv down")
+		}
+		return names, nil
+	}, time.Hour, func() time.Time { return now })
+
+	ok, err := set.Contains(t.Context(), "a")
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	// A dataset was created (Invalidate) and the reload fails: the guard answers from the set it
+	// already has instead of turning the hiccup into an authorization error.
+	failing = true
+	set.Invalidate()
+	ok, err = set.Contains(t.Context(), "a")
+	require.NoError(t, err, "a failed reload must not become an authorization error")
+	require.True(t, ok)
+	ok, err = set.Contains(t.Context(), "plain")
+	require.NoError(t, err, "an unrelated repository is not failed by the guard's KV hiccup")
+	require.False(t, ok)
+	require.Equal(t, 2, calls, "one reload after Invalidate, then the TTL holds off the failing store")
+
+	// At the Authorize level that is the difference between a hiccup and an outage: writes to
+	// unrelated repositories keep working, and the dataset still refuses the write.
+	guard := NewImmutabilityAuthService(&stubAuthService{}, set)
+	res, err := guard.Authorize(t.Context(), &auth.AuthorizationRequest{RequiredPermissions: permissions.Node{
+		Permission: permissions.Permission{Action: permissions.WriteObjectAction, Resource: permissions.ObjectArn("plain", "x")}}})
+	require.NoError(t, err)
+	require.True(t, res.Allowed)
+	res, err = guard.Authorize(t.Context(), &auth.AuthorizationRequest{RequiredPermissions: permissions.Node{
+		Permission: permissions.Permission{Action: permissions.WriteObjectAction, Resource: permissions.ObjectArn("a", "x")}}})
+	require.NoError(t, err)
+	require.False(t, res.Allowed, "the known dataset stays immutable while the set is stale")
+
+	// Recovery: after the TTL the new dataset is picked up.
+	failing = false
+	names = []string{"a", "b"}
+	now = now.Add(2 * time.Hour)
+	ok, err = set.Contains(t.Context(), "b")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, 3, calls)
+}
+
+// TestDatasetRepoSetInvalidateDuringLoad covers the two properties the loader running outside the
+// mutex must not lose: an Invalidate (a dataset create on another goroutine) does not block until
+// the scan finishes, and it is not masked by that scan - the next Contains reloads and sees the
+// new dataset, so the guard does not hide it for a whole TTL.
+func TestDatasetRepoSetInvalidateDuringLoad(t *testing.T) {
+	now := time.Unix(3000, 0)
+	names := []string{"a"}
+	loading := make(chan struct{})
+	release := make(chan struct{})
+
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+	var first sync.Once
+	set := newDatasetRepoSet(func(context.Context) ([]string, error) {
+		mu.Lock()
+		calls++
+		snapshot := append([]string(nil), names...) // what the scan of the store sees right now
+		mu.Unlock()
+		first.Do(func() {
+			close(loading)
+			<-release
+		})
+		return snapshot, nil
+	}, time.Hour, func() time.Time { return now })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := set.Contains(context.Background(), "b"); err != nil {
+			t.Error(err)
+		}
+	}()
+	<-loading
+
+	// The mutex is not held across the load, so a create on another goroutine is not stuck behind
+	// the scan.
+	invalidated := make(chan struct{})
+	go func() {
+		set.Invalidate()
+		close(invalidated)
+	}()
+	select {
+	case <-invalidated:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Invalidate blocked while a load was running: the mutex is held across the scan")
+	}
+
+	// The dataset the invalidation is about lands while the scan is running.
+	mu.Lock()
+	names = []string{"a", "b"}
+	mu.Unlock()
+	close(release)
+	<-done
+
+	ok, err := set.Contains(t.Context(), "b")
+	require.NoError(t, err)
+	require.True(t, ok, "the invalidation must not be masked by the scan that was already running")
+	mu.Lock()
+	require.Equal(t, 2, calls)
+	mu.Unlock()
+
+	// And once the invalidation is served, the cache answers normally again.
+	ok, err = set.Contains(t.Context(), "b")
+	require.NoError(t, err)
+	require.True(t, ok)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 2, calls)
+}
+
+// TestDatasetRepoSetSingleFlight proves that a burst of concurrent authorizations runs exactly one
+// loader - in production a full scan of the datasets/ partition - and that the other callers wait
+// on that load rather than on a lock held across it.
+func TestDatasetRepoSetSingleFlight(t *testing.T) {
+	const callers = 50
+
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+	loading := make(chan struct{})
+	release := make(chan struct{})
+	var started sync.Once
+	set := newDatasetRepoSet(func(context.Context) ([]string, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		started.Do(func() { close(loading) })
+		<-release
+		return []string{"a"}, nil
+	}, time.Hour, time.Now)
+
+	// The load is held open until every caller is in flight, so the burst really is concurrent.
+	var wg sync.WaitGroup
+	results := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ok, err := set.Contains(context.Background(), "a")
+			switch {
+			case err != nil:
+				results <- err
+			case !ok:
+				results <- errors.New("dataset repository not found in the cached set")
+			}
+		}()
+	}
+	<-loading
+	close(release)
+	wg.Wait()
+	close(results)
+
+	for err := range results {
+		require.NoError(t, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 1, calls, "a burst of authorizations must run one loader, not one per caller")
 }
