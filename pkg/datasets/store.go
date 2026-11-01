@@ -677,22 +677,32 @@ func (s *Store) ListDatasets(ctx context.Context) ([]*DatasetRecord, error) {
 // first dataset.
 //
 // The scan is the paging primitive of GET /datasets: the caller stops it when its page is
-// full, so the records before the cursor and after the page are never read. Dataset names
-// are unique keys, so a name is a stable cursor while datasets are created and deleted.
+// full, so neither the records before the cursor nor those after the page are decoded - the
+// cursor record itself is read only to be skipped. Dataset names are unique keys, so a name is
+// a stable cursor while datasets are created and deleted.
 func (s *Store) ScanDatasets(ctx context.Context, after string, fn func(*DatasetRecord) (bool, error)) error {
 	prefix := []byte(datasetKeyPrefix + kv.PathDelimiter)
 	start := prefix
+	var cursor []byte
 	if after != "" {
 		key, err := datasetKey(after)
 		if err != nil {
 			return err
 		}
-		// "/" sorts before every byte a dataset name can contain, so datasets/<after>/ is
-		// greater than datasets/<after> and smaller than datasets/<after...> of a longer
-		// name: the cursor itself is skipped and its successors are not.
-		start = append(key, kv.PathDelimiter...)
+		// The scan starts at the cursor key and the callback skips that one entry (see
+		// ScanProposals): KeyStart is inclusive, and seeking past the cursor by key
+		// arithmetic is wrong. Appending the delimiter - datasets/<after>/ - steps over the
+		// open interval (datasets/<after>, datasets/<after>/), i.e. exactly the datasets
+		// named "<after>-...", because "-" (0x2d) sorts before "/" (0x2f) and the name pattern
+		// admits "-" (M1). Appending 0x00 instead does not survive a store that orders encoded
+		// keys (CosmosDB base32-encodes them), where the padding of the shorter encoding can
+		// sort the cursor key after the appended one.
+		start, cursor = key, key
 	}
 	return s.scanPrefixFrom(ctx, prefix, start, func(key, value []byte) (bool, error) {
+		if len(cursor) > 0 && bytes.Equal(key, cursor) {
+			return true, nil // the cursor itself belongs to the previous page
+		}
 		// The reconcile lease (§12.3) lives at datasets/_lease, under the same prefix as the
 		// dataset records. It is a lease, not a dataset, so it is skipped by name rather than
 		// decoded (its value would look like a record with an empty name and state).
@@ -1817,13 +1827,18 @@ func (s *Store) ScanGrants(ctx context.Context, dataset, after string, fn func(*
 		return err
 	}
 	start := prefix
+	var cursor []byte
 	if after != "" {
-		// See ScanDatasets: the delimiter sorts before every name byte, so the cursor itself
-		// is skipped and the grants that follow it are not. The cursor is copied first, so
-		// the prefix slice owned by the caller is never appended to in place.
-		start = append(append(append([]byte(nil), prefix...), []byte(after)...), kv.PathDelimiter...)
+		// See ScanDatasets: the scan starts at the cursor key, which KeyStart includes, and
+		// the callback skips it. The cursor is copied first, so the prefix slice owned by the
+		// caller is never appended to in place.
+		start = append(append([]byte(nil), prefix...), []byte(after)...)
+		cursor = start
 	}
 	return s.scanPrefixFrom(ctx, prefix, start, func(key, value []byte) (bool, error) {
+		if len(cursor) > 0 && bytes.Equal(key, cursor) {
+			return true, nil // the cursor itself belongs to the previous page
+		}
 		rec, err := decodeRecord[GrantRecord]("grant record", key, value)
 		if err != nil {
 			return false, err

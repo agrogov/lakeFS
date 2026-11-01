@@ -118,9 +118,9 @@ func datasetNames(page []*DatasetView) []string {
 	return names
 }
 
-// TestListPagesFromCursorWithBoundedReads is BUG-14 for GET /datasets: the scan starts after
-// the cursor and stops at the page, and it never walks the datasets the page does not
-// contain.
+// TestListPagesFromCursorWithBoundedReads is BUG-14 for GET /datasets: the scan starts at the
+// cursor, skips the cursor record and stops at the page, and it never walks the datasets the
+// page does not contain.
 func TestListPagesFromCursorWithBoundedReads(t *testing.T) {
 	f, svc, counter := newCountingServiceFixture(t)
 	commit := f.sourceRepo(t, "src-paging-list", map[string]string{"data/a.parquet": "a"})
@@ -141,7 +141,8 @@ func TestListPagesFromCursorWithBoundedReads(t *testing.T) {
 	require.Equal(t, 3, counter.entriesWithin("datasets/"), "two records of the page plus one that proves has_more")
 	require.Equal(t, 3, gets, "the latest version of those three records")
 
-	// The next page starts after the cursor: the first two datasets are not read at all.
+	// The next page starts at the cursor: the first two datasets are not read at all, and the
+	// cursor record is read only to be skipped (it is never decoded).
 	counter.reset()
 	second, err := svc.List(f.ctx, f.caller(), ListRequest{Amount: 2, After: first.NextOffset})
 	require.NoError(t, err)
@@ -150,15 +151,16 @@ func TestListPagesFromCursorWithBoundedReads(t *testing.T) {
 	require.Empty(t, second.NextOffset)
 	_, scans = counter.counts()
 	require.Equal(t, 1, scans)
-	require.Equal(t, 2, counter.entriesWithin("datasets/"), "the page ends the dataset set: no read past it")
+	require.Equal(t, 3, counter.entriesWithin("datasets/"), "the cursor record and the page; no read past it")
 
-	// A page past the end is empty and says so, without reading anything.
+	// A page past the end is empty and says so: only the cursor record is read, and it is
+	// skipped without being decoded.
 	counter.reset()
 	after, err := svc.List(f.ctx, f.caller(), ListRequest{Amount: 2, After: "page-d"})
 	require.NoError(t, err)
 	require.Empty(t, after.Datasets)
 	require.False(t, after.HasMore)
-	require.Zero(t, counter.entriesWithin("datasets/"))
+	require.Equal(t, 1, counter.entriesWithin("datasets/"), "the cursor record, and nothing else")
 
 	// A cursor that is not a dataset name is a bad request, not a key error.
 	_, err = svc.List(f.ctx, f.caller(), ListRequest{After: "Not A Name!"})
@@ -300,7 +302,88 @@ func TestListAccessPagesWithBoundedReads(t *testing.T) {
 	require.Len(t, second.Grants, 1)
 	require.Equal(t, "carol", second.Grants[0].PrincipalID)
 	require.False(t, second.HasMore)
-	require.Equal(t, 1, counter.entriesWithin("grants/paging-access/"), "the page ends the grant set: no read past it")
+	require.Equal(t, 2, counter.entriesWithin("grants/paging-access/"),
+		"the cursor grant and the page; no read past it")
+}
+
+// pagedDatasetNames walks GET /datasets from the first page to the page that ends the set
+// and returns every name it saw, in order.
+func pagedDatasetNames(t *testing.T, svc *Service, f *serviceFixture, amount int) []string {
+	t.Helper()
+	names := make([]string, 0)
+	after := ""
+	for pages := 0; ; pages++ {
+		require.Less(t, pages, 10, "the listing did not terminate")
+		res, err := svc.List(f.ctx, f.caller(), ListRequest{Amount: amount, After: after})
+		require.NoError(t, err)
+		names = append(names, datasetNames(res.Datasets)...)
+		if !res.HasMore {
+			return names
+		}
+		require.NotEmpty(t, res.NextOffset, "has_more must carry a cursor")
+		require.NotEqual(t, after, res.NextOffset, "the cursor must advance")
+		after = res.NextOffset
+	}
+}
+
+// pagedGrantPrincipals walks GET /datasets/{ds}/access the same way and returns the principal
+// id of every grant it saw, in order.
+func pagedGrantPrincipals(t *testing.T, svc *Service, f *serviceFixture, dataset string, amount int) []string {
+	t.Helper()
+	ids := make([]string, 0)
+	after := ""
+	for pages := 0; ; pages++ {
+		require.Less(t, pages, 10, "the listing did not terminate")
+		res, err := svc.ListAccess(f.ctx, f.caller(), dataset, after, amount)
+		require.NoError(t, err)
+		for _, grant := range res.Grants {
+			ids = append(ids, grant.PrincipalID)
+		}
+		if !res.HasMore {
+			return ids
+		}
+		require.NotEmpty(t, res.NextOffset, "has_more must carry a cursor")
+		require.NotEqual(t, after, res.NextOffset, "the cursor must advance")
+		after = res.NextOffset
+	}
+}
+
+// TestListPagesPastCursorExtensions is M1: a page cursor is a whole name, and a name that
+// extends the cursor with "-" (0x2d) sorts before the cursor with a "/" (0x2f) appended, so
+// continuing a page by seeking to key(cursor)+"/" skips every "<cursor>-..." entry. Both the
+// dataset listing and the grant listing must page to each name exactly once.
+//
+// The names are the collision of the review's repro - "x", "x-2" and "x2" - spelled out with
+// names the dataset-name pattern accepts (it requires at least three characters, so the bare
+// "x" cannot be a dataset name): the cursor, the extension whose next byte sorts before the
+// delimiter, and the extension whose next byte sorts after it.
+func TestListPagesPastCursorExtensions(t *testing.T) {
+	const grantsDataset = "sales"
+	wantDatasets := []string{"sales", "sales-2024", "sales2"}
+	wantPrincipals := []string{"alice", "alice-x", "alice2"}
+
+	f, svc, _ := newCountingServiceFixture(t)
+	commit := f.sourceRepo(t, "src-paging-extensions", map[string]string{"data/a.parquet": "a"})
+	def := prefixDefinition("src-paging-extensions", commit.String(), "data", "data/")
+	for _, name := range wantDatasets {
+		f.createPublishedDataset(t, name, def)
+	}
+	for _, principal := range wantPrincipals {
+		f.addUser(t, principal)
+		_, err := f.svc.GrantAccess(f.ctx, f.caller(), grantsDataset, PrincipalTypeUser, principal)
+		require.NoError(t, err)
+	}
+
+	for _, amount := range []int{1, 2} {
+		t.Run(fmt.Sprintf("datasets-page-size-%d", amount), func(t *testing.T) {
+			// Equal on the whole set is exactly "every name once": a name skipped by a page
+			// is missing and a name a page repeats is duplicated.
+			require.Equal(t, wantDatasets, pagedDatasetNames(t, svc, f, amount))
+		})
+		t.Run(fmt.Sprintf("grants-page-size-%d", amount), func(t *testing.T) {
+			require.Equal(t, wantPrincipals, pagedGrantPrincipals(t, svc, f, grantsDataset, amount))
+		})
+	}
 }
 
 // TestDescendingKeySegmentReversesOrder pins the encoding the proposal listing pages with
