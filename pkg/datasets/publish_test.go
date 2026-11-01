@@ -5,8 +5,11 @@ package datasets
 // no-op detection of §6.2 step 8.
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/graveler"
+	"github.com/treeverse/lakefs/pkg/kv"
 )
 
 // publish calls the publish primitive on a resolved definition and fails on error.
@@ -1012,4 +1016,218 @@ func TestReconcile_DoesNotRollBackAHeartbeatingPublish(t *testing.T) {
 	require.Equal(t, 1, head.LatestVersion)
 	require.True(t, head.UpdatedAt.Equal(clock.Now()))
 	require.True(t, datasetPinsInclude(t, f, dataset, 2), "the pins of the live publish are not released")
+}
+
+// competingWriteStore is a kv.Store view of the publish heartbeat's CAS (m3): the first
+// conditional write of the dataset record is beaten by a competing writer - which is exactly
+// what PublishRequest.BeforeCommit does from the materialisation goroutine - so the
+// heartbeat's predicate is stale. Every other call passes through unchanged.
+type competingWriteStore struct {
+	kv.Store
+	target   []byte
+	mu       sync.Mutex
+	attempts int
+	beaten   bool
+}
+
+// SetIf writes value, losing the CAS once on target before it does.
+func (c *competingWriteStore) SetIf(ctx context.Context, partitionKey, key, value []byte, predicate kv.Predicate) error {
+	c.mu.Lock()
+	compete := !c.beaten && bytes.Equal(key, c.target)
+	c.attempts++
+	c.mu.Unlock()
+	if compete {
+		res, err := c.Store.Get(ctx, partitionKey, key)
+		if err == nil {
+			var rec DatasetRecord
+			if decodeErr := json.Unmarshal(res.Value, &rec); decodeErr == nil {
+				// A competing writer of the same record (a heartbeat of the materialisation,
+				// or its BeforeCommit CAS) that leaves the state alone.
+				rec.UpdatedAt = rec.UpdatedAt.Add(time.Second)
+				if bumped, encodeErr := json.Marshal(&rec); encodeErr == nil {
+					if err := c.Store.SetIf(ctx, partitionKey, key, bumped, res.Predicate); err == nil {
+						c.mu.Lock()
+						c.beaten = true
+						c.mu.Unlock()
+					}
+				}
+			}
+		}
+	}
+	return c.Store.SetIf(ctx, partitionKey, key, value, predicate)
+}
+
+// wasBeaten reports whether the injected collision really made a CAS stale, and how many
+// conditional writes the record saw: a retry is at least two.
+func (c *competingWriteStore) wasBeaten() (beaten bool, attempts int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.beaten, c.attempts
+}
+
+// TestPublishHeartbeat_RetriesALostCAS is m3: losing the heartbeat CAS to the other writer of
+// the same record is an ordinary optimistic-concurrency loss, so the heartbeat re-reads,
+// re-checks ownership and re-CASes - the way advanceDataset does - instead of reporting a
+// conflict that would cancel a publish that never conflicted.
+func TestPublishHeartbeat_RetriesALostCAS(t *testing.T) {
+	const (
+		dataset = "heartbeat-cas"
+		source  = "src-heartbeat-cas"
+	)
+	f := newServiceFixture(t)
+	f.installClock(time.Date(2032, 5, 6, 7, 8, 9, 0, time.UTC))
+
+	commit := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition(source, commit.String(), "data", "data/"),
+	})
+	require.NoError(t, err)
+
+	// A live publish of v2 owns the record; its heartbeat runs on the record it started with.
+	f.leaveInTransientState(t, dataset, DatasetStatePublishing, 2)
+	publishing := f.datasetRecord(t, dataset)
+
+	key, err := datasetKey(dataset)
+	require.NoError(t, err)
+	competing := &competingWriteStore{Store: f.svc.store.store, target: key}
+	f.svc.store.store = competing
+
+	require.NoError(t, f.svc.heartbeatPublish(f.ctx, publishing, 2),
+		"a lost CAS must be retried, not reported as a lost record (m3)")
+	beaten, attempts := competing.wasBeaten()
+	require.True(t, beaten, "the heartbeat really lost its CAS once")
+	require.GreaterOrEqual(t, attempts, 2, "the write was attempted again after the collision")
+
+	head := f.datasetRecord(t, dataset)
+	require.Equal(t, DatasetStatePublishing, head.State, "the retried heartbeat only moves UpdatedAt")
+	require.Equal(t, 2, head.PendingVersion)
+	require.Equal(t, 1, head.LatestVersion)
+	require.True(t, head.UpdatedAt.Equal(f.svc.now()), "the retried CAS wrote the refresh")
+}
+
+// blockingGetStore holds one read of the dataset record until the test releases it or the
+// read's context is cancelled. It is how the stop-path test keeps a heartbeat inside its read
+// while the publish finishes, and it honours cancellation the way a real kv driver does.
+type blockingGetStore struct {
+	kv.Store
+	mu      sync.Mutex
+	target  []byte
+	armed   bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+// Get serves the blocked read, then falls through to the real store.
+func (b *blockingGetStore) Get(ctx context.Context, partitionKey, key []byte) (*kv.ValueWithPredicate, error) {
+	b.mu.Lock()
+	block := b.armed && bytes.Equal(key, b.target)
+	b.armed = false
+	b.mu.Unlock()
+	if block {
+		close(b.entered)
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return b.Store.Get(ctx, partitionKey, key)
+}
+
+// TestPublish_CompletesWithAHeartbeatInFlight is the stop path of m3 end to end: the publish
+// finishes while a heartbeat tick is inside its read, stopHeartbeat cancels the heartbeat
+// context, the cancelled read fails, and the publish still writes its version and advances the
+// head. The failure is the heartbeat losing its context, so it must not be reported as a lost
+// record (see publishLostRecord) - and it must not fail the publish either.
+func TestPublish_CompletesWithAHeartbeatInFlight(t *testing.T) {
+	const (
+		dataset = "tick-in-flight"
+		source  = "src-tick-in-flight"
+	)
+	f := newServiceFixture(t)
+	clock := f.installClock(time.Date(2032, 6, 7, 8, 9, 10, 0, time.UTC))
+	ticks := f.installFakeTicker()
+
+	first := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition(source, first.String(), "data", "data/"),
+	})
+	require.NoError(t, err)
+	second := f.commitTo(t, source, "main", map[string]string{"data/a.parquet": "b"})
+
+	// Hold the publish inside its materialisation, so a tick can be in flight when it ends.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	realPublish := f.svc.publishFn
+	var once sync.Once
+	f.svc.publishFn = func(ctx context.Context, materializer *Materializer, req PublishRequest) (*PublishResult, error) {
+		once.Do(func() { close(entered) })
+		<-release
+		return realPublish(ctx, materializer, req)
+	}
+
+	errs := make(chan error, 1)
+	go func() {
+		_, err := f.svc.PublishVersion(f.ctx, f.caller(), dataset, PublishVersionRequest{
+			Definition: prefixDefinition(source, second.String(), "data", "data/"),
+			Message:    "v2",
+		})
+		errs <- err
+	}()
+	<-entered
+
+	key, err := datasetKey(dataset)
+	require.NoError(t, err)
+	blocking := &blockingGetStore{
+		Store:   f.svc.store.store,
+		target:  key,
+		armed:   true,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	f.svc.store.store = blocking
+
+	clock.Advance(f.cfg.PublishTimeout / 2)
+	ticks <- clock.Now()
+	select {
+	case <-blocking.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the heartbeat never read the publishing record")
+	}
+
+	// The publish ends and stopHeartbeat cancels the heartbeat context; the cancelled read is
+	// what lets the heartbeat goroutine return, and the publish continues to its own writes.
+	close(release)
+	select {
+	case err := <-errs:
+		require.NoError(t, err, "a tick in flight must not fail the publish (m3)")
+	case <-time.After(30 * time.Second):
+		t.Fatal("the publish did not finish while a heartbeat was in flight")
+	}
+
+	head := f.datasetRecord(t, dataset)
+	require.Equal(t, DatasetStateActive, head.State)
+	require.Equal(t, 2, head.LatestVersion)
+	require.Zero(t, head.PendingVersion)
+	require.True(t, datasetPinsInclude(t, f, dataset, 2), "the published version keeps its pins")
+}
+
+// TestPublishHeartbeat_StopPathIsNotALostRecord is the log decision of m3: stopHeartbeat
+// cancels the publish context before it closes the ticker, so a heartbeat that was in flight
+// when the publish finished fails on that cancelled context. That failure is the stop path, not
+// a lost record, and must not be logged as one - otherwise every publish that ends during a
+// tick emits a false Warn line and the line stops being evidence of a stale takeover.
+func TestPublishHeartbeat_StopPathIsNotALostRecord(t *testing.T) {
+	stopped, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.False(t, publishLostRecord(stopped, context.Canceled),
+		"a heartbeat that fails because the publish is being stopped is not a lost record")
+	require.False(t, publishLostRecord(stopped, fmt.Errorf("%w: gone", ErrDatasetConflict)))
+
+	live := t.Context()
+	require.True(t, publishLostRecord(live, fmt.Errorf("%w: dataset %q is active now", ErrDatasetConflict, "ds")),
+		"a failure on a live context is a lost record")
+	require.False(t, publishLostRecord(live, nil), "a successful heartbeat reports nothing")
 }

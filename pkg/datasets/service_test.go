@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"sort"
 	"testing"
 	"time"
@@ -567,6 +568,91 @@ func TestServiceDeleteRejectsLivePublish(t *testing.T) {
 	require.True(t, isNotFound(err), "a stale publishing record is deleted")
 }
 
+// TestServiceDeleteKeepsTheHeadRecordWhenACleanupStepFails covers m2: the head record is
+// deleted last, and only when every record it refers to is gone - the rule
+// reconciler.finishDelete already applied on the crash-repair path. Deleting it after a failed
+// step forgets the leftovers, because nothing would ever converge them again.
+func TestServiceDeleteKeepsTheHeadRecordWhenACleanupStepFails(t *testing.T) {
+	const dataset = "half-deleted"
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, "src-half-deleted", map[string]string{"data/a.parquet": "a"})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition("src-half-deleted", commit.String(), "data", "data/"),
+	})
+	require.NoError(t, err)
+
+	f.svc.store.deleteVersionFn = func(context.Context, string, int) error {
+		return errors.New("injected DeleteVersion failure")
+	}
+	err = f.svc.Delete(f.ctx, f.caller(), dataset)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "injected DeleteVersion failure")
+
+	rec, _, err := f.svc.store.GetDataset(f.ctx, dataset)
+	require.NoError(t, err, "the head record survives a delete that could not finish (m2)")
+	require.Equal(t, DatasetStateDeleting, rec.State, "the record is left for the reconciler to finish")
+	versions, err := f.svc.store.ListVersions(f.ctx, dataset)
+	require.NoError(t, err)
+	require.Len(t, versions, 1, "the version whose cleanup failed is still recorded")
+
+	// The leftover record is what makes the retry (and the reconciler) able to converge.
+	f.svc.store.deleteVersionFn = nil
+	require.NoError(t, f.svc.Delete(f.ctx, f.caller(), dataset))
+	_, _, err = f.svc.store.GetDataset(f.ctx, dataset)
+	require.ErrorIs(t, err, kv.ErrNotFound)
+	versions, err = f.svc.store.ListVersions(f.ctx, dataset)
+	require.NoError(t, err)
+	require.Empty(t, versions)
+}
+
+// TestServiceCreateReleasesLeftoverPinsOfADeletedDataset covers the second half of m2: a delete
+// that failed before releasing the pins leaves "<name>@vN" references under
+// pins/<repo>/<commit>, and cleanupLeftoverRecords now releases them before it removes the
+// version records. Without that step the old source commits stayed pinned - and a rollback of
+// the new dataset's v1 could not release them either - for the whole life of the new dataset.
+func TestServiceCreateReleasesLeftoverPinsOfADeletedDataset(t *testing.T) {
+	const dataset = "recycled"
+	f := newServiceFixture(t)
+
+	oldCommit := f.sourceRepo(t, "src-recycled-old", map[string]string{"data/a.parquet": "a"})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition("src-recycled-old", oldCommit.String(), "data", "data/"),
+	})
+	require.NoError(t, err)
+	require.True(t, datasetPinsInclude(t, f, dataset, 1), "v1 pins the source commit")
+
+	// Reproduce the leftover state a failed delete can leave: the head record and the dataset
+	// repository are gone, the pin reference and the v1 VersionRecord are not.
+	stale, predicate, err := f.svc.store.GetDataset(f.ctx, dataset)
+	require.NoError(t, err)
+	require.NoError(t, f.svc.store.DeleteDataset(f.ctx, dataset, stale, predicate))
+	require.NoError(t, f.cat.DeleteRepository(f.ctx, dataset, graveler.WithForce(true)))
+
+	newCommit := f.sourceRepo(t, "src-recycled-new", map[string]string{"data/a.parquet": "b"})
+	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition("src-recycled-new", newCommit.String(), "data", "data/"),
+	})
+	require.NoError(t, err, "the leftover version record of the old incarnation does not block v1")
+	require.Equal(t, 1, view.Record.LatestVersion)
+
+	t.Run("the old incarnation's pin is released", func(t *testing.T) {
+		_, _, err := f.svc.store.GetPin(f.ctx, "src-recycled-old", oldCommit.String())
+		require.ErrorIs(t, err, kv.ErrNotFound, "no reference of the old dataset survives (m2)")
+		_, err = f.refMgr.GetBranch(f.ctx, f.repositoryRecord(t, "src-recycled-old"),
+			graveler.BranchID(PinBranch(oldCommit.String())))
+		require.Error(t, err, "the orphaned pin branch is deleted with its last reference")
+	})
+
+	t.Run("the new version pins its own source", func(t *testing.T) {
+		_, _, err := f.svc.store.GetPin(f.ctx, "src-recycled-new", newCommit.String())
+		require.NoError(t, err)
+		require.True(t, datasetPinsInclude(t, f, dataset, 1))
+	})
+}
+
 // TestServiceCreateFailureRollsBackInline covers BUG-10: a create that fails after the
 // repository and the guard were written removes them and the record inline, so the name is
 // immediately reusable instead of staying "creating" for a reconcile timeout.
@@ -877,7 +963,10 @@ func TestServiceAccessGrantRoundTrip(t *testing.T) {
 
 	t.Run("unknown principal is 404", func(t *testing.T) {
 		_, err := f.svc.GrantAccess(f.ctx, f.caller(), "shared-set", PrincipalTypeUser, "nobody")
-		require.ErrorIs(t, err, ErrDatasetNotFound)
+		// m6: the dataset exists, the principal does not, and the two 404s are distinguishable.
+		require.ErrorIs(t, err, ErrPrincipalNotFound)
+		require.NotErrorIs(t, err, ErrDatasetNotFound)
+		require.Contains(t, err.Error(), "nobody")
 	})
 
 	t.Run("invalid principal type is 400", func(t *testing.T) {
@@ -910,8 +999,51 @@ func TestServiceAccessGrantRoundTrip(t *testing.T) {
 
 	t.Run("revoking an unknown grant is 404", func(t *testing.T) {
 		err := f.svc.RevokeAccess(f.ctx, f.caller(), "shared-set", PrincipalTypeUser, "alice")
-		require.ErrorIs(t, err, ErrDatasetNotFound)
+		// m6: the dataset exists, the grant does not.
+		require.ErrorIs(t, err, ErrGrantNotFound)
+		require.NotErrorIs(t, err, ErrDatasetNotFound)
+		require.Contains(t, err.Error(), "shared-set")
 	})
+}
+
+// TestWriteServiceErrorDistinguishesTheNotFoundSentinels covers the HTTP half of m6: a missing
+// grant and an unknown principal are 404s, and neither claims the dataset itself is missing, so
+// the three not-found cases of the access card are distinguishable by the response body.
+func TestWriteServiceErrorDistinguishesTheNotFoundSentinels(t *testing.T) {
+	srv := &server{authzFailureStatus: http.StatusUnauthorized}
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "missing grant",
+			err:  fmt.Errorf("%w: user %q on dataset %q", ErrGrantNotFound, "alice", "shared-set"),
+			want: ErrGrantNotFound.Error(),
+		},
+		{
+			name: "unknown principal",
+			err:  fmt.Errorf("%w: user %q", ErrPrincipalNotFound, "nobody"),
+			want: ErrPrincipalNotFound.Error(),
+		},
+		{
+			name: "unknown dataset",
+			err:  fmt.Errorf("%w: %q", ErrDatasetNotFound, "never-existed"),
+			want: ErrDatasetNotFound.Error(),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodDelete, "/datasets/shared-set/access/user/alice", nil)
+			srv.writeServiceError(rec, req, tc.err)
+			require.Equal(t, http.StatusNotFound, rec.Code, "body: %s", rec.Body.String())
+			require.Contains(t, rec.Body.String(), tc.want)
+			if tc.want != ErrDatasetNotFound.Error() {
+				require.NotContains(t, rec.Body.String(), ErrDatasetNotFound.Error(),
+					"only the dataset itself is missing in the dataset case")
+			}
+		})
+	}
 }
 
 func TestServiceDatasetsAllReadMembership(t *testing.T) {

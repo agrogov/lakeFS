@@ -124,8 +124,11 @@ func (s *server) writeServiceError(w http.ResponseWriter, r *http.Request, err e
 	// ErrTaskNotFound came in with the publish/versions card (§10.1 version and task reads),
 	// ErrRefNotFound came in with the diff card (§10.3 bad left/right ref), ErrProposalNotFound
 	// came in with the proposals card (§5.6, §10.1), and isNotFound covers the store/catalog
-	// path. Every one of them must map to 404: dropping any sends a client-fixable case to 500.
-	case errors.Is(err, ErrDatasetNotFound), errors.Is(err, ErrVersionNotFound), errors.Is(err, ErrTaskNotFound), errors.Is(err, ErrRefNotFound), errors.Is(err, ErrProposalNotFound), errors.Is(err, ErrMetadataKeyNotFound), isNotFound(err):
+	// path. ErrGrantNotFound and ErrPrincipalNotFound are the access card's two not-founds
+	// (m6): the dataset exists in both cases, so a client can tell them from ErrDatasetNotFound
+	// by the message. Every one of them must map to 404: dropping any sends a client-fixable
+	// case to 500.
+	case errors.Is(err, ErrDatasetNotFound), errors.Is(err, ErrVersionNotFound), errors.Is(err, ErrTaskNotFound), errors.Is(err, ErrRefNotFound), errors.Is(err, ErrProposalNotFound), errors.Is(err, ErrMetadataKeyNotFound), errors.Is(err, ErrGrantNotFound), errors.Is(err, ErrPrincipalNotFound), isNotFound(err):
 		httputil.WriteAPIError(w, r, http.StatusNotFound, err.Error())
 	case errors.Is(err, ErrNameTaken), errors.Is(err, ErrDatasetConflict), errors.Is(err, ErrPublishInProgress), errors.Is(err, ErrProposalNotOpen), errors.Is(err, ErrMetadataKeyTypeChange), errors.Is(err, ErrMetadataKeyRename), errors.Is(err, kv.ErrPredicateFailed):
 		httputil.WriteAPIError(w, r, http.StatusConflict, err.Error())

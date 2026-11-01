@@ -69,6 +69,16 @@ var (
 	// ErrVersionNotFound reports an unknown version of a known dataset (404, §10.4).
 	ErrVersionNotFound = errors.New("dataset version not found")
 
+	// ErrGrantNotFound reports an access grant that does not exist (404, §10.1). It is a
+	// sentinel of its own rather than ErrDatasetNotFound: the dataset does exist, so a
+	// client that gets a 404 must be able to tell "wrong dataset" from "no such grant".
+	ErrGrantNotFound = errors.New("dataset grant not found")
+
+	// ErrPrincipalNotFound reports a grant target - a user or a group - that does not
+	// exist (404). Like ErrGrantNotFound it is distinct from ErrDatasetNotFound, which
+	// stays the answer for the dataset itself only.
+	ErrPrincipalNotFound = errors.New("principal not found")
+
 	// ErrTaskNotFound reports an unknown asynchronous task (404, §10.1).
 	ErrTaskNotFound = errors.New("dataset task not found")
 
@@ -685,7 +695,17 @@ func (s *Service) leavePending(ctx context.Context, dataset string, version int)
 // leftover: it was made for this name, not for a deleted dataset, and the docs make it conflicted
 // once the name is taken (DOC-8). It is kept, so its author sees the conflict and can update it
 // onto the new dataset instead of finding it gone.
+//
+// The pin references of the previous incarnation go first (m2): a delete that failed before
+// releasing them left "<name>@vN" under pins/<repo>/<commit>, and nothing else here touches
+// pin records. Left alone, those source commits would stay pinned, and rollback of this
+// dataset's v1 would not release them either, for the whole lifetime of the new dataset.
+// ReleaseDataset is idempotent and tolerates a source repository that is gone, so a name with
+// no leftovers pays one empty listing and nothing else.
 func (s *Service) cleanupLeftoverRecords(ctx context.Context, dataset, preserveProposalID string) error {
+	if err := s.pins.ReleaseDataset(ctx, dataset); err != nil {
+		return fmt.Errorf("datasets: release leftover pins of %q: %w", dataset, err)
+	}
 	versions, err := s.store.ListVersions(ctx, dataset)
 	if err != nil {
 		return err
@@ -900,7 +920,9 @@ func (s *Service) List(ctx context.Context, caller Caller, req ListRequest) (*Li
 //
 // Every step tolerates "not found", so a delete that was already in progress can simply be
 // retried and the reconciler can finish a crashed one (§6.6, §12.3): the record is moved to
-// state "deleting" first, which is what makes the retry safe.
+// state "deleting" first, which is what makes the retry safe. A step that fails therefore
+// leaves the record in "deleting" and does not remove the head record (m2): forgetting it would
+// leave the leftovers of this name - pins included - with nothing that converges them.
 func (s *Service) Delete(ctx context.Context, caller Caller, name string) error {
 	if err := s.authorizer.CheckDataset(ctx, caller, ActionDeleteDataset, name); err != nil {
 		return err
@@ -979,11 +1001,18 @@ func (s *Service) Delete(ctx context.Context, caller Caller, name string) error 
 			errs = append(errs, err)
 		}
 	}
-	if err := s.store.DeleteDataset(ctx, name, current, nil); err != nil && !isNotFound(err) {
-		if errors.Is(err, kv.ErrPredicateFailed) {
-			errs = append(errs, fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, name))
-		} else {
-			errs = append(errs, err)
+	// BUG-7/m2: the head record goes last, and only once everything it refers to is gone -
+	// the same rule reconciler.finishDelete applies on the crash-repair path. Deleting it
+	// after a failed step would forget the leftovers (a version, proposal, task, grant or
+	// pin record), and a re-create of the name would then inherit them; leaving it in
+	// "deleting" is what lets the retry and the reconciler finish the job.
+	if len(errs) == 0 {
+		if err := s.store.DeleteDataset(ctx, name, current, nil); err != nil && !isNotFound(err) {
+			if errors.Is(err, kv.ErrPredicateFailed) {
+				errs = append(errs, fmt.Errorf("%w: dataset %q changed concurrently", ErrDatasetConflict, name))
+			} else {
+				errs = append(errs, err)
+			}
 		}
 	}
 
@@ -1892,7 +1921,10 @@ func (s *Service) RevokeAccess(ctx context.Context, caller Caller, dataset, prin
 	}
 	if _, err := s.store.GetGrant(ctx, dataset, principalType, principalID); err != nil {
 		if errors.Is(err, kv.ErrNotFound) {
-			return fmt.Errorf("%w: no grant for %s %q on dataset %q", ErrDatasetNotFound, principalType, principalID, dataset)
+			// m6: the dataset exists, the grant does not, so this is ErrGrantNotFound and
+			// not a 404 about the dataset.
+			return fmt.Errorf("%w: %s %q on dataset %q",
+				ErrGrantNotFound, principalType, principalID, dataset)
 		}
 		return err
 	}
@@ -2267,31 +2299,60 @@ func (s *Service) publish(ctx context.Context, rec *DatasetRecord, def Definitio
 //
 // It is called once before the materialisation starts, every publish_timeout/3 while it runs,
 // and once more immediately before the commit and the tag (PublishRequest.BeforeCommit).
+//
+// A lost CAS is an ordinary optimistic-concurrency loss, not a lost record (m3): the beat
+// writes the very same record as PublishRequest.BeforeCommit does from the materialisation
+// goroutine, so the loser of a benign collision must re-read, re-check ownership and re-CAS -
+// the retry advanceDataset does - instead of declaring the publish taken over. Ownership is
+// reported lost only when a fresh read shows a different state, PendingVersion or dataset.
 func (s *Service) heartbeatPublish(ctx context.Context, rec *DatasetRecord, version int) error {
-	current, predicate, err := s.store.GetDataset(ctx, rec.Name)
-	if errors.Is(err, kv.ErrNotFound) {
-		return fmt.Errorf("%w: dataset %q was deleted", ErrPublishInProgress, rec.Name)
-	}
-	if err != nil {
-		return err
-	}
-	switch {
-	case current.State == DatasetStateDeleting:
-		return fmt.Errorf("%w: dataset %q is being deleted", ErrPublishInProgress, rec.Name)
-	case !ownsPublish(current, rec, version):
-		return fmt.Errorf("%w: dataset %q is no longer publishing version %d",
-			ErrDatasetConflict, rec.Name, version)
-	}
-	next := *current
-	next.UpdatedAt = s.now()
-	if err := s.store.PutDatasetIf(ctx, &next, current, predicate); err != nil {
-		if errors.Is(err, kv.ErrPredicateFailed) {
-			return fmt.Errorf("%w: dataset %q changed while publishing version %d",
+	for attempt := 0; attempt < publishWriteRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		current, predicate, err := s.store.GetDataset(ctx, rec.Name)
+		if errors.Is(err, kv.ErrNotFound) {
+			return fmt.Errorf("%w: dataset %q was deleted", ErrPublishInProgress, rec.Name)
+		}
+		if err != nil {
+			return err
+		}
+		switch {
+		case current.State == DatasetStateDeleting:
+			return fmt.Errorf("%w: dataset %q is being deleted", ErrPublishInProgress, rec.Name)
+		case !ownsPublish(current, rec, version):
+			return fmt.Errorf("%w: dataset %q is no longer publishing version %d",
 				ErrDatasetConflict, rec.Name, version)
 		}
-		return err
+		next := *current
+		next.UpdatedAt = s.now()
+		err = s.store.PutDatasetIf(ctx, &next, current, predicate)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, kv.ErrPredicateFailed) {
+			return err
+		}
+		// Somebody wrote the record between the read and the write. Loop and re-read: only
+		// the state that comes back decides whether this attempt still owns the record.
+		if attempt+1 < publishWriteRetries {
+			s.pausePublishWrite(ctx, attempt)
+		}
 	}
-	return nil
+	return fmt.Errorf("%w: dataset %q changed while publishing version %d",
+		ErrDatasetConflict, rec.Name, version)
+}
+
+// publishLostRecord reports whether err from heartbeatPublish means this attempt lost the
+// publishing record, rather than the publish being stopped (m3).
+//
+// stopHeartbeat cancels publishCtx before it closes the ticker, so a heartbeat that was in
+// flight when the publish finished fails on the cancelled context. That is the stop path and
+// says nothing about the record: without this check every publish that ends during a tick
+// emitted a false, Warn-level "lost the record" line, which made the line an operator would
+// use to diagnose a genuine stale takeover by the reconciler untrustworthy.
+func publishLostRecord(publishCtx context.Context, err error) bool {
+	return err != nil && publishCtx.Err() == nil
 }
 
 // publishInTransientState reports whether rec is a record the publish state machine owns: the
@@ -2360,6 +2421,11 @@ func (s *Service) startPublishHeartbeat(ctx context.Context, rec *DatasetRecord,
 				return
 			case <-ticks:
 				if err := s.heartbeatPublish(publishCtx, rec, version); err != nil {
+					// m3: a failure on the stop path is the heartbeat losing its context,
+					// not the publish losing its record; only a live context reports that.
+					if !publishLostRecord(publishCtx, err) {
+						return
+					}
 					logging.FromContext(publishCtx).WithError(err).WithFields(logging.Fields{
 						"dataset": rec.Name,
 						"version": version,
@@ -2641,8 +2707,9 @@ func (s *Service) requireDataset(ctx context.Context, dataset string) error {
 	return nil
 }
 
-// requirePrincipal returns 404 (ErrDatasetNotFound, the control plane's only not-found
-// mapping for a principal) when the grant target does not exist.
+// requirePrincipal returns 404 (ErrPrincipalNotFound) when the grant target does not exist.
+// m6: it is not ErrDatasetNotFound - the dataset exists, the user or group does not - so a
+// client can tell the two 404s apart.
 func (s *Service) requirePrincipal(ctx context.Context, principalType, principalID string) error {
 	var err error
 	switch principalType {
@@ -2655,7 +2722,7 @@ func (s *Service) requirePrincipal(ctx context.Context, principalType, principal
 		return nil
 	}
 	if errors.Is(err, auth.ErrNotFound) || errors.Is(err, kv.ErrNotFound) {
-		return fmt.Errorf("%w: %s %q does not exist", ErrDatasetNotFound, principalType, principalID)
+		return fmt.Errorf("%w: %s %q", ErrPrincipalNotFound, principalType, principalID)
 	}
 	return err
 }
