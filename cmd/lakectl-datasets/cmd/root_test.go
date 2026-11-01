@@ -97,6 +97,41 @@ func TestOutputFlag(t *testing.T) {
 	})
 }
 
+// TestMetadataFilterWireQuery pins the repeated-metadata wire shape (CLI-6, review m1): a key
+// repeated on the command line is sent as one `metadata.<key>` query parameter per value, which
+// is what the server reads as OR within that key — metadata.tier=gold&metadata.tier=silver
+// matches a dataset whose tier is gold *or* silver. Collapsing the values, or joining them with
+// a comma, would silently change the server's answer, so the shape is pinned here.
+func TestMetadataFilterWireQuery(t *testing.T) {
+	root := NewRoot()
+	list, _, err := root.Find([]string{"list"})
+	require.NoError(t, err)
+	require.NoError(t, list.ParseFlags([]string{
+		"--metadata", "tier=gold",
+		"--metadata", "tier=silver",
+		"--metadata", "owner=data-platform",
+	}))
+
+	// The flag help must describe the same semantics the server implements.
+	require.Contains(t, list.Flags().Lookup(metadataFlagName).Usage, "a repeated key matches any of its values")
+
+	filters, err := parseMetadataFilters(list)
+	require.NoError(t, err)
+	require.Equal(t, map[string][]string{
+		"tier":  {"gold", "silver"},
+		"owner": {"data-platform"},
+	}, filters)
+
+	editor := metadataFilterEditor(filters)
+	require.NotNil(t, editor)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://example.com"+controlPlanePath+"/", nil)
+	require.NoError(t, err)
+	require.NoError(t, editor(t.Context(), req))
+	require.Equal(t, []string{"gold", "silver"}, req.URL.Query()["metadata.tier"])
+	require.Equal(t, []string{"data-platform"}, req.URL.Query()["metadata.owner"])
+	require.Equal(t, "metadata.owner=data-platform&metadata.tier=gold&metadata.tier=silver", req.URL.RawQuery)
+}
+
 // TestCheckResponse pins the error mapping of §10.4: one message plus one line per problem.
 func TestCheckResponse(t *testing.T) {
 	t.Run("expected status", func(t *testing.T) {

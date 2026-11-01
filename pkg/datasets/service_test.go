@@ -352,7 +352,7 @@ func TestServiceList(t *testing.T) {
 	})
 
 	t.Run("metadata filter", func(t *testing.T) {
-		result, err := f.svc.List(f.ctx, f.caller(), ListRequest{Metadata: map[string]string{"tier": "gold"}})
+		result, err := f.svc.List(f.ctx, f.caller(), ListRequest{Metadata: map[string][]string{"tier": {"gold"}}})
 		require.NoError(t, err)
 		require.Equal(t, []string{"alpha-one", "beta-three"}, namesOf(result.Datasets))
 	})
@@ -360,14 +360,37 @@ func TestServiceList(t *testing.T) {
 	t.Run("metadata filter and prefix", func(t *testing.T) {
 		result, err := f.svc.List(f.ctx, f.caller(), ListRequest{
 			Prefix:   "alpha-",
-			Metadata: map[string]string{"tier": "gold"},
+			Metadata: map[string][]string{"tier": {"gold"}},
 		})
 		require.NoError(t, err)
 		require.Equal(t, []string{"alpha-one"}, namesOf(result.Datasets))
 	})
 
 	t.Run("metadata filter without match", func(t *testing.T) {
-		result, err := f.svc.List(f.ctx, f.caller(), ListRequest{Metadata: map[string]string{"tier": "bronze"}})
+		result, err := f.svc.List(f.ctx, f.caller(), ListRequest{Metadata: map[string][]string{"tier": {"bronze"}}})
+		require.NoError(t, err)
+		require.Empty(t, result.Datasets)
+	})
+
+	// Review m1: a repeated metadata key keeps every value, so the filter matches any of
+	// them (OR) instead of silently narrowing to the first one.
+	t.Run("repeated metadata values match any of them", func(t *testing.T) {
+		result, err := f.svc.List(f.ctx, f.caller(), ListRequest{Metadata: map[string][]string{"tier": {"gold", "silver"}}})
+		require.NoError(t, err)
+		require.Equal(t, []string{"alpha-one", "alpha-two", "beta-three"}, namesOf(result.Datasets))
+	})
+
+	// Different keys are still ANDed, and a repeated key stays OR inside that AND.
+	t.Run("metadata filters on different keys are ANDed", func(t *testing.T) {
+		result, err := f.svc.List(f.ctx, f.caller(), ListRequest{
+			Metadata: map[string][]string{"tier": {"gold", "silver"}, "owner": {"data-platform"}},
+		})
+		require.NoError(t, err)
+		require.Equal(t, []string{"alpha-two"}, namesOf(result.Datasets))
+
+		result, err = f.svc.List(f.ctx, f.caller(), ListRequest{
+			Metadata: map[string][]string{"tier": {"gold", "silver"}, "owner": {"missing"}},
+		})
 		require.NoError(t, err)
 		require.Empty(t, result.Datasets)
 	})

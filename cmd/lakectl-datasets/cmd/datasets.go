@@ -68,7 +68,7 @@ func listCmd() *cobra.Command {
 	withPaginationFlags(cmd)
 	cmd.Flags().String(prefixFlagName, "", "only list datasets whose name starts with this prefix")
 	cmd.Flags().StringArray(metadataFlagName, nil,
-		"only list datasets whose latest version metadata holds key=value (repeatable)")
+		"only list datasets whose latest version metadata holds key=value (repeatable; a repeated key matches any of its values)")
 	return cmd
 }
 

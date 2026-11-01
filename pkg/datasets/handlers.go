@@ -1245,15 +1245,20 @@ func pullRequestListToAPI(views []*ProposalView, hasMore bool, nextOffset string
 // metadataFilters extracts the dynamic metadata.<key>=<value> query parameters of §10.1.
 // OpenAPI 3.0 cannot declare dynamic parameter names, so the request validator passes them
 // through and the handler reads them from the raw query.
-func metadataFilters(r *http.Request) map[string]string {
+//
+// Every value of a repeated parameter is kept instead of collapsing to the first one
+// (review m1): metadata.tier=gold&metadata.tier=silver matches a dataset whose tier is gold
+// or silver, which is what the CLI's repeatable --metadata flag documents and sends. Filters
+// on different keys still have to all match (see metadataMatches).
+func metadataFilters(r *http.Request) map[string][]string {
 	query := r.URL.Query()
-	filters := make(map[string]string)
+	filters := make(map[string][]string, len(query))
 	for key, values := range query {
 		name, ok := cutMetadataFilterPrefix(key)
 		if !ok || name == "" || len(values) == 0 {
 			continue
 		}
-		filters[name] = values[0]
+		filters[name] = values
 	}
 	if len(filters) == 0 {
 		return nil

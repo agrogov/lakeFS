@@ -217,7 +217,9 @@ func parsePaginationOptions(cmd *cobra.Command) (paginationOptions, error) {
 
 // parseMetadataFilters parses the repeatable `--metadata key=value` flag into the
 // `metadata.<key>=<value>` filters of §10.1. A key may be repeated, and every value of that key
-// is kept and sent (CLI-6): `--metadata tier=gold --metadata tier=silver` filters on both.
+// is kept and sent (CLI-6); the server matches any of them (OR, review m1), so
+// `--metadata tier=gold --metadata tier=silver` matches datasets whose tier is gold or silver,
+// while filters on different keys must all match.
 func parseMetadataFilters(cmd *cobra.Command) (map[string][]string, error) {
 	pairs, err := cmd.Flags().GetStringArray(metadataFlagName)
 	if err != nil {

@@ -56,9 +56,11 @@ paths:
         filtered by `dataset:ReadDataset` in addition to requiring `dataset:ListDatasets`.
 
         Metadata filters use dynamic query parameters of the form `metadata.<key>=<value>` and
-        match against the latest version's metadata. OpenAPI 3.0 cannot declare dynamic query
-        parameter names, so they are documented here rather than declared below; unknown query
-        parameters are passed through to the handler.
+        match against the latest version's metadata. A `<key>` may be repeated, and the filter
+        then matches when any of its values matches (OR): `metadata.tier=gold&metadata.tier=silver`
+        is "tier is gold or silver". Filters on different keys must all match (AND). OpenAPI 3.0
+        cannot declare dynamic query parameter names, so they are documented here rather than
+        declared below; unknown query parameters are passed through to the handler.
       parameters:
         - $ref: "#/components/parameters/Prefix"
         - $ref: "#/components/parameters/After"

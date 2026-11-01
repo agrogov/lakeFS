@@ -783,11 +783,13 @@ func (s *Service) GetByRef(ctx context.Context, caller Caller, name, ref string)
 }
 
 // ListRequest is the input of Service.List: the filters and pagination of GET /datasets
-// (§10.1). Metadata filters match the metadata of the latest version.
+// (§10.1). Metadata filters match the metadata of the latest version: a key given more than
+// once matches when any of its values matches (OR), and filters on different keys must all
+// match (AND) — so metadata.tier=gold&metadata.tier=silver is "tier is gold or silver".
 type ListRequest struct {
 	Prefix   string
 	Search   string
-	Metadata map[string]string
+	Metadata map[string][]string
 	After    string
 	Amount   int
 }
@@ -2684,20 +2686,36 @@ func matchesSearch(rec *DatasetRecord, query string) bool {
 
 // metadataMatches applies the metadata.<key>=<value> filters of §10.1 to the metadata of the
 // dataset's latest version. A dataset without a version matches no metadata filter.
-func metadataMatches(view *DatasetView, want map[string]string) bool {
+//
+// A key may carry several values: the query parameter was repeated (review m1) or the CLI
+// sent one per repeated --metadata flag. The filter then matches when *any* of them matches,
+// so `--metadata tier=gold --metadata tier=silver` filters on both; filters on different keys
+// must all match. A key with no values matches nothing.
+func metadataMatches(view *DatasetView, want map[string][]string) bool {
 	if len(want) == 0 {
 		return true
 	}
 	if view.Version == nil {
 		return false
 	}
-	for key, value := range want {
+	for key, values := range want {
 		got, ok := view.Version.Definition.Metadata[key]
-		if !ok || !metadataValueMatches(got, value) {
+		if !ok || !anyMetadataValueMatches(got, values) {
 			return false
 		}
 	}
 	return true
+}
+
+// anyMetadataValueMatches reports whether a metadata value matches any of the requested values
+// of its key (OR within a key).
+func anyMetadataValueMatches(got any, want []string) bool {
+	for _, value := range want {
+		if metadataValueMatches(got, value) {
+			return true
+		}
+	}
+	return false
 }
 
 // metadataValueMatches compares one metadata value with the filter string. Multi-value keys

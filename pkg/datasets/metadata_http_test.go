@@ -183,6 +183,53 @@ func TestDatasetsHTTPMetadataKeysDenied(t *testing.T) {
 	require.Equal(t, []string{"public", "internal"}, *decodeMetadataKey(t, rec.Body.Bytes()).AllowedValues)
 }
 
+// TestDatasetsHTTPMetadataFilterRepeatedKey is review m1: a repeated metadata.<key> query
+// parameter keeps every value instead of being reduced to the first one, so the handler and
+// the CLI (which sends one parameter per repeated --metadata flag) agree with the documented
+// semantics — OR within a key, AND across keys — while the single-value behaviour is unchanged.
+func TestDatasetsHTTPMetadataFilterRepeatedKey(t *testing.T) {
+	handler, deps, accessKey, secret := newControlPlaneWithDeps(t)
+	commit := seedHandlerSource(t, deps.Catalog)
+	def := objectDefinition("handler-src", commit.String(), "reference/countries.csv", "geo/countries.csv")
+
+	for _, ds := range []struct {
+		name     string
+		metadata map[string]any
+	}{
+		{name: "filter-gold", metadata: map[string]any{"tier": "gold", "owner": "analytics"}},
+		{name: "filter-silver", metadata: map[string]any{"tier": "silver", "owner": "analytics"}},
+		{name: "filter-bronze", metadata: map[string]any{"tier": "bronze"}},
+	} {
+		body := createDatasetBody(t, ds.name, withMetadata(def, ds.metadata), false)
+		rec := doRequest(t, handler, http.MethodPost, "", body, accessKey, secret)
+		require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
+	}
+
+	listNames := func(t *testing.T, query string) []string {
+		t.Helper()
+		rec := doRequest(t, handler, http.MethodGet, query, "", accessKey, secret)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		var list apigen.DatasetList
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &list), "body: %s", rec.Body.String())
+		names := make([]string, 0, len(list.Results))
+		for _, dataset := range list.Results {
+			names = append(names, dataset.Id)
+		}
+		return names
+	}
+
+	// The single-value behaviour of §10.1 is unchanged.
+	require.Equal(t, []string{"filter-gold"}, listNames(t, "?metadata.tier=gold"))
+	require.Empty(t, listNames(t, "?metadata.tier=platinum"))
+	// A repeated key matches any of its values (OR), not just the first one.
+	require.Equal(t, []string{"filter-gold", "filter-silver"}, listNames(t, "?metadata.tier=gold&metadata.tier=silver"))
+	// Different keys are ANDed, and the repeated key stays OR inside that AND.
+	require.Equal(t, []string{"filter-gold", "filter-silver"},
+		listNames(t, "?metadata.tier=gold&metadata.tier=silver&metadata.owner=analytics"))
+	// A value list whose values all miss matches nothing, rather than falling back to one value.
+	require.Empty(t, listNames(t, "?metadata.tier=platinum&metadata.tier=diamond"))
+}
+
 func TestDatasetsHTTPConfig(t *testing.T) {
 	handler, accessKey, secret := newControlPlane(t)
 	rec := doRequest(t, handler, http.MethodGet, "/config", "", accessKey, secret)
