@@ -42,6 +42,14 @@ var errDatasetRepoSetNotLoaded = errors.New("datasets: dataset repository set wa
 // ordinary read traffic never touches the KV store.
 const datasetRepoCacheTTL = 2 * time.Second
 
+// datasetRepoLoadTimeout bounds one reload of the set. The reload is detached from the request
+// that triggered it (see refresh), so it needs a bound of its own.
+const datasetRepoLoadTimeout = 30 * time.Second
+
+// errDatasetRepoSetLoadPanicked is recorded when the loader panicked, so the attempt counts as a
+// failed refresh rather than leaving the set in the middle of one.
+var errDatasetRepoSetLoadPanicked = errors.New("datasets: dataset repository set loader panicked")
+
 // serviceCallerKey is the context key of the service-caller marker, and it is deliberately
 // unexported. The marker only ever exempts a caller from the SEC-2 guard, and the guard's value
 // is that a caller cannot switch it off, so nothing outside this package may build it: no
@@ -157,35 +165,47 @@ func (s *DatasetRepoSet) Contains(ctx context.Context, repo string) (bool, error
 // refresh runs the loader outside s.mu and swaps its result in under it. Only the goroutine that
 // won the single-flight gate calls it; it closes done once the new state is visible, so the
 // waiters in Contains answer from the same load.
+//
+// The load runs on a context detached from the leader's cancellation and bounded by
+// datasetRepoLoadTimeout: the leader's result is shared with every waiter, so one cancelled
+// request must not hand its context.Canceled to the others. The state is published and done
+// closed in a deferred call, so a panicking loader cannot leave the gate set and every later
+// authorization waiting on a channel nobody closes.
 func (s *DatasetRepoSet) refresh(ctx context.Context, done chan struct{}) {
 	s.mu.Lock()
 	generation := s.generation
 	s.mu.Unlock()
 
-	names, err := s.load(ctx)
-
-	s.mu.Lock()
-	s.fetched = s.now()
-	if s.generation == generation {
-		// No Invalidate landed while the load ran, so this attempt is the one that was owed and
-		// its result is not known to be incomplete.
-		s.stale = false
-	}
-	if err != nil {
-		// Failed refresh: keep the last known set, if any. A KV hiccup must not fail every write
-		// in the installation, and the attempt counts against the TTL, so the store is retried
-		// on the next TTL rather than on every authorization.
-		s.lastErr = err
-	} else {
-		set := make(map[string]struct{}, len(names))
-		for _, n := range names {
-			set[n] = struct{}{}
+	var names []string
+	err := errDatasetRepoSetLoadPanicked // replaced unless the loader panics
+	defer func() {
+		s.mu.Lock()
+		s.fetched = s.now()
+		if s.generation == generation {
+			// No Invalidate landed while the load ran, so this attempt is the one that was owed
+			// and its result is not known to be incomplete.
+			s.stale = false
 		}
-		s.names, s.loaded, s.lastErr = set, true, nil
-	}
-	s.refreshing = nil
-	s.mu.Unlock()
-	close(done)
+		if err != nil {
+			// Failed refresh: keep the last known set, if any. A KV hiccup must not fail every
+			// write in the installation, and the attempt counts against the TTL, so the store is
+			// retried on the next TTL rather than on every authorization.
+			s.lastErr = err
+		} else {
+			set := make(map[string]struct{}, len(names))
+			for _, n := range names {
+				set[n] = struct{}{}
+			}
+			s.names, s.loaded, s.lastErr = set, true, nil
+		}
+		s.refreshing = nil
+		s.mu.Unlock()
+		close(done)
+	}()
+
+	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), datasetRepoLoadTimeout)
+	defer cancel()
+	names, err = s.load(loadCtx)
 }
 
 // fresh reports whether the cached set may answer without a load: no invalidation is pending and

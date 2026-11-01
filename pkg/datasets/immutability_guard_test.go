@@ -407,3 +407,55 @@ func TestDatasetRepoSetSingleFlight(t *testing.T) {
 	defer mu.Unlock()
 	require.Equal(t, 1, calls, "a burst of authorizations must run one loader, not one per caller")
 }
+
+// TestDatasetRepoSetLoadIgnoresLeaderCancellation: the leader's load is shared with every waiter,
+// so a leader whose request is cancelled must not fail the others with its context.Canceled.
+func TestDatasetRepoSetLoadIgnoresLeaderCancellation(t *testing.T) {
+	set := newDatasetRepoSet(func(ctx context.Context) ([]string, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if _, ok := ctx.Deadline(); !ok {
+			return nil, errors.New("the load must be bounded by a deadline of its own")
+		}
+		return []string{"a"}, nil
+	}, time.Hour, time.Now)
+
+	leaderCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+	ok, err := set.Contains(leaderCtx, "a")
+	require.NoError(t, err, "the load must not inherit the leader's cancellation")
+	require.True(t, ok)
+
+	ok, err = set.Contains(t.Context(), "a")
+	require.NoError(t, err)
+	require.True(t, ok)
+}
+
+// TestDatasetRepoSetLoaderPanicReleasesGate: a panicking loader must not leave the single-flight
+// gate set, or every later authorization would wait on a channel nobody closes.
+func TestDatasetRepoSetLoaderPanicReleasesGate(t *testing.T) {
+	now := time.Unix(4000, 0)
+	panicking := true
+	set := newDatasetRepoSet(func(context.Context) ([]string, error) {
+		if panicking {
+			panic("loader bug")
+		}
+		return []string{"a"}, nil
+	}, time.Second, func() time.Time { return now })
+
+	require.Panics(t, func() { _, _ = set.Contains(t.Context(), "a") })
+
+	// Before the TTL the failed attempt answers; nothing was ever loaded, so it fails closed.
+	_, err := set.Contains(t.Context(), "a")
+	require.ErrorIs(t, err, errDatasetRepoSetLoadPanicked)
+
+	// After the TTL a new load runs instead of waiting on the abandoned gate.
+	panicking = false
+	now = now.Add(time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	ok, err := set.Contains(ctx, "a")
+	require.NoError(t, err)
+	require.True(t, ok)
+}
