@@ -1,7 +1,8 @@
 package icebergcatalog
 
-// Namespace reads for the Iceberg REST catalog (ICEBERG_CATALOG_PLAN.md §5 "Addressing rules",
-// §7.2 "Authorization" and §11 I-1 "namespaces list/get/head (repo/ref levels)").
+// Namespace reads and writes for the Iceberg REST catalog (ICEBERG_CATALOG_PLAN.md §5
+// "Addressing rules", §6.1 "Layout on the branch", §7.2 "Authorization", §11 I-1 "namespaces
+// list/get/head (repo/ref levels)" and §11 I-2 "namespaces create/update-properties/drop").
 //
 // Iceberg has no repository or branch level: a namespace is an ordered list of levels and a table
 // is a namespace plus a name. lakeFS addresses a repository and a ref on top of that, so the
@@ -16,6 +17,20 @@ package icebergcatalog
 //	GET  /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}
 //	HEAD /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}
 //	    → the namespace object of §5, with the properties carried by its marker entry
+//
+//	POST   /v1/{prefix}/namespaces
+//	    → stage the marker of a new namespace, with its properties (I2-2)
+//	POST   /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/properties
+//	    → merge an update into the properties of an existing marker (I2-2)
+//	DELETE /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}
+//	    → remove an empty namespace marker (I2-2)
+//
+// The write half of this file is the HTTP and authorization layer of §6.2's staging writes: the
+// store creates and updates the marker (store.go, I2-1), and the lakeFS catalog removes it. This
+// file decides which marker is written or removed and who may do it, keeps the properties merge of
+// the spec, and never assumes a client's precondition (a drop checks the tables under the marker
+// itself). Writes are staged on the branch and become part of the repository on an explicit lakeFS
+// commit, and they are refused on a tag or a commit (Q-I4, enforced by authz.go from I1-6).
 //
 // The macro-level mapping lives in exactly one place, ident.go: ParseNamespace turns the
 // namespace path parameter (or the `parent` query parameter) into an Address whose Repo and Ref
@@ -36,6 +51,15 @@ package icebergcatalog
 //     exactly the §7.2 row "list namespaces under repo.ref";
 //   - get and head are authorized with catalog:GetNamespace on the namespace ARN.
 //
+// The write rules of §7.2 and Q-I4:
+//
+//   - create, update-properties and drop are authorized with
+//     catalog:Create/Update/DeleteNamespace on the namespace ARN, plus fs:ReadRepository and
+//     fs:WriteObject on the reserved _lakefs_iceberg/ area (authz.go, RequiredNode);
+//   - a write must address a branch. A tag or a commit answers 403 ForbiddenException "ref is
+//     read-only", and a ref that resolves to nothing answers 404 NoSuchWarehouseException, the
+//     same answer a read of it gets.
+//
 // Reads work on any ref (branch, tag or commit), which is why the store is asked for the marker
 // on Address.Ref rather than on a branch (§1.1 goal 1). Properties are the user metadata of the
 // `_lakefs_iceberg/ns/<ns>/.namespace` marker entry (§6.1): no second lookup is needed.
@@ -47,8 +71,9 @@ package icebergcatalog
 //
 // Clean-room note: written from ICEBERG_CATALOG_PLAN.md, the Apache Iceberg REST OpenAPI spec
 // (https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml,
-// ListNamespaces / GetNamespace / NamespaceExists) and the public lakeFS documentation only. No
-// code from lakeFS Enterprise or from upstream lakeFS >= 1.87 was used.
+// ListNamespaces / GetNamespace / NamespaceExists / CreateNamespace / UpdateProperties /
+// DropNamespace) and the public lakeFS documentation only. No code from lakeFS Enterprise or from
+// upstream lakeFS >= 1.87 was used.
 
 import (
 	"context"
@@ -56,6 +81,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -72,20 +98,42 @@ const (
 	// different value cannot name this catalog (§14 Q-I3).
 	namespacesPattern = "/v1/{prefix}/namespaces"
 
-	// namespacePattern serves GetNamespace (GET) and NamespaceExists (HEAD) for one namespace.
+	// namespacePattern serves GetNamespace (GET), NamespaceExists (HEAD) and DropNamespace
+	// (DELETE) for one namespace.
 	namespacePattern = "/v1/{prefix}/namespaces/{namespace}"
+
+	// namespacePropertiesPattern serves UpdateProperties (POST), which changes the properties of
+	// one existing namespace.
+	namespacePropertiesPattern = "/v1/{prefix}/namespaces/{namespace}/properties"
 
 	// The wire forms advertised in GET /v1/config once this file's routes are mounted. They
 	// come from the REST OpenAPI spec's operation paths (components.paths) with the catalog's
 	// {prefix} segment; the route table builds the same string so a client can match one against
 	// the other.
-	listNamespacesEndpoint = "GET /v1/{prefix}/namespaces"
-	getNamespaceEndpoint   = "GET /v1/{prefix}/namespaces/{namespace}"
-	headNamespaceEndpoint  = "HEAD /v1/{prefix}/namespaces/{namespace}"
+	listNamespacesEndpoint            = "GET /v1/{prefix}/namespaces"
+	getNamespaceEndpoint              = "GET /v1/{prefix}/namespaces/{namespace}"
+	headNamespaceEndpoint             = "HEAD /v1/{prefix}/namespaces/{namespace}"
+	createNamespaceEndpoint           = "POST /v1/{prefix}/namespaces"
+	updateNamespacePropertiesEndpoint = "POST /v1/{prefix}/namespaces/{namespace}/properties"
+	dropNamespaceEndpoint             = "DELETE /v1/{prefix}/namespaces/{namespace}"
 
 	// ErrTypeNoSuchNamespace is the Iceberg error type of a missing namespace, 404
 	// (components.schemas.NoSuchNamespaceException).
 	ErrTypeNoSuchNamespace = "NoSuchNamespaceException"
+
+	// ErrTypeNamespaceAlreadyExists is the Iceberg error type of a create on a namespace name
+	// that is taken, 409 (§11 I-2; the spec's CreateNamespaceResponse lists
+	// NamespaceAlreadyExistsException as the model of its 409).
+	ErrTypeNamespaceAlreadyExists = "NamespaceAlreadyExistsException"
+
+	// ErrTypeNamespaceNotEmpty is the Iceberg error type of a drop of a namespace that still
+	// holds tables, 409 (components.examples.NamespaceNotEmptyError).
+	ErrTypeNamespaceNotEmpty = "NamespaceNotEmptyException"
+
+	// ErrTypeUnprocessableEntity is the Iceberg error type of a properties request the server
+	// cannot process, 422: a key that appears in both the removals and the updates
+	// (components.examples.UnprocessableEntityDuplicateKey).
+	ErrTypeUnprocessableEntity = "UnprocessableEntityException"
 
 	// namespaceListDelimiter is the listing delimiter used to collapse the marker tree below a
 	// parent namespace into one entry per immediate child namespace: every
@@ -93,17 +141,38 @@ const (
 	// (pkg/catalog/entry_listing_iterator.go), so the child name is the only path component left
 	// after the parent prefix.
 	namespaceListDelimiter = "/"
+
+	// namespaceChildPageSize is the page size of the child-namespace walk of a drop check (§11
+	// I-2). A namespace rarely has more than a handful of children, and the walk still paginates,
+	// so a small page keeps the emptiness check cheap without capping how many children it sees.
+	namespaceChildPageSize = 32
 )
 
-// NamespaceLister is the listing surface the namespace read endpoints need in addition to Store.
-// It is a separate interface rather than more methods on Store because these three calls are
-// lakeFS-level listings (repositories, branches and entries), not catalog state; *catalog.Catalog
-// implements all three. Keeping it explicit means the HTTP layer cannot accidentally use a read
-// path the store does not provide.
+// NamespaceLister is the lakeFS surface the namespace endpoints need in addition to Store. It is a
+// separate interface rather than more methods on Store because these calls are lakeFS-level
+// operations (repository, branch and entry listings, ref resolution and the one entry removal the
+// write half performs), not catalog state; *catalog.Catalog implements all of them. Keeping it
+// explicit means the HTTP layer cannot accidentally use a lakeFS path the store does not provide.
 type NamespaceLister interface {
 	ListRepositories(ctx context.Context, limit int, prefix, searchString, after string, opts ...catalog.ListRepositoriesOptionsFunc) ([]*catalog.Repository, bool, error)
 	ListBranches(ctx context.Context, repositoryID string, prefix string, limit int, after string, opts ...graveler.ListOptionsFunc) ([]*catalog.Branch, bool, error)
 	ListEntries(ctx context.Context, repositoryID string, reference string, prefix string, after string, delimiter string, limit int) ([]*catalog.DBEntry, bool, error)
+
+	// BranchExists reports whether ref names a branch of the repository. A write may only
+	// address a branch (Q-I4), so this is the call that decides whether a write is allowed on
+	// the ref at all.
+	BranchExists(ctx context.Context, repositoryID string, branch string) (bool, error)
+
+	// GetCommit resolves a ref - branch, tag or commit ID - to a commit, or reports that it
+	// resolves to nothing. The write half asks it after BranchExists answered false, so a tag
+	// or a commit is refused as a read-only ref while a ref that exists nowhere is a missing
+	// warehouse (404), exactly as a read of the same ref would answer.
+	GetCommit(ctx context.Context, repositoryID string, reference string) (*catalog.CommitLog, error)
+
+	// DeleteEntry stages the removal of one entry on a branch: dropping a namespace removes its
+	// marker. It is called only after the namespace was read and found empty, and it carries the
+	// caller's SetOptionsFuncs so a protected branch can still refuse it.
+	DeleteEntry(ctx context.Context, repositoryID string, branch string, path string, opts ...graveler.SetOptionsFunc) error
 }
 
 // namespaceService serves the namespace read endpoints of §5. It owns the three things a handler
@@ -157,6 +226,24 @@ func (n *namespaceService) Routes() []route {
 			handler:  n.handleHeadNamespace,
 			endpoint: headNamespaceEndpoint,
 		},
+		{
+			method:   http.MethodPost,
+			pattern:  namespacesPattern,
+			handler:  n.handleCreateNamespace,
+			endpoint: createNamespaceEndpoint,
+		},
+		{
+			method:   http.MethodPost,
+			pattern:  namespacePropertiesPattern,
+			handler:  n.handleUpdateNamespaceProperties,
+			endpoint: updateNamespacePropertiesEndpoint,
+		},
+		{
+			method:   http.MethodDelete,
+			pattern:  namespacePattern,
+			handler:  n.handleDeleteNamespace,
+			endpoint: dropNamespaceEndpoint,
+		},
 	}
 }
 
@@ -175,6 +262,40 @@ type listNamespacesResponse struct {
 type getNamespaceResponse struct {
 	Namespace  Namespace         `json:"namespace"`
 	Properties map[string]string `json:"properties"`
+}
+
+// createNamespaceRequest is CreateNamespaceRequest (spec: components.schemas.CreateNamespaceRequest).
+// Namespace is the full path including the repository and ref levels, in the same shape the
+// listing returns; `namespace` is the only required field of the model.
+type createNamespaceRequest struct {
+	Namespace  []string          `json:"namespace"`
+	Properties map[string]string `json:"properties"`
+}
+
+// createNamespaceResponse is CreateNamespaceResponse (spec: components.schemas.CreateNamespaceResponse):
+// the namespace that was created and the properties the server stored for it, which is exactly what
+// the request asked for because §6.1 stores the properties verbatim as the marker's user metadata.
+type createNamespaceResponse struct {
+	Namespace  Namespace         `json:"namespace"`
+	Properties map[string]string `json:"properties"`
+}
+
+// updateNamespacePropertiesRequest is UpdateNamespacePropertiesRequest
+// (spec: components.schemas.UpdateNamespacePropertiesRequest): the keys to remove and the keys to
+// set. Properties that are in neither list are left untouched.
+type updateNamespacePropertiesRequest struct {
+	Removals []string          `json:"removals"`
+	Updates  map[string]string `json:"updates"`
+}
+
+// updateNamespacePropertiesResponse is UpdateNamespacePropertiesResponse
+// (spec: components.schemas.UpdateNamespacePropertiesResponse). Updated and Removed are required by
+// the model and are therefore always arrays; Missing lists the removals that named a property the
+// namespace did not have, which the spec describes as a partial success and not an error.
+type updateNamespacePropertiesResponse struct {
+	Updated []string `json:"updated"`
+	Removed []string `json:"removed"`
+	Missing []string `json:"missing,omitempty"`
 }
 
 // handleListNamespaces is GET /v1/{prefix}/namespaces: the three levels of the namespace tree of
@@ -241,7 +362,7 @@ func (n *namespaceService) handleListNamespaces(w http.ResponseWriter, r *http.R
 // properties of its marker entry (§6.1). The marker is read on Address.Ref, so the same request
 // answers on a branch, a tag and a commit.
 func (n *namespaceService) handleGetNamespace(w http.ResponseWriter, r *http.Request) {
-	addr, _, ok := n.authorizeGetNamespace(w, r)
+	addr, ok := n.authorizeGetNamespace(w, r)
 	if !ok {
 		return
 	}
@@ -264,7 +385,7 @@ func (n *namespaceService) handleGetNamespace(w http.ResponseWriter, r *http.Req
 // spec answers 204 with no body on success and 404 when the namespace is absent; the existence
 // check is the same authorized marker read as GET, so HEAD cannot reveal a namespace GET hides.
 func (n *namespaceService) handleHeadNamespace(w http.ResponseWriter, r *http.Request) {
-	addr, _, ok := n.authorizeGetNamespace(w, r)
+	addr, ok := n.authorizeGetNamespace(w, r)
 	if !ok {
 		return
 	}
@@ -278,31 +399,444 @@ func (n *namespaceService) handleHeadNamespace(w http.ResponseWriter, r *http.Re
 // authorizeGetNamespace parses and authorizes the namespace path parameter for GET and HEAD,
 // writing the error itself when either step fails. The two verbs share it so they cannot diverge
 // on what they accept or who may ask.
-func (n *namespaceService) authorizeGetNamespace(w http.ResponseWriter, r *http.Request) (Address, Caller, bool) {
+func (n *namespaceService) authorizeGetNamespace(w http.ResponseWriter, r *http.Request) (Address, bool) {
 	if !n.checkPrefix(w, r) {
-		return Address{}, Caller{}, false
+		return Address{}, false
 	}
-	addr, err := ParseNamespace(chi.URLParam(r, "namespace"))
-	if err != nil {
-		n.writeError(w, err)
-		return Address{}, Caller{}, false
-	}
-	if addr.Ref == "" || len(addr.Namespace) == 0 {
-		// GET/HEAD address a namespace, not the repository or the branch level: a namespace
-		// object only exists where a marker entry can exist (§6.1).
-		n.writeError(w, fmt.Errorf("%w: a namespace address needs a repository, a ref and at least one namespace level",
-			ErrInvalidIdentifier))
-		return Address{}, Caller{}, false
+	addr, ok := n.namespaceTarget(w, r)
+	if !ok {
+		return Address{}, false
 	}
 	caller, ok := n.caller(w, r)
 	if !ok {
-		return Address{}, Caller{}, false
+		return Address{}, false
 	}
 	if err := n.authz.Authorize(r.Context(), caller, Request{Op: OpGetNamespace, Address: addr}); err != nil {
 		n.writeError(w, err)
-		return Address{}, Caller{}, false
+		return Address{}, false
 	}
-	return addr, caller, true
+	return addr, true
+}
+
+// namespaceTarget parses the {namespace} path parameter of a get, head, properties or delete
+// request and requires it to name a namespace: a repository, a ref and at least one namespace
+// level. The repository and the ref macro levels are never writable or readable as namespaces
+// themselves, because no marker entry can exist for them (§6.1).
+func (n *namespaceService) namespaceTarget(w http.ResponseWriter, r *http.Request) (Address, bool) {
+	addr, err := ParseNamespace(chi.URLParam(r, "namespace"))
+	if err != nil {
+		n.writeError(w, err)
+		return Address{}, false
+	}
+	if addr.Ref == "" || len(addr.Namespace) == 0 {
+		// GET/HEAD/DELETE/properties address a namespace, not the repository or the branch
+		// level: a namespace object only exists where a marker entry can exist (§6.1).
+		n.writeError(w, fmt.Errorf("%w: a namespace address needs a repository, a ref and at least one namespace level",
+			ErrInvalidIdentifier))
+		return Address{}, false
+	}
+	return addr, true
+}
+
+// handleCreateNamespace is POST /v1/{prefix}/namespaces: it stages a marker entry for a new
+// namespace, carrying the request's properties as the marker's user metadata (§6.1), and answers
+// 200 with the namespace it created (spec: CreateNamespaceResponse).
+//
+// The create is a create on an absent value in the store (§6.2, I2-1), so a name that is already
+// taken - in the staging area or in the committed data - is a conflict and not an overwrite: it is
+// answered 409 NamespaceAlreadyExistsException, and the existing marker keeps its properties.
+//
+// The address of a create comes from the request body, so the body is decoded before the
+// authorization decision. That is the one place where the catalog cannot authorize first: the
+// repository and the ref the caller must be allowed to write only exist in the body. The
+// middleware still rejected an unauthenticated caller long before this handler ran (§7.1), and a
+// caller without a grant learns nothing but the shape of its own request.
+func (n *namespaceService) handleCreateNamespace(w http.ResponseWriter, r *http.Request) {
+	if !n.checkPrefix(w, r) {
+		return
+	}
+	var body createNamespaceRequest
+	if !decodeJSONBody(w, r, &body) {
+		return
+	}
+	addr, err := namespaceAddressFromLevels(body.Namespace)
+	if err != nil {
+		n.writeError(w, err)
+		return
+	}
+	if err := validateProperties(body.Properties); err != nil {
+		n.writeError(w, err)
+		return
+	}
+	if !n.authorizeWrite(w, r, OpCreateNamespace, addr) {
+		return
+	}
+	if err := n.store.CreateNamespace(r.Context(), addr, body.Properties); err != nil {
+		n.writeError(w, err)
+		return
+	}
+	properties := body.Properties
+	if properties == nil {
+		// An omitted properties object is a namespace without properties, which is still a
+		// namespace: the response model defaults it to {}, so the client gets an object and not
+		// a null it would have to check.
+		properties = map[string]string{}
+	}
+	writeJSON(w, http.StatusOK, createNamespaceResponse{
+		Namespace:  fullNamespace(addr, ""),
+		Properties: properties,
+	})
+}
+
+// handleUpdateNamespaceProperties is POST /v1/{prefix}/namespaces/{namespace}/properties: it sets
+// and removes properties of an existing namespace, leaving every property it was not asked about
+// alone (spec: UpdateProperties).
+//
+// The merge is a read-modify-write over the marker's user metadata, which is the whole state of a
+// namespace (§6.1). It is done here rather than in the store because only the handler knows what to
+// report back: the updated keys, the removed keys and the removals that named a property the
+// namespace did not have (the spec's "missing", a partial success). A namespace that does not exist
+// is 404 NoSuchNamespaceException, and the store's update requires the marker to exist so a
+// properties update cannot resurrect a dropped namespace.
+func (n *namespaceService) handleUpdateNamespaceProperties(w http.ResponseWriter, r *http.Request) {
+	if !n.checkPrefix(w, r) {
+		return
+	}
+	addr, ok := n.namespaceTarget(w, r)
+	if !ok {
+		return
+	}
+	// Authorize before the body is decoded: the address is entirely in the path, so the caller's
+	// grant (and the Q-I4 branch rule) can be decided without touching the request body.
+	if !n.authorizeWrite(w, r, OpUpdateNamespace, addr) {
+		return
+	}
+	var body updateNamespacePropertiesRequest
+	if !decodeJSONBody(w, r, &body) {
+		return
+	}
+	if err := validateProperties(body.Updates); err != nil {
+		n.writeError(w, err)
+		return
+	}
+	if err := validatePropertyRemovals(body.Removals); err != nil {
+		n.writeError(w, err)
+		return
+	}
+	for _, key := range body.Removals {
+		if _, both := body.Updates[key]; both {
+			// The spec answers 422 for a key that appears in two fields that must be disjoint
+			// (components.examples.UnprocessableEntityDuplicateKey).
+			writeIcebergError(w, http.StatusUnprocessableEntity, ErrTypeUnprocessableEntity,
+				fmt.Sprintf("property %q appears in both removals and updates", key))
+			return
+		}
+	}
+
+	marker, err := n.store.GetNamespace(r.Context(), addr)
+	if err != nil {
+		n.writeError(w, err)
+		return
+	}
+	merged := marker.Properties
+	if merged == nil {
+		merged = make(map[string]string, len(body.Updates))
+	}
+	updated := make([]string, 0, len(body.Updates))
+	for key, value := range body.Updates {
+		merged[key] = value
+		updated = append(updated, key)
+	}
+	removed := make([]string, 0, len(body.Removals))
+	missing := make([]string, 0)
+	for _, key := range body.Removals {
+		if _, exists := merged[key]; !exists {
+			missing = append(missing, key)
+			continue
+		}
+		delete(merged, key)
+		removed = append(removed, key)
+	}
+	// The lists are reported in a stable order, so a client (and a test) can compare them.
+	sort.Strings(updated)
+	sort.Strings(removed)
+	sort.Strings(missing)
+
+	if err := n.store.UpdateNamespace(r.Context(), addr, merged); err != nil {
+		n.writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updateNamespacePropertiesResponse{
+		Updated: updated,
+		Removed: removed,
+		Missing: missing,
+	})
+}
+
+// handleDeleteNamespace is DELETE /v1/{prefix}/namespaces/{namespace}: it removes the marker of an
+// empty namespace and answers 204 with no body (spec: DropNamespace).
+//
+// The client's "must be empty" precondition is not taken on trust: the catalog lists what is below
+// the marker itself (§11 I-2). A namespace is not empty when a table pointer exists anywhere under
+// "tables/<ns>/" - including the tables of a descendant namespace, because that key prefix is a
+// prefix of theirs - or when a child namespace marker exists below "ns/<ns>/". Either case is 409
+// NamespaceNotEmptyException. A namespace that does not exist at all is 404
+// NoSuchNamespaceException.
+func (n *namespaceService) handleDeleteNamespace(w http.ResponseWriter, r *http.Request) {
+	if !n.checkPrefix(w, r) {
+		return
+	}
+	addr, ok := n.namespaceTarget(w, r)
+	if !ok {
+		return
+	}
+	if !n.authorizeWrite(w, r, OpDeleteNamespace, addr) {
+		return
+	}
+	ctx := r.Context()
+	if _, err := n.store.GetNamespace(ctx, addr); err != nil {
+		n.writeError(w, err)
+		return
+	}
+	empty, err := n.namespaceIsEmpty(ctx, addr)
+	if err != nil {
+		n.writeError(w, err)
+		return
+	}
+	if !empty {
+		n.writeError(w, &NamespaceNotEmptyException{Repo: addr.Repo, Ref: addr.Ref, Namespace: addr.Namespace})
+		return
+	}
+	markerPath, err := namespaceMarkerPath(addr.Namespace)
+	if err != nil {
+		n.writeError(w, err)
+		return
+	}
+	if err := n.lister.DeleteEntry(ctx, addr.Repo, addr.Ref, markerPath); err != nil {
+		if errors.Is(err, graveler.ErrNotFound) {
+			// The marker was removed by another writer between the read and the delete: the
+			// answer is the 404 a client that asks twice should see.
+			err = &NoSuchNamespaceException{Repo: addr.Repo, Ref: addr.Ref, Namespace: addr.Namespace}
+		}
+		n.writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// refKind is what a write resolved its ref to. A write needs a branch (Q-I4): a tag or a commit
+// is readable but not writable, and a ref that resolves to nothing means the warehouse the client
+// named does not exist.
+type refKind int
+
+const (
+	// refMissing is a ref that resolves to no branch, tag or commit. It is a missing warehouse
+	// (404), never an empty listing and never a read-only ref.
+	refMissing refKind = iota
+	// refBranch is a branch: the only ref a write may address.
+	refBranch
+	// refReadOnly is a tag or a commit: readable on any ref, never writable (Q-I4).
+	refReadOnly
+)
+
+// refKind resolves ref of repo to a branch, a read-only ref (tag or commit) or nothing.
+//
+// BranchExists cannot answer for a ref that is not a valid branch name - a tag may carry a dot or
+// a character a branch name forbids - so that answer is treated as "not a branch" and GetCommit,
+// which dereferences any ref, decides whether the ref exists at all. A repository that does not
+// exist is a missing ref: the write answers NoSuchWarehouseException, like a read of the same
+// address.
+func (n *namespaceService) refKind(ctx context.Context, repo, ref string) (refKind, error) {
+	isBranch, err := n.lister.BranchExists(ctx, repo, ref)
+	switch {
+	case err == nil && isBranch:
+		return refBranch, nil
+	case err != nil && !errors.Is(err, graveler.ErrInvalidBranchID) && !isMissingWarehouse(err):
+		return refMissing, err
+	}
+	if _, err := n.lister.GetCommit(ctx, repo, ref); err != nil {
+		if isMissingWarehouse(err) {
+			return refMissing, nil
+		}
+		return refMissing, err
+	}
+	return refReadOnly, nil
+}
+
+// authorizeWrite authorizes one namespace write on addr, including the Q-I4 rule that the ref must
+// be a branch.
+//
+// The ref is resolved first only so the decision can be made with the right RefIsBranch value; the
+// permission check inside Authorize still runs first, so a caller without a grant learns nothing
+// about the ref it named - not whether it exists, not whether it is a branch. A ref that resolves
+// to nothing is turned into NoSuchWarehouseException after the permission check has passed: a
+// missing ref is not a read-only ref, and a client that named a repository or a branch that does
+// not exist should get the same 404 a read would.
+func (n *namespaceService) authorizeWrite(w http.ResponseWriter, r *http.Request, op Operation, addr Address) bool {
+	caller, ok := n.caller(w, r)
+	if !ok {
+		return false
+	}
+	kind, err := n.refKind(r.Context(), addr.Repo, addr.Ref)
+	if err != nil {
+		n.writeError(w, err)
+		return false
+	}
+	err = n.authz.Authorize(r.Context(), caller, Request{Op: op, Address: addr, RefIsBranch: kind == refBranch})
+	if err != nil {
+		var readOnly *ReadOnlyRefError
+		if kind == refMissing && errors.As(err, &readOnly) {
+			// Only the ref rule objected: the caller may write, but the ref does not exist.
+			n.writeError(w, &NoSuchWarehouseException{Repo: addr.Repo, Ref: addr.Ref})
+			return false
+		}
+		n.writeError(w, err)
+		return false
+	}
+	return true
+}
+
+// namespaceAddressFromLevels turns the `namespace` array of a create request into a catalog
+// Address: the first two levels are the repository and the ref (§5, "Levels 1 and 2 are always
+// repo and ref") and every level after them is a real namespace level.
+//
+// The levels are validated with the same rules as a path parameter (ident.go), so a body cannot
+// name a repository, a ref or a namespace level that the /v1/{prefix}/namespaces/{namespace} form
+// could not, and it cannot address the repository or repository.ref level itself: a create needs at
+// least one namespace level, because a marker only exists for a real namespace (§6.1).
+func namespaceAddressFromLevels(levels []string) (Address, error) {
+	if err := validateLevelShape(levels); err != nil {
+		return Address{}, err
+	}
+	if len(levels) < macroLevels+1 {
+		return Address{}, fmt.Errorf("%w: namespace %q must name a repository, a ref and at least one namespace level",
+			ErrInvalidIdentifier, Namespace(levels).String())
+	}
+	addr := Address{Repo: levels[0], Ref: levels[1], Namespace: Namespace(levels[macroLevels:])}
+	if err := validateRepo(addr.Repo); err != nil {
+		return Address{}, err
+	}
+	if err := validateRef(addr.Ref); err != nil {
+		return Address{}, err
+	}
+	if err := validateNamespace(addr.Namespace); err != nil {
+		return Address{}, err
+	}
+	return addr, nil
+}
+
+// validateProperties rejects a property set the marker cannot carry: §6.1 stores the properties as
+// the entry user metadata, and a user-metadata key must not be empty. It is a 400, not a 500: the
+// request is malformed, the server is fine.
+func validateProperties(properties map[string]string) error {
+	for key := range properties {
+		if key == "" {
+			return fmt.Errorf("%w: a namespace property has an empty name", ErrInvalidIdentifier)
+		}
+	}
+	return nil
+}
+
+// validatePropertyRemovals applies the same rule to the removals list of a properties update.
+func validatePropertyRemovals(removals []string) error {
+	for _, key := range removals {
+		if key == "" {
+			return fmt.Errorf("%w: a namespace property has an empty name", ErrInvalidIdentifier)
+		}
+	}
+	return nil
+}
+
+// namespaceIsEmpty reports whether the namespace holds no tables and no child namespace, i.e.
+// whether dropping it loses nothing. The checks look under the marker in the layout of §6.1:
+//
+//   - any entry under `_lakefs_iceberg/tables/<ns>/` is a table of this namespace or of a
+//     descendant namespace (a table pointer of a child namespace is below the same prefix), so
+//     the namespace is not empty;
+//   - any common-prefix entry under `_lakefs_iceberg/ns/<ns>/` is a child namespace marker.
+//     The namespace's own `_lakefs_iceberg/ns/<ns>/.namespace` marker is not a common prefix and
+//     is therefore not mistaken for a child.
+func (n *namespaceService) namespaceIsEmpty(ctx context.Context, addr Address) (bool, error) {
+	hasTables, err := n.anyEntry(ctx, addr, tableEntriesPrefix(addr.Namespace))
+	if err != nil {
+		return false, err
+	}
+	if hasTables {
+		return false, nil
+	}
+	hasChild, err := n.hasChildNamespace(ctx, addr)
+	if err != nil {
+		return false, err
+	}
+	return !hasChild, nil
+}
+
+// anyEntry reports whether any entry at all exists below prefix on addr.Ref.
+func (n *namespaceService) anyEntry(ctx context.Context, addr Address, prefix string) (bool, error) {
+	entries, hasMore, err := n.lister.ListEntries(ctx, addr.Repo, addr.Ref, prefix, "",
+		namespaceListDelimiter, 1)
+	if err != nil {
+		return false, err
+	}
+	return len(entries) > 0 || hasMore, nil
+}
+
+// hasChildNamespace reports whether a child namespace marker exists below the namespace. It walks
+// the delimiter listing in pages, because the namespace's own marker is an ordinary entry of that
+// listing and may share a page with a child prefix.
+func (n *namespaceService) hasChildNamespace(ctx context.Context, addr Address) (bool, error) {
+	prefix := namespaceEntryPrefix(addr.Namespace)
+	after := ""
+	for {
+		entries, hasMore, err := n.lister.ListEntries(ctx, addr.Repo, addr.Ref, prefix, after,
+			namespaceListDelimiter, namespaceChildPageSize)
+		if err != nil {
+			return false, err
+		}
+		for _, entry := range entries {
+			if entry.CommonLevel {
+				return true, nil
+			}
+		}
+		if !hasMore || len(entries) == 0 {
+			return false, nil
+		}
+		after = entries[len(entries)-1].Path
+	}
+}
+
+// tableEntriesPrefix is the reserved key prefix of the tables of a namespace and of its descendants
+// (§6.1): `_lakefs_iceberg/tables/<ns levels…>/`.
+func tableEntriesPrefix(namespace Namespace) string {
+	return ReservedPrefix + "/" + TablesDirectory + "/" + strings.Join(namespace, "/") + "/"
+}
+
+// NoSuchWarehouseException is the 404 of a write that names a repository or a ref that does not
+// exist. Reads answer the underlying lakeFS error (isMissingWarehouse); a write has to resolve the
+// ref before it can decide whether it is a branch, so it rebuilds the same answer from a kind it
+// resolved to nothing.
+type NoSuchWarehouseException struct {
+	Repo string
+	Ref  string
+}
+
+// Error implements error. It names the repository and the ref, which the caller named itself.
+func (e *NoSuchWarehouseException) Error() string {
+	return fmt.Sprintf("no such repository %q or ref %q", e.Repo, e.Ref)
+}
+
+// NamespaceNotEmptyException is the 409 of a drop of a namespace that still holds tables or child
+// namespaces (spec: components.examples.NamespaceNotEmptyError).
+type NamespaceNotEmptyException struct {
+	Repo      string
+	Ref       string
+	Namespace Namespace
+}
+
+// Error implements error.
+func (e *NamespaceNotEmptyException) Error() string {
+	return fmt.Sprintf("namespace %q in %s@%s is not empty: it still holds tables or child namespaces",
+		e.Namespace.Dotted(), e.Repo, e.Ref)
 }
 
 // listRepositories is the root level of §5: "GET namespaces with no parent lists repositories the
@@ -531,15 +1065,17 @@ func (n *namespaceService) caller(w http.ResponseWriter, r *http.Request) (Calle
 
 // writeError maps the typed errors of this package onto the catalog envelope and the statuses of
 // §2.1. A refusal is 403 ForbiddenException; a missing repository or ref on a listing is 404
-// NoSuchWarehouseException; a missing marker is 404 NoSuchNamespaceException; a malformed
-// identifier or page token is 400; anything undecided or unexpected is 500 with no detail, never a
-// permission (§12).
+// NoSuchWarehouseException; a missing marker is 404 NoSuchNamespaceException; a create on a taken
+// name and a drop of a non-empty namespace are 409; a malformed identifier or page token is 400;
+// anything undecided or unexpected is 500 with no detail, never a permission (§12).
 func (n *namespaceService) writeError(w http.ResponseWriter, err error) {
 	var (
 		denied       *PermissionDeniedError
 		readOnly     *ReadOnlyRefError
 		authzFailure *AuthorizationError
 		noNamespace  *NoSuchNamespaceException
+		noWarehouse  *NoSuchWarehouseException
+		notEmpty     *NamespaceNotEmptyException
 	)
 	switch {
 	case errors.Is(err, ErrInvalidIdentifier):
@@ -553,6 +1089,13 @@ func (n *namespaceService) writeError(w http.ResponseWriter, err error) {
 			"the authorization decision failed")
 	case errors.As(err, &noNamespace):
 		writeIcebergError(w, http.StatusNotFound, ErrTypeNoSuchNamespace, noNamespace.Error())
+	case errors.As(err, &noWarehouse):
+		writeIcebergError(w, http.StatusNotFound, ErrTypeNoSuchWarehouse, noWarehouse.Error())
+	case errors.As(err, &notEmpty):
+		writeIcebergError(w, http.StatusConflict, ErrTypeNamespaceNotEmpty, notEmpty.Error())
+	case errors.Is(err, ErrAlreadyExists):
+		// The store's create found an existing marker: the name is taken (I2-1).
+		writeIcebergError(w, http.StatusConflict, ErrTypeNamespaceAlreadyExists, err.Error())
 	case isMissingWarehouse(err):
 		writeIcebergError(w, http.StatusNotFound, ErrTypeNoSuchWarehouse,
 			"the repository or ref named by the request does not exist")

@@ -109,7 +109,22 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 	if err != nil {
 		return err
 	}
-	handler, err := NewRouter(authMiddleware, cfg)
+
+	// The operations of §2.1 that need the server's catalog, block adapter and auth service are
+	// contributed by a service of their own (namespaces.go is the first; the tables service of
+	// I2-4 is the next). Their endpoint strings reach GET /v1/config through the route table, so
+	// the catalog cannot advertise an operation it does not mount.
+	//
+	// A builder that was handed no catalog or block adapter (a unit test's minimal ServerDeps)
+	// mounts GET /v1/config only, and then advertises nothing but itself: advertisedEndpoints is
+	// derived from the mounted routes, so an empty endpoint list is the true statement that this
+	// router serves no catalog operation. The lakefs-sso binary always supplies both.
+	var services []routeSource
+	if deps.Catalog != nil && deps.BlockAdapter != nil && deps.AuthService != nil {
+		store := NewStore(deps.Catalog, deps.BlockAdapter)
+		services = append(services, NewNamespaceService(store, NewAuthorizer(deps.AuthService), deps.Catalog, cfg))
+	}
+	handler, err := NewRouter(authMiddleware, cfg, services...)
 	if err != nil {
 		return err
 	}
@@ -161,7 +176,9 @@ func DisabledHandler() http.Handler {
 
 // NewRouter builds the catalog sub-router. It is mounted at APIBasePath (and, with a warehouse
 // segment in between, at RelativeToBasePath) by RoutesBuilder, so its routes are relative to
-// that mount point.
+// that mount point. services are the operation tables of the catalog's own services (namespaces
+// today; tables in I2-4): every operation they carry is mounted and, through the route table,
+// advertised in GET /v1/config.
 //
 // The middleware stack is ordered the way §12 and I1-3 require, and the order is not
 // interchangeable:
@@ -183,8 +200,8 @@ func DisabledHandler() http.Handler {
 // authMiddleware is a parameter (rather than built here) so the router can be exercised without
 // a full auth service; a nil middleware leaves only the authenticated-user requirement, so every
 // route answers 401.
-func NewRouter(authMiddleware func(http.Handler) http.Handler, cfg *Config) (http.Handler, error) {
-	return newRouter(authMiddleware, cfg, newServer(cfg))
+func NewRouter(authMiddleware func(http.Handler) http.Handler, cfg *Config, services ...routeSource) (http.Handler, error) {
+	return newRouter(authMiddleware, cfg, newServer(cfg, services...))
 }
 
 // newRouter is NewRouter with the catalog surface injected, so a test can put an operation that
@@ -318,6 +335,13 @@ type CatalogConfig struct {
 	Endpoints []string          `json:"endpoints"`
 }
 
+// routeSource is a catalog service that contributes operations to the route table: every route it
+// returns is mounted on the catalog router and, when it carries a wire form, advertised in
+// GET /v1/config. The namespace service (namespaces.go) is the first implementation.
+type routeSource interface {
+	Routes() []route
+}
+
 // route is one catalog operation: the chi route that serves it, and the wire form the catalog
 // advertises for it in GET /v1/config.
 type route struct {
@@ -334,17 +358,21 @@ type route struct {
 // list those routes advertise. (It is not named after the catalog because pkg/catalog, which
 // store.go reads through, is imported as `catalog` in this package.)
 type server struct {
-	cfg    *Config
+	cfg *Config
+	// routes is the whole route table: the catalog's own operations followed by the route tables
+	// of its services.
 	routes []route
+	// services are the operation tables this catalog mounts in addition to GET /v1/config.
+	services []routeSource
 	// endpoints is the explicit list GET /v1/config returns, derived from routes so that it
 	// cannot promise an operation the router does not serve (§2.1).
 	endpoints []string
 }
 
 // newServer builds the catalog's HTTP surface and derives its endpoint list from its own route
-// table.
-func newServer(cfg *Config) *server {
-	s := &server{cfg: cfg}
+// table. A server without services is a catalog that serves GET /v1/config only.
+func newServer(cfg *Config, services ...routeSource) *server {
+	s := &server{cfg: cfg, services: services}
 	s.routes = s.ownRoutes()
 	s.endpoints = advertisedEndpoints(s.routes)
 	return s
@@ -353,12 +381,17 @@ func newServer(cfg *Config) *server {
 // ownRoutes is the catalog's route table and with it the compatibility contract of §2.1.
 //
 // An operation is added here - and so both mounted and advertised - only when it is implemented
-// and its test passes. The read path arrives in this order: namespaces (I1-8), tables (I1-9),
-// relative_to (I1-10, which reuses these routes), then the write path of I-2.
+// and its test passes. GET /v1/config is the catalog's own operation; everything else arrives with
+// a service that contributes its Routes(), so the endpoint list is exactly what the router serves.
+// The read path arrives in this order: namespaces (I1-8), tables (I1-9), relative_to (I1-10, which
+// reuses these routes), then the write path of I-2 (namespaces here, tables in I2-4).
 func (s *server) ownRoutes() []route {
-	return []route{
-		{method: http.MethodGet, pattern: configPath, handler: s.handleConfig},
+	routes := make([]route, 0, 1+len(s.services))
+	routes = append(routes, route{method: http.MethodGet, pattern: configPath, handler: s.handleConfig})
+	for _, service := range s.services {
+		routes = append(routes, service.Routes()...)
 	}
+	return routes
 }
 
 // advertisedEndpoints is the endpoints list of GET /v1/config: every route that carries a wire

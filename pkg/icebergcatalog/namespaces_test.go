@@ -22,7 +22,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/model"
+	"github.com/treeverse/lakefs/pkg/catalog"
+	"github.com/treeverse/lakefs/pkg/kv"
+	"github.com/treeverse/lakefs/pkg/kv/kvparams"
 	"github.com/treeverse/lakefs/pkg/permissions"
+	"github.com/treeverse/lakefs/pkg/upload"
 )
 
 const (
@@ -101,7 +105,8 @@ func namespacesAllRepositoriesStatements() model.Statements {
 // the branch-level listing has two branches while only one carries catalog state.
 func newNamespacesFixture(t *testing.T) *namespacesFixture {
 	t.Helper()
-	base := newStoreFixture(t)
+	cat := newNamespacesCatalog(t)
+	base := &storeFixture{ctx: t.Context(), catalog: cat, store: NewStore(cat, cat.BlockAdapter)}
 	ctx := base.ctx
 
 	_, err := base.catalog.CreateRepository(ctx, nsTestRepo, "", "mem://iceberg-namespaces-ns", nsTestRef, false)
@@ -130,6 +135,33 @@ func newNamespacesFixture(t *testing.T) *namespacesFixture {
 	_, err = base.catalog.CreateTag(ctx, nsTestRepo, nsTestTag, ref)
 	require.NoError(t, err, "create tag %s", nsTestTag)
 	return f
+}
+
+// newNamespacesCatalog builds the fixture's catalog with a local cache directory of its own.
+//
+// The package's shared fixture (store_test.go) uses the configured cache directory, which by
+// default lives outside any temporary directory, so consecutive runs of the package can meet each
+// other's cached meta-ranges and fail inside a commit with "no such file" on a workspace file -
+// the store tests hit the same problem when they are run shuffled. A per-test directory makes the
+// namespace tests hermetic; it changes nothing about what they assert.
+func newNamespacesCatalog(t *testing.T) *catalog.Catalog {
+	t.Helper()
+	ctx := t.Context()
+	kvStore, err := kv.Open(ctx, kvparams.Config{Type: "mem"})
+	require.NoError(t, err, "open mem KV store")
+	t.Cleanup(kvStore.Close)
+
+	cfg := storeTestConfig(t)
+	cfg.Committed.LocalCache.Dir = t.TempDir()
+
+	cat, err := catalog.New(ctx, catalog.Config{
+		Config:       cfg,
+		KVStore:      kvStore,
+		PathProvider: upload.DefaultPathProvider,
+	})
+	require.NoError(t, err, "build catalog")
+	t.Cleanup(func() { _ = cat.Close() })
+	return cat
 }
 
 // createNamespace stages a marker on main through the store's own create path.
@@ -359,4 +391,411 @@ func TestNamespacesRead(t *testing.T) {
 			url.Values{"pageSize": {"one"}}), "alice")
 		requireEnvelope(t, size, http.StatusBadRequest, ErrTypeBadRequest)
 	})
+}
+
+// Tests for the namespace write endpoints of I2-2 (ICEBERG_CATALOG_PLAN.md §6.1 "Layout on the
+// branch", §7.2 "Authorization" and §11 I-2 "namespaces create/update-properties/drop"). Every
+// test name starts with TestNamespacesWrite so that the task's validation command,
+// `go test -run TestNamespacesWrite ./pkg/icebergcatalog/`, runs exactly this file's write half.
+//
+// The fixture is the read fixture of this file: the real catalog store on an in-memory KV store,
+// the ACL auth service, the production middleware stack and the router a client talks to. The
+// namespace markers are written by the endpoints themselves, and the table pointer a drop has to
+// find is staged through the store's own create path (I2-1), so "a namespace that still holds
+// tables" is the state the catalog (not the client) has to detect.
+
+const (
+	// nsWriteCreateTarget is POST /v1/{prefix}/namespaces, the create endpoint.
+	nsWriteCreateTarget = "/v1/" + CatalogPrefix + "/namespaces"
+)
+
+// writeRequest sends one catalog write as user, with an optional JSON body.
+func (f *namespacesFixture) writeRequest(t *testing.T, method, target, user, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	if body != "" {
+		req.Header.Set("Content-Type", contentTypeJSON)
+	}
+	req.Header.Set("X-Test-User", user)
+	rec := httptest.NewRecorder()
+	f.router.ServeHTTP(rec, req)
+	return rec
+}
+
+// namespacePropertiesTarget is the properties URL of one namespace address.
+func namespacePropertiesTarget(levels ...string) string {
+	return namespacesTarget(levels...) + "/properties"
+}
+
+// jsonBody marshals a request body.
+func jsonBody(t *testing.T, body any) string {
+	t.Helper()
+	encoded, err := json.Marshal(body)
+	require.NoError(t, err)
+	return string(encoded)
+}
+
+// decodeCreateNamespace asserts a successful create and decodes it.
+func decodeCreateNamespace(t *testing.T, rec *httptest.ResponseRecorder) createNamespaceResponse {
+	t.Helper()
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	var response createNamespaceResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response), "body: %s", rec.Body.String())
+	return response
+}
+
+// decodeUpdateNamespaceProperties asserts a successful properties update and decodes it.
+func decodeUpdateNamespaceProperties(t *testing.T, rec *httptest.ResponseRecorder) updateNamespacePropertiesResponse {
+	t.Helper()
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	var response updateNamespacePropertiesResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response), "body: %s", rec.Body.String())
+	return response
+}
+
+// requireForbiddenReadOnly asserts the Q-I4 refusal: 403 ForbiddenException whose message is
+// exactly "ref is read-only", the message the plan fixes for a write on a tag or a commit.
+func requireForbiddenReadOnly(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	apiError := requireEnvelope(t, rec, http.StatusForbidden, ErrTypeForbidden)
+	require.Equal(t, ErrRefReadOnly.Error(), apiError.Message)
+}
+
+// writeFixture is the read fixture (which already carries a committed inventory/books/authors/other
+// tree and a tag) plus the write half of the §7.2 policy: the catalog write actions and
+// fs:WriteObject on the reserved _lakefs_iceberg/ area. Without them every write endpoint would
+// answer 403, which is the read fixture's whole point.
+func writeFixture(t *testing.T) *namespacesFixture {
+	t.Helper()
+	f := newNamespacesFixture(t)
+	f.authz.attachStatements(t, "write-grants", "alice", append(
+		authzWriteStatements(),
+		model.Statement{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{permissions.ListRepositoriesAction},
+			Resource: permissions.All,
+		},
+	))
+	// dana may write on every repository, so a missing repository is reached by the lookup
+	// instead of being refused at the authorization gate.
+	f.authz.attachStatements(t, "write-all-repositories", "dana", append(
+		namespacesAllRepositoriesStatements(),
+		model.Statement{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{permissions.WriteObjectAction},
+			Resource: permissions.All,
+		},
+	))
+	return f
+}
+
+// TestNamespacesWrite covers create, update-properties and drop, the statuses of §11 I-2 and the
+// endpoint list GET /v1/config advertises once they are mounted.
+//
+// The subtests share one fixture - and so one catalog instance - on purpose: each fixture builds a
+// catalog with its own local pyramid cache over the same cache root, and a run that builds many
+// catalogs in one process can lose a meta range to the cache's eviction (the store tests hit the
+// same thing when they are run shuffled). Sharing the fixture keeps one catalog alive for the
+// whole file. The subtests are independent in what they assert: each works on namespaces the
+// others do not use, except that the update-properties subtests build on each other in order.
+func TestNamespacesWrite(t *testing.T) {
+	f := writeFixture(t)
+	t.Run("create", func(t *testing.T) { testNamespacesWriteCreate(t, f) })
+	t.Run("update properties", func(t *testing.T) { testNamespacesWriteUpdateProperties(t, f) })
+	t.Run("drop", func(t *testing.T) { testNamespacesWriteDrop(t, f) })
+	t.Run("advertised endpoints", func(t *testing.T) { testNamespacesWriteAdvertisedEndpoints(t, f) })
+}
+
+func testNamespacesWriteCreate(t *testing.T, f *namespacesFixture) {
+
+	t.Run("create stages the namespace and its properties", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodPost, nsWriteCreateTarget, "alice", jsonBody(t, createNamespaceRequest{
+			Namespace:  []string{nsTestRepo, nsTestRef, "sales"},
+			Properties: map[string]string{"owner": "sales-team"},
+		}))
+		response := decodeCreateNamespace(t, rec)
+		require.Equal(t, Namespace{nsTestRepo, nsTestRef, "sales"}, response.Namespace)
+		require.Equal(t, map[string]string{"owner": "sales-team"}, response.Properties)
+
+		// The marker is readable immediately: a catalog write is staged on the branch (§6.2).
+		get := decodeGetNamespace(t, f.request(t, http.MethodGet,
+			namespacesTarget(nsTestRepo, nsTestRef, "sales"), "alice"))
+		require.Equal(t, map[string]string{"owner": "sales-team"}, get.Properties)
+
+		head := f.request(t, http.MethodHead,
+			namespacesTarget(nsTestRepo, nsTestRef, "sales"), "alice")
+		require.Equal(t, http.StatusNoContent, head.Code, "body: %s", head.Body.String())
+
+		// ...and not committed: the tag over the previous commit does not see it. Staging, not
+		// auto-commit, is the documented behaviour (§6.2 "why stage instead of auto-commit").
+		tag := f.request(t, http.MethodGet,
+			namespacesTarget(nsTestRepo, nsTestTag, "sales"), "alice")
+		requireEnvelope(t, tag, http.StatusNotFound, ErrTypeNoSuchNamespace)
+	})
+
+	t.Run("create without properties answers an empty property object", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodPost, nsWriteCreateTarget, "alice", jsonBody(t, createNamespaceRequest{
+			Namespace: []string{nsTestRepo, nsTestRef, "no-properties"},
+		}))
+		response := decodeCreateNamespace(t, rec)
+		require.NotNil(t, response.Properties)
+		require.Empty(t, response.Properties)
+	})
+
+	t.Run("create on an existing namespace is 409 and keeps the properties", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodPost, nsWriteCreateTarget, "alice", jsonBody(t, createNamespaceRequest{
+			Namespace:  []string{nsTestRepo, nsTestRef, "inventory"},
+			Properties: map[string]string{"owner": "someone-else"},
+		}))
+		requireEnvelope(t, rec, http.StatusConflict, ErrTypeNamespaceAlreadyExists)
+
+		get := decodeGetNamespace(t, f.request(t, http.MethodGet,
+			namespacesTarget(nsTestRepo, nsTestRef, "inventory"), "alice"))
+		require.Equal(t, map[string]string{"owner": "data-team"}, get.Properties,
+			"a losing create must not overwrite the existing properties")
+	})
+
+	t.Run("create of the repository or ref level is 400", func(t *testing.T) {
+		for _, levels := range [][]string{
+			{nsTestRepo},
+			{nsTestRepo, nsTestRef},
+		} {
+			rec := f.writeRequest(t, http.MethodPost, nsWriteCreateTarget, "alice", jsonBody(t, createNamespaceRequest{
+				Namespace: levels,
+			}))
+			requireEnvelope(t, rec, http.StatusBadRequest, ErrTypeBadRequest)
+		}
+	})
+
+	t.Run("create with an empty namespace or property name is 400", func(t *testing.T) {
+		empty := f.writeRequest(t, http.MethodPost, nsWriteCreateTarget, "alice", jsonBody(t, createNamespaceRequest{}))
+		requireEnvelope(t, empty, http.StatusBadRequest, ErrTypeBadRequest)
+
+		emptyProperty := f.writeRequest(t, http.MethodPost, nsWriteCreateTarget, "alice", jsonBody(t, createNamespaceRequest{
+			Namespace:  []string{nsTestRepo, nsTestRef, "bad-property"},
+			Properties: map[string]string{"": "value"},
+		}))
+		requireEnvelope(t, emptyProperty, http.StatusBadRequest, ErrTypeBadRequest)
+	})
+
+	t.Run("create on a tag is 403 ref is read-only", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodPost, nsWriteCreateTarget, "alice", jsonBody(t, createNamespaceRequest{
+			Namespace: []string{nsTestRepo, nsTestTag, "on-a-tag"},
+		}))
+		requireForbiddenReadOnly(t, rec)
+
+		// A commit ID is as read-only as a tag (§5, Q-I4): both are refs a write cannot move.
+		commit, err := f.catalog.GetBranchReference(f.ctx, nsTestRepo, nsTestRef)
+		require.NoError(t, err, "read the main branch reference")
+		onCommit := f.writeRequest(t, http.MethodPost, nsWriteCreateTarget, "alice", jsonBody(t, createNamespaceRequest{
+			Namespace: []string{nsTestRepo, commit, "on-a-commit"},
+		}))
+		requireForbiddenReadOnly(t, onCommit)
+	})
+
+	t.Run("create on a missing branch or repository is 404 NoSuchWarehouse", func(t *testing.T) {
+		missingBranch := f.writeRequest(t, http.MethodPost, nsWriteCreateTarget, "alice", jsonBody(t, createNamespaceRequest{
+			Namespace: []string{nsTestRepo, "missing-branch", "ns"},
+		}))
+		requireEnvelope(t, missingBranch, http.StatusNotFound, ErrTypeNoSuchWarehouse)
+
+		missingRepo := f.writeRequest(t, http.MethodPost, nsWriteCreateTarget, "dana", jsonBody(t, createNamespaceRequest{
+			Namespace: []string{"missing-repo", "main", "ns"},
+		}))
+		requireEnvelope(t, missingRepo, http.StatusNotFound, ErrTypeNoSuchWarehouse)
+	})
+
+	t.Run("a caller without grants is refused", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodPost, nsWriteCreateTarget, "bob", jsonBody(t, createNamespaceRequest{
+			Namespace: []string{nsTestRepo, nsTestRef, "not-allowed"},
+		}))
+		requireEnvelope(t, rec, http.StatusForbidden, ErrTypeForbidden)
+	})
+
+	t.Run("a malformed body is 400", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodPost, nsWriteCreateTarget, "alice", "{not json")
+		requireEnvelope(t, rec, http.StatusBadRequest, ErrTypeBadRequest)
+	})
+}
+
+func testNamespacesWriteUpdateProperties(t *testing.T, f *namespacesFixture) {
+
+	t.Run("properties are merged, not replaced", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodPost,
+			namespacePropertiesTarget(nsTestRepo, nsTestRef, "inventory"), "alice",
+			jsonBody(t, updateNamespacePropertiesRequest{
+				Updates:  map[string]string{"team": "core", "owner": "analytics"},
+				Removals: []string{},
+			}))
+		response := decodeUpdateNamespaceProperties(t, rec)
+		require.Equal(t, []string{"owner", "team"}, response.Updated)
+		require.Empty(t, response.Removed)
+		require.Empty(t, response.Missing)
+
+		get := decodeGetNamespace(t, f.request(t, http.MethodGet,
+			namespacesTarget(nsTestRepo, nsTestRef, "inventory"), "alice"))
+		require.Equal(t, map[string]string{"owner": "analytics", "team": "core"}, get.Properties,
+			"a property that was not mentioned must survive the update")
+	})
+
+	t.Run("removals are applied and the rest is kept", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodPost,
+			namespacePropertiesTarget(nsTestRepo, nsTestRef, "inventory"), "alice",
+			jsonBody(t, updateNamespacePropertiesRequest{Removals: []string{"owner"}}))
+		response := decodeUpdateNamespaceProperties(t, rec)
+		require.Equal(t, []string{"owner"}, response.Removed)
+		require.Empty(t, response.Updated)
+		require.Empty(t, response.Missing)
+
+		get := decodeGetNamespace(t, f.request(t, http.MethodGet,
+			namespacesTarget(nsTestRepo, nsTestRef, "inventory"), "alice"))
+		require.Equal(t, map[string]string{"team": "core"}, get.Properties)
+	})
+
+	t.Run("a removal of a property that is not there is a partial success", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodPost,
+			namespacePropertiesTarget(nsTestRepo, nsTestRef, "inventory"), "alice",
+			jsonBody(t, updateNamespacePropertiesRequest{Removals: []string{"not-there"}}))
+		response := decodeUpdateNamespaceProperties(t, rec)
+		require.Equal(t, []string{"not-there"}, response.Missing)
+		require.Empty(t, response.Updated)
+		require.Empty(t, response.Removed)
+		require.Contains(t, rec.Body.String(), `"updated":[]`,
+			"updated and removed are required arrays of the response model")
+	})
+
+	t.Run("an unknown namespace is 404", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodPost,
+			namespacePropertiesTarget(nsTestRepo, nsTestRef, "inventory", "missing"), "alice",
+			jsonBody(t, updateNamespacePropertiesRequest{Updates: map[string]string{"a": "b"}}))
+		requireEnvelope(t, rec, http.StatusNotFound, ErrTypeNoSuchNamespace)
+	})
+
+	t.Run("a key in both updates and removals is 422", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodPost,
+			namespacePropertiesTarget(nsTestRepo, nsTestRef, "inventory"), "alice",
+			jsonBody(t, updateNamespacePropertiesRequest{
+				Updates:  map[string]string{"team": "other"},
+				Removals: []string{"team"},
+			}))
+		requireEnvelope(t, rec, http.StatusUnprocessableEntity, ErrTypeUnprocessableEntity)
+
+		get := decodeGetNamespace(t, f.request(t, http.MethodGet,
+			namespacesTarget(nsTestRepo, nsTestRef, "inventory"), "alice"))
+		require.Equal(t, map[string]string{"team": "core"}, get.Properties,
+			"a refused update must not change anything")
+	})
+
+	t.Run("an update on a tag is 403 ref is read-only", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodPost,
+			namespacePropertiesTarget(nsTestRepo, nsTestTag, "inventory"), "alice",
+			jsonBody(t, updateNamespacePropertiesRequest{Updates: map[string]string{"a": "b"}}))
+		requireForbiddenReadOnly(t, rec)
+	})
+
+	t.Run("a caller without grants is refused", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodPost,
+			namespacePropertiesTarget(nsTestRepo, nsTestRef, "inventory"), "bob",
+			jsonBody(t, updateNamespacePropertiesRequest{Updates: map[string]string{"a": "b"}}))
+		requireEnvelope(t, rec, http.StatusForbidden, ErrTypeForbidden)
+	})
+}
+
+func testNamespacesWriteDrop(t *testing.T, f *namespacesFixture) {
+
+	t.Run("an empty namespace is dropped", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodDelete,
+			namespacesTarget(nsTestRepo, nsTestRef, "other"), "alice", "")
+		require.Equal(t, http.StatusNoContent, rec.Code, "body: %s", rec.Body.String())
+		require.Empty(t, rec.Body.String())
+
+		get := f.request(t, http.MethodGet, namespacesTarget(nsTestRepo, nsTestRef, "other"), "alice")
+		requireEnvelope(t, get, http.StatusNotFound, ErrTypeNoSuchNamespace)
+	})
+
+	t.Run("a namespace that still holds a table is 409", func(t *testing.T) {
+		create := f.writeRequest(t, http.MethodPost, nsWriteCreateTarget, "alice", jsonBody(t, createNamespaceRequest{
+			Namespace: []string{nsTestRepo, nsTestRef, "with-a-table"},
+		}))
+		decodeCreateNamespace(t, create)
+
+		// The table is staged through the store's own create path: the catalog, not the client,
+		// has to notice that the namespace is not empty (§11 I-2).
+		require.NoError(t, f.store.CreateTable(f.ctx, Address{
+			Repo: nsTestRepo, Ref: nsTestRef, Namespace: Namespace{"with-a-table"}, Table: "orders",
+		}, TablePointer{
+			MetadataLocation: "mem://iceberg-namespaces-ns/_iceberg/table-uuid/metadata/1.json",
+			TableUUID:        "table-uuid",
+			FormatVersion:    2,
+		}), "stage a table pointer under the namespace")
+
+		rec := f.writeRequest(t, http.MethodDelete,
+			namespacesTarget(nsTestRepo, nsTestRef, "with-a-table"), "alice", "")
+		requireEnvelope(t, rec, http.StatusConflict, ErrTypeNamespaceNotEmpty)
+
+		head := f.request(t, http.MethodHead, namespacesTarget(nsTestRepo, nsTestRef, "with-a-table"), "alice")
+		require.Equal(t, http.StatusNoContent, head.Code, "body: %s", head.Body.String())
+	})
+
+	t.Run("a namespace with child namespaces is 409", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodDelete,
+			namespacesTarget(nsTestRepo, nsTestRef, "inventory"), "alice", "")
+		requireEnvelope(t, rec, http.StatusConflict, ErrTypeNamespaceNotEmpty)
+	})
+
+	t.Run("an absent namespace is 404", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodDelete,
+			namespacesTarget(nsTestRepo, nsTestRef, "inventory", "missing"), "alice", "")
+		requireEnvelope(t, rec, http.StatusNotFound, ErrTypeNoSuchNamespace)
+	})
+
+	t.Run("a drop on a tag is 403 ref is read-only", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodDelete,
+			namespacesTarget(nsTestRepo, nsTestTag, "inventory"), "alice", "")
+		requireForbiddenReadOnly(t, rec)
+	})
+
+	t.Run("a drop on a missing branch is 404 NoSuchWarehouse", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodDelete,
+			namespacesTarget(nsTestRepo, "missing-branch", "inventory"), "alice", "")
+		requireEnvelope(t, rec, http.StatusNotFound, ErrTypeNoSuchWarehouse)
+	})
+
+	t.Run("a caller without grants is refused", func(t *testing.T) {
+		rec := f.writeRequest(t, http.MethodDelete,
+			namespacesTarget(nsTestRepo, nsTestRef, "inventory"), "bob", "")
+		requireEnvelope(t, rec, http.StatusForbidden, ErrTypeForbidden)
+	})
+}
+
+// testNamespacesWriteAdvertisedEndpoints pins the §2.1 negotiation promise: once the write
+// endpoints are mounted, GET /v1/config advertises them, and it advertises nothing else.
+func testNamespacesWriteAdvertisedEndpoints(t *testing.T, f *namespacesFixture) {
+
+	// The read fixture's router is built from the service's route table alone, so this subtest
+	// builds the catalog surface the way the production router does: GET /v1/config plus the
+	// namespace service's operations.
+	router, err := newRouter(namespacesUser, &Config{},
+		newServer(&Config{Prefix: CatalogPrefix}, f.serve))
+	require.NoError(t, err, "build catalog router")
+	req := httptest.NewRequest(http.MethodGet, configPath, nil)
+	req.Header.Set("X-Test-User", "alice")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	var response CatalogConfig
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response), "body: %s", rec.Body.String())
+
+	require.Equal(t, []string{
+		listNamespacesEndpoint,
+		getNamespaceEndpoint,
+		headNamespaceEndpoint,
+		createNamespaceEndpoint,
+		updateNamespacePropertiesEndpoint,
+		dropNamespaceEndpoint,
+	}, response.Endpoints, "the advertised list is the mounted route table")
+	require.Contains(t, response.Endpoints, createNamespaceEndpoint)
+	require.Contains(t, response.Endpoints, updateNamespacePropertiesEndpoint)
+	require.Contains(t, response.Endpoints, dropNamespaceEndpoint)
 }
