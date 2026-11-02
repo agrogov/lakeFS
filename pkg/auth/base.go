@@ -89,6 +89,10 @@ var statementByName = map[string]model.Statement{
 			permissions.CatalogReadTableAction,
 			permissions.CatalogListViewsAction,
 			permissions.CatalogReadViewAction,
+			// Data-plane read (credential vending / remote signing). WriteTableData is
+			// intentionally absent: it is a data-plane write action, granted by
+			// CatalogReadWrite's catalog:*.
+			permissions.CatalogReadTableDataAction,
 		},
 		Effect: model.StatementEffectAllow,
 	},

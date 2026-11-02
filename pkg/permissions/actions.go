@@ -89,6 +89,11 @@ const (
 	CatalogCreateViewAction                   = "catalog:CreateView"
 	CatalogUpdateViewAction                   = "catalog:UpdateView"
 	CatalogDeleteViewAction                   = "catalog:DeleteView"
+	// Data-plane actions. They gate access to a table's data files (credential vending and
+	// remote signing, ICEBERG_CATALOG_PLAN.md §8) and are deliberately separate from the
+	// metadata actions above: catalog:ReadTable alone does not grant access to the data.
+	CatalogReadTableDataAction  = "catalog:ReadTableData"
+	CatalogWriteTableDataAction = "catalog:WriteTableData"
 )
 
 var serviceSet = map[string]struct{}{

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/permissions"
 )
 
@@ -60,6 +61,44 @@ func TestDatasetsActionsNotInPicker(t *testing.T) {
 		require.NotEqual(t, "datasets", service,
 			"permissions.Actions must not offer deprecated datasets actions; got %q", action)
 	}
+}
+
+// TestCatalogTableDataActions covers the data-plane catalog actions added for the Iceberg REST
+// catalog (ICEBERG_CATALOG_PLAN.md §7.2): they must be valid, offered by the policy-editor action
+// picker, and granted by the built-in policies that imply data access.
+func TestCatalogTableDataActions(t *testing.T) {
+	t.Parallel()
+
+	for _, action := range []string{
+		permissions.CatalogReadTableDataAction,
+		permissions.CatalogWriteTableDataAction,
+	} {
+		require.NoError(t, permissions.IsValidAction(action))
+		require.Contains(t, permissions.Actions, action)
+	}
+
+	require.Equal(t, "catalog:ReadTableData", permissions.CatalogReadTableDataAction)
+	require.Equal(t, "catalog:WriteTableData", permissions.CatalogWriteTableDataAction)
+
+	catalogRead := policyActions(t, "CatalogRead")
+	require.Contains(t, catalogRead, permissions.CatalogReadTableDataAction,
+		"CatalogRead must allow reading table data (credential vending / remote signing)")
+	require.NotContains(t, catalogRead, permissions.CatalogWriteTableDataAction,
+		"CatalogRead must not allow writing table data")
+
+	// CatalogReadWrite grants catalog:* - a prefix wildcard that already matches the data actions;
+	// assert the wildcard rather than the expanded action list.
+	catalogReadWrite := policyActions(t, "CatalogReadWrite")
+	require.Contains(t, catalogReadWrite, "catalog:*")
+}
+
+// policyActions returns the action patterns of a built-in policy.
+func policyActions(t *testing.T, name string) []string {
+	t.Helper()
+	statements, err := auth.MakeStatementForPolicyType(name, []string{permissions.All})
+	require.NoError(t, err)
+	require.Len(t, statements, 1)
+	return statements[0].Action
 }
 
 func TestAllActions(t *testing.T) {

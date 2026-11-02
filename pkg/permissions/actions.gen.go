@@ -76,4 +76,6 @@ var Actions = []string{
 	"catalog:CreateView",
 	"catalog:UpdateView",
 	"catalog:DeleteView",
+	"catalog:ReadTableData",
+	"catalog:WriteTableData",
 }
