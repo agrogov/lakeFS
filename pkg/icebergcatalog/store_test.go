@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,9 +41,20 @@ var (
 	storeTestConfigErr  error
 )
 
-// storeTestConfig builds the process configuration the fixture's catalog is built from.
-// config.NewConfig writes process globals, so it runs once (like the datasets fixture) rather than
-// per fixture.
+// storeTestConfig builds the configuration one fixture's catalog is built from. config.NewConfig
+// writes process globals, so it runs once (like the datasets fixture) rather than per fixture; the
+// committed local cache, however, is the fixture's own.
+//
+// The cache directory must not be shared. Every fixture creates and closes its own Catalog, and a
+// Catalog closes its pyramid instances, which evict and remove files under the cache root. With the
+// default ~/lakefs/data/cache all fixtures of one process used the same root - and so did a second
+// `go test` process, or a developer and CI on the same machine - so one fixture's Close deleted the
+// workspace file another was still writing:
+//
+//	open .../cache/meta-range/<ns>/workspace/<uuid>: no such file or directory
+//
+// t.TempDir() is per test and removed by the testing package, so no fixture can see another's files
+// and nothing is written outside the test's own directory.
 func storeTestConfig(t *testing.T) *config.ConfigImpl {
 	t.Helper()
 	storeTestConfigOnce.Do(func() {
@@ -52,6 +64,14 @@ func storeTestConfig(t *testing.T) *config.ConfigImpl {
 	})
 	require.NoError(t, storeTestConfigErr, "build test config")
 	cfg := storeTestConfigBase // nested sections are values, so this copy belongs to the fixture
+
+	// The cache is per fixture, not per process: see above.
+	cfg.Committed.LocalCache.Dir = path.Join(t.TempDir(), "cache")
+	// Bound the caches too, as pkg/api/serve_test.go does. The defaults belong to a server (1 GiB
+	// local cache, 400 MB SSTable cache) and no fixture here holds more than a handful of entries.
+	cfg.Committed.LocalCache.SizeBytes = 24 << 20
+	cfg.Committed.SSTable.Memory.CacheSizeBytes = 2 << 20
+
 	return &cfg
 }
 
