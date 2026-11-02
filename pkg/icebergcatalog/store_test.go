@@ -21,6 +21,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/config"
+	"github.com/treeverse/lakefs/pkg/graveler"
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/kv/kvparams"
 	_ "github.com/treeverse/lakefs/pkg/kv/mem" // register the "mem" KV driver
@@ -62,6 +63,13 @@ type storeFixture struct {
 
 func newStoreFixture(t *testing.T) *storeFixture {
 	t.Helper()
+	return newStoreFixtureReadOnly(t, false)
+}
+
+// newStoreFixtureReadOnly builds the same fixture on a repository created read-only, i.e. an
+// immutable (datasets) repository. A catalog write against it must be rejected without Force.
+func newStoreFixtureReadOnly(t *testing.T, readOnly bool) *storeFixture {
+	t.Helper()
 	ctx := t.Context()
 
 	kvStore, err := kv.Open(ctx, kvparams.Config{Type: "mem"})
@@ -76,14 +84,15 @@ func newStoreFixture(t *testing.T) *storeFixture {
 	require.NoError(t, err, "build catalog")
 	t.Cleanup(func() { _ = cat.Close() })
 
-	_, err = cat.CreateRepository(ctx, storeTestRepo, "", "mem://"+storeTestRepo+"-ns", "main", false)
+	_, err = cat.CreateRepository(ctx, storeTestRepo, "", "mem://"+storeTestRepo+"-ns", "main", readOnly)
 	require.NoError(t, err, "create repository")
 
 	return &storeFixture{ctx: ctx, catalog: cat, store: NewStore(cat, cat.BlockAdapter)}
 }
 
-// stageEntry stages one ordinary entry on main, exactly how a catalog write will create a marker
-// or a pointer (I2-1 adds the conditional variant).
+// stageEntry stages one ordinary entry on main, unconditionally: the write of a fixture that is
+// not testing the condition itself.
+
 func (f *storeFixture) stageEntry(t *testing.T, entryPath string, metadata map[string]string) {
 	t.Helper()
 	err := f.catalog.CreateEntry(f.ctx, storeTestRepo, "main", catalog.DBEntry{
@@ -94,6 +103,21 @@ func (f *storeFixture) stageEntry(t *testing.T, entryPath string, metadata map[s
 		Metadata:        metadata,
 	})
 	require.NoError(t, err, "stage entry %s", entryPath)
+}
+
+// headRef is the commit main points at, i.e. what an explicit lakeFS commit last wrote.
+func (f *storeFixture) headRef(t *testing.T) string {
+	t.Helper()
+	ref, err := f.catalog.GetBranchReference(f.ctx, storeTestRepo, "main")
+	require.NoError(t, err, "get the main branch reference")
+	return ref
+}
+
+// entryAt reads the raw entry at path on ref, through the same staged-then-committed resolution a
+// reader gets.
+func (f *storeFixture) entryAt(t *testing.T, ref, entryPath string) (*catalog.DBEntry, error) {
+	t.Helper()
+	return f.catalog.GetEntry(f.ctx, storeTestRepo, ref, entryPath, catalog.GetEntryParams{})
 }
 
 func (f *storeFixture) commit(t *testing.T, message string) string {
@@ -395,4 +419,358 @@ func TestStoreRead(t *testing.T) {
 		var missing *NoSuchTableException
 		require.False(t, errors.As(err, &missing), "the pointer exists; the metadata file is what is absent")
 	})
+}
+
+// TestStoreWrite covers the write half: markers and pointers are staged on the branch through the
+// same conditional path (create on an absent value, replace on a matching condition), never
+// auto-committed, and never with Force.
+func TestStoreWrite(t *testing.T) {
+	namespace := Namespace{"inventory", "books"}
+	properties := map[string]string{"owner": "data-team", "description": "book inventory"}
+
+	t.Run("create namespace stages a marker and does not commit it", func(t *testing.T) {
+		f := newStoreFixture(t)
+		addr := Address{Repo: storeTestRepo, Ref: "main", Namespace: namespace}
+		headBefore := f.headRef(t)
+
+		require.NoError(t, f.store.CreateNamespace(f.ctx, addr, properties))
+
+		markerPath, err := namespaceMarkerPath(namespace)
+		require.NoError(t, err)
+
+		// The write is in the branch staging area, with the properties as its user metadata.
+		staged, err := f.entryAt(t, "main", markerPath)
+		require.NoError(t, err)
+		require.Equal(t, properties, map[string]string(staged.Metadata))
+		require.Equal(t, catalog.AddressTypeRelative, staged.AddressType)
+		require.Equal(t, markerPath, staged.PhysicalAddress, "a marker is a metadata-only entry")
+
+		// No auto-commit: main still points at the commit it pointed at before the write, and that
+		// commit knows nothing about the marker.
+		require.Equal(t, headBefore, f.headRef(t), "a catalog write must not commit")
+		_, err = f.entryAt(t, headBefore, markerPath)
+		require.ErrorIs(t, err, graveler.ErrNotFound, "the marker is staged, not committed")
+
+		// The staged marker is already readable through the catalog.
+		got, err := f.store.GetNamespace(f.ctx, addr)
+		require.NoError(t, err)
+		require.Equal(t, properties, got.Properties)
+
+		// An explicit lakeFS commit is what makes it part of the repository.
+		commit := f.commit(t, "create the namespace")
+		committed, err := f.entryAt(t, commit, markerPath)
+		require.NoError(t, err)
+		require.Equal(t, properties, map[string]string(committed.Metadata))
+	})
+
+	t.Run("create namespace is a create on an absent value", func(t *testing.T) {
+		f := newStoreFixture(t)
+		addr := Address{Repo: storeTestRepo, Ref: "main", Namespace: namespace}
+
+		require.NoError(t, f.store.CreateNamespace(f.ctx, addr, properties))
+
+		// Staged conflict: the marker in the staging area already counts.
+		err := f.store.CreateNamespace(f.ctx, addr, map[string]string{"owner": "someone-else"})
+		require.ErrorIs(t, err, ErrAlreadyExists)
+		got, err := f.store.GetNamespace(f.ctx, addr)
+		require.NoError(t, err)
+		require.Equal(t, properties, got.Properties, "the losing create must not overwrite the winner")
+
+		// Committed conflict: a create that a previous commit landed also counts.
+		f.commit(t, "create the namespace")
+		err = f.store.CreateNamespace(f.ctx, addr, map[string]string{"owner": "someone-else"})
+		require.ErrorIs(t, err, ErrAlreadyExists)
+	})
+
+	t.Run("update namespace requires the marker", func(t *testing.T) {
+		f := newStoreFixture(t)
+		addr := Address{Repo: storeTestRepo, Ref: "main", Namespace: namespace}
+
+		err := f.store.UpdateNamespace(f.ctx, addr, properties)
+		require.Error(t, err)
+		var missing *NoSuchNamespaceException
+		require.True(t, errors.As(err, &missing), "an update of an absent namespace is a 404, got %v", err)
+
+		require.NoError(t, f.store.CreateNamespace(f.ctx, addr, map[string]string{"owner": "data-team", "keep": "no"}))
+		next := map[string]string{"owner": "platform", "description": "book inventory"}
+		require.NoError(t, f.store.UpdateNamespace(f.ctx, addr, next))
+
+		got, err := f.store.GetNamespace(f.ctx, addr)
+		require.NoError(t, err)
+		require.Equal(t, next, got.Properties, "the properties are replaced as a whole set; merging is the caller's")
+
+		// The update is staged, and survives a commit.
+		f.commit(t, "update the namespace")
+		got, err = f.store.GetNamespace(f.ctx, addr)
+		require.NoError(t, err)
+		require.Equal(t, next, got.Properties)
+	})
+
+	t.Run("update namespace of a namespace created in the same staging area", func(t *testing.T) {
+		f := newStoreFixture(t)
+		addr := Address{Repo: storeTestRepo, Ref: "main", Namespace: namespace}
+
+		require.NoError(t, f.store.CreateNamespace(f.ctx, addr, nil), "a namespace with no properties is createable")
+		require.NoError(t, f.store.UpdateNamespace(f.ctx, addr, properties))
+
+		got, err := f.store.GetNamespace(f.ctx, addr)
+		require.NoError(t, err)
+		require.Equal(t, properties, got.Properties)
+	})
+
+	t.Run("create table stages a pointer", func(t *testing.T) {
+		f := newStoreFixture(t)
+		addr := Address{Repo: storeTestRepo, Ref: "main", Namespace: namespace, Table: "orders"}
+		tableLocation := "mem://" + storeTestRepo + "-ns/_iceberg/" + storeTestUUID
+		metadataLocation := f.putMetadata(t,
+			"_iceberg/"+storeTestUUID+"/metadata/00001.metadata.json",
+			storeTestMetadata(t, storeTestUUID, tableLocation))
+		pointer := TablePointer{MetadataLocation: metadataLocation, TableUUID: storeTestUUID, FormatVersion: 2}
+
+		headBefore := f.headRef(t)
+		require.NoError(t, f.store.CreateTable(f.ctx, addr, pointer))
+		require.Equal(t, headBefore, f.headRef(t), "a catalog write must not commit")
+
+		pointerPath, err := tablePointerPath(addr)
+		require.NoError(t, err)
+		staged, err := f.entryAt(t, "main", pointerPath)
+		require.NoError(t, err)
+		require.Equal(t, pointerMetadata(metadataLocation, storeTestUUID, 2), map[string]string(staged.Metadata),
+			"the pointer's user metadata is the wire layout of section 6.1")
+
+		// What was written reads back through the read half, unchanged.
+		got, err := f.store.GetTable(f.ctx, addr)
+		require.NoError(t, err)
+		require.Equal(t, pointer, got.Pointer)
+		require.Equal(t, tableLocation, got.Metadata.Location())
+
+		// A commit keeps it, and a tag on that commit reads it too.
+		commit := f.commit(t, "create the table")
+		f.createTag(t, "v1", commit)
+		atTag := addr
+		atTag.Ref = "v1"
+		got, err = f.store.GetTable(f.ctx, atTag)
+		require.NoError(t, err)
+		require.Equal(t, pointer, got.Pointer)
+	})
+
+	t.Run("create table is a create on an absent value", func(t *testing.T) {
+		f := newStoreFixture(t)
+		addr := Address{Repo: storeTestRepo, Ref: "main", Namespace: namespace, Table: "orders"}
+		pointer := TablePointer{
+			MetadataLocation: f.putMetadata(t,
+				"_iceberg/"+storeTestUUID+"/metadata/00001.metadata.json",
+				storeTestMetadata(t, storeTestUUID, "mem://"+storeTestRepo+"-ns/_iceberg/"+storeTestUUID)),
+			TableUUID:     storeTestUUID,
+			FormatVersion: 2,
+		}
+		require.NoError(t, f.store.CreateTable(f.ctx, addr, pointer))
+
+		// A second create with a different pointer must not replace the first one's pointer.
+		other := TablePointer{
+			MetadataLocation: f.putMetadata(t,
+				"_iceberg/"+storeAltUUID+"/metadata/00001.metadata.json",
+				storeTestMetadata(t, storeAltUUID, "mem://"+storeTestRepo+"-ns/_iceberg/"+storeAltUUID)),
+			TableUUID:     storeAltUUID,
+			FormatVersion: 2,
+		}
+		err := f.store.CreateTable(f.ctx, addr, other)
+		require.ErrorIs(t, err, ErrAlreadyExists)
+
+		got, err := f.store.GetTable(f.ctx, addr)
+		require.NoError(t, err)
+		require.Equal(t, pointer, got.Pointer, "the losing create must not orphan the existing metadata.json")
+
+		// The same holds once the first create is committed.
+		f.commit(t, "create the table")
+		err = f.store.CreateTable(f.ctx, addr, other)
+		require.ErrorIs(t, err, ErrAlreadyExists)
+	})
+
+	t.Run("pointer swap conditions on metadata-location", func(t *testing.T) {
+		f := newStoreFixture(t)
+		addr := Address{Repo: storeTestRepo, Ref: "main", Namespace: namespace, Table: "orders"}
+
+		putPointer := func(tableUUID string, seq int) TablePointer {
+			pointer := TablePointer{
+				MetadataLocation: f.putMetadata(t,
+					"_iceberg/"+tableUUID+"/metadata/"+strconv.Itoa(seq)+".metadata.json",
+					storeTestMetadata(t, tableUUID, "mem://"+storeTestRepo+"-ns/_iceberg/"+tableUUID)),
+				TableUUID:     tableUUID,
+				FormatVersion: 2,
+			}
+			return pointer
+		}
+
+		base := putPointer(storeTestUUID, 1)
+		require.NoError(t, f.store.CreateTable(f.ctx, addr, base))
+
+		next := putPointer(storeTestUUID, 2)
+		require.NoError(t, f.store.UpdateTablePointer(f.ctx, addr, base, next))
+
+		got, err := f.store.GetTable(f.ctx, addr)
+		require.NoError(t, err)
+		require.Equal(t, next, got.Pointer)
+		require.Equal(t, next.TableUUID, got.Metadata.TableUUID().String(),
+			"the metadata.json the pointer names is the one GetTable loaded")
+
+		// The base pointer is now stale: a second commit built on it loses the compare-and-swap
+		// instead of moving the pointer back to a metadata.json that is no longer current.
+		stale := putPointer(storeTestUUID, 3)
+		err = f.store.UpdateTablePointer(f.ctx, addr, base, stale)
+		require.ErrorIs(t, err, graveler.ErrPreconditionFailed)
+
+		got, err = f.store.GetTable(f.ctx, addr)
+		require.NoError(t, err)
+		require.Equal(t, next, got.Pointer, "a lost swap leaves the winner's pointer in place")
+
+		// A swap on a pointer that does not exist is a precondition failure too, not a create:
+		// UpdateTablePointer must never be the way an absent pointer gets created (§6.2 step 6).
+		missingAddr := addr
+		missingAddr.Table = "invoices"
+		err = f.store.UpdateTablePointer(f.ctx, missingAddr, base, next)
+		require.ErrorIs(t, err, graveler.ErrPreconditionFailed)
+		_, err = f.store.GetTable(f.ctx, missingAddr)
+		var missing *NoSuchTableException
+		require.True(t, errors.As(err, &missing), "the failed swap must not create a pointer, got %v", err)
+	})
+
+	t.Run("a protected branch rejects a catalog write", func(t *testing.T) {
+		f := newStoreFixture(t)
+		require.NoError(t, f.catalog.SetBranchProtectionRules(f.ctx, storeTestRepo, &graveler.BranchProtectionRules{
+			BranchPatternToBlockedActions: map[string]*graveler.BranchProtectionBlockedActions{
+				"main": {Value: []graveler.BranchProtectionBlockedAction{
+					graveler.BranchProtectionBlockedAction_STAGING_WRITE,
+				}},
+			},
+		}, nil))
+
+		addr := Address{Repo: storeTestRepo, Ref: "main", Namespace: namespace}
+		require.ErrorIs(t, f.store.CreateNamespace(f.ctx, addr, properties), graveler.ErrWriteToProtectedBranch,
+			"writes go through without Force, so branch protection applies")
+	})
+
+	t.Run("an immutable repository rejects a catalog write", func(t *testing.T) {
+		f := newStoreFixtureReadOnly(t, true)
+		addr := Address{Repo: storeTestRepo, Ref: "main", Namespace: namespace}
+		require.ErrorIs(t, f.store.CreateNamespace(f.ctx, addr, properties), graveler.ErrReadOnlyRepository,
+			"writes go through without Force, so a read-only repository applies")
+	})
+
+	t.Run("the write half rejects what the read half would refuse", func(t *testing.T) {
+		f := newStoreFixture(t)
+		addr := Address{Repo: storeTestRepo, Ref: "main", Namespace: namespace, Table: "orders"}
+		location := "mem://" + storeTestRepo + "-ns/_iceberg/" + storeTestUUID + "/metadata/00001.metadata.json"
+
+		for _, tc := range []struct {
+			name    string
+			pointer TablePointer
+		}{
+			{name: "no metadata location", pointer: TablePointer{TableUUID: storeTestUUID, FormatVersion: 2}},
+			{name: "no table uuid", pointer: TablePointer{MetadataLocation: location, FormatVersion: 2}},
+			{name: "format version 0", pointer: TablePointer{MetadataLocation: location, TableUUID: storeTestUUID}},
+			{name: "format version 3", pointer: TablePointer{MetadataLocation: location, TableUUID: storeTestUUID, FormatVersion: 3}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				require.ErrorIs(t, f.store.CreateTable(f.ctx, addr, tc.pointer), ErrInvalidPointer)
+				// Nothing was written: the read half still answers "no such table".
+				_, err := f.store.GetTable(f.ctx, addr)
+				var missing *NoSuchTableException
+				require.True(t, errors.As(err, &missing), "got %v", err)
+			})
+		}
+
+		require.ErrorIs(t,
+			f.store.UpdateTablePointer(f.ctx, addr, TablePointer{TableUUID: storeTestUUID, FormatVersion: 2},
+				TablePointer{MetadataLocation: location, TableUUID: storeTestUUID, FormatVersion: 2}),
+			ErrInvalidPointer, "a swap with no base metadata-location has no compare-and-swap target")
+
+		_, err := EncodeNamespaceProperties(map[string]string{"": "nameless"})
+		require.ErrorIs(t, err, ErrInvalidNamespaceProperties)
+
+		metadata, err := EncodeNamespaceProperties(nil)
+		require.NoError(t, err)
+		require.NotNil(t, metadata, "a marker with no properties still carries metadata, not nil")
+		require.Empty(t, metadata)
+
+		addr.Ref = ""
+		require.ErrorIs(t, f.store.CreateNamespace(f.ctx, addr, properties), ErrInvalidIdentifier)
+		addr.Ref = "main"
+		addr.Namespace = Namespace{"inventory/../etc"}
+		require.ErrorIs(t, f.store.CreateNamespace(f.ctx, addr, properties), ErrInvalidIdentifier,
+			"a namespace level cannot escape the reserved prefix")
+	})
+}
+
+// TestPointerCAS is the §12 "CAS race" unit test at pointer granularity: two clients built their
+// commit on the same base pointer and both swap. Exactly one wins; the other sees
+// graveler.ErrPreconditionFailed, which the commit endpoint answers with 409 (I2-3). The rounds
+// repeat so both orderings of the two goroutines are exercised.
+func TestPointerCAS(t *testing.T) {
+	f := newStoreFixture(t)
+	namespace := Namespace{"inventory", "books"}
+	addr := Address{Repo: storeTestRepo, Ref: "main", Namespace: namespace, Table: "orders"}
+
+	putPointer := func(seq int) TablePointer {
+		return TablePointer{
+			MetadataLocation: f.putMetadata(t,
+				"_iceberg/"+storeTestUUID+"/metadata/"+strconv.Itoa(seq)+".metadata.json",
+				storeTestMetadata(t, storeTestUUID, "mem://"+storeTestRepo+"-ns/_iceberg/"+storeTestUUID)),
+			TableUUID:     storeTestUUID,
+			FormatVersion: 2,
+		}
+	}
+
+	base := putPointer(1)
+	require.NoError(t, f.store.CreateTable(f.ctx, addr, base))
+
+	const rounds = 8
+	for round := 1; round <= rounds; round++ {
+		current, err := f.store.GetTable(f.ctx, addr)
+		require.NoError(t, err)
+		base = current.Pointer
+
+		// Both clients read the same base pointer and each writes its own metadata.json, the way
+		// two commits build on the same snapshot (metadata files are never overwritten).
+		next := []TablePointer{putPointer(1000 + round*2), putPointer(1001 + round*2)}
+
+		errs := make([]error, len(next))
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := range next {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start // both goroutines are running before either swaps
+				errs[i] = f.store.UpdateTablePointer(f.ctx, addr, base, next[i])
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+
+		winners := 0
+		for i, err := range errs {
+			switch {
+			case err == nil:
+				winners++
+			case errors.Is(err, graveler.ErrPreconditionFailed):
+				// The loser must be told the pointer moved, so its caller answers 409 and retries
+				// against the winner's metadata.json rather than overwriting it.
+			default:
+				require.NoError(t, err, "round %d: goroutine %d failed with an unexpected error", round, i)
+			}
+		}
+		require.Equal(t, 1, winners, "round %d: exactly one goroutine must win, errors: %v", round, errs)
+
+		// The surviving pointer is the winner's, whole: the loser did not half-apply.
+		got, err := f.store.GetTable(f.ctx, addr)
+		require.NoError(t, err)
+		require.Contains(t, []TablePointer{next[0], next[1]}, got.Pointer,
+			"round %d: the branch must name one of the two candidates", round)
+		for i, err := range errs {
+			if err == nil {
+				require.Equal(t, next[i], got.Pointer, "round %d: the winner's pointer is the one stored", round)
+			}
+		}
+	}
 }
