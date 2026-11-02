@@ -38,6 +38,7 @@ func TestACLToStatementActions(t *testing.T) {
 				permissions.CatalogGetNamespaceAction,
 				permissions.CatalogListTablesAction,
 				permissions.CatalogReadTableAction,
+				permissions.CatalogReadTableDataAction,
 				permissions.CatalogListViewsAction,
 				permissions.CatalogReadViewAction,
 			},
