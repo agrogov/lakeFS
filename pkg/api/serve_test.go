@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/deepmap/oapi-codegen/pkg/securityprovider"
+	"github.com/go-chi/chi/v5"
 	"github.com/spf13/viper"
 	"github.com/treeverse/lakefs/pkg/actions"
 	"github.com/treeverse/lakefs/pkg/api"
@@ -300,6 +301,116 @@ func TestNotImplementedAPI(t *testing.T) {
 		}
 		if resp.StatusCode != http.StatusNotImplemented {
 			t.Fatalf("expected status code %d, got %d for '%s'", http.StatusNotImplemented, resp.StatusCode, route)
+		}
+	}
+}
+
+// TestNotImplementedServicesKeepsHookRoutes is Spike S-I3 (ICEBERG_CATALOG_PLAN.md §4.1).
+// MountNotImplementedServices runs after the extra-routes builders, so a wrapper binary
+// (lakefs-sso) may already have mounted /iceberg/api/ and must keep it: chi v5.2.4 panics
+// when Mount() targets a pattern that is already mounted, and a second mount would shadow
+// the hook's handler. The placeholders the hook did not claim must stay 501.
+func TestNotImplementedServicesKeepsHookRoutes(t *testing.T) {
+	const (
+		icebergPrefix = "/iceberg/api/"
+		hookHeader    = "X-LakeFS-Hook"
+	)
+	hookHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(hookHeader, "iceberg")
+		w.WriteHeader(http.StatusOK)
+	})
+	subRouter := func(register func(r chi.Router)) http.Handler {
+		r := chi.NewRouter()
+		register(r)
+		return r
+	}
+
+	tests := []struct {
+		name     string
+		hook     http.Handler
+		hookPath string
+	}{
+		{
+			name:     "plain handler mounted at the prefix",
+			hook:     hookHandler,
+			hookPath: icebergPrefix + "v1/config",
+		},
+		{
+			name: "sub-router serving the path the probe uses",
+			hook: subRouter(func(r chi.Router) {
+				r.Get("/probe", hookHandler)
+				r.Get("/v1/config", hookHandler)
+			}),
+			hookPath: icebergPrefix + "v1/config",
+		},
+		{
+			// The probe inside MountNotImplementedServices cannot report a hit here: a
+			// sub-router answers only for the paths it registers. The mount itself must
+			// still be detected, or Mount() panics.
+			name: "sub-router serving none of the probed paths",
+			hook: subRouter(func(r chi.Router) {
+				r.Get("/v1/namespaces", hookHandler)
+			}),
+			hookPath: icebergPrefix + "v1/namespaces",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router := chi.NewRouter()
+			router.Mount(icebergPrefix, tt.hook)
+
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("MountNotImplementedServices panicked over a hook-mounted %q: %v", icebergPrefix, r)
+					}
+				}()
+				api.MountNotImplementedServices(router)
+				// Mounting twice is a no-op: the placeholders this call registered are
+				// detected on the second call exactly like a hook's mount is.
+				api.MountNotImplementedServices(router)
+			}()
+
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tt.hookPath, nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("hook route %q: expected status code %d, got %d", tt.hookPath, http.StatusOK, rec.Code)
+			}
+			if got := rec.Header().Get(hookHeader); got != "iceberg" {
+				t.Fatalf("hook route %q did not answer: header %q = %q", tt.hookPath, hookHeader, got)
+			}
+
+			// The hook claimed only /iceberg/api/, so the other placeholders stay mounted.
+			for _, route := range []string{"/iceberg/relative_to/v1/config", "/mds/iceberg/api/v1/config"} {
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, route, nil))
+				if rec.Code != http.StatusNotImplemented {
+					t.Fatalf("expected status code %d for %q, got %d", http.StatusNotImplemented, route, rec.Code)
+				}
+			}
+		})
+	}
+}
+
+// TestNotImplementedServicesWithCoreCatchAll pins the other half of the detection: the core
+// router ends with a catch-all that answers every path, so a bare Match() reports every path
+// as taken. The placeholders must still be mounted on such a router, or an unmatched iceberg
+// request falls through to the catch-all instead of answering 501.
+func TestNotImplementedServicesWithCoreCatchAll(t *testing.T) {
+	router := chi.NewRouter()
+	router.Mount("/", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	api.MountNotImplementedServices(router)
+
+	routes := []string{"/iceberg/api/v1/config", "/iceberg/relative_to/v1/config", "/mds/iceberg/api/v1/config"}
+	for _, route := range routes {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, route, nil))
+		if rec.Code != http.StatusNotImplemented {
+			t.Fatalf("expected status code %d for %q, got %d", http.StatusNotImplemented, route, rec.Code)
 		}
 	}
 }
