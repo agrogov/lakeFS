@@ -166,3 +166,27 @@ sso:
 #   immutable_guard_groups: []         # extra groups that get the immutability deny policy
 #   metadata:
 #     strict: false                    # reject metadata keys that are not defined
+
+# Apache Iceberg REST Catalog (ICEBERG_CATALOG_PLAN.md §10). Disabled by default.
+# Served by the lakefs-sso hook at /iceberg/api/ (and the relative_to alias
+# /iceberg/relative_to/…/api/), which is the same catalog with the warehouse carried in the
+# URL. While disabled the 501 placeholders stay in place. Catalog state is stored as ordinary
+# lakeFS entries, so branch, diff, merge, revert and commit work on it.
+# Every key can also be set through the environment: LAKEFS_ICEBERG_ENABLED,
+# LAKEFS_ICEBERG_TOKEN_TTL, LAKEFS_ICEBERG_MAX_REQUEST_BODY, ...
+# iceberg:
+#   enabled: false
+#   # Value of the "prefix" override returned by GET /v1/config; clients prepend it to every
+#   # identifier they send back. This is a constant of the catalog: only "lakefs" is accepted.
+#   prefix: lakefs
+#   # Lifetime of a token minted by POST /v1/oauth/tokens (client_credentials grant).
+#   token_ttl: 1h
+#   # Largest catalog request body the server reads, in bytes. 8MiB is spelled 8388608 because
+#   # the setting is a plain byte count (YAML has no size suffixes here).
+#   max_request_body: 8388608
+#   # Objects clients write under the table location are protected from the uncommitted GC for
+#   # this long, until the catalog commit registers them as lakeFS entries (§6.3).
+#   uncommitted_gc_grace: 24h
+#   # Resolve a commit that only re-points metadata at compacted data files instead of
+#   # conflicting with a concurrent change (§6.4).
+#   ignore_compaction_commits: true

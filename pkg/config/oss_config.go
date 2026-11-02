@@ -10,6 +10,7 @@ type ConfigImpl struct {
 	UI         UI                     `mapstructure:"ui"`
 	SSO        SecretSection          `mapstructure:"sso"`      // absorbed so viper.UnmarshalExact accepts the "sso:" YAML key; parsed by pkg/sso
 	Datasets   map[string]interface{} `mapstructure:"datasets"` // absorbed so viper.UnmarshalExact accepts the "datasets:" YAML key; parsed by pkg/datasets
+	Iceberg    map[string]interface{} `mapstructure:"iceberg"`  // absorbed so viper.UnmarshalExact accepts the "iceberg:" YAML key; parsed by pkg/icebergcatalog
 }
 
 // SecretSection is a config section kept only so viper.UnmarshalExact accepts its key; it is
