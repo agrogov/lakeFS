@@ -1,41 +1,107 @@
-# agent-progress — RBAC kanban management (RBAC_DESIGN.md)
+# agent-progress — OSS Iceberg REST Catalog board (ICEBERG_CATALOG_PLAN.md)
 
 Role: kanban management only. This agent plans, links, tracks; it does NOT implement.
 Workers pick tasks from tasks.json. Max 5 in_progress. Parallel only when depends_on is
-satisfied AND files_expected are disjoint.
+satisfied AND files_expected are disjoint. Autocommit is ON: one commit per task, message
+`<task-id>: <short description>`, staged files = files_expected only, and only after the
+task's validation command exits 0 (record its tail in the task's validation_result).
 
-## Board layout (17 tasks)
-Phase A (safety fixes, shippable in both simplified and internal modes):
-  A1 templates | A2 idempotent bootstrap | A3 cache primitives | A4 builder routing | A5 ACL-set gate | A6 webui badge
-Phase B (internal mode):
-  B2 bootstrap -> B3 auth_builder ; B1 profile (needs A3) ; B4 reconcile (needs A1) ; B5 rbac-migrate (needs A2) ; B6 docs (needs B3,B5)
-Option 3 (gap fill, after Option 2):
-  C1 conditions | C2 metadata ABAC | C3 branch filtering | C4 datasets actions | C5 403 opt-in
+Previous board: RBAC_DESIGN.md — archived as tasks.rbac.json / agent-progress.rbac.txt.
+
+## Board layout (34 tasks)
+
+Phase I-0 (spikes + the one core blocker)
+  I0-1 iceberg-go update coverage | I0-2 file-registration cost + GC window
+  I0-3 mount-order fix (pkg/api/services.go) | I0-4 PyIceberg/DuckDB request capture
+
+Phase I-1 (read path, 10 tasks)
+  I1-1 permissions (+gen) | I1-2 config | I1-3 router/errors/endpoints | I1-4 ident
+  I1-5 auth+oauth | I1-6 authz | I1-7 store read | I1-8 namespaces read
+  I1-9 tables read | I1-10 relative_to
+
+Phase I-2 (write path, 8 tasks)
+  I2-1 store write | I2-2 namespaces write | I2-3 commit (requirements/updates/CAS)
+  I2-4 create table | I2-5 drop + metrics | I2-6 register
+  I2-7 conformance (iceberg-go catalogtest + RCK) | I2-8 esti read smoke
+
+Phase I-3: I3-1 file staging | I3-2 uncommitted-GC grace + reserved prefix
+Phase I-4: I4-1 remote signing | I4-2 STS vending
+Phase I-5: I5-1 compaction auto-resolve | I5-2 ETag | I5-3 Idempotency-Key
+Phase I-6: I6-1 datasets table/namespace materialisation | I6-2 datasets authz + docs
+           I6-3 esti dataset table item
+Close-out: D1 docs/iceberg.md + fold spike notes + DATASETS_DESIGN §16
 
 ## Dependency edges (blocking)
-A3 -> B1, B2
-A2 -> B2, B3, B5, C4
-A1 -> B4, C4
-B2,B4 -> B3
-B3,B5 -> B6
-A5,B1 -> C2
-A5 -> C3
-C3 -> C5
-(no deps: A4, A6, C1)
 
-## Wave plan (<=5 concurrent)
-W1: A1 A2 A3 A4 A5        W2: A6 B1 B2 B4 C1
-W3: B3 B5                 W4: B6 C2 C3 C4    W5: C5
+I0-3 -> every I-1 task
+I1-2 -> I1-3, I1-4, I1-7
+I1-3 -> I1-5
+I1-1, I1-4 -> I1-6
+I1-3, I1-5, I1-6, I1-7 -> I1-8
+I1-8 -> I1-9 -> I2-4 -> I2-5 ; I1-8 -> I1-10
+I1-7 -> I2-1 -> I2-2, I2-3, I2-4
+I0-1, I2-1, I1-6 -> I2-3
+I2-1, I2-4 -> I2-6
+I2-2, I2-3, I2-6 -> I2-7
+I2-6, I1-10 -> I2-8
+I0-2, I2-3 -> I3-1 ; I0-2, I2-1 -> I3-2
+I3-1, I3-2, I2-8 -> I3-3
+I1-6, I2-3 -> I4-1 -> I4-2 (I4-2 also needs I1-1)
+I3-1 -> I5-1 ; I1-9 -> I5-2 ; I2-3 -> I5-3
+I3-1, I3-3 -> I6-1 -> I6-2 -> I6-3
+I2-7 -> D1
 
 ## File-collision watch (do not run these together)
-- controller.go: A5, C2, C3, C5 (serialized via deps)
-- pkg/auth/service.go: A3 (UserKey), C2 — C2 already depends on B1/A5; add review note if C2 starts before A3 is merged
-- pkg/sso/*: B1, B2, B3, B5 — B3 edits auth_builder.go only (wires B2/B4); B5 stays in rbac_migrate.go + cmd
-- pkg/auth/base.go: A1, C4 (C4 depends on A1)
-- setup.go (auth): A2, C4 (C4 depends on A2)
+
+- pkg/icebergcatalog/http.go: I1-3 then I2-2/I2-4/I2-5/I2-6/I5-3 (each also touches it)
+- pkg/icebergcatalog/tables.go: I1-9 -> I2-4 -> I2-5 ; I5-2 also touches it
+- pkg/icebergcatalog/namespaces.go: I1-8 -> I2-2
+- pkg/icebergcatalog/store.go: I1-7 -> I2-1
+- pkg/icebergcatalog/commit.go: I2-3 -> I5-1
+- pkg/icebergcatalog/config.go: I1-2 -> I3-2 -> I4-2 -> I5-1
+- pkg/icebergcatalog/sign.go: I4-1 -> I4-2
+- esti/iceberg_test.go: I2-8 -> I3-3
+- DATASETS_DESIGN.md: I6-2, D1 (D1 runs last)
+- tasks.json / agent-progress.txt: D1 only (plus the initial planning commit)
+
+## Wave plan (<=5 concurrent, deps + disjoint files verified)
+
+W1: I0-1 I0-2 I0-3 I0-4 I1-1
+W2: I1-2
+W3: I1-3 I1-4
+W4: I1-5 I1-6 I1-7
+W5: I1-8 I2-1
+W6: I1-9 I1-10 I2-2
+W7: I2-3 I2-4 I3-2
+W8: I2-5
+W9: I2-6 I3-1 I5-2
+W10: I2-7 I2-8 I4-1 I5-1 I5-3
+W11: I3-3 I4-2 D1
+W12: I6-1
+W13: I6-2
+W14: I6-3
+
+Milestones: read path done at I1-10; usable minimum (I-2 + I-3 exit criteria) at
+I2-7 + I3-3; v1 complete at I6-3.
+
+## Decisions locked at planning time
+
+- Q-I3 prefix is a constant `lakefs`; any other value is 404 NoSuchWarehouseException.
+- Q-I4 writes to a tag/commit ref return 403 ForbiddenException.
+- Q-I5 default table location `<storage_namespace>/_iceberg/<table-uuid>`.
+- Q-I6 the OAuth token is a lakeFS JWT, no refresh flow.
+- Q-I8 remove-snapshots keeps files (no tombstoning in v1) unless I0-2 says otherwise.
+- Staging, not auto-commit: catalog writes land on the branch and take effect on an
+  explicit lakeFS commit (§6.2).
+- Spike notes live in per-spike files (ICEBERG_SPIKE_S-I1..S-I4.md) so the four spikes can
+  run in parallel; D1 folds them back into ICEBERG_CATALOG_PLAN.md and deletes them.
 
 ## Status
-- All tasks created; wave-1 tasks A1-A5 marked ready.
-- No implementation done by this agent (earlier trial edits were reverted; HEAD = 95dceafc2).
-- Open design questions from RBAC_DESIGN §9 still unanswered (rbac-migrate merge strategy,
-  break-glass membership, cross-replica TTL) — do not block wave-1 tasks on them.
+
+- Ledger created from ICEBERG_CATALOG_PLAN.md at HEAD 577304b0f on feature/datasets.
+- Wave-1 tasks I0-1..I0-4 and I1-1 are `ready`; the rest are `backlog`.
+- No implementation done by this agent.
+- Already-done check: pkg/datasets/authz.go:597 immutabilityDeniedActions ALREADY denies
+  catalog:Create*/Update*/Delete* for namespace/table/view, so §7.2's "add these to
+  immutabilityDeniedActions" is a no-op — verify in I1-6, do not re-add.
+- Not in go.mod yet: github.com/apache/iceberg-go (I0-1 adds it).

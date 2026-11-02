@@ -1,198 +1,732 @@
 {
-  "project": "lakeFS policy RBAC (RBAC_DESIGN.md)",
-  "design_doc": "RBAC_DESIGN.md",
-  "branch": "feature/azure-entra-sso-apache",
+  "project": "OSS Iceberg REST Catalog (ICEBERG_CATALOG_PLAN.md)",
+  "design_doc": "ICEBERG_CATALOG_PLAN.md",
+  "branch": "feature/datasets",
+  "base_commit": "577304b0f",
+  "previous_board": "tasks.rbac.json (archived; RBAC_DESIGN.md board)",
   "board_rules": [
     "Max 5 tasks in_progress at once.",
     "Parallelism only between tasks with disjoint files_expected and satisfied depends_on.",
     "One commit per implementable task, message format: '<task-id>: <short description>'.",
-    "Definition of done per task: task-scoped tests pass, lint clean, diff limited to files_expected, evidence recorded in the task's 'validation' field.",
-    "License guard (RBAC_DESIGN §2): never copy from upstream commits at/after 358544dd7 (BSL)."
+    "Definition of done per task: task-scoped tests pass, lint clean, diff limited to files_expected, evidence recorded in the task's 'validation_result' field.",
+    "License guard (ICEBERG_CATALOG_PLAN.md §2, DATASETS_DESIGN.md §2): implement from the Apache Iceberg spec and lakeFS public docs only. Never copy from lakeFS Enterprise code or upstream >= 1.87 (BSL). Cite the spec URL in the PR.",
+    "Spike tasks (type=spike) deliver a written note file, not product code; they may be superseded by a later task's findings, which must be recorded in the superseding task's notes.",
+    "Any task that changes the wire format must update /v1/config 'endpoints' in the same commit (ICEBERG_CATALOG_PLAN.md §2.1: clients only call advertised endpoints)."
   ],
   "statuses": ["backlog", "ready", "in_progress", "in_review", "done"],
+  "autocommit": {
+    "enabled": true,
+    "per_task": true,
+    "message_format": "<task-id>: <short description>",
+    "precondition": "validation command for the task exited 0 and its tail is in validation_result",
+    "scope": "git add exactly files_expected; never stage unrelated work. tasks.json and agent-progress.txt are committed only by the planning commit and by D1.",
+    "on_failure": "do not commit; leave status in_progress, write the failing output into validation_result.details, stop and report",
+    "never": [
+      "amend or force-push a commit belonging to another task",
+      "commit generated code without the generator change that produced it"
+    ]
+  },
   "work_waves": {
-    "comment": "Suggested scheduling; workers may pick any 'ready' task while respecting the max-5 cap.",
-    "wave1": ["A1", "A2", "A3", "A4", "A5"],
-    "wave2": ["A6", "B1", "B2", "B4", "C1"],
-    "wave3": ["B3", "B5"],
-    "wave4": ["B6", "C2", "C3", "C4"],
-    "wave5": ["C5"]
+    "comment": "Advisory scheduling that respects depends_on and the max-5 cap. Workers may pick any 'ready' task whose deps are done and whose files_expected do not collide with another in_progress task.",
+    "wave1": ["I0-1", "I0-2", "I0-3", "I0-4", "I1-1"],
+    "wave2": ["I1-2"],
+    "wave3": ["I1-3", "I1-4"],
+    "wave4": ["I1-5", "I1-6", "I1-7"],
+    "wave5": ["I1-8", "I2-1"],
+    "wave6": ["I1-9", "I1-10", "I2-2"],
+    "wave7": ["I2-3", "I2-4", "I3-2"],
+    "wave8": ["I2-5"],
+    "wave9": ["I2-6", "I3-1", "I5-2"],
+    "wave10": ["I2-7", "I2-8", "I4-1", "I5-1", "I5-3"],
+    "wave11": ["I3-3", "I4-2", "D1"],
+    "wave12": ["I6-1"],
+    "wave13": ["I6-2"],
+    "wave14": ["I6-3"]
+  },
+  "milestones": {
+    "read_path": ["I1-1", "I1-10"],
+    "usable_minimum": ["I2-7", "I3-3"],
+    "full_v1": ["I6-3"]
   },
   "tasks": [
     {
-      "id": "A1",
-      "type": "implement",
-      "title": "ACL/template fixes: catalog:* in AllAccess; PR/Catalog grants in ACL Read/Write/Super",
-      "refs": ["§3.3 #1 #2", "§4.5 #1"],
+      "id": "I0-1",
+      "phase": "I-0 Spikes",
+      "type": "spike",
+      "title": "S-I1: pin iceberg-go v0.7.0 and prove its Updates/Requirements cover all 23 spec update actions",
+      "scope": "Add github.com/apache/iceberg-go v0.7.0 to go.mod/go.sum. Write a table-driven test that JSON-decodes one example payload per update action from the REST spec into iceberg-go's table.Updates and asserts the action type round-trips; list any action that does not decode. Deliverable is the note file ICEBERG_SPIKE_S-I1.md: verdict per action, and the local-implementation list for what is missing.",
+      "refs": ["§4.2", "§2.1", "§11 I-0"],
       "status": "ready",
       "depends_on": [],
-      "files_expected": ["pkg/auth/base.go", "contrib/auth/acl/permission.go", "contrib/auth/acl/permission_test.go"],
-      "validation": "go test ./contrib/auth/acl/... ./pkg/auth/..."
+      "files_expected": ["go.mod", "go.sum", "pkg/icebergcatalog/doc.go", "pkg/icebergcatalog/updates_coverage_test.go", "ICEBERG_SPIKE_S-I1.md"],
+      "validation": "go test -run TestUpdatesCoverage ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I0-1: pin iceberg-go and prove update/requirement coverage",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "Only the metadata model is needed: table.ParseMetadataBytes, MetadataBuilderFromBase, UpdateTableMetadata, Requirements/Updates JSON, Requirement.Validate, NewMetadataWithUUID.",
+        "iceberg-go's write helpers live in catalog/internal and cannot be imported, so writing metadata.json stays our own code.",
+        "Blocks I2-3 (commit path); if an action is missing, I2-3 implements it locally."
+      ]
     },
     {
-      "id": "A2",
-      "type": "implement",
-      "title": "Idempotent RBAC bootstrap in pkg/auth/setup (ErrAlreadyExists=success, EnsureRBACBaseGroups, never overwrite edited built-ins)",
-      "refs": ["§4.3"],
+      "id": "I0-2",
+      "phase": "I-0 Spikes",
+      "type": "spike",
+      "title": "S-I2: measure per-commit file-registration cost and define the uncommitted-GC grace window",
+      "scope": "Build a throwaway harness (not committed) that creates a table with a 10k-file append, then measures (a) walls per staged entry via catalog.CreateEntry vs a batched path, (b) whether PrepareGCUncommitted (pkg/catalog/catalog.go:2994) would list objects written directly by the client under <storage_namespace>/_iceberg/. Deliverable is ICEBERG_SPIKE_S-I2.md with numbers and a recommendation for §6.3 (stage all files vs manifests+metadata only) and for iceberg.uncommitted_gc_grace.",
+      "refs": ["§6.3", "§13 risk 'Staging thousands of entries per append'", "§11 I-0"],
       "status": "ready",
       "depends_on": [],
-      "files_expected": ["pkg/auth/setup/setup.go", "pkg/auth/setup/setup_test.go"],
-      "validation": "go test ./pkg/auth/setup/... (run-twice + edited-policy cases)"
+      "files_expected": ["ICEBERG_SPIKE_S-I2.md"],
+      "validation": "recorded numbers: staging writes/s, total commit wall time at 10k files, uncommitted-GC visibility yes/no",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I0-2: measure file registration cost and the uncommitted GC window",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "Decides the §6.3 staging strategy that I3-1 implements.",
+        "If staging 10k entries is too slow, the fallback is manifests+metadata plus a per-table GC rule (see §13)."
+      ]
     },
     {
-      "id": "A3",
+      "id": "I0-3",
+      "phase": "I-0 Spikes",
       "type": "implement",
-      "title": "Cache invalidation primitives: pkg/cache Delete/Purge; auth.Cache InvalidateUser/InvalidateUserPolicies/PurgePolicies",
-      "refs": ["§4.7"],
+      "title": "S-I3 fix: MountNotImplementedServices must not panic or shadow a hook-mounted /iceberg/api/",
+      "scope": "pkg/api/services.go mounts /iceberg/api/, /iceberg/relative_to/ and /mds/iceberg/api/ unconditionally. A hook-mounted route on the same pattern either panics in chi v5.2.4 ('attempting to Mount() a handler on an existing path') or the 501 shadows it. Detect a pattern that is already registered (chi Router.Match with a new RouteContext) and skip it; keep /mds/iceberg/api/ a 501. Add a serve_test case proving a pre-mounted /iceberg/api/ survives MountNotImplementedServices and still answers.",
+      "refs": ["§4.1", "§3 annex 'chi duplicate mount panic'", "§11 I-0"],
       "status": "ready",
       "depends_on": [],
-      "notes": "pkg/cache.Cache has no Delete/Purge today; also fixes mockCache in pkg/graveler/settings/manager_test.go. UserKey.id must be exported for out-of-package invalidation.",
-      "files_expected": ["pkg/cache/cache.go", "pkg/cache/no_cache.go", "pkg/auth/cache.go", "pkg/auth/service.go", "pkg/graveler/settings/manager_test.go", "pkg/auth/cache_test.go"],
-      "validation": "go test ./pkg/cache/... ./pkg/auth/... ./pkg/graveler/settings/..."
+      "files_expected": ["pkg/api/services.go", "pkg/api/serve_test.go"],
+      "validation": "go test -run 'TestNotImplementedServices|TestServices' ./pkg/api/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I0-3: don't mount a 501 stub over a hook-registered iceberg route",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "Existing stub test is at pkg/api/serve_test.go:291.",
+        "Blocks every I-1 task: without it the lakefs-sso hook panics at startup.",
+        "Record this as a merge-conflict surface in DATASETS_DESIGN.md §16 when D1 lands."
+      ]
     },
     {
-      "id": "A4",
-      "type": "implement",
-      "title": "Route lakefs setup and superuser through authServiceBuilder (fixes lakefs-sso setup/superuser failure)",
-      "refs": ["§4.2"],
+      "id": "I0-4",
+      "phase": "I-0 Spikes",
+      "type": "spike",
+      "title": "S-I4: PyIceberg and DuckDB against a stub /v1/config and stub read endpoints",
+      "scope": "Stand up a minimal stub (not committed) that answers GET /v1/config with overrides.prefix and an explicit endpoints list, then capture exactly which requests PyIceberg and DuckDB issue for: connect, list namespaces, load table. Deliverable is ICEBERG_SPIKE_S-I4.md: request log per client, required vs optional response fields, and whether a client rejects an endpoints list that omits rename/transactions.",
+      "refs": ["§2.1 endpoint negotiation", "§11 I-0", "§11 I-1 exit criteria"],
       "status": "ready",
       "depends_on": [],
-      "files_expected": ["cmd/lakefs/cmd/setup.go", "cmd/lakefs/cmd/superuser.go"],
-      "validation": "go test ./cmd/lakefs/cmd/... ; manual: lakefs-sso setup with rbac=internal"
+      "files_expected": ["ICEBERG_SPIKE_S-I4.md"],
+      "validation": "request log captured from pyiceberg and duckdb against the stub; recorded in the note",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I0-4: capture PyIceberg and DuckDB requests against a stub catalog",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "Feeds I1-3 (endpoints list) and I1-2 (config response shape).",
+        "PyIceberg is the client that most closely follows the spec; DuckDB is the strictest about omitted endpoints."
+      ]
     },
     {
-      "id": "A5",
+      "id": "I1-1",
+      "phase": "I-1 Read path",
       "type": "implement",
-      "title": "SetGroupACL returns 409 when RBAC mode is not simplified (protects custom policies)",
-      "refs": ["§3.3 #4", "§4.5 #3"],
+      "title": "permissions: add catalog:ReadTableData / catalog:WriteTableData and grant them to CatalogRead / CatalogReadWrite",
+      "scope": "Add CatalogReadTableDataAction and CatalogWriteTableDataAction to pkg/permissions/actions.go and regenerate actions.gen.go (make gen-code). Add ReadTableData to the CatalogRead built-in policy; CatalogReadWrite already uses catalog:*. Extend the actions test. Do not touch ARNs (CatalogTableArn already exists).",
+      "refs": ["§7.2 changes", "§3 annex 'catalog:* actions'"],
       "status": "ready",
       "depends_on": [],
-      "files_expected": ["pkg/api/controller.go", "pkg/api/controller_test.go"],
-      "validation": "go test -run TestSetGroupACL ./pkg/api/..."
+      "files_expected": ["pkg/permissions/actions.go", "pkg/permissions/actions.gen.go", "pkg/permissions/actions_test.go", "pkg/auth/base.go"],
+      "validation": "make gen-code && go test ./pkg/permissions/... ./pkg/auth/... && make validate-permissions-gen",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I1-1: add catalog table-data actions and grant read to CatalogRead",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "Blocks I1-6 (authz) and I4-2 (credential vending).",
+        "Do not add WriteTableData to CatalogRead: it is a data-plane write action.",
+        "The docs note that pre-existing custom policies must add the new actions manually belongs to D1."
+      ]
     },
     {
-      "id": "A6",
+      "id": "I1-2",
+      "phase": "I-1 Read path",
       "type": "implement",
-      "title": "webui simplified mode: 'Custom (policies)' read-only badge for multi-policy groups instead of empty dropdown",
-      "refs": ["§3.3 #5", "§4.5 #4"],
+      "title": "icebergcatalog config: iceberg.* section, defaults, validation, absorbed key",
+      "scope": "New pkg/icebergcatalog/config.go modelled on pkg/datasets/config.go: enabled, prefix (default lakefs), token_ttl (1h), max_request_body (8MiB), uncommitted_gc_grace (24h), ignore_compaction_commits (true, consumed in I5-1). Return a wrapped ErrInvalidConfig on bad input. Absorb the 'iceberg:' key in pkg/config/oss_config.go so viper.UnmarshalExact accepts it, and document the block in cmd/lakefs-sso/config.example.yaml. Reject prefix != 'lakefs' at load time (Q-I3 is resolved as a constant).",
+      "refs": ["§10", "§14 Q-I3"],
       "status": "backlog",
-      "depends_on": [],
-      "notes": "Needs NoAcl signal from the 404 body of GetGroupACL ('Multiple policies attached').",
-      "files_expected": ["webui/src/pages/auth/groups/index.tsx"],
-      "validation": "cd webui && npm run lint && npm test"
+      "depends_on": ["I0-3"],
+      "files_expected": ["pkg/icebergcatalog/config.go", "pkg/icebergcatalog/config_test.go", "pkg/config/oss_config.go", "cmd/lakefs-sso/config.example.yaml"],
+      "validation": "go test ./pkg/icebergcatalog/... ./pkg/config/...",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I1-2: add the iceberg catalog configuration section",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "disabled must keep the 501 stubs (I1-3 mounts nothing).",
+        "Follow the datasets convention: LoadConfig from viper, never from the core unmarshal."
+      ]
     },
     {
-      "id": "B1",
+      "id": "I1-3",
+      "phase": "I-1 Read path",
       "type": "implement",
-      "title": "ACL service profile API (UpdateUserProfile, UpdateUserFriendlyName) + wire cache invalidation into group/policy mutations; SSO uses service API, delete kvProfileStore; EnsureUser GetUser-first",
-      "refs": ["§1.1 #1 #5", "§4.6", "§4.7"],
+      "title": "icebergcatalog http: RoutesBuilder, auth-before-validation middleware order, error model, /v1/config with explicit endpoints",
+      "scope": "New pkg/icebergcatalog/http.go + errors.go: RoutesBuilder matching the datasets signature (ctx, cmdpkg.ServerDeps, *chi.Mux), mounting /iceberg/api/ and /iceberg/relative_to/, and mounting a 501 handler when iceberg.enabled is false. Fix the datasets middleware-order defect: authentication runs BEFORE body/request validation. Implement the Iceberg error envelope {error:{message,type,code}} with 400/401/403/404/409/413/501 mappings and a body limit from config (413). GET /v1/config returns defaults + overrides.prefix + an explicit endpoints list that omits rename, transactions and views. Register the builder in cmd/lakefs-sso/main.go next to datasets.RoutesBuilder.",
+      "refs": ["§2.1 endpoint negotiation", "§4 architecture http.go", "§7.1", "§11 I-1", "§12 security tests"],
       "status": "backlog",
-      "depends_on": ["A3"],
-      "files_expected": ["contrib/auth/acl/service.go", "contrib/auth/acl/service_test.go", "pkg/sso/user.go", "pkg/sso/oidc_provider.go", "pkg/sso/authentication_builder.go"],
-      "validation": "go test ./contrib/auth/acl/... ./pkg/sso/..."
+      "depends_on": ["I1-2"],
+      "files_expected": ["pkg/icebergcatalog/http.go", "pkg/icebergcatalog/errors.go", "pkg/icebergcatalog/http_test.go", "cmd/lakefs-sso/main.go"],
+      "validation": "go test ./pkg/icebergcatalog/... && go build ./cmd/lakefs-sso/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I1-3: mount the iceberg catalog router with an explicit endpoint list",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "Blocks every other I-1/I-2 handler task.",
+        "The endpoints list is the compatibility contract: add an entry only when the endpoint is implemented and passes its test."
+      ]
     },
     {
-      "id": "B2",
+      "id": "I1-4",
+      "phase": "I-1 Read path",
       "type": "implement",
-      "title": "pkg/sso/rbac_bootstrap.go: EnsureRBACBase + rbac-bootstrap-version key in auth partition",
-      "refs": ["§4.3"],
+      "title": "icebergcatalog ident: parse repo.ref.ns...table with %1F, dots, and relative_to forms",
+      "scope": "New pkg/icebergcatalog/ident.go: decode namespace path parameters joined by %1F, accept the advertised namespace-separator, and map the three addressing forms (§5) to (repo, ref, namespace, table). Implement the repo/ref/namespace level split, the docs' namespace rules (case-sensitive, <=255 chars, no empty level, only dots as special chars), and the relative_to variants /iceberg/relative_to/{repo}.{branch}/api and /iceberg/relative_to/{repo}/api. Client namespace must never be able to escape repo.ref.",
+      "refs": ["§5 Addressing", "§12 unit tests 'identifier parsing'"],
       "status": "backlog",
-      "depends_on": ["A2", "A3"],
-      "files_expected": ["pkg/sso/rbac_bootstrap.go", "pkg/sso/rbac_bootstrap_test.go"],
-      "validation": "go test ./pkg/sso/... (bootstrap twice + version bump)"
+      "depends_on": ["I1-2"],
+      "files_expected": ["pkg/icebergcatalog/ident.go", "pkg/icebergcatalog/ident_test.go"],
+      "validation": "go test -run TestIdent ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I1-4: parse iceberg identifiers for repo, ref and namespace",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "Pure functions, no I/O: safe to run in parallel with I1-6/I1-7.",
+        "Advertise namespace-separator only if ident actually implements it; RCK runs with supports-names-with-dot=false."
+      ]
     },
     {
-      "id": "B3",
+      "id": "I1-5",
+      "phase": "I-1 Read path",
       "type": "implement",
-      "title": "auth_builder: resolveAuthMode (none/simplified/internal, reject external w/ SSO), rbacAuthService wrapper, bootstrap order, break-glass into Admins",
-      "refs": ["§4.1", "§4.2"],
+      "title": "icebergcatalog auth: POST /v1/oauth/tokens plus bearer/basic auth on every other route",
+      "scope": "New pkg/icebergcatalog/auth.go + oauth.go: verify client_credentials against the auth service's credential lookup, mint a lakeFS JWT with auth.GenerateJWTLogin (pkg/auth/token.go:74), return {access_token, token_type:'bearer', expires_in, issued_token_type}. Every other route accepts Authorization: Bearer verified by auth.VerifyToken (pkg/auth/token.go:54) and HTTP basic for rest.auth.type=basic clients. Reuse the GenericAuthMiddleware wiring pattern from pkg/datasets/http.go. Bad credentials return 401 with no detail.",
+      "refs": ["§7.1", "§2.1 OAuth", "§12 security tests"],
       "status": "backlog",
-      "depends_on": ["A2", "B2", "B4"],
-      "files_expected": ["pkg/sso/auth_builder.go", "pkg/sso/auth_builder_test.go"],
-      "validation": "go test ./pkg/sso/... (resolveAuthMode table)"
+      "depends_on": ["I1-3"],
+      "files_expected": ["pkg/icebergcatalog/auth.go", "pkg/icebergcatalog/oauth.go", "pkg/icebergcatalog/auth_test.go"],
+      "validation": "go test -run 'TestOAuth|TestAuth' ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I1-5: authenticate iceberg clients with OAuth and bearer credentials",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "Q-I6 resolved: the token is a lakeFS JWT, no refresh; clients re-auth from `credential`.",
+        "No browser flow: SSO users use access keys."
+      ]
     },
     {
-      "id": "B4",
+      "id": "I1-6",
+      "phase": "I-1 Read path",
       "type": "implement",
-      "title": "contrib/auth/acl/reconcile.go: ReconcileACLPolicies — recompute stored ACL policy statements from templates, once per template version",
-      "refs": ["§3.3 #3", "§4.5 #2"],
+      "title": "icebergcatalog authz: catalog:* on CatalogNamespaceArn/CatalogTableArn plus fs:ReadRepository",
+      "scope": "New pkg/icebergcatalog/authz.go implementing the §7.2 matrix: ListNamespaces/GetNamespace/Create/Update/DeleteNamespace on the namespace ARN, ListTables with a catalog:TableName StringLike filter, ReadTable/Create/Update/DeleteTable on the table ARN, and (from I4-2) ReadTableData/WriteTableData. Additionally require fs:ReadRepository on the repo and, for writes, fs:WriteObject on ObjectArn(repo, '_lakefs_iceberg/*'). Writes on a non-branch ref return 403 ForbiddenException 'ref is read-only' (Q-I4). Table-driven test over the full matrix, including the deny cases.",
+      "refs": ["§7.2", "§12 unit tests 'authz matrix'", "§14 Q-I4"],
       "status": "backlog",
-      "depends_on": ["A1"],
-      "notes": "Standalone new file; startup wiring happens in B3 (auth_builder).",
-      "files_expected": ["contrib/auth/acl/reconcile.go", "contrib/auth/acl/reconcile_test.go"],
-      "validation": "go test ./contrib/auth/acl/... (before/after template change)"
+      "depends_on": ["I1-1", "I1-4"],
+      "files_expected": ["pkg/icebergcatalog/authz.go", "pkg/icebergcatalog/authz_test.go"],
+      "validation": "go test -run TestAuthz ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I1-6: authorize iceberg catalog requests on catalog ARNs",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "ARNs are branch-agnostic by design (§7.2): do not invent a branch-scoped ARN.",
+        "Dataset repos are blocked through the existing dataset-<name>-immutable deny (pkg/datasets/authz.go:597 already denies catalog create/update/delete) — verify, don't duplicate."
+      ]
     },
     {
-      "id": "B5",
+      "id": "I1-7",
+      "phase": "I-1 Read path",
       "type": "implement",
-      "title": "lakefs-sso rbac-migrate command: dry-run default, --yes to apply, --cleanup, idempotent, prints sso.group_mapping rewrites + rollback warning",
-      "refs": ["§4.4"],
+      "title": "icebergcatalog store (read): resolve namespace markers and table pointers on any ref, load metadata.json",
+      "scope": "New pkg/icebergcatalog/store.go: read the _lakefs_iceberg/ns/<ns>/.namespace marker and the _lakefs_iceberg/tables/<ns>/<table>/.pointer entry on a branch/tag/commit (staged value first, then committed), decode the pointer's user metadata (iceberg.metadata-location, iceberg.table-uuid, iceberg.format-version), and load the referenced metadata.json through the block adapter. Handle a missing pointer as 404 NoSuchTableException and a missing marker as 404 NoSuchNamespaceException. No writes in this task.",
+      "refs": ["§6.1 layout", "§4 architecture store.go"],
       "status": "backlog",
-      "depends_on": ["A2"],
-      "files_expected": ["pkg/sso/rbac_migrate.go", "pkg/sso/rbac_migrate_test.go", "cmd/lakefs-sso/main.go"],
-      "validation": "go test ./pkg/sso/... (plan/apply/re-run no-op on kv/mem)"
+      "depends_on": ["I1-2", "I1-4"],
+      "files_expected": ["pkg/icebergcatalog/store.go", "pkg/icebergcatalog/store_test.go"],
+      "validation": "go test -run TestStoreRead ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I1-7: read iceberg pointers and namespace markers from graveler",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "I2-1 adds the write half to the same file — depends_on makes them sequential.",
+        "Metadata reads must work on a commit ref (read-only path), which is the whole point of any-ref reads."
+      ]
     },
     {
-      "id": "B6",
+      "id": "I1-8",
+      "phase": "I-1 Read path",
+      "type": "implement",
+      "title": "icebergcatalog namespaces (read): list/get/head across repo, branch and namespace levels",
+      "scope": "New pkg/icebergcatalog/namespaces.go: GET /v1/{prefix}/namespaces (no parent lists readable repositories; parent repo lists branches; parent repo.ref lists real namespaces), GET and HEAD a namespace with its properties from the marker entry. Pagination via pageToken/pageSize where the client sends it. Filter branches with the authz helper rather than returning what the caller cannot read.",
+      "refs": ["§5 Addressing rules", "§7.2", "§11 I-1"],
+      "status": "backlog",
+      "depends_on": ["I1-3", "I1-5", "I1-6", "I1-7"],
+      "files_expected": ["pkg/icebergcatalog/namespaces.go", "pkg/icebergcatalog/namespaces_test.go"],
+      "validation": "go test -run TestNamespacesRead ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I1-8: serve namespace reads across repository and ref levels",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "The repo/branch levels are lakeFS's own extension of the namespace namespace tree; keep the mapping in one place (ident.go) so a client cannot see a level it should not."
+      ]
+    },
+    {
+      "id": "I1-9",
+      "phase": "I-1 Read path",
+      "type": "implement",
+      "title": "icebergcatalog tables (read): list/load/head with snapshots=all|refs on any ref",
+      "scope": "New pkg/icebergcatalog/tables.go (read half): GET /v1/{prefix}/namespaces/{ns}/tables with pageToken/pageSize, GET and HEAD /v1/{prefix}/namespaces/{ns}/tables/{t} returning LoadTableResult{metadata-location, metadata, config}, honouring the snapshots query parameter. Unknown table is 404 NoSuchTableException with type/code set. No ETag yet (I5-2).",
+      "refs": ["§2.1 ETag note", "§11 I-1"],
+      "status": "backlog",
+      "depends_on": ["I1-8"],
+      "files_expected": ["pkg/icebergcatalog/tables.go", "pkg/icebergcatalog/tables_test.go"],
+      "validation": "go test -run TestTablesRead ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I1-9: serve iceberg table metadata on any ref",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "I2-4/I2-5/I5-2 extend the same file; depends_on keeps them serialized.",
+        "metadata-location in the response must be the pointer's physical URI, not a lakeFS path."
+      ]
+    },
+    {
+      "id": "I1-10",
+      "phase": "I-1 Read path",
+      "type": "implement",
+      "title": "icebergcatalog relative_to: mount /iceberg/relative_to/{repo}.{branch}/api and /iceberg/relative_to/{repo}/api",
+      "scope": "New pkg/icebergcatalog/relative.go: strip the relative_to segment, bind repo and (optionally) branch from the path so the client's first namespace level is the namespace (or the ref) as in §5, and delegate to the same handlers as /iceberg/api. Both forms must return identical results for the same table. A relative_to path for an unknown repo/branch is 404 NoSuchWarehouseException.",
+      "refs": ["§5 table", "§1.1 goal 2", "§11 I-1"],
+      "status": "backlog",
+      "depends_on": ["I1-8"],
+      "files_expected": ["pkg/icebergcatalog/relative.go", "pkg/icebergcatalog/relative_test.go"],
+      "validation": "go test -run TestRelativeTo ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I1-10: serve the relative_to addressing forms",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "Must be wire-compatible with the published DuckDB and Starburst recipes (docs.lakefs.io/iceberg).",
+        "Blocks I2-8 (esti read smoke) because DuckDB reads through relative_to."
+      ]
+    },
+    {
+      "id": "I2-1",
+      "phase": "I-2 Write path",
+      "type": "implement",
+      "title": "icebergcatalog store (write): namespace markers and pointer writes with graveler.WithCondition",
+      "scope": "Extend pkg/icebergcatalog/store.go with the write half: create/update namespace markers (properties in entry user metadata), write a table pointer with graveler.WithCondition comparing iceberg.metadata-location (pkg/graveler/graveler.go:283) so a lost race returns graveler.ErrPreconditionFailed, and staged create on an absent value (If-None-Match: * semantics, pkg/api/apiutil/conditions.go:16-36). All writes go through catalog.CreateEntry without Force, so branch protection and dataset immutability apply naturally. Two-goroutine race test: exactly one wins, the other sees ErrPreconditionFailed.",
+      "refs": ["§6.2 steps 5-6", "§6.1 layout", "§12 unit tests 'CAS race'"],
+      "status": "backlog",
+      "depends_on": ["I1-7"],
+      "files_expected": ["pkg/icebergcatalog/store.go", "pkg/icebergcatalog/store_test.go"],
+      "validation": "go test -run 'TestStoreWrite|TestPointerCAS' ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I2-1: write iceberg namespace markers and pointers with a conditional swap",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "Deliberately no auto-commit: catalog writes are staged on the branch (§6.2 'why stage instead of auto-commit').",
+        "Never overwrite an existing pointer without a matching condition — the GC-safety argument depends on it."
+      ]
+    },
+    {
+      "id": "I2-2",
+      "phase": "I-2 Write path",
+      "type": "implement",
+      "title": "icebergcatalog namespaces (write): create, update properties, delete, with endpoint list update",
+      "scope": "Extend namespaces.go with POST /v1/{prefix}/namespaces (409 NamespaceAlreadyExistsException), POST .../{ns}/properties (merge, 404 if absent), DELETE .../{ns} (404 if absent, 409 if it still holds tables). Advertise these in the /v1/config endpoints list in the same commit. Writes to a tag/commit ref are 403 (from I1-6).",
+      "refs": ["§6.1", "§7.2", "§2.1 endpoints"],
+      "status": "backlog",
+      "depends_on": ["I2-1", "I1-8"],
+      "files_expected": ["pkg/icebergcatalog/namespaces.go", "pkg/icebergcatalog/namespaces_test.go", "pkg/icebergcatalog/http.go"],
+      "validation": "go test -run TestNamespacesWrite ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I2-2: create, update and drop iceberg namespaces",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "Namespace delete must check for tables under the marker, not assume the client did."
+      ]
+    },
+    {
+      "id": "I2-3",
+      "phase": "I-2 Write path",
+      "type": "implement",
+      "title": "icebergcatalog commit: requirements -> updates -> new metadata.json -> CAS pointer",
+      "scope": "New pkg/icebergcatalog/commit.go + metadata.go implementing §6.2 end to end: resolve the base pointer, run Requirement.Validate per requirement and map failure to 409 CommitFailedException, apply updates with table.UpdateTableMetadata, reject set-location with 400 (documented Enterprise limitation), write newLoc = .../metadata/<seq>-<uuid>.metadata.json through the block adapter (never overwriting), then swap the pointer with WithCondition on the base metadata-location. ErrPreconditionFailed is 409; any other error after the metadata write is 500 CommitStateUnknownException. Implement locally any update action I0-1 found missing. Table-driven tests from the spec examples.",
+      "refs": ["§6.2", "§4.2", "§12 unit tests", "§11 I-2"],
+      "status": "backlog",
+      "depends_on": ["I0-1", "I2-1", "I1-6"],
+      "files_expected": ["pkg/icebergcatalog/commit.go", "pkg/icebergcatalog/metadata.go", "pkg/icebergcatalog/commit_test.go", "pkg/icebergcatalog/metadata_test.go"],
+      "validation": "go test -run 'TestCommit|TestRequirements|TestUpdates' ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I2-3: apply iceberg requirements and updates with an atomic pointer swap",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "Never map an unknown commit outcome to 409: 500/502/504 means CommitStateUnknownException to the client, which must not assume failure (§2.1).",
+        "The orphan metadata file on a failed CAS is intentional: GC collects it.",
+        "Blocks I2-4, I2-5, I2-7, I3-1, I4-1 and I5-1/I5-3."
+      ]
+    },
+    {
+      "id": "I2-4",
+      "phase": "I-2 Write path",
+      "type": "implement",
+      "title": "icebergcatalog tables (write): create (staged) and default table location",
+      "scope": "Extend tables.go with POST /v1/{prefix}/namespaces/{ns}/tables: accept the staged create body, generate the table UUID, default the location to <storage_namespace>/_iceberg/<table-uuid> when omitted (Q-I5), write the initial metadata.json, and stage the pointer with assert-create semantics. A duplicate create is 409 AlreadyExistsException. Advertise create in the endpoints list in the same commit.",
+      "refs": ["§6.1", "§6.2", "§14 Q-I5"],
+      "status": "backlog",
+      "depends_on": ["I2-1", "I1-9"],
+      "files_expected": ["pkg/icebergcatalog/tables.go", "pkg/icebergcatalog/tables_test.go", "pkg/icebergcatalog/location.go", "pkg/icebergcatalog/http.go"],
+      "validation": "go test -run TestCreateTable ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I2-4: create iceberg tables with a stable managed location",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "Q-I2 resolved: create is staged, not auto-committed.",
+        "Table location is stable across branches; never derive it from the branch name (§13 rejected alternative)."
+      ]
+    },
+    {
+      "id": "I2-5",
+      "phase": "I-2 Write path",
+      "type": "implement",
+      "title": "icebergcatalog tables (write): drop table and no-op report-metrics",
+      "scope": "Extend tables.go with DELETE /v1/{prefix}/namespaces/{ns}/tables/{t} (drop the pointer entry only; data files stay until GC) and POST .../metrics accepting and discarding the payload with 204. Unknown table is 404. Advertise drop and report-metrics in the endpoints list in the same commit.",
+      "refs": ["§11 I-2", "§2.1 endpoints"],
+      "status": "backlog",
+      "depends_on": ["I2-4"],
+      "files_expected": ["pkg/icebergcatalog/tables.go", "pkg/icebergcatalog/tables_test.go", "pkg/icebergcatalog/http.go"],
+      "validation": "go test -run TestDropTable ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I2-5: drop iceberg tables and accept report metrics",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "Drop is staged like every other catalog change; the data-plane files are reclaimed by the normal GC once unreferenced.",
+        "Q-I8: remove-snapshots keeps files; do not delete file entries here."
+      ]
+    },
+    {
+      "id": "I2-6",
+      "phase": "I-2 Write path",
+      "type": "implement",
+      "title": "icebergcatalog register: adopt an existing metadata.json as a table pointer",
+      "scope": "New pkg/icebergcatalog/register.go: POST /v1/{prefix}/namespaces/{ns}/register validates the given metadata-location is inside <storage_namespace>/_iceberg/<uuid>/, parses it with table.ParseMetadataBytes to obtain the uuid and format version, and stages the pointer. Reject a location outside the managed prefix with 400 (this is also the §13 'client writes outside the table location' guard). Registering an existing table is 409. Advertise register in the endpoints list in the same commit.",
+      "refs": ["§11 I-2", "§13 risks", "§12 unit tests"],
+      "status": "backlog",
+      "depends_on": ["I2-1", "I2-4"],
+      "files_expected": ["pkg/icebergcatalog/register.go", "pkg/icebergcatalog/register_test.go", "pkg/icebergcatalog/http.go"],
+      "validation": "go test -run TestRegister ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I2-6: register an existing iceberg table into the catalog",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "I-1's exit criteria depend on register, which is why the read-path demo lands here.",
+        "Staging the table's files is I3-1, not here: register only adopts the pointer."
+      ]
+    },
+    {
+      "id": "I2-7",
+      "phase": "I-2 Write path",
+      "type": "implement",
+      "title": "conformance: iceberg-go catalogtest external suite plus documented RCK run",
+      "scope": "Add pkg/icebergcatalog/conformance/external_conformance_test.go driving iceberg-go's catalog/catalogtest against a lakefs-sso instance configured by REST_CATALOG_URI, REST_CATALOG_CREDENTIAL and REST_CATALOG_WAREHOUSE, skipped unless the env vars are set. Add conformance/README.md with the exact RCK invocation (./gradlew :iceberg-open-api:test --tests RESTCompatibilityKitSuite -Drck.local=false -Drck.uri=...), the supports-names-with-dot=false flag and the allowlist of the two tests that hard-code local paths.",
+      "refs": ["§12 testing 'Conformance'", "§11 I-2 exit criteria"],
+      "status": "backlog",
+      "depends_on": ["I2-2", "I2-3", "I2-6"],
+      "files_expected": ["pkg/icebergcatalog/conformance/external_conformance_test.go", "pkg/icebergcatalog/conformance/README.md"],
+      "validation": "go vet ./pkg/icebergcatalog/conformance/ && REST_CATALOG_URI=... REST_CATALOG_CREDENTIAL=... REST_CATALOG_WAREHOUSE=... go test ./pkg/icebergcatalog/conformance/ (result recorded)",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I2-7: run the iceberg-go and RCK conformance suites",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "This is the I-2 exit gate: without a green run, I-2 is not done.",
+        "Record the RCK allowlist rationale in the README so a future Iceberg release can shrink it."
+      ]
+    },
+    {
+      "id": "I2-8",
+      "phase": "I-2 Write path",
+      "type": "implement",
+      "title": "esti: PyIceberg and DuckDB read a registered table (read-path smoke)",
+      "scope": "Add esti/iceberg_test.go + helpers that start lakefs-sso on MinIO with iceberg.enabled, register a fixture table, then read it with PyIceberg through /iceberg/api and with DuckDB through /iceberg/relative_to/{repo}.{branch}/api. Skip when the docker/pyiceberg environment is absent, following the existing esti skip conventions.",
+      "refs": ["§12 testing 'Esti'", "§1.1 goals 1-3", "§11 I-1 exit criteria"],
+      "status": "backlog",
+      "depends_on": ["I2-6", "I1-10"],
+      "files_expected": ["esti/iceberg_test.go", "esti/iceberg_utils.go"],
+      "validation": "go test -run TestIcebergReadPath ./esti/ (recorded output or documented skip)",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I2-8: smoke-test the read path with PyIceberg and DuckDB",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "I3-3 extends the same file; depends_on keeps them serialized.",
+        "Use the docker-based esti harness, not a locally installed client, so CI can run it."
+      ]
+    },
+    {
+      "id": "I3-1",
+      "phase": "I-3 File registration + GC",
+      "type": "implement",
+      "title": "icebergcatalog files: stage manifest, manifest-list and data files as lakeFS entries on add-snapshot",
+      "scope": "New pkg/icebergcatalog/files.go per §6.3: on a commit containing add-snapshot, read the new snapshot's manifest list, read each added manifest with iceberg-go's Avro reader, and stage one entry per metadata/manifest-list/manifest/data file under _lakefs_iceberg/files/<table-uuid>/<relative path> with AddressType=Full pointing at the physical object the client wrote. Batch the writes (CreateEntries / import path) using the strategy I0-2 recommends. On remove-snapshots, stage tombstones only if I0-2 says the cost is acceptable (Q-I8 default: keep files). Reject a snapshot whose manifests reference paths outside <storage_namespace>/_iceberg/<uuid>/ with 400.",
+      "refs": ["§6.3", "§13 risks", "§14 Q-I8", "§12 tests"],
+      "status": "backlog",
+      "depends_on": ["I0-2", "I2-3"],
+      "files_expected": ["pkg/icebergcatalog/files.go", "pkg/icebergcatalog/files_test.go"],
+      "validation": "go test -run 'TestStageTableFiles|TestForeignLocationRejected' ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I3-1: stage table files as lakeFS entries so GC and diff can see them",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "This is what makes diff, merge and datasets materialisation see table contents (§6.3, §9).",
+        "The foreign-location rejection is a security control, not an optimisation: it also blocks reads of other buckets."
+      ]
+    },
+    {
+      "id": "I3-2",
+      "phase": "I-3 File registration + GC",
+      "type": "implement",
+      "title": "icebergcatalog GC: uncommitted-GC grace for _iceberg/, and deny fs: writes to _lakefs_iceberg/",
+      "scope": "Implement iceberg.uncommitted_gc_grace (default 24h) so uncommitted GC does not delete objects a client wrote under <storage_namespace>/_iceberg/ before the catalog commit stages them. Read pkg/catalog/catalog.go PrepareGCUncommitted (line ~2994) first and pick the least invasive hook; if no hook exists, add a narrow, tested predicate rather than changing GC's default behaviour. Also register a deny on fs:WriteObject/fs:DeleteObject for arn:lakefs:fs:::repository/*/branch/_lakefs_iceberg/*, following pkg/datasets/authz.go:672, so the reserved prefix cannot be forged through the object API.",
+      "refs": ["§6.1 reserved prefix", "§6.3 uncommitted-GC window", "§12 security tests"],
+      "status": "backlog",
+      "depends_on": ["I0-2", "I2-1"],
+      "files_expected": ["pkg/icebergcatalog/gc.go", "pkg/icebergcatalog/gc_test.go", "pkg/icebergcatalog/config.go"],
+      "validation": "go test -run 'TestUncommittedGcGrace|TestReservedPrefixDenied' ./pkg/icebergcatalog/ ./pkg/catalog/...",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I3-2: protect uncommitted iceberg files from GC and reserve the layout prefix",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "A grace window is a mitigation, not a proof: state the residual window explicitly in the code comment and in D1's docs.",
+        "Do not change GC defaults for non-iceberg repos."
+      ]
+    },
+    {
+      "id": "I3-3",
+      "phase": "I-3 File registration + GC",
+      "type": "implement",
+      "title": "esti: append, commit, GC, still readable; branch, write, merge, read on main",
+      "scope": "Extend esti/iceberg_test.go with the I-3 exit criteria: PyIceberg appends to a table, the lakeFS commit stages the files, GC runs and the table is still readable; then create a branch, write a second append on the branch, merge into main and read the merged table with DuckDB. Assert that diff shows the staged file entries, not only the pointer.",
+      "refs": ["§11 I-3 exit criteria", "§6.4 merge", "§12 testing 'Esti'"],
+      "status": "backlog",
+      "depends_on": ["I3-1", "I3-2", "I2-8"],
+      "files_expected": ["esti/iceberg_test.go"],
+      "validation": "go test -run 'TestIcebergAppendGC|TestIcebergBranchMerge' ./esti/ (recorded output)",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I3-3: prove GC safety and branch/merge semantics end to end",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "This is the 'usable minimum' gate together with I2-7.",
+        "Conflicting concurrent changes to one table must conflict at merge (§6.4) — assert the conflict case too."
+      ]
+    },
+    {
+      "id": "I4-1",
+      "phase": "I-4 Data access",
+      "type": "implement",
+      "title": "remote signing: POST .../tables/{t}/sign scoped to the table location",
+      "scope": "New pkg/icebergcatalog/sign.go implementing remote signing: sign S3 URLs with the blockstore's own credentials, verify the requested URI is under the table location, and require catalog:ReadTableData for reads and catalog:WriteTableData for writes. Honour X-Iceberg-Access-Delegation: remote-signing. Advertise the endpoint only when s3.remote-signing-enabled is true.",
+      "refs": ["§8 mode table", "§2.1 access delegation", "§7.2"],
+      "status": "backlog",
+      "depends_on": ["I1-6", "I2-3"],
+      "files_expected": ["pkg/icebergcatalog/sign.go", "pkg/icebergcatalog/sign_test.go"],
+      "validation": "go test -run TestRemoteSigning ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I4-1: sign table data access with the blockstore credentials",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "The location-prefix check is the only thing between a signed URL and a foreign bucket: test it explicitly.",
+        "Before the prefix check, resolve the URI lexical form (no .. escapes, no other bucket)."
+      ]
+    },
+    {
+      "id": "I4-2",
+      "phase": "I-4 Data access",
+      "type": "implement",
+      "title": "credential vending: STS session scoped to the table prefix, gated by ReadTableData/WriteTableData",
+      "scope": "New pkg/icebergcatalog/creds.go implementing §8's STS vending for S3: blockstore.s3.credentials_vending.{role_arn, session_duration (default 1h, min 15m), external_id, endpoint}, a session policy scoped to <storage_namespace>/_iceberg/<uuid>/, best-effort (a vending failure falls back to no credentials rather than failing the load). Requires catalog:ReadTableData for read sessions and catalog:WriteTableData for write sessions. Advertise vended-credentials in /v1/config only when configured.",
+      "refs": ["§8 mode table", "§7.2", "§2.1 access delegation"],
+      "status": "backlog",
+      "depends_on": ["I1-1", "I4-1"],
+      "files_expected": ["pkg/icebergcatalog/creds.go", "pkg/icebergcatalog/creds_test.go", "pkg/icebergcatalog/config.go", "pkg/icebergcatalog/sign.go"],
+      "validation": "go test -run TestCredentialVending ./pkg/icebergcatalog/ && go test -tags integration -run TestVendMinIO ./pkg/icebergcatalog/ (recorded)",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I4-2: vend scoped STS credentials for table data",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "S3 only; other blockstores fall back to the client's own credentials (§8).",
+        "The session policy must be the narrowest that works: the table prefix, not the storage namespace."
+      ]
+    },
+    {
+      "id": "I5-1",
+      "phase": "I-5 Merge niceties",
+      "type": "implement",
+      "title": "compaction commit auto-resolve plus iceberg.ignore_compaction_commits",
+      "scope": "Detect commits whose message carries lakefs.compaction.operation-id and, when iceberg.ignore_compaction_commits is true (default), auto-resolve table-pointer merge conflicts caused only by a compaction commit instead of reporting a conflict. Default-true matches the publicly documented Enterprise behaviour. Unit tests for: compaction vs non-compaction conflict, flag off, three-way case.",
+      "refs": ["§6.4", "§10", "§11 I-5"],
+      "status": "backlog",
+      "depends_on": ["I3-1"],
+      "files_expected": ["pkg/icebergcatalog/commit.go", "pkg/icebergcatalog/commit_test.go", "pkg/icebergcatalog/config.go"],
+      "validation": "go test -run TestCompactionAutoResolve ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I5-1: auto-resolve compaction commit conflicts on table pointers",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "Only auto-resolve when the pointer's base metadata is still an ancestor; never guess a three-way merge of snapshots."
+      ]
+    },
+    {
+      "id": "I5-2",
+      "phase": "I-5 Merge niceties",
+      "type": "implement",
+      "title": "ETag / If-None-Match on table load, varying with snapshots=all|refs",
+      "scope": "Add an ETag derived from the pointer metadata-location plus the snapshots query parameter so all and refs never collide; return 304 on a matching If-None-Match. Keep it opt-in on the client side: a client that sends no header is unaffected. Unit tests for: same params -> 304, different snapshots value -> 200 with a different ETag.",
+      "refs": ["§2.1 ETag note", "§11 I-5"],
+      "status": "backlog",
+      "depends_on": ["I1-9"],
+      "files_expected": ["pkg/icebergcatalog/etag.go", "pkg/icebergcatalog/etag_test.go", "pkg/icebergcatalog/tables.go"],
+      "validation": "go test -run TestETag ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I5-2: return ETags that vary with the snapshots parameter",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "The spec requires the ETag to vary with the snapshots parameter; a constant ETag is worse than none."
+      ]
+    },
+    {
+      "id": "I5-3",
+      "phase": "I-5 Merge niceties",
+      "type": "implement",
+      "title": "Idempotency-Key support with an advertised lifetime",
+      "scope": "Store responses for Idempotency-Key on the mutating catalog endpoints in KV with a TTL, and advertise idempotency-key-lifetime in /v1/config only if the storage is actually wired. A replay returns the stored response, including a stored 409. Unit tests for: replay returns the same body, expired key re-executes, missing key unaffected.",
+      "refs": ["§2.1 idempotency", "§11 I-5"],
+      "status": "backlog",
+      "depends_on": ["I2-3"],
+      "files_expected": ["pkg/icebergcatalog/idempotency.go", "pkg/icebergcatalog/idempotency_test.go", "pkg/icebergcatalog/http.go"],
+      "validation": "go test -run TestIdempotency ./pkg/icebergcatalog/",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I5-3: honour Idempotency-Key on catalog mutations",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "Advertise the lifetime only when it is true — §2.1 requires responses to be stored for the advertised window.",
+        "Never swallow a 409 into a success on replay."
+      ]
+    },
+    {
+      "id": "I6-1",
+      "phase": "I-6 Datasets items",
+      "type": "implement",
+      "title": "datasets: accept table and namespace items when iceberg.enabled, and materialise them",
+      "scope": "Remove the unconditional 501-rejection of ItemTypeTable/ItemTypeNamespace (pkg/datasets/validate.go:222-225) and gate them on iceberg.enabled. Add a materialiser opener that resolves the table at the source ref and copies the pointer entry plus every _lakefs_iceberg/files/<uuid>/... entry reachable from the pinned snapshot, so absolute paths inside metadata stay valid (§9). Namespace items materialise the namespace marker and their tables.",
+      "refs": ["§9", "§6.3", "DATASETS_DESIGN.md §1.2 §3 §7.4"],
+      "status": "backlog",
+      "depends_on": ["I3-1", "I3-3"],
+      "files_expected": ["pkg/datasets/validate.go", "pkg/datasets/validate_test.go", "pkg/datasets/materialize.go", "pkg/datasets/materialize_test.go"],
+      "validation": "go test ./pkg/datasets/...",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I6-1: materialise table and namespace items into datasets",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "This is the payoff of §6.3: without staged file entries a table item cannot be materialised at all.",
+        "Keep the existing validation error for table items when iceberg is disabled."
+      ]
+    },
+    {
+      "id": "I6-2",
+      "phase": "I-6 Datasets items",
+      "type": "implement",
+      "title": "datasets authz for table sources, plus api/datasets.yml, docs and DATASETS_DESIGN updates",
+      "scope": "Extend pkg/datasets SourceObjectArn/authz for table items: check catalog:ReadTable and catalog:ReadTableData on CatalogTableArn for the source ref. Document table and namespace items in api/datasets.yml (regenerate with make gen-api) and docs/datasets.md, and update DATASETS_DESIGN.md §1.2, §3 (parity row), §7.4, §17 and Q4 to point at the landed catalog.",
+      "refs": ["§9 changes", "§3 design refs"],
+      "status": "backlog",
+      "depends_on": ["I6-1"],
+      "files_expected": ["pkg/datasets/authz.go", "pkg/datasets/authz_test.go", "api/datasets.yml", "pkg/api/apigen/lakefs.gen.go", "docs/datasets.md", "DATASETS_DESIGN.md"],
+      "validation": "go test ./pkg/datasets/... && make validate-api",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I6-2: authorize table sources and document table items",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "pkg/api/apigen/lakefs.gen.go is generated: commit it together with api/datasets.yml only.",
+        "A dataset table item is read-only at the destination through the existing immutability deny."
+      ]
+    },
+    {
+      "id": "I6-3",
+      "phase": "I-6 Datasets items",
+      "type": "implement",
+      "title": "esti: a dataset with a table item, published, then read through the catalog at <ds>.v1",
+      "scope": "Extend esti/datasets_test.go with the §11 I-6 exit criterion: define a dataset with a table item, publish it, then read the table through /iceberg/api at <dataset>.<ref>.<ns>.<table> with PyIceberg. Assert a write through the catalog into the dataset repo is denied.",
+      "refs": ["§11 I-6 exit criteria", "§9 datasets read path"],
+      "status": "backlog",
+      "depends_on": ["I6-2"],
+      "files_expected": ["esti/datasets_test.go"],
+      "validation": "go test -run TestDatasetTableItem ./esti/ (recorded output)",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "I6-3: verify a published dataset table is readable through the catalog",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "Final v1 gate."
+      ]
+    },
+    {
+      "id": "D1",
+      "phase": "Docs / close-out",
       "type": "docs",
-      "title": "config.example.yaml rbac: internal + CHANGELOG_SSO.md migration steps (simplified→internal, rollback)",
-      "refs": ["§4.9", "§6"],
+      "title": "docs/iceberg.md, fold spike notes into the plan, and record the mount conflict surface",
+      "scope": "Write docs/iceberg.md for the OSS catalog: addressing forms, enable/disable, staged-commit semantics, RBAC actions (including that pre-upgrade custom policies must add catalog:ReadTableData/WriteTableData by hand), data-plane modes and the remaining uncommitted-GC grace window. Fold the four ICEBERG_SPIKE_*.md files into ICEBERG_CATALOG_PLAN.md and delete them. Add the pkg/api/services.go mount change to DATASETS_DESIGN.md §16 (merge-conflict surface). Update this ledger's statuses.",
+      "refs": ["§12", "§7.2", "§13", "§16 of DATASETS_DESIGN"],
       "status": "backlog",
-      "depends_on": ["B3", "B5"],
-      "files_expected": ["cmd/lakefs-sso/config.example.yaml", "CHANGELOG_SSO.md"],
-      "validation": "manual review; links/commands resolve"
-    },
-    {
-      "id": "C1",
-      "type": "implement",
-      "title": "StringEquals/StringNotEquals condition operators (OperatorFactory + StringMatchOperator reuse)",
-      "refs": ["§5.1"],
-      "status": "backlog",
-      "depends_on": [],
-      "files_expected": ["pkg/auth/condition.go", "pkg/auth/condition_test.go"],
-      "validation": "go test ./pkg/auth/..."
-    },
-    {
-      "id": "C2",
-      "type": "implement",
-      "title": "AuthorizationRequest.Fields lazy provider + lakefs:RepositoryMetadata/<k> conditions (API authorizeCallback + gateway handler), memoised per request",
-      "refs": ["§5.2 phase 1"],
-      "status": "backlog",
-      "depends_on": ["A5", "B1"],
-      "files_expected": ["pkg/auth/service.go", "pkg/auth/authorization_request.gen.go or wrappers", "pkg/api/controller.go", "pkg/gateway/handler.go"],
-      "validation": "go test ./pkg/auth/... ./pkg/api/... ./pkg/gateway/... ; missing key => deny"
-    },
-    {
-      "id": "C3",
-      "type": "implement",
-      "title": "ListBranches filtered by policy (repo-ARN grant => all; else per-branch CheckPermission; else 401)",
-      "refs": ["§5.3"],
-      "status": "backlog",
-      "depends_on": ["A5"],
-      "files_expected": ["pkg/api/controller.go", "pkg/api/controller_test.go"],
-      "validation": "go test -run TestListBranches ./pkg/api/... (explicit deny hides branch)"
-    },
-    {
-      "id": "C4",
-      "type": "implement",
-      "title": "datasets action service in permissions + Datasets* built-in policies; ARN arn:lakefs:datasets:::dataset/<name>",
-      "refs": ["§5.4", "DATASETS_DESIGN §9.6"],
-      "status": "backlog",
-      "depends_on": ["A1", "A2"],
-      "notes": "Blocked on datasets feature landing; agree on ARN prefix earlier via design note.",
-      "files_expected": ["pkg/permissions/actions.go", "pkg/auth/base.go", "pkg/auth/setup/setup.go"],
-      "validation": "go test ./pkg/permissions/... ./pkg/auth/setup/..."
-    },
-    {
-      "id": "C5",
-      "type": "implement",
-      "title": "Authorization failures: fix Allowed=false-without-error 500 => 401; opt-in auth.authorization_failure_status: 403 (default stays 401)",
-      "refs": ["§5.5"],
-      "status": "backlog",
-      "depends_on": ["C3"],
-      "notes": "Default must stay 401: webui/SDKs map 401-without-auth-message to AuthorizationError; swagger has no 403 on these endpoints.",
-      "files_expected": ["pkg/config/config.go", "pkg/api/controller.go", "api/swagger.yml (only if 403 documented)"],
-      "validation": "go test ./pkg/api/... ; make validate-api if swagger touched"
+      "depends_on": ["I2-7"],
+      "files_expected": ["docs/iceberg.md", "ICEBERG_CATALOG_PLAN.md", "DATASETS_DESIGN.md", "tasks.json", "agent-progress.txt"],
+      "validation": "manual review; links resolve; spike notes removed and folded",
+      "validation_result": null,
+      "autocommit": true,
+      "commit_message": "D1: document the OSS iceberg catalog and close the board",
+      "commit": {"sha": null, "at": null},
+      "notes": [
+        "This is the only task allowed to commit tasks.json and agent-progress.txt.",
+        "Keep the Enterprise clean-room note in the public docs (§2)."
+      ]
     }
   ]
 }
