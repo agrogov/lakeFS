@@ -714,7 +714,7 @@ func (s *Service) ListAllPullRequests(ctx context.Context, caller Caller, filter
 	default:
 		return nil, &ValidationError{Problems: []Problem{{
 			Path:    "status",
-			Message: fmt.Sprintf("must be %q, %q or %q", ProposalStatusOpen, ProposalStatusClosed, "all"),
+			Message: fmt.Sprintf("must be %q, %q, %q or %q", ProposalStatusOpen, ProposalStatusClosed, ProposalStatusMerged, "all"),
 		}}}
 	}
 

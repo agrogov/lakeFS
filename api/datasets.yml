@@ -602,7 +602,7 @@ paths:
           description: Only return pull requests in this state (`all` is the default)
           schema:
             type: string
-            enum: [open, closed, all]
+            enum: [open, closed, merged, all]
             default: all
         - name: dataset
           in: query
