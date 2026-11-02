@@ -1,9 +1,10 @@
 package icebergcatalog
 
-// Tests for the table read endpoints (ICEBERG_CATALOG_PLAN.md §2.1 protocol facts, §5 "Addressing
-// rules", §7.2 "Authorization" and §11 I-1 "tables list/load/head on any ref"). Every test name
-// starts with TestTablesRead so that the task's validation command,
-// `go test -run TestTablesRead ./pkg/icebergcatalog/`, runs exactly this file.
+// Tests for the table endpoints: the read trio of ICEBERG_CATALOG_PLAN.md §11 I-1 (list, load and
+// head on any ref) and the staged create of §11 I-2 / task I2-4 (§2.1 protocol facts, §5
+// "Addressing rules", §6.2 "Atomic commit", §7.2 "Authorization"). The read tests are named
+// TestTablesRead and the create tests TestCreateTable, so the two tasks' validation commands
+// (`go test -run TestTablesRead` and `go test -run TestCreateTable`) each run this file.
 //
 // The fixture is the real read path end to end: a catalog store (graveler + committed ranges) on
 // an in-memory KV store, an in-memory block adapter, the simplified-ACL auth service the
@@ -20,9 +21,12 @@ package icebergcatalog
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -261,6 +265,11 @@ func newTablesFixture(t *testing.T) *tablesFixture {
 	authz.user(t, "bob")
 	authz.user(t, "dana")
 	authz.attachStatements(t, "orders-only", "dana", tablesOrdersOnlyStatements())
+	// carol holds the write half of §7.2 (authzWriteStatements): catalog:CreateTable and the other
+	// catalog writes plus fs:WriteObject on the reserved _lakefs_iceberg/ area. The create tests use
+	// her, so "a caller without the write grant" is alice, who holds the read half only.
+	authz.user(t, "carol")
+	authz.attachStatements(t, "writer", "carol", authzWriteStatements())
 
 	store := NewStore(base.catalog, base.catalog.BlockAdapter)
 	service := NewTableService(store, authz.authz, base.catalog, &Config{Prefix: CatalogPrefix})
@@ -717,7 +726,7 @@ func TestTablesRead(t *testing.T) {
 		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
 		var response CatalogConfig
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
-		require.Equal(t, []string{listTablesEndpoint, loadTableEndpoint, tableExistsEndpoint},
+		require.Equal(t, []string{listTablesEndpoint, loadTableEndpoint, tableExistsEndpoint, createTableEndpoint},
 			response.Endpoints, "the advertised list is the route table of this file")
 	})
 }
@@ -741,4 +750,412 @@ func (f *tablesFixture) tablePointer(t *testing.T, addr Address) TablePointer {
 	table, err := f.store.GetTable(f.ctx, addr)
 	require.NoError(t, err, "read the table pointer")
 	return table.Pointer
+}
+
+// ---------------------------------------------------------------------------------------------
+// Create table (§11 I-2, task I2-4)
+// ---------------------------------------------------------------------------------------------
+//
+// The create tests run on the same fixture as the read tests - the same router, store, block
+// adapter and auth service - so a create goes through the production middleware stack and the §7.2
+// authorization, and its result is read back through the read endpoints. `sales` is the namespace
+// newTablesFixture creates with a marker and no table, which is why the creates below happen there:
+// nothing they do can be confused with the table tree the read tests assert on.
+//
+// The schema IDs below are the client's own numbering, as a REST client sends them: the create path
+// hands an unbound partition spec and sort order to iceberg-go, which resolves those placeholders
+// against this schema and assigns the table's fresh IDs.
+
+const createTableSchema = `{"type": "struct", "schema-id": 0, "fields": [
+	{"id": 10, "name": "id", "required": true, "type": "long"},
+	{"id": 20, "name": "name", "required": false, "type": "string"}
+]}`
+
+// createTableBody builds a CreateTableRequest body: a name, a schema and the members a test adds
+// verbatim (a "location", a "partition-spec", "properties", …).
+func createTableBody(name, schema string, members ...string) string {
+	parts := []string{`"name": ` + strconv.Quote(name), `"schema": ` + schema}
+	parts = append(parts, members...)
+	return "{" + strings.Join(parts, ", ") + "}"
+}
+
+// tablesCreateTarget is the create URL of a namespace: createTable and listTables share one path,
+// and only the method tells them apart.
+func tablesCreateTarget(namespaceParam string) string {
+	return tablesListTarget(namespaceParam, nil)
+}
+
+// postTable sends one create request as user.
+func (f *tablesFixture) postTable(t *testing.T, namespaceParam, user, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, tablesCreateTarget(namespaceParam), strings.NewReader(body))
+	req.Header.Set("X-Test-User", user)
+	req.Header.Set("Content-Type", contentTypeJSON)
+	rec := httptest.NewRecorder()
+	f.router.ServeHTTP(rec, req)
+	return rec
+}
+
+// tablesNamespaceParam is the namespace path parameter of a namespace of the fixture repository on
+// ref: the macro levels (repository, ref) followed by the client namespace levels (§5).
+func tablesNamespaceParam(ref string, namespace Namespace) string {
+	return nodes(append([]string{tablesTestRepo, ref}, namespace...)...)
+}
+
+// tableAddressOf is the address a create test creates.
+func tableAddressOf(namespace Namespace, table string) Address {
+	return Address{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: namespace, Table: table}
+}
+
+// entryOn reads one entry of the fixture repository on ref. It is the fixture's own repository, not
+// the storeFixture's, which is why it does not go through storeFixture.entryAt.
+func (f *tablesFixture) entryOn(t *testing.T, ref, entryPath string) (*catalog.DBEntry, error) {
+	t.Helper()
+	return f.catalog.GetEntry(f.ctx, tablesTestRepo, ref, entryPath, catalog.GetEntryParams{})
+}
+
+// stagedPointerOf reads the pointer entry the create staged on the ref, i.e. the entry a reader
+// resolves before any lakeFS commit.
+func (f *tablesFixture) stagedPointerOf(t *testing.T, addr Address) map[string]string {
+	t.Helper()
+	pointerPath, err := tablePointerPath(addr)
+	require.NoError(t, err, "build the pointer path")
+	entry, err := f.entryOn(t, addr.Ref, pointerPath)
+	require.NoError(t, err, "read the staged pointer %s", pointerPath)
+	return entry.Metadata
+}
+
+// tableObject reads the object at a fully qualified URI through the block adapter, the way a client
+// (or Store.loadMetadata) reads a table file.
+func (f *tablesFixture) tableObject(t *testing.T, location string) string {
+	t.Helper()
+	repo, err := f.catalog.GetRepository(f.ctx, tablesTestRepo)
+	require.NoError(t, err, "get the repository")
+	reader, err := f.catalog.BlockAdapter.Get(f.ctx, block.ObjectPointer{
+		StorageID:        repo.StorageID,
+		StorageNamespace: repo.StorageNamespace,
+		Identifier:       location,
+		IdentifierType:   block.IdentifierTypeFull,
+	})
+	require.NoError(t, err, "read the object at %s", location)
+	defer func() { _ = reader.Close() }()
+	data, err := io.ReadAll(reader)
+	require.NoError(t, err, "read the object at %s", location)
+	return string(data)
+}
+
+// currentSchemaFieldIDs maps the field names of the table's current schema to the IDs the catalog
+// assigned, so a test can assert that a request's placeholder source IDs were resolved instead of
+// hard-coding the fresh numbering.
+func currentSchemaFieldIDs(t *testing.T, metadata map[string]json.RawMessage) map[string]int {
+	t.Helper()
+	var schemas []struct {
+		Fields []struct {
+			ID   int    `json:"id"`
+			Name string `json:"name"`
+		} `json:"fields"`
+	}
+	require.NoError(t, json.Unmarshal(metadata["schemas"], &schemas), "decode schemas")
+	require.NotEmpty(t, schemas, "the metadata of a table carries a schema")
+	ids := make(map[string]int, len(schemas[0].Fields))
+	for _, field := range schemas[0].Fields {
+		ids[field.Name] = field.ID
+	}
+	return ids
+}
+
+// TestCreateTable covers the create of §11 I-2 end to end: the managed default location of §14
+// Q-I5, an explicit location inside the table area, the initial metadata.json, the placeholder
+// source IDs of a create request, the assert-create condition (a duplicate is 409), and the error
+// paths a client can hit - a malformed body, a missing namespace, a tag ref, a missing grant.
+func TestCreateTable(t *testing.T) {
+	f := newTablesFixture(t)
+	sales := Namespace{"sales"}
+	salesParam := tablesNamespaceParam(tablesTestRef, sales)
+
+	t.Run("stages the pointer with the managed default location", func(t *testing.T) {
+		head := f.headRef(t)
+
+		rec := f.postTable(t, salesParam, "carol", createTableBody("create_default", createTableSchema))
+		body := decodeLoadTable(t, rec)
+
+		// §14 Q-I5: <storage_namespace>/_iceberg/<table-uuid>, and the location never carries the
+		// ref, so the same table is the same files on every branch (§6.1, §13 rejected alternative).
+		var tableUUID, location string
+		require.NoError(t, json.Unmarshal(body.Metadata["table-uuid"], &tableUUID))
+		require.NoError(t, json.Unmarshal(body.Metadata["location"], &location))
+		// The location is the whole of <storage_namespace>/_iceberg/<table-uuid>: nothing in it names
+		// the ref, which is what makes it the same on every branch.
+		require.Equal(t, f.storageNamespace+"/_iceberg/"+tableUUID, location)
+
+		// The response names a metadata.json under the table's location, and that file is the
+		// document the response carries (§6.2 step 4).
+		require.True(t, strings.HasPrefix(body.MetadataLocation, location+"/metadata/"),
+			"metadata-location %q is not under %q", body.MetadataLocation, location+"/metadata/")
+		returned, err := json.Marshal(body.Metadata)
+		require.NoError(t, err, "re-encode the returned metadata")
+		require.JSONEq(t, string(returned), f.tableObject(t, body.MetadataLocation),
+			"the returned metadata is the document that was written")
+
+		var formatVersion int
+		require.NoError(t, json.Unmarshal(body.Metadata["format-version"], &formatVersion))
+		require.Equal(t, 2, formatVersion, "a create without format-version makes a v2 table")
+		if raw, ok := body.Metadata["snapshots"]; ok {
+			var snapshots []json.RawMessage
+			require.NoError(t, json.Unmarshal(raw, &snapshots))
+			require.Empty(t, snapshots, "a new table has no snapshots")
+		}
+
+		// The pointer is staged on the branch, with assert-create semantics, and the branch head did
+		// not move: create is staged, not auto-committed (§14 Q-I2).
+		require.Equal(t, head, f.headRef(t), "create must not commit the branch")
+		addr := tableAddressOf(sales, "create_default")
+		pointer := f.stagedPointerOf(t, addr)
+		require.Equal(t, body.MetadataLocation, pointer[MetadataLocationKey])
+		require.Equal(t, tableUUID, pointer[TableUUIDKey])
+		require.Equal(t, "2", pointer[FormatVersionKey])
+
+		// And the read path serves it immediately, before any commit.
+		loaded := decodeLoadTable(t, f.request(t, http.MethodGet,
+			tablesLoadTarget(salesParam, "create_default", nil), "alice"))
+		require.Equal(t, body.MetadataLocation, loaded.MetadataLocation)
+		require.Equal(t, http.StatusNoContent, f.request(t, http.MethodHead,
+			tablesLoadTarget(salesParam, "create_default", nil), "alice").Code)
+	})
+
+	t.Run("honours an explicit location inside the table area", func(t *testing.T) {
+		location := f.storageNamespace + "/_iceberg/66666666-6666-6666-6666-666666666666"
+		rec := f.postTable(t, salesParam, "carol", createTableBody("create_explicit", createTableSchema,
+			`"location": `+strconv.Quote(location+"/")))
+		body := decodeLoadTable(t, rec)
+
+		var got string
+		require.NoError(t, json.Unmarshal(body.Metadata["location"], &got))
+		require.Equal(t, location, got, "a trailing slash is normalized away")
+		require.True(t, strings.HasPrefix(body.MetadataLocation, location+"/metadata/"),
+			"metadata-location %q is not under the requested location", body.MetadataLocation)
+		// The location is the client's; the table uuid is still the one the catalog generated, and it
+		// is the same in metadata.json and in the pointer.
+		var tableUUID string
+		require.NoError(t, json.Unmarshal(body.Metadata["table-uuid"], &tableUUID))
+		require.Equal(t, tableUUID,
+			f.stagedPointerOf(t, tableAddressOf(sales, "create_explicit"))[TableUUIDKey])
+		require.NotEmpty(t, f.tableObject(t, body.MetadataLocation), "the metadata file is written there")
+	})
+
+	t.Run("refuses a location outside the table area", func(t *testing.T) {
+		for name, location := range map[string]string{
+			"another bucket":  "mem://some-other-bucket/tables/x",
+			"the area itself": f.storageNamespace + "/_iceberg",
+			"dot dot":         f.storageNamespace + "/_iceberg/uuid/../../elsewhere",
+			"empty segment":   f.storageNamespace + "/_iceberg//uuid",
+			"plain path":      "/tmp/tables/x",
+		} {
+			t.Run(name, func(t *testing.T) {
+				rec := f.postTable(t, salesParam, "carol", createTableBody("create_outside", createTableSchema,
+					`"location": `+strconv.Quote(location)))
+				requireEnvelope(t, rec, http.StatusBadRequest, ErrTypeBadRequest)
+			})
+		}
+		// Nothing was staged by any of the refused requests.
+		refusedPath, err := tablePointerPath(tableAddressOf(sales, "create_outside"))
+		require.NoError(t, err)
+		_, err = f.entryOn(t, tablesTestRef, refusedPath)
+		require.Error(t, err, "a refused create must not stage a pointer")
+	})
+
+	t.Run("carries the request's properties and format version", func(t *testing.T) {
+		rec := f.postTable(t, salesParam, "carol", createTableBody("create_v1", createTableSchema,
+			`"properties": {"owner": "data-team", "format-version": "1"}`))
+		body := decodeLoadTable(t, rec)
+
+		var version int
+		require.NoError(t, json.Unmarshal(body.Metadata["format-version"], &version))
+		require.Equal(t, 1, version)
+		var properties map[string]string
+		require.NoError(t, json.Unmarshal(body.Metadata["properties"], &properties))
+		require.Equal(t, "data-team", properties["owner"])
+		require.NotContains(t, properties, "format-version",
+			"format-version is a field of the metadata, not a property of the table")
+
+		pointer := f.stagedPointerOf(t, tableAddressOf(sales, "create_v1"))
+		require.Equal(t, "1", pointer[FormatVersionKey], "the pointer advertises the table's own version")
+	})
+
+	t.Run("resolves the request's placeholder source IDs", func(t *testing.T) {
+		// A create request carries the client's source IDs (10 and 20 here, as a client numbers its
+		// own schema), not field IDs of a table that does not exist yet. Decoding them as bound IDs
+		// would reject the request; the table's metadata must carry the resolved IDs instead.
+		rec := f.postTable(t, salesParam, "carol", createTableBody("create_partitioned", createTableSchema,
+			`"partition-spec": {"spec-id": 0, "fields": [
+				{"name": "id_bucket", "transform": "bucket[4]", "source-id": 10, "field-id": 1000}
+			]}`,
+			`"write-order": {"order-id": 1, "fields": [
+				{"transform": "identity", "source-id": 20, "direction": "asc", "null-order": "nulls-first"}
+			]}`))
+		body := decodeLoadTable(t, rec)
+
+		ids := currentSchemaFieldIDs(t, body.Metadata)
+		require.Equal(t, []string{"id", "name"}, sortedFieldNames(ids), "the schema keeps its fields")
+		require.NotEqual(t, 10, ids["id"], "the catalog assigns the table's own field IDs")
+
+		var specs []struct {
+			Fields []struct {
+				Name      string `json:"name"`
+				Transform string `json:"transform"`
+				SourceID  int    `json:"source-id"`
+			} `json:"fields"`
+		}
+		require.NoError(t, json.Unmarshal(body.Metadata["partition-specs"], &specs))
+		require.Len(t, specs, 1)
+		require.Len(t, specs[0].Fields, 1)
+		require.Equal(t, "id_bucket", specs[0].Fields[0].Name)
+		require.Equal(t, "bucket[4]", specs[0].Fields[0].Transform)
+		require.Equal(t, ids["id"], specs[0].Fields[0].SourceID,
+			"the placeholder source ID was resolved to the table's own field ID")
+
+		var orders []struct {
+			Fields []struct {
+				SourceID int `json:"source-id"`
+			} `json:"fields"`
+		}
+		require.NoError(t, json.Unmarshal(body.Metadata["sort-orders"], &orders))
+		require.NotEmpty(t, orders)
+		require.Len(t, orders[0].Fields, 1)
+		require.Equal(t, ids["name"], orders[0].Fields[0].SourceID)
+	})
+
+	t.Run("a duplicate create is 409 AlreadyExistsException", func(t *testing.T) {
+		first := decodeLoadTable(t, f.postTable(t, salesParam, "carol",
+			createTableBody("create_duplicate", createTableSchema)))
+		before := f.stagedPointerOf(t, tableAddressOf(sales, "create_duplicate"))
+		require.Equal(t, first.MetadataLocation, before[MetadataLocationKey])
+
+		rec := f.postTable(t, salesParam, "carol", createTableBody("create_duplicate", createTableSchema))
+		requireEnvelope(t, rec, http.StatusConflict, ErrTypeAlreadyExists)
+
+		after := f.stagedPointerOf(t, tableAddressOf(sales, "create_duplicate"))
+		require.Equal(t, before, after, "the losing create must not replace the pointer")
+
+		// The table the first create made is still the one the read path serves, and it is still the
+		// only one under that name.
+		require.Equal(t, first.MetadataLocation, decodeLoadTable(t, f.request(t, http.MethodGet,
+			tablesLoadTarget(salesParam, "create_duplicate", nil), "alice")).MetadataLocation)
+	})
+
+	t.Run("a malformed create body is 400", func(t *testing.T) {
+		for name, body := range map[string]string{
+			"no schema":         createTableBody("create_bad", "null"),
+			"no name":           "{" + `"schema": ` + createTableSchema + "}",
+			"empty body":        "",
+			"truncated json":    `{"name": "create_bad", "schema":`,
+			"schema not struct": createTableBody("create_bad", `{"type": "list"}`),
+			"format version 3":  createTableBody("create_bad", createTableSchema, `"properties": {"format-version": "3"}`),
+			"unknown transform": createTableBody("create_bad", createTableSchema,
+				`"partition-spec": {"spec-id": 0, "fields": [{"name": "x", "transform": "nope", "source-id": 1, "field-id": 1000}]}`),
+		} {
+			t.Run(name, func(t *testing.T) {
+				rec := f.postTable(t, salesParam, "carol", body)
+				requireEnvelope(t, rec, http.StatusBadRequest, ErrTypeBadRequest)
+			})
+		}
+	})
+
+	t.Run("a namespace that does not exist is 404 NoSuchNamespaceException", func(t *testing.T) {
+		missing := tablesNamespaceParam(tablesTestRef, Namespace{"missing_ns"})
+		rec := f.postTable(t, missing, "carol", createTableBody("t", createTableSchema))
+		requireEnvelope(t, rec, http.StatusNotFound, ErrTypeNoSuchNamespace)
+	})
+
+	t.Run("a tag ref is 403 ForbiddenException", func(t *testing.T) {
+		tagged := tablesNamespaceParam(tablesTestTag, sales)
+		rec := f.postTable(t, tagged, "carol", createTableBody("create_on_tag", createTableSchema))
+		requireEnvelope(t, rec, http.StatusForbidden, ErrTypeForbidden)
+	})
+
+	t.Run("a caller without catalog:CreateTable is refused", func(t *testing.T) {
+		// alice holds the read half of §7.2 only.
+		rec := f.postTable(t, salesParam, "alice", createTableBody("create_denied", createTableSchema))
+		requireEnvelope(t, rec, http.StatusForbidden, ErrTypeForbidden)
+
+		// bob holds nothing at all, and the answer is the same 403 - the refusal does not say
+		// whether the table or the namespace exists.
+		rec = f.postTable(t, salesParam, "bob", createTableBody("create_denied", createTableSchema))
+		requireEnvelope(t, rec, http.StatusForbidden, ErrTypeForbidden)
+	})
+
+	t.Run("a prefix other than the catalog prefix is 404 NoSuchWarehouseException", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost,
+			"/v1/not-the-prefix/namespaces/"+salesParam+"/tables",
+			strings.NewReader(createTableBody("t", createTableSchema)))
+		req.Header.Set("X-Test-User", "carol")
+		rec := httptest.NewRecorder()
+		f.router.ServeHTTP(rec, req)
+		requireEnvelope(t, rec, http.StatusNotFound, ErrTypeNoSuchWarehouse)
+	})
+
+	t.Run("stage-create initializes the metadata without creating the table", func(t *testing.T) {
+		rec := f.postTable(t, salesParam, "carol", createTableBody("create_staged", createTableSchema,
+			`"stage-create": true`))
+		body := decodeLoadTable(t, rec)
+
+		// The spec's stage-create: "the table is not created, but table metadata is initialized and
+		// returned". No pointer is staged, so the table does not exist on the branch.
+		require.NotEmpty(t, f.tableObject(t, body.MetadataLocation),
+			"the initialized metadata.json is written")
+		requireEnvelope(t, f.request(t, http.MethodGet,
+			tablesLoadTarget(salesParam, "create_staged", nil), "alice"),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+		stagedPath, err := tablePointerPath(tableAddressOf(sales, "create_staged"))
+		require.NoError(t, err)
+		_, err = f.entryOn(t, tablesTestRef, stagedPath)
+		require.Error(t, err, "a staged create stages no pointer")
+	})
+
+	t.Run("a created table is listed and an uncreated one is not", func(t *testing.T) { // A table is listed exactly when its pointer exists (§6.1, I1-9), which is the other half of
+		// "create stages a pointer": the listing sees a staged create, and a stage-create that staged
+		// nothing stays invisible.
+		require.Equal(t, http.StatusOK, f.postTable(t, salesParam, "carol",
+			createTableBody("create_listed", createTableSchema)).Code)
+		require.Equal(t, http.StatusOK, f.postTable(t, salesParam, "carol", createTableBody("create_unlisted",
+			createTableSchema, `"stage-create": true`)).Code)
+
+		names := tableNamesOf(decodeListTables(t, f.request(t, http.MethodGet,
+			tablesListTarget(salesParam, nil), "alice")))
+		require.Contains(t, names, "create_listed")
+		require.NotContains(t, names, "create_unlisted", "an uncreated staged table is not a table")
+	})
+
+	t.Run("the production router mounts and advertises the create endpoint", func(t *testing.T) {
+		// RoutesBuilder is what the lakefs-sso binary mounts, so this is the wiring test: the tables
+		// service has to be one of its route sources, or the create endpoint would be served by no
+		// router at all. An advertised endpoint is a promise (§2.1), and advertisedEndpoints is
+		// derived from the mounted routes, so the config response proves both halves at once.
+		useConfig(t, "iceberg:\n  enabled: true\n")
+		deps := newServerDeps(t)
+		deps.Catalog, deps.BlockAdapter = f.catalog, f.catalog.BlockAdapter
+
+		mux := coreRouter()
+		require.NoError(t, RoutesBuilder(t.Context(), deps, mux), "mount the catalog")
+
+		rec := do(t, mux, http.MethodGet, APIBasePath+configPath, testAccessKeyID, testSecretAccessKey)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		var response CatalogConfig
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response), "body: %s", rec.Body.String())
+		for _, endpoint := range []string{createTableEndpoint, listTablesEndpoint, loadTableEndpoint, tableExistsEndpoint} {
+			require.Contains(t, response.Endpoints, endpoint)
+		}
+	})
+}
+
+// sortedFieldNames returns the field names of currentSchemaFieldIDs in lexical order, so a test can
+// assert the set of fields the catalog kept without depending on map iteration order or on the IDs
+// it assigned.
+func sortedFieldNames(m map[string]int) []string {
+	names := make([]string, 0, len(m))
+	for name := range m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }

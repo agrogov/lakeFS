@@ -111,9 +111,9 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 	}
 
 	// The operations of §2.1 that need the server's catalog, block adapter and auth service are
-	// contributed by a service of their own (namespaces.go is the first; the tables service of
-	// I2-4 is the next). Their endpoint strings reach GET /v1/config through the route table, so
-	// the catalog cannot advertise an operation it does not mount.
+	// contributed by a service of their own (namespaces.go, tables.go). Their endpoint strings reach
+	// GET /v1/config through the route table, so the catalog cannot advertise an operation it does
+	// not mount.
 	//
 	// A builder that was handed no catalog or block adapter (a unit test's minimal ServerDeps)
 	// mounts GET /v1/config only, and then advertises nothing but itself: advertisedEndpoints is
@@ -122,7 +122,11 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 	var services []routeSource
 	if deps.Catalog != nil && deps.BlockAdapter != nil && deps.AuthService != nil {
 		store := NewStore(deps.Catalog, deps.BlockAdapter)
-		services = append(services, NewNamespaceService(store, NewAuthorizer(deps.AuthService), deps.Catalog, cfg))
+		authorizer := NewAuthorizer(deps.AuthService)
+		services = append(services,
+			NewNamespaceService(store, authorizer, deps.Catalog, cfg),
+			// The table reads of I1-9 and the staged create of I2-4.
+			NewTableService(store, authorizer, deps.Catalog, cfg))
 	}
 	handler, err := NewRouter(authMiddleware, cfg, services...)
 	if err != nil {
@@ -299,12 +303,11 @@ func maxRequestBody(cfg *Config) int64 {
 // failure it writes the catalog error and the caller returns: a body over
 // iceberg.max_request_body is 413, an empty or malformed body is 400 (§12).
 //
-// The first handler that decodes a body is POST /v1/oauth/tokens (I1-5), followed by the write
-// path of I-2. The helper is written here, next to the limit it enforces, so that the 413 answer
-// has exactly one owner instead of being re-derived by every handler; the router tests exercise
-// it through the production middleware stack.
-//
-//nolint:unused // used by the request-body handlers that land in I1-5 and I-2
+// The handlers that decode a body are the write operations: POST /v1/oauth/tokens (I1-5), the
+// remote-signing endpoint (I-4), and the create of I2-4 (tables.go handleCreateTable). The helper
+// is written here, next to the limit it enforces, so that the 413 answer has exactly one owner
+// instead of being re-derived by every handler; the router tests exercise it through the
+// production middleware stack.
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 	err := json.NewDecoder(r.Body).Decode(dst)
 	if err == nil {

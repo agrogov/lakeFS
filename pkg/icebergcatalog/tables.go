@@ -1,9 +1,11 @@
 package icebergcatalog
 
-// Table reads for the Iceberg REST catalog (ICEBERG_CATALOG_PLAN.md §2.1 "Protocol facts",
-// §5 "Addressing rules", §7.2 "Authorization" and §11 I-1 "tables list/load/head on any ref").
+// Table reads and the staged create for the Iceberg REST catalog (ICEBERG_CATALOG_PLAN.md §2.1
+// "Protocol facts", §5 "Addressing rules", §6.2 "Atomic commit", §7.2 "Authorization", §11 I-1
+// "tables list/load/head on any ref" and I-2 "create table").
 //
-// Three operations live here, and they are the read half of table addressing (§5 row 3):
+// Four operations live here: the three reads of I1-9, which are the read half of table addressing
+// (§5 row 3), and the staged create of I2-4, which is the first operation of the write path.
 //
 //	GET  /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/tables
 //	    → the table identifiers below one namespace, pageToken / pageSize in, `next-page-token` out
@@ -11,6 +13,8 @@ package icebergcatalog
 //	    → LoadTableResult{metadata-location, metadata, config}
 //	HEAD /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/tables/{table}
 //	    → 204 when the table exists, 404 NoSuchTableException when it does not
+//	POST /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/tables
+//	    CreateTableRequest in, 200 LoadTableResult out, 409 AlreadyExistsException when taken
 //
 // A table is read on Address.Ref, which may be a branch, a tag or a commit: that is the any-ref
 // read of §1.1 goal 1, the reason the pointer and its metadata.json are resolved through the
@@ -59,6 +63,37 @@ package icebergcatalog
 // listing delimiter: with one, a nested namespace's tables would be indistinguishable from a
 // table of the listed namespace.
 //
+// The create is an initialize-and-stage, never an auto-commit (§6.2 "why stage instead of
+// auto-commit", §14 Q-I2):
+//
+//  1. the table UUID is generated here, because it is what names the table's managed location
+//     (§14 Q-I5, location.go) and what metadata.json carries as `table-uuid`;
+//  2. the location is the client's when it sent one inside the catalog's table area, and
+//     <storage_namespace>/_iceberg/<table-uuid> otherwise. It never contains the ref, so a table's
+//     files are the same on every branch - the property that keeps metadata valid after a merge
+//     (§6.1, and the alternative §6.3 rejects);
+//  3. the initial metadata.json is written under <location>/metadata/, so the pointer a reader
+//     finds never names a file that is not there (metadata.go);
+//  4. the pointer is staged with the assert-create condition of store.CreateTable - a
+//     compare-and-swap on an absent value, i.e. If-None-Match: * (§6.2). A name that is already
+//     taken is 409 AlreadyExistsException, and the metadata.json of the losing request is left
+//     unreferenced for GC, exactly like the orphan of a lost commit (§6.2 step 4).
+//
+// The response is the LoadTableResult of the spec's CreateTableResponse, built from the bytes that
+// were just written, so a client sees the same document a later load returns.
+//
+// The spec's `stage-create` member is honoured in its documented sense: with stage-create=true the
+// metadata is initialized and returned and the table is *not* created, so no pointer is staged.
+// The phase-two commit such a client sends next (assert-create against a table that does not exist
+// yet) is not served by Store.Commit, which requires a base pointer; until that path exists, a
+// client that asks for a staged create gets the initializing half of it and no table.
+//
+// The namespace a table is created in has to exist, i.e. its marker has to be present on the
+// branch: that is the spec's 404 NoSuchNamespaceException for createTable, and §6.1 defines a
+// namespace by its marker. (A listing still reports a table whose namespace was never created,
+// because there the pointer is what makes the table exist; create is the operation that requires
+// the namespace.)
+//
 // Authorization is the §7.2 row for each operation - catalog:ListTables filtered per table by the
 // catalog:TableName condition, and catalog:ReadTable on the table ARN - plus the fs:ReadRepository
 // every catalog request needs. The listing asks Authorizer.FilterTables, which evaluates the
@@ -69,8 +104,9 @@ package icebergcatalog
 //
 // Clean-room note: written from ICEBERG_CATALOG_PLAN.md, the Apache Iceberg REST OpenAPI spec
 // (https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml, listTables /
-// loadTable / tableExists, and components.parameters.snapshots), the Apache Iceberg table format
-// spec (https://github.com/apache/iceberg/blob/main/format/spec.md, "Table Metadata" and
+// loadTable / tableExists / createTable, components.schemas.CreateTableRequest, and
+// components.parameters.snapshots), the Apache Iceberg table format spec
+// (https://github.com/apache/iceberg/blob/main/format/spec.md, "Table Metadata" and
 // "Snapshot References") and the public lakeFS documentation only. No code from lakeFS Enterprise
 // or from upstream lakeFS >= 1.87 (BSL) was used.
 
@@ -82,9 +118,13 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/table"
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/catalog"
+	"github.com/treeverse/lakefs/pkg/graveler"
 	"github.com/treeverse/lakefs/pkg/httputil"
 )
 
@@ -101,10 +141,17 @@ const (
 	listTablesEndpoint  = "GET /v1/{prefix}/namespaces/{namespace}/tables"
 	loadTableEndpoint   = "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}"
 	tableExistsEndpoint = "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}"
+	createTableEndpoint = "POST /v1/{prefix}/namespaces/{namespace}/tables"
 
 	// ErrTypeNoSuchTable is the Iceberg error type of a missing table, 404
 	// (components.schemas.NoSuchTableException, the 404 of loadTable and tableExists).
 	ErrTypeNoSuchTable = "NoSuchTableException"
+
+	// ErrTypeAlreadyExists is the Iceberg error type of a create whose name is taken, 409
+	// (components.schemas.AlreadyExistsException, the 409 of createTable and of the other create
+	// operations of the spec). It is not CommitFailedException: a create is not a lost commit, and
+	// the client must not retry it - the table it asked for is already there.
+	ErrTypeAlreadyExists = "AlreadyExistsException"
 
 	// SnapshotsAll is the default value of the `snapshots` query parameter: every snapshot
 	// currently valid for the table. It is also what an absent parameter means.
@@ -115,11 +162,27 @@ const (
 	SnapshotsRefs = "refs"
 )
 
-// TableLister is the listing surface the table read endpoints need in addition to Store: the
-// entry walk that finds the table pointers of a namespace. It is a separate interface rather than
-// more methods on Store because it is a lakeFS listing, not catalog state, and *catalog.Catalog
-// (also the NamespaceLister of the namespace endpoints) implements it.
+// ErrInvalidCreateTable is wrapped by every validation failure of a create request that is not
+// already an identifier or a location problem: a missing schema, a schema or partition spec or sort
+// order that cannot describe a table, and a format version this catalog does not serve. The HTTP
+// layer maps it to 400 BadRequestException - the request is refused as sent, and nothing is staged.
+var ErrInvalidCreateTable = errors.New("invalid iceberg create table request")
+
+// BranchLister reports whether a ref names a branch. The write path needs it for the Q-I4 rule of
+// §7.2: a table may be created on a branch, never on a tag or a commit, which is a refusal the
+// Authorizer can only make when it is told what the ref is (Request.RefIsBranch).
+//
+// Resolving it is a lakeFS ref read, so it lives next to the listing rather than in Store.
+type BranchLister interface {
+	GetBranchReference(ctx context.Context, repositoryID string, branch string) (string, error)
+}
+
+// TableLister is the lakeFS surface the table endpoints need in addition to Store: the entry walk
+// that finds the table pointers of a namespace, and the ref resolution a write needs. It is a
+// separate interface rather than more methods on Store because these are lakeFS reads, not catalog
+// state, and *catalog.Catalog (also the NamespaceLister of the namespace endpoints) implements it.
 type TableLister interface {
+	BranchLister
 	ListEntries(ctx context.Context, repositoryID string, reference string, prefix string, after string, delimiter string, limit int) ([]*catalog.DBEntry, bool, error)
 }
 
@@ -173,6 +236,12 @@ func (s *tableService) Routes() []route {
 			handler:  s.handleHeadTable,
 			endpoint: tableExistsEndpoint,
 		},
+		{
+			method:   http.MethodPost,
+			pattern:  tablesPattern,
+			handler:  s.handleCreateTable,
+			endpoint: createTableEndpoint,
+		},
 	}
 }
 
@@ -202,6 +271,45 @@ type loadTableResult struct {
 	MetadataLocation string            `json:"metadata-location"`
 	Metadata         json.RawMessage   `json:"metadata"`
 	Config           map[string]string `json:"config"`
+}
+
+// createTableRequest is CreateTableRequest (spec: components.schemas.CreateTableRequest): the
+// table to create, its schema, and the optional members that shape the initial metadata.json.
+//
+// The three structural members are decoded into iceberg-go's *unbound* types, which is the
+// documented way for a catalog to read this request (table.UnboundPartitionSpec,
+// table.UnboundSortOrder): a create request carries the client's placeholder source IDs - Spark
+// numbers the columns of a new table from zero - not field IDs of a table that does not exist yet.
+// table.NewMetadataWithUUID resolves those placeholders through the schema in the same request and
+// assigns fresh IDs; decoding into the bound types instead would reject a valid request, or bind a
+// placeholder to an unrelated column.
+//
+// The members this catalog does not interpret are absent rather than rejected: the spec allows a
+// server to ignore what it does not model, and an unknown member of a create request cannot change
+// the table this endpoint stages.
+type createTableRequest struct {
+	// Name is the table's name. Create addresses a namespace, so the name is in the body.
+	Name string `json:"name"`
+
+	// Schema is the initial schema in the format spec's JSON form. It is required.
+	Schema *iceberg.Schema `json:"schema"`
+
+	// Location is the table's base location. Optional: an absent location becomes the managed
+	// location of §14 Q-I5 (location.go), and a location outside the catalog's table area is 400.
+	Location string `json:"location,omitempty"`
+
+	// PartitionSpec is the initial partition spec; absent means unpartitioned.
+	PartitionSpec *iceberg.UnboundPartitionSpec `json:"partition-spec,omitempty"`
+
+	// WriteOrder is the initial sort order; absent means unsorted.
+	WriteOrder *table.UnboundSortOrder `json:"write-order,omitempty"`
+
+	// StageCreate asks for the metadata to be initialized without creating the table (below).
+	StageCreate bool `json:"stage-create"`
+
+	// Properties are the initial table properties, including `format-version` when the client
+	// asks for a version other than the default (2).
+	Properties iceberg.Properties `json:"properties,omitempty"`
 }
 
 // handleListTables is GET /v1/{prefix}/namespaces/{namespace}/tables: the table identifiers
@@ -321,6 +429,164 @@ func (s *tableService) handleHeadTable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleCreateTable is POST /v1/{prefix}/namespaces/{namespace}/tables (spec: createTable): a new
+// table's initial metadata.json, its pointer staged on the branch with assert-create semantics, and
+// the LoadTableResult of the spec's CreateTableResponse.
+//
+// The body is decoded before the authorization decision, and it has to be: createTable carries the
+// table name in the body, so the catalog:TableName ARN of §7.2 cannot be built until the body is
+// read. That leaks nothing - an unauthorized caller gets the same 403 whatever name it sends - and
+// the body is bounded by iceberg.max_request_body (http.go), so neither the order of the
+// middleware stack (authentication first) nor the size bound is given up.
+//
+// The order after that is the read path's: validate, authorize, resolve, act. Authorization needs
+// the branch resolution first (Q-I4), and the refusal of a tag or a commit is the Authorizer's so
+// that an unauthorized caller cannot tell a tag from a branch.
+func (s *tableService) handleCreateTable(w http.ResponseWriter, r *http.Request) {
+	if !s.checkPrefix(w, r) {
+		return
+	}
+	addr, ok := s.namespaceAddress(w, r)
+	if !ok {
+		return
+	}
+
+	var request createTableRequest
+	if !decodeJSONBody(w, r, &request) {
+		return
+	}
+	name, err := decodeTableName(request.Name)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	addr.Table = name
+
+	caller, ok := s.caller(w, r)
+	if !ok {
+		return
+	}
+	isBranch, err := s.isBranchRef(r.Context(), addr)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	if err := s.authz.Authorize(r.Context(), caller, Request{
+		Op:          OpCreateTable,
+		Address:     addr,
+		RefIsBranch: isBranch,
+	}); err != nil {
+		s.writeError(w, err)
+		return
+	}
+
+	result, err := s.createTable(r.Context(), addr, request)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// createTable is the create itself, once the request is parsed and authorized: initialize the
+// metadata, write it, and stage the pointer (§6.2, §14 Q-I5).
+//
+// Every failure before the pointer write leaves nothing behind that a reader can see. A failure of
+// the pointer write after metadata.json exists leaves an unreferenced metadata file, which is the
+// same orphan a lost commit leaves and which GC collects (§6.2 step 4); a duplicate create
+// therefore costs one collectable object, and nothing can point a table at the loser's document.
+func (s *tableService) createTable(ctx context.Context, addr Address, request createTableRequest) (*loadTableResult, error) {
+	if request.Schema == nil {
+		return nil, fmt.Errorf("%w: the request carries no schema", ErrInvalidCreateTable)
+	}
+	// §6.1: a namespace exists when its marker does, and the spec's createTable answers 404
+	// NoSuchNamespaceException for one that does not. The check is a read on the same ref the
+	// pointer is staged on, so it sees the branch's staging area too.
+	if _, err := s.store.GetNamespace(ctx, addr); err != nil {
+		return nil, err
+	}
+
+	tableUUID, err := uuid.NewRandom()
+	if err != nil {
+		return nil, fmt.Errorf("generate a table uuid: %w", err)
+	}
+	location, err := s.store.TableLocation(ctx, addr.Repo, request.Location, tableUUID.String())
+	if err != nil {
+		return nil, err
+	}
+
+	// The unbound spec and order are handed over embedded: NewMetadataWithUUID resolves their
+	// placeholder source IDs against the schema of this same request and assigns fresh IDs, which
+	// is exactly the create-table flow the iceberg-go types document.
+	var spec *iceberg.PartitionSpec
+	if request.PartitionSpec != nil {
+		spec = &request.PartitionSpec.PartitionSpec
+	}
+	order := table.UnsortedSortOrder
+	if request.WriteOrder != nil {
+		order = request.WriteOrder.SortOrder
+	}
+	metadata, err := table.NewMetadataWithUUID(request.Schema, spec, order, location, request.Properties, tableUUID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: the schema, partition spec or sort order cannot describe a table: %w",
+			ErrInvalidCreateTable, err)
+	}
+	// Format version 3 is a v1 non-goal (§1.2), exactly as on the commit path.
+	version := metadata.Version()
+	if version != 1 && version != 2 {
+		return nil, fmt.Errorf("%w: format version %d is not supported: this catalog serves format versions 1 and 2",
+			ErrInvalidCreateTable, version)
+	}
+
+	metadataLocation, err := NewMetadataFileLocation(location, "", metadata)
+	if err != nil {
+		return nil, err
+	}
+	metadataJSON, err := s.store.WriteMetadata(ctx, addr.Repo, metadataLocation, metadata)
+	if err != nil {
+		return nil, err
+	}
+	pointer := TablePointer{
+		MetadataLocation: metadataLocation,
+		TableUUID:        tableUUID.String(),
+		FormatVersion:    version,
+	}
+	if !request.StageCreate {
+		// The assert-create staging of §6.2: a value where an absent one was required is
+		// ErrAlreadyExists, which the HTTP layer answers 409 AlreadyExistsException.
+		if err := s.store.CreateTable(ctx, addr, pointer); err != nil {
+			return nil, err
+		}
+	}
+
+	return &loadTableResult{
+		MetadataLocation: metadataLocation,
+		Metadata:         json.RawMessage(metadataJSON),
+		Config:           map[string]string{},
+	}, nil
+}
+
+// isBranchRef reports whether addr.Ref names a branch, for the Q-I4 rule of §7.2 that only a branch
+// may be written to.
+//
+// A ref the catalog cannot resolve to a branch is "not a branch", which is the fail-safe direction:
+// the Authorizer then refuses the write with the 403 "ref is read-only" answer of §14 Q-I4.
+// graveler.ErrInvalidBranchID belongs in that group - a tag such as "v1.0" is a valid ref and not a
+// valid branch name, and reporting it as a server error would turn a client's typo into a 500. A
+// repository that does not exist is propagated instead: it is the 404 NoSuchWarehouseException of
+// §5, not a read-only ref.
+func (s *tableService) isBranchRef(ctx context.Context, addr Address) (bool, error) {
+	_, err := s.lister.GetBranchReference(ctx, addr.Repo, addr.Ref)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, graveler.ErrBranchNotFound), errors.Is(err, graveler.ErrInvalidBranchID):
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
 // authorizeTable parses, authorizes and resolves the table address of GET and HEAD, writing the
@@ -557,8 +823,9 @@ func (s *tableService) caller(w http.ResponseWriter, r *http.Request) (Caller, b
 // writeError maps the typed errors of this package onto the catalog envelope and the statuses of
 // §2.1. A refusal is 403 ForbiddenException; a missing table is 404 NoSuchTableException; a
 // missing namespace is 404 NoSuchNamespaceException; a missing repository or ref is 404
-// NoSuchWarehouseException; a malformed identifier, page token or query value is 400; anything
-// undecided or unexpected is 500 with no detail, never a permission (§12).
+// NoSuchWarehouseException; a taken name is 409 AlreadyExistsException; a malformed identifier,
+// page token, query value or create request is 400; a write the branch or the repository refuses is
+// 403; anything undecided or unexpected is 500 with no detail, never a permission (§12).
 func (s *tableService) writeError(w http.ResponseWriter, err error) {
 	var (
 		denied       *PermissionDeniedError
@@ -568,8 +835,13 @@ func (s *tableService) writeError(w http.ResponseWriter, err error) {
 		noNamespace  *NoSuchNamespaceException
 	)
 	switch {
-	case errors.Is(err, ErrInvalidIdentifier):
+	case errors.Is(err, ErrInvalidIdentifier), errors.Is(err, ErrInvalidCreateTable),
+		errors.Is(err, ErrInvalidTableLocation):
 		writeIcebergError(w, http.StatusBadRequest, ErrTypeBadRequest, err.Error())
+	case errors.Is(err, ErrAlreadyExists):
+		// A create whose name is taken: the table the client asked for exists, so this is not a
+		// lost commit the client should retry as-is (§6.2).
+		writeIcebergError(w, http.StatusConflict, ErrTypeAlreadyExists, err.Error())
 	case errors.As(err, &readOnly):
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, readOnly.Message())
 	case errors.As(err, &denied):
@@ -581,6 +853,11 @@ func (s *tableService) writeError(w http.ResponseWriter, err error) {
 		writeIcebergError(w, http.StatusNotFound, ErrTypeNoSuchTable, noTable.Error())
 	case errors.As(err, &noNamespace):
 		writeIcebergError(w, http.StatusNotFound, ErrTypeNoSuchNamespace, noNamespace.Error())
+	case errors.Is(err, graveler.ErrWriteToProtectedBranch), errors.Is(err, graveler.ErrReadOnlyRepository):
+		// A staging write the repository refuses: a protected branch or an immutable (datasets)
+		// repository. The catalog never passes graveler.WithForce, so the core rules apply unchanged
+		// (§6.2 "why stage instead of auto-commit").
+		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, err.Error())
 	case isMissingWarehouse(err):
 		writeIcebergError(w, http.StatusNotFound, ErrTypeNoSuchWarehouse,
 			"the repository or ref named by the request does not exist")
