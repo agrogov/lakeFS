@@ -125,7 +125,8 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 		authorizer := NewAuthorizer(deps.AuthService)
 		services = append(services,
 			NewNamespaceService(store, authorizer, deps.Catalog, cfg),
-			// The table reads of I1-9 and the staged create of I2-4.
+			// The table reads of I1-9, the staged create of I2-4, and the drop and metrics sink
+			// of I2-5.
 			NewTableService(store, authorizer, deps.Catalog, cfg))
 	}
 	handler, err := NewRouter(authMiddleware, cfg, services...)
@@ -181,8 +182,8 @@ func DisabledHandler() http.Handler {
 // NewRouter builds the catalog sub-router. It is mounted at APIBasePath (and, with a warehouse
 // segment in between, at RelativeToBasePath) by RoutesBuilder, so its routes are relative to
 // that mount point. services are the operation tables of the catalog's own services (namespaces
-// today; tables in I2-4): every operation they carry is mounted and, through the route table,
-// advertised in GET /v1/config.
+// and tables): every operation they carry is mounted and, through the route table, advertised in
+// GET /v1/config.
 //
 // The middleware stack is ordered the way §12 and I1-3 require, and the order is not
 // interchangeable:
@@ -387,7 +388,8 @@ func newServer(cfg *Config, services ...routeSource) *server {
 // and its test passes. GET /v1/config is the catalog's own operation; everything else arrives with
 // a service that contributes its Routes(), so the endpoint list is exactly what the router serves.
 // The read path arrives in this order: namespaces (I1-8), tables (I1-9), relative_to (I1-10, which
-// reuses these routes), then the write path of I-2 (namespaces here, tables in I2-4).
+// reuses these routes), then the write path of I-2 (namespaces here, tables in I2-4 and - drop and
+// report-metrics - I2-5).
 func (s *server) ownRoutes() []route {
 	routes := make([]route, 0, 1+len(s.services))
 	routes = append(routes, route{method: http.MethodGet, pattern: configPath, handler: s.handleConfig})

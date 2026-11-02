@@ -1,10 +1,12 @@
 package icebergcatalog
 
 // Tests for the table endpoints: the read trio of ICEBERG_CATALOG_PLAN.md §11 I-1 (list, load and
-// head on any ref) and the staged create of §11 I-2 / task I2-4 (§2.1 protocol facts, §5
-// "Addressing rules", §6.2 "Atomic commit", §7.2 "Authorization"). The read tests are named
-// TestTablesRead and the create tests TestCreateTable, so the two tasks' validation commands
-// (`go test -run TestTablesRead` and `go test -run TestCreateTable`) each run this file.
+// head on any ref), the staged create of §11 I-2 / task I2-4 (§2.1 protocol facts, §5
+// "Addressing rules", §6.2 "Atomic commit", §7.2 "Authorization"), and the drop and metrics sink
+// of task I2-5 (§11 I-2, §14 Q-I8). The read tests are named TestTablesRead, the create tests
+// TestCreateTable and the drop and metrics tests TestDropTable and TestReportMetrics, so each
+// task's validation command (`go test -run TestTablesRead`, `-run TestCreateTable`,
+// `-run TestDropTable`) runs the tests it names.
 //
 // The fixture is the real read path end to end: a catalog store (graveler + committed ranges) on
 // an in-memory KV store, an in-memory block adapter, the simplified-ACL auth service the
@@ -37,6 +39,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/auth/model"
 	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/catalog"
+	"github.com/treeverse/lakefs/pkg/graveler"
 	"github.com/treeverse/lakefs/pkg/permissions"
 )
 
@@ -726,8 +729,10 @@ func TestTablesRead(t *testing.T) {
 		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
 		var response CatalogConfig
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
-		require.Equal(t, []string{listTablesEndpoint, loadTableEndpoint, tableExistsEndpoint, createTableEndpoint},
-			response.Endpoints, "the advertised list is the route table of this file")
+		require.Equal(t, []string{
+			listTablesEndpoint, loadTableEndpoint, tableExistsEndpoint, createTableEndpoint,
+			dropTableEndpoint, reportMetricsEndpoint,
+		}, response.Endpoints, "the advertised list is the route table of this file")
 	})
 }
 
@@ -1158,4 +1163,381 @@ func sortedFieldNames(m map[string]int) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// ---------------------------------------------------------------------------------------------
+// Drop table and report metrics (§11 I-2, task I2-5)
+// ---------------------------------------------------------------------------------------------
+//
+// The drop and metrics tests run on the same fixture as the read and create tests - the same router,
+// store, block adapter and auth service - so both go through the production middleware stack and the
+// §7.2 authorization, and their effect is read back through the read endpoints.
+
+// tablesCatalogRef is the commit tablesTestRef points at, i.e. what an explicit lakeFS commit last
+// wrote to the fixture's repository. storeFixture.headRef answers the same question for the store
+// fixture's own repository ("repo"), which is not the repository these tables live in ("lakehouse").
+func (f *tablesFixture) tablesCatalogRef(t *testing.T) string {
+	t.Helper()
+	ref, err := f.catalog.GetBranchReference(f.ctx, tablesTestRepo, tablesTestRef)
+	require.NoError(t, err, "get the %s branch reference", tablesTestRef)
+	return ref
+}
+
+// tableMetricsTarget is the report-metrics URL of one table.
+func tableMetricsTarget(namespaceParam, table string) string {
+	return tablesLoadTarget(namespaceParam, table, nil) + "/metrics"
+}
+
+// deleteTable sends one drop request as user. The optional query parameters are the ones a client
+// adds to a drop - `purgeRequested` - so a test can show they change nothing.
+func (f *tablesFixture) deleteTable(t *testing.T, namespaceParam, table, user string, query url.Values) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodDelete, tablesLoadTarget(namespaceParam, table, query), nil)
+	req.Header.Set("X-Test-User", user)
+	rec := httptest.NewRecorder()
+	f.router.ServeHTTP(rec, req)
+	return rec
+}
+
+// postTableMetrics sends one report-metrics request as user.
+func (f *tablesFixture) postTableMetrics(t *testing.T, namespaceParam, table, user, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, tableMetricsTarget(namespaceParam, table), strings.NewReader(body))
+	req.Header.Set("X-Test-User", user)
+	req.Header.Set("Content-Type", contentTypeJSON)
+	rec := httptest.NewRecorder()
+	f.router.ServeHTTP(rec, req)
+	return rec
+}
+
+// deleteNamespace sends one namespace drop request as user through router. The namespace parameter
+// is the same path parameter a table request uses, macro levels included (§5).
+func deleteNamespace(t *testing.T, router http.Handler, namespaceParam, user string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodDelete, "/v1/"+CatalogPrefix+"/namespaces/"+namespaceParam, nil)
+	req.Header.Set("X-Test-User", user)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+// pointerEntryGone asserts that the table pointer of addr is no longer an entry of addr.Ref, i.e.
+// that the drop staged a removal rather than leaving the pointer behind.
+func (f *tablesFixture) pointerEntryGone(t *testing.T, addr Address) {
+	t.Helper()
+	pointerPath, err := tablePointerPath(addr)
+	require.NoError(t, err, "build the pointer path")
+	_, err = f.entryOn(t, addr.Ref, pointerPath)
+	require.ErrorIs(t, err, graveler.ErrNotFound, "the pointer entry %s must be gone", pointerPath)
+}
+
+// TestDropTable covers the drop of §11 I-2 end to end: the pointer-only removal, the data-plane
+// files that stay until GC (§14 Q-I8), the any-ref behaviour of a staged drop, the namespace that
+// becomes droppable once its last table is, and the error paths a client can hit.
+//
+// What a drop must be, and what these subtests therefore pin:
+//   - it removes exactly one entry, the table's pointer (§6.1). The table stops existing on the ref
+//     it was dropped on and keeps existing on every other ref whose pointer still names its
+//     metadata - the release tag of the fixture proves the any-ref half;
+//   - it deletes no data-plane file: the metadata.json the dropped pointer named is still readable
+//     from the object store afterwards, which is the Q-I8 rule of §14 and the reason a drop is a
+//     staged, revertible lakeFS change rather than a destructive purge;
+//   - the spec's `purgeRequested` query parameter changes nothing, whatever its value;
+//   - a table that does not exist is 404 NoSuchTableException, a tag ref is the Q-I4 403, and a
+//     caller without catalog:DeleteTable is refused with the same 403.
+func TestDropTable(t *testing.T) {
+	f := newTablesFixture(t)
+	books := Namespace{"inventory", "books"}
+	booksParam := tablesNamespaceParam(tablesTestRef, books)
+	ordersAddr := tableAddressOf(books, "orders")
+	titlesAddr := tableAddressOf(books, "titles")
+
+	// The pointers and the document of the table the first subtest drops, read before the drop.
+	ordersPointer := f.tablePointer(t, ordersAddr)
+	titlesPointer := f.tablePointer(t, titlesAddr)
+	ordersDocument := f.tableObject(t, ordersPointer.MetadataLocation)
+
+	t.Run("drops the pointer and leaves the data-plane files in place", func(t *testing.T) {
+		head := f.tablesCatalogRef(t)
+
+		rec := f.deleteTable(t, booksParam, "orders", "carol", nil)
+		require.Equal(t, http.StatusNoContent, rec.Code, "body: %s", rec.Body.String())
+		require.Empty(t, rec.Body.String(), "a drop has no response body")
+
+		// The table is gone from every read of the branch: load, head and the listing agree.
+		requireEnvelope(t, f.request(t, http.MethodGet, tablesLoadTarget(booksParam, "orders", nil), "alice"),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+		requireEnvelope(t, f.request(t, http.MethodHead, tablesLoadTarget(booksParam, "orders", nil), "alice"),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+		names := tableNamesOf(decodeListTables(t, f.request(t, http.MethodGet,
+			tablesListTarget(booksParam, nil), "alice")))
+		require.NotContains(t, names, "orders")
+		require.Contains(t, names, "titles", "a drop must not touch a sibling table")
+
+		f.pointerEntryGone(t, ordersAddr)
+		require.Equal(t, titlesPointer, f.tablePointer(t, titlesAddr), "the sibling pointer is unchanged")
+
+		// §14 Q-I8: the drop removed the pointer, not the files it named. The metadata.json of the
+		// dropped table is still in the object store, and so are the data/manifest files it
+		// references; GC reclaims them once nothing references them (§6.3, phase I-3).
+		require.Equal(t, ordersDocument, f.tableObject(t, ordersPointer.MetadataLocation),
+			"the dropped table's metadata.json must stay until GC")
+
+		// The drop is staged like every other catalog write: the branch head did not move, and
+		// nothing was committed (§6.2, §14 Q-I2).
+		require.Equal(t, head, f.tablesCatalogRef(t), "a drop must not commit the branch")
+	})
+
+	t.Run("a table dropped on a branch is still readable on a tag", func(t *testing.T) {
+		// release tagged the commit the fixture made before any drop, so the tag's pointer still
+		// names the dropped table's metadata. That is the any-ref read of §1.1 goal 1, and the
+		// reason a drop has to be a pointer removal: nothing on the tag's side changed.
+		tagged := tablesNamespaceParam(tablesTestTag, books)
+		body := decodeLoadTable(t, f.request(t, http.MethodGet, tablesLoadTarget(tagged, "orders", nil), "alice"))
+		require.Equal(t, ordersPointer.MetadataLocation, body.MetadataLocation,
+			"the tag still names the metadata of the table dropped on the branch")
+		require.Equal(t, http.StatusNoContent, f.request(t, http.MethodHead,
+			tablesLoadTarget(tagged, "orders", nil), "alice").Code)
+	})
+
+	t.Run("a commit carries the drop, and the previous commit still has the table", func(t *testing.T) {
+		before := f.tablesCatalogRef(t)
+		require.Equal(t, http.StatusNoContent, f.deleteTable(t, booksParam, "titles", "carol", nil).Code)
+
+		// Before the commit the drop is only in the staging area (previous subtest's observation);
+		// the commit is what makes it part of the repository.
+		after := f.commitCatalog(t)
+		require.NotEqual(t, before, after, "the commit wrote a new commit")
+
+		requireEnvelope(t, f.request(t, http.MethodGet, tablesLoadTarget(booksParam, "titles", nil), "alice"),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+		// ... and the commit it superseded still serves the table: a drop is revertible because
+		// only an entry was removed.
+		previous := tablesNamespaceParam(before, books)
+		require.Equal(t, titlesPointer.MetadataLocation,
+			decodeLoadTable(t, f.request(t, http.MethodGet,
+				tablesLoadTarget(previous, "titles", nil), "alice")).MetadataLocation)
+	})
+
+	t.Run("purgeRequested is accepted and purges nothing", func(t *testing.T) {
+		// iceberg-go sends purgeRequested=false for DropTable and true for PurgeTable. v1 answers
+		// both with the same pointer-only drop: the files are GC's to reclaim, and one catalog
+		// request must not delete files another ref may still reference (§14 Q-I8).
+		const uuid = "77777777-7777-7777-7777-777777777777"
+		sales := Namespace{"sales"}
+		salesParam := tablesNamespaceParam(tablesTestRef, sales)
+
+		for _, purge := range []string{"false", "true"} {
+			t.Run("purgeRequested="+purge, func(t *testing.T) {
+				pointer := f.createTableWithMetadata(t, sales, "purged", uuid,
+					storeTestMetadata(t, uuid, f.storageNamespace+"/_iceberg/"+uuid))
+
+				rec := f.deleteTable(t, salesParam, "purged", "carol", url.Values{"purgeRequested": {purge}})
+				require.Equal(t, http.StatusNoContent, rec.Code, "body: %s", rec.Body.String())
+
+				f.pointerEntryGone(t, tableAddressOf(sales, "purged"))
+				require.NotEmpty(t, f.tableObject(t, pointer.MetadataLocation),
+					"purgeRequested=%s must not delete the table's files", purge)
+			})
+		}
+	})
+
+	t.Run("an unknown table is 404 NoSuchTableException", func(t *testing.T) {
+		// A table that never existed, a table dropped twice, and a table in a namespace that does
+		// not exist are the same answer: the pointer is what makes a table exist (§6.1).
+		for name, namespaceParam := range map[string]string{
+			"never created": booksParam,
+			"missing ns":    tablesNamespaceParam(tablesTestRef, Namespace{"missing_ns"}),
+		} {
+			t.Run(name, func(t *testing.T) {
+				rec := f.deleteTable(t, namespaceParam, "no_such_table", "carol", nil)
+				requireEnvelope(t, rec, http.StatusNotFound, ErrTypeNoSuchTable)
+			})
+		}
+
+		// orders was dropped by the first subtest, so dropping it again is the same 404.
+		rec := f.deleteTable(t, booksParam, "orders", "carol", nil)
+		requireEnvelope(t, rec, http.StatusNotFound, ErrTypeNoSuchTable)
+	})
+
+	t.Run("a namespace becomes droppable once its last table is dropped", func(t *testing.T) {
+		// The last half of "drop removes the pointer entry only": the namespace emptiness check of
+		// I2-2 walks the same `tables/<ns>/` prefix a drop cleans up, so a table that is dropped
+		// stops keeping its namespace alive, and nothing else has to be deleted.
+		//
+		// This fixture's router carries the table service's routes alone (the read tests assert the
+		// exact advertised list), so the namespace endpoints of I2-2 are mounted here explicitly.
+		cfg := &Config{Prefix: CatalogPrefix}
+		router, err := newRouter(tablesUser, cfg,
+			newServer(cfg, f.serve, NewNamespaceService(f.store, f.authz.authz, f.catalog, cfg)))
+		require.NoError(t, err, "mount the namespace and table services together")
+
+		sales := Namespace{"sales"}
+		salesParam := tablesNamespaceParam(tablesTestRef, sales)
+		require.Equal(t, http.StatusOK, f.postTable(t, salesParam, "carol",
+			createTableBody("last_table", createTableSchema)).Code)
+
+		rec := deleteNamespace(t, router, salesParam, "carol")
+		requireEnvelope(t, rec, http.StatusConflict, ErrTypeNamespaceNotEmpty)
+
+		require.Equal(t, http.StatusNoContent, f.deleteTable(t, salesParam, "last_table", "carol", nil).Code)
+		rec = deleteNamespace(t, router, salesParam, "carol")
+		require.Equal(t, http.StatusNoContent, rec.Code, "body: %s", rec.Body.String())
+	})
+
+	t.Run("a tag ref is 403 ForbiddenException", func(t *testing.T) {
+		tagged := tablesNamespaceParam(tablesTestTag, books)
+		rec := f.deleteTable(t, tagged, "orders", "carol", nil)
+		requireForbiddenReadOnly(t, rec)
+	})
+
+	t.Run("a caller without catalog:DeleteTable is refused", func(t *testing.T) {
+		// alice holds the read half of §7.2 only, bob holds nothing at all: both get the same 403,
+		// and neither refusal says whether the table exists.
+		inventory := Namespace{"inventory"}
+		inventoryParam := tablesNamespaceParam(tablesTestRef, inventory)
+		for _, user := range []string{"alice", "bob"} {
+			rec := f.deleteTable(t, inventoryParam, "summary", user, nil)
+			requireEnvelope(t, rec, http.StatusForbidden, ErrTypeForbidden)
+		}
+		// The refused requests changed nothing: the table is still there.
+		require.Equal(t, http.StatusNoContent, f.request(t, http.MethodHead,
+			tablesLoadTarget(inventoryParam, "summary", nil), "alice").Code)
+	})
+
+	t.Run("a prefix other than the catalog prefix is 404 NoSuchWarehouseException", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodDelete,
+			"/v1/not-the-prefix/namespaces/"+booksParam+"/tables/titles", nil)
+		req.Header.Set("X-Test-User", "carol")
+		rec := httptest.NewRecorder()
+		f.router.ServeHTTP(rec, req)
+		requireEnvelope(t, rec, http.StatusNotFound, ErrTypeNoSuchWarehouse)
+	})
+
+	t.Run("the production router mounts and advertises the drop endpoint", func(t *testing.T) {
+		// An advertised endpoint is a promise (§2.1), and advertisedEndpoints is derived from the
+		// mounted routes, so the config response of the production router proves both halves at
+		// once: the tables service contributes dropTable and reportMetrics.
+		useConfig(t, "iceberg:\n  enabled: true\n")
+		deps := newServerDeps(t)
+		deps.Catalog, deps.BlockAdapter = f.catalog, f.catalog.BlockAdapter
+
+		mux := coreRouter()
+		require.NoError(t, RoutesBuilder(t.Context(), deps, mux), "mount the catalog")
+
+		rec := do(t, mux, http.MethodGet, APIBasePath+configPath, testAccessKeyID, testSecretAccessKey)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		var response CatalogConfig
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response), "body: %s", rec.Body.String())
+		require.Contains(t, response.Endpoints, dropTableEndpoint)
+		require.Contains(t, response.Endpoints, reportMetricsEndpoint)
+	})
+}
+
+// TestReportMetrics covers the metrics sink of §11 I-2: the endpoint accepts a client's scan or
+// commit report, stores nothing, and answers 204 - while still refusing a caller without the
+// catalog:UpdateTable action and a report for a table this catalog does not have.
+func TestReportMetrics(t *testing.T) {
+	f := newTablesFixture(t)
+	books := Namespace{"inventory", "books"}
+	booksParam := tablesNamespaceParam(tablesTestRef, books)
+
+	// The two report shapes of the spec's ReportMetricsRequest, flattened around the report-type
+	// discriminator. The body is discarded, so these are here to show the endpoint accepts the
+	// documents a real client sends - not to have the fields asserted on.
+	const (
+		scanReport = `{"report-type": "scan-report", "table-name": "lakehouse.main.inventory.books.orders",
+			"snapshot-id": 3055729675574597004, "filter": {"type": "true"}, "schema-id": 0,
+			"projected-field-ids": [1], "projected-field-names": ["x"], "metadata": {}, "metrics": {}}`
+		commitReport = `{"report-type": "commit-report", "table-name": "lakehouse.main.inventory.books.orders",
+			"snapshot-id": 3055729675574597004, "sequence-number": 1, "operation": "append",
+			"commit-metrics": {"total-data-files": 1, "added-data-files": 1},
+			"commit-report": {"duration-ms": 12, "manifests-created": 1, "metadata-json-result": {}}}`
+	)
+
+	t.Run("a scan report is accepted and discarded", func(t *testing.T) {
+		head := f.tablesCatalogRef(t)
+		before := f.stagedPointerOf(t, tableAddressOf(books, "orders"))
+
+		rec := f.postTableMetrics(t, booksParam, "orders", "carol", scanReport)
+		require.Equal(t, http.StatusNoContent, rec.Code, "body: %s", rec.Body.String())
+		require.Empty(t, rec.Body.String(), "reportMetrics has no response body")
+
+		// Nothing was written: the branch head did not move and the pointer is the same entry.
+		require.Equal(t, head, f.tablesCatalogRef(t), "reporting metrics must not commit the branch")
+		require.Equal(t, before, f.stagedPointerOf(t, tableAddressOf(books, "orders")))
+	})
+
+	t.Run("a commit report is accepted and discarded", func(t *testing.T) {
+		rec := f.postTableMetrics(t, booksParam, "orders", "carol", commitReport)
+		require.Equal(t, http.StatusNoContent, rec.Code, "body: %s", rec.Body.String())
+		require.Empty(t, rec.Body.String())
+	})
+
+	t.Run("the payload is not decoded", func(t *testing.T) {
+		// A report is telemetry: the catalog has nowhere to put it (v1 stores nothing) and a client
+		// only checks whether the request failed, so the shape of a payload the server throws away
+		// must not turn into a 400. An empty body and an unknown report type are both accepted.
+		for name, body := range map[string]string{
+			"empty body":          "",
+			"unknown report type": `{"report-type": "some-future-report"}`,
+			"not json at all":     "not json",
+		} {
+			t.Run(name, func(t *testing.T) {
+				rec := f.postTableMetrics(t, booksParam, "orders", "carol", body)
+				require.Equal(t, http.StatusNoContent, rec.Code, "body: %s", rec.Body.String())
+			})
+		}
+		// The table is still exactly what it was: metrics reporting is not a state change.
+		require.Equal(t, http.StatusOK, f.request(t, http.MethodGet,
+			tablesLoadTarget(booksParam, "orders", nil), "alice").Code)
+	})
+
+	t.Run("a report for a table that does not exist is 404 NoSuchTableException", func(t *testing.T) {
+		rec := f.postTableMetrics(t, booksParam, "no_such_table", "carol", scanReport)
+		requireEnvelope(t, rec, http.StatusNotFound, ErrTypeNoSuchTable)
+	})
+
+	t.Run("a report for a tag ref is 403 ForbiddenException", func(t *testing.T) {
+		// §7.2 has no row of its own for metrics; authz.go assigns the operation to
+		// catalog:UpdateTable, which is a write of the §7.2 matrix and so needs a branch (Q-I4).
+		// Reporting a scan of a tag is therefore refused as a read-only ref, like every other write
+		// the catalog refuses there.
+		tagged := tablesNamespaceParam(tablesTestTag, books)
+		rec := f.postTableMetrics(t, tagged, "orders", "carol", scanReport)
+		requireForbiddenReadOnly(t, rec)
+	})
+
+	t.Run("a caller without catalog:UpdateTable is refused", func(t *testing.T) {
+		// alice holds the read half of §7.2 only, bob holds nothing at all.
+		for _, user := range []string{"alice", "bob"} {
+			rec := f.postTableMetrics(t, booksParam, "orders", user, scanReport)
+			requireEnvelope(t, rec, http.StatusForbidden, ErrTypeForbidden)
+		}
+	})
+
+	t.Run("a prefix other than the catalog prefix is 404 NoSuchWarehouseException", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost,
+			"/v1/not-the-prefix/namespaces/"+booksParam+"/tables/orders/metrics",
+			strings.NewReader(scanReport))
+		req.Header.Set("X-Test-User", "carol")
+		rec := httptest.NewRecorder()
+		f.router.ServeHTTP(rec, req)
+		requireEnvelope(t, rec, http.StatusNotFound, ErrTypeNoSuchWarehouse)
+	})
+
+	t.Run("a table dropped on the branch takes its metrics endpoint with it", func(t *testing.T) {
+		// Existence is the pointer (§6.1), so a drop ends the table's metrics endpoint too.
+		require.Equal(t, http.StatusNoContent, f.deleteTable(t, booksParam, "orders", "carol", nil).Code)
+		rec := f.postTableMetrics(t, booksParam, "orders", "carol", scanReport)
+		requireEnvelope(t, rec, http.StatusNotFound, ErrTypeNoSuchTable)
+	})
+
+	t.Run("config advertises report metrics", func(t *testing.T) {
+		rec := f.request(t, http.MethodGet, configPath, "alice")
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		var response CatalogConfig
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+		require.Contains(t, response.Endpoints, reportMetricsEndpoint)
+	})
 }

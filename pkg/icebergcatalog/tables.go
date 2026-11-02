@@ -1,20 +1,26 @@
 package icebergcatalog
 
-// Table reads and the staged create for the Iceberg REST catalog (ICEBERG_CATALOG_PLAN.md §2.1
-// "Protocol facts", §5 "Addressing rules", §6.2 "Atomic commit", §7.2 "Authorization", §11 I-1
-// "tables list/load/head on any ref" and I-2 "create table").
+// Table reads, the staged create, the drop and the metrics sink for the Iceberg REST catalog
+// (ICEBERG_CATALOG_PLAN.md §2.1 "Protocol facts", §5 "Addressing rules", §6.2 "Atomic commit",
+// §7.2 "Authorization", §11 I-1 "tables list/load/head on any ref" and I-2 "create table, drop,
+// metrics (accept and discard)").
 //
-// Four operations live here: the three reads of I1-9, which are the read half of table addressing
-// (§5 row 3), and the staged create of I2-4, which is the first operation of the write path.
+// Six operations live here: the three reads of I1-9, which are the read half of table addressing
+// (§5 row 3), the staged create of I2-4, which is the first operation of the write path, and the
+// drop and the metrics sink of I2-5.
 //
-//	GET  /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/tables
+//	GET    /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/tables
 //	    → the table identifiers below one namespace, pageToken / pageSize in, `next-page-token` out
-//	GET  /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/tables/{table}
+//	GET    /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/tables/{table}
 //	    → LoadTableResult{metadata-location, metadata, config}
-//	HEAD /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/tables/{table}
+//	HEAD   /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/tables/{table}
 //	    → 204 when the table exists, 404 NoSuchTableException when it does not
-//	POST /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/tables
+//	POST   /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/tables
 //	    CreateTableRequest in, 200 LoadTableResult out, 409 AlreadyExistsException when taken
+//	DELETE /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/tables/{table}
+//	    → 204 after the table's pointer is removed, 404 NoSuchTableException when there is none
+//	POST   /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/tables/{table}/metrics
+//	    ReportMetricsRequest in, 204 out: the report is accepted and discarded
 //
 // A table is read on Address.Ref, which may be a branch, a tag or a commit: that is the any-ref
 // read of §1.1 goal 1, the reason the pointer and its metadata.json are resolved through the
@@ -94,17 +100,50 @@ package icebergcatalog
 // because there the pointer is what makes the table exist; create is the operation that requires
 // the namespace.)
 //
-// Authorization is the §7.2 row for each operation - catalog:ListTables filtered per table by the
-// catalog:TableName condition, and catalog:ReadTable on the table ARN - plus the fs:ReadRepository
-// every catalog request needs. The listing asks Authorizer.FilterTables, which evaluates the
-// namespace-level gate and the per-table condition in one place, so the endpoint cannot return a
-// table the caller may not see. Load and head are authorized before the pointer is resolved, so a
-// caller without catalog:ReadTable cannot distinguish a missing table from a forbidden one (both
-// requests are 403 for it, §12).
+// The drop removes exactly one entry, the table's pointer, and nothing else (§6.1: a pointer is the
+// only thing that makes a table exist). metadata.json, manifest lists, manifests and data files are
+// the data plane's files and stay where they are: the catalog's job on a drop is to stop pointing at
+// them, and reclaiming them is GC's job once nothing on any ref references them (§6.3, phase I-3).
+// That is the Q-I8 rule of §14 applied to the drop - v1 never expires or tombstones a file - and it
+// is what makes the operation reversible: because the drop is staged like every other catalog write
+// (§6.2, §14 Q-I2) and only removes an entry, reverting the lakeFS commit that carries it brings the
+// table back, and a table dropped on one branch stays readable on a branch or a tag whose pointer
+// still names its metadata.
 //
+// So a drop sends no delete to object storage. The spec's `purgeRequested` query parameter is
+// accepted and deliberately has no effect whatever its value: purging would make one catalog
+// request the owner of files that other branches, tags and commits' pointers may still reference,
+// and the lakeFS GC already answers "is this file unreachable?" for the whole repository at once
+// (ICEBERG_CATALOG_PLAN.md §6.3, §14 Q-I8).
+//
+// Existence for a drop is the pointer entry, not a readable metadata.json: a drop has to be able to
+// remove a pointer that names a document this catalog cannot parse, or a broken table could never be
+// dropped. GET and HEAD are stricter on purpose (handleHeadTable), only because serving a table is
+// a different question from removing its name.
+//
+// The metrics sink of reportMetrics is telemetry: a client reports what a scan or a commit cost and
+// takes no interest in the answer beyond "it was not an error". v1 stores none of it - nothing in
+// §6.1 has a place for a report - so the endpoint resolves the table (the spec's 404
+// NoSuchTableException for a table this catalog does not have), drains the request body and answers
+// 204. The payload is therefore not decoded: a report is discarded whether it is a scan report, a
+// commit report or something a newer spec added, and a client that sends one is never handed a 400
+// for the shape of data the server is throwing away anyway.
+//
+// Authorization is the §7.2 row for each operation - catalog:ListTables filtered per table by the
+// catalog:TableName condition, catalog:ReadTable on the table ARN, catalog:CreateTable for create
+// and catalog:DeleteTable for drop - plus the fs:ReadRepository every catalog request needs and the
+// fs:WriteObject §7.2 adds for the reserved _lakefs_iceberg/ area of a write. reportMetrics has no
+// row of its own in §7.2; authz.go assigns it to catalog:UpdateTable on the table ARN, the
+// "commit, register, properties, metrics" action of the write half. The listing asks
+// Authorizer.FilterTables, which evaluates the namespace-level gate and the per-table condition in
+// one place, so the endpoint cannot return a table the caller may not see. Load, head, drop and the
+// metrics sink are all authorized before the pointer is resolved, so a caller without the action
+// cannot distinguish a missing table from a forbidden one (both requests are 403 for it, §12).
+
 // Clean-room note: written from ICEBERG_CATALOG_PLAN.md, the Apache Iceberg REST OpenAPI spec
 // (https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml, listTables /
-// loadTable / tableExists / createTable, components.schemas.CreateTableRequest, and
+// loadTable / tableExists / createTable / dropTable / reportMetrics,
+// components.schemas.CreateTableRequest and components.schemas.ReportMetricsRequest, and
 // components.parameters.snapshots), the Apache Iceberg table format spec
 // (https://github.com/apache/iceberg/blob/main/format/spec.md, "Table Metadata" and
 // "Snapshot References") and the public lakeFS documentation only. No code from lakeFS Enterprise
@@ -115,6 +154,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
@@ -133,15 +173,21 @@ const (
 	// {prefix} is the value GET /v1/config advertised as overrides.prefix (§14 Q-I3).
 	tablesPattern = "/v1/{prefix}/namespaces/{namespace}/tables"
 
-	// tablePattern serves LoadTable (GET) and TableExists (HEAD) for one table.
+	// tablePattern serves LoadTable (GET), TableExists (HEAD) and DropTable (DELETE) for one table.
 	tablePattern = "/v1/{prefix}/namespaces/{namespace}/tables/{table}"
+
+	// tableMetricsPattern serves ReportMetrics (POST), which hangs off one table and is the only
+	// table operation with a sub-path of its own.
+	tableMetricsPattern = "/v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics"
 
 	// The wire forms advertised in GET /v1/config once this file's routes are mounted. They are
 	// the operation paths of the REST OpenAPI spec with the catalog's {prefix} segment.
-	listTablesEndpoint  = "GET /v1/{prefix}/namespaces/{namespace}/tables"
-	loadTableEndpoint   = "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}"
-	tableExistsEndpoint = "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}"
-	createTableEndpoint = "POST /v1/{prefix}/namespaces/{namespace}/tables"
+	listTablesEndpoint    = "GET /v1/{prefix}/namespaces/{namespace}/tables"
+	loadTableEndpoint     = "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}"
+	tableExistsEndpoint   = "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}"
+	createTableEndpoint   = "POST /v1/{prefix}/namespaces/{namespace}/tables"
+	dropTableEndpoint     = "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}"
+	reportMetricsEndpoint = "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics"
 
 	// ErrTypeNoSuchTable is the Iceberg error type of a missing table, 404
 	// (components.schemas.NoSuchTableException, the 404 of loadTable and tableExists).
@@ -178,12 +224,23 @@ type BranchLister interface {
 }
 
 // TableLister is the lakeFS surface the table endpoints need in addition to Store: the entry walk
-// that finds the table pointers of a namespace, and the ref resolution a write needs. It is a
-// separate interface rather than more methods on Store because these are lakeFS reads, not catalog
+// that finds the table pointers of a namespace, the single-entry read that decides whether a table
+// exists, the entry removal that drops one, and the ref resolution a write needs. It is a separate
+// interface rather than more methods on Store because these are lakeFS operations, not catalog
 // state, and *catalog.Catalog (also the NamespaceLister of the namespace endpoints) implements it.
 type TableLister interface {
 	BranchLister
 	ListEntries(ctx context.Context, repositoryID string, reference string, prefix string, after string, delimiter string, limit int) ([]*catalog.DBEntry, bool, error)
+
+	// GetEntry resolves one entry on a ref - the branch staging area first, then the committed
+	// data - so the table pointer of a staged create is found exactly like a committed one. Drop
+	// and the metrics sink use it to decide existence without loading metadata.json.
+	GetEntry(ctx context.Context, repositoryID string, reference string, path string, params catalog.GetEntryParams) (*catalog.DBEntry, error)
+
+	// DeleteEntry stages the removal of one entry on a branch: dropping a table removes its
+	// pointer. It is called only after the pointer was found, and it carries no
+	// graveler.SetOptionsFunc, so a protected branch or a read-only repository still refuses it.
+	DeleteEntry(ctx context.Context, repositoryID string, branch string, path string, opts ...graveler.SetOptionsFunc) error
 }
 
 // tableService serves the table read endpoints of §5. It owns the three things a handler needs:
@@ -241,6 +298,18 @@ func (s *tableService) Routes() []route {
 			pattern:  tablesPattern,
 			handler:  s.handleCreateTable,
 			endpoint: createTableEndpoint,
+		},
+		{
+			method:   http.MethodDelete,
+			pattern:  tablePattern,
+			handler:  s.handleDropTable,
+			endpoint: dropTableEndpoint,
+		},
+		{
+			method:   http.MethodPost,
+			pattern:  tableMetricsPattern,
+			handler:  s.handleReportMetrics,
+			endpoint: reportMetricsEndpoint,
 		},
 	}
 }
@@ -568,6 +637,142 @@ func (s *tableService) createTable(ctx context.Context, addr Address, request cr
 	}, nil
 }
 
+// handleDropTable is DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table} (spec: dropTable):
+// remove the table's pointer from the branch and answer 204 with no body.
+//
+// The order is the create's without the body: parse, authorize (including the Q-I4 branch rule),
+// resolve, act. A table that has no pointer on addr.Ref is 404 NoSuchTableException, and a pointer
+// that names an unreadable metadata.json is still dropped - see the file comment for why that
+// difference from GET and HEAD is deliberate.
+//
+// The query string is not read at all. The spec's `purgeRequested` parameter asks for the data files
+// to be deleted with the table; v1 accepts every value and deletes nothing but the pointer, because
+// the files are reclaimed by GC once they are unreferenced (§6.3, §14 Q-I8).
+func (s *tableService) handleDropTable(w http.ResponseWriter, r *http.Request) {
+	addr, ok := s.authorizeTableWrite(w, r, OpDeleteTable)
+	if !ok {
+		return
+	}
+	if err := s.dropTable(r.Context(), addr); err != nil {
+		s.writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// dropTable removes the pointer of addr from the branch: the one entry that makes the table exist
+// (§6.1). Nothing else is touched - the metadata.json it named and every data file the metadata
+// references stay in the object store, which is what makes the drop staged, reversible and
+// GC-collected rather than destructive (file comment, §14 Q-I8).
+func (s *tableService) dropTable(ctx context.Context, addr Address) error {
+	pointerPath, err := s.requireTablePointer(ctx, addr)
+	if err != nil {
+		return err
+	}
+	if err := s.lister.DeleteEntry(ctx, addr.Repo, addr.Ref, pointerPath); err != nil {
+		if errors.Is(err, graveler.ErrNotFound) {
+			// The pointer was removed by another writer between the read and the delete: the answer
+			// is the 404 a client that drops twice should see.
+			return &NoSuchTableException{
+				Repo:      addr.Repo,
+				Ref:       addr.Ref,
+				Namespace: addr.Namespace,
+				Table:     addr.Table,
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+// handleReportMetrics is POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics
+// (spec: reportMetrics): accept a client's scan or commit report and discard it with 204.
+//
+// The endpoint is telemetry, so it answers exactly two questions: may this caller address this
+// table (§7.2), and does the table exist (the spec's 404 NoSuchTableException). The body is then
+// drained and forgotten - v1 has nowhere to put a report (§6.1) - so a payload this catalog does
+// not model, or does not model yet, is still accepted: refusing it would fail a request whose only
+// possible outcome is that both sides lose the data (file comment).
+func (s *tableService) handleReportMetrics(w http.ResponseWriter, r *http.Request) {
+	addr, ok := s.authorizeTableWrite(w, r, OpUpdateTable)
+	if !ok {
+		return
+	}
+	if _, err := s.requireTablePointer(r.Context(), addr); err != nil {
+		s.writeError(w, err)
+		return
+	}
+	// Drain the body instead of decoding it, so the connection stays reusable and an oversized
+	// report cannot be buffered: limitRequestBody (http.go) already bounded what can be read.
+	if r.Body != nil {
+		_, _ = io.Copy(io.Discard, r.Body)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// requireTablePointer returns the reserved key of the table pointer of addr, or
+// NoSuchTableException when the pointer is not present on addr.Ref.
+//
+// Existence is the pointer entry itself, not a metadata.json that parses: the drop has to be able to
+// remove a pointer that names a document this catalog cannot read, and the metrics sink has no
+// reason to read a document it throws away. Both therefore ask the cheaper, more literal question
+// §6.1 defines - "is the pointer there?" - and resolve it the way a reader does, staging area first.
+func (s *tableService) requireTablePointer(ctx context.Context, addr Address) (string, error) {
+	pointerPath, err := tablePointerPath(addr)
+	if err != nil {
+		return "", err
+	}
+	if _, err := s.lister.GetEntry(ctx, addr.Repo, addr.Ref, pointerPath, catalog.GetEntryParams{}); err != nil {
+		if errors.Is(err, graveler.ErrNotFound) {
+			return "", &NoSuchTableException{
+				Repo:      addr.Repo,
+				Ref:       addr.Ref,
+				Namespace: addr.Namespace,
+				Table:     addr.Table,
+			}
+		}
+		return "", err
+	}
+	return pointerPath, nil
+}
+
+// authorizeTableWrite parses and authorizes the table address of a write endpoint of this file that
+// carries no body: drop and report metrics. It is the write counterpart of authorizeTable, and it
+// writes the error itself when a step fails so the two verbs cannot diverge on what they accept or
+// who may ask.
+//
+// The ref is resolved before the decision so that Request.RefIsBranch is truthful (Q-I4); a ref that
+// is not a branch makes Authorizer answer the read-only 403, and a caller without the action gets
+// the same 403 for a branch and a tag alike.
+func (s *tableService) authorizeTableWrite(w http.ResponseWriter, r *http.Request, op Operation) (Address, bool) {
+	if !s.checkPrefix(w, r) {
+		return Address{}, false
+	}
+	addr, err := ParseTable(chi.URLParam(r, "namespace"), chi.URLParam(r, "table"))
+	if err != nil {
+		s.writeError(w, err)
+		return Address{}, false
+	}
+	caller, ok := s.caller(w, r)
+	if !ok {
+		return Address{}, false
+	}
+	isBranch, err := s.isBranchRef(r.Context(), addr)
+	if err != nil {
+		s.writeError(w, err)
+		return Address{}, false
+	}
+	if err := s.authz.Authorize(r.Context(), caller, Request{
+		Op:          op,
+		Address:     addr,
+		RefIsBranch: isBranch,
+	}); err != nil {
+		s.writeError(w, err)
+		return Address{}, false
+	}
+	return addr, true
+}
+
 // isBranchRef reports whether addr.Ref names a branch, for the Q-I4 rule of §7.2 that only a branch
 // may be written to.
 //
@@ -821,11 +1026,12 @@ func (s *tableService) caller(w http.ResponseWriter, r *http.Request) (Caller, b
 }
 
 // writeError maps the typed errors of this package onto the catalog envelope and the statuses of
-// §2.1. A refusal is 403 ForbiddenException; a missing table is 404 NoSuchTableException; a
-// missing namespace is 404 NoSuchNamespaceException; a missing repository or ref is 404
-// NoSuchWarehouseException; a taken name is 409 AlreadyExistsException; a malformed identifier,
-// page token, query value or create request is 400; a write the branch or the repository refuses is
-// 403; anything undecided or unexpected is 500 with no detail, never a permission (§12).
+// §2.1. A refusal is 403 ForbiddenException; a missing table - on a load, a head, a drop or a
+// metrics report - is 404 NoSuchTableException; a missing namespace is 404
+// NoSuchNamespaceException; a missing repository or ref is 404 NoSuchWarehouseException; a taken
+// name is 409 AlreadyExistsException; a malformed identifier, page token, query value or create
+// request is 400; a write the branch or the repository refuses is 403; anything undecided or
+// unexpected is 500 with no detail, never a permission (§12).
 func (s *tableService) writeError(w http.ResponseWriter, err error) {
 	var (
 		denied       *PermissionDeniedError
