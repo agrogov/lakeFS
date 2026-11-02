@@ -40,6 +40,14 @@ type serviceFixture struct {
 
 func newServiceFixture(t *testing.T) *serviceFixture {
 	t.Helper()
+	return newServiceFixtureOnStore(t, nil)
+}
+
+// newServiceFixtureOnStore builds the fixture with the datasets control-plane records on
+// controlPlane, or on the fixture's mem store when it is nil. The catalog, the auth service
+// and the block adapter always use the mem store.
+func newServiceFixtureOnStore(t *testing.T, controlPlane kv.Store) *serviceFixture {
+	t.Helper()
 	f := newDatasetFixture(t)
 	ctx := t.Context()
 
@@ -57,7 +65,10 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 		StorageNamespacePrefix: "mem://datasets",
 	}
 	cfg.setDefaults()
-	svc, err := NewService(cfg, f.kvStore, f.cat, authService)
+	if controlPlane == nil {
+		controlPlane = f.kvStore
+	}
+	svc, err := NewService(cfg, controlPlane, f.cat, authService)
 	require.NoError(t, err)
 
 	fixture := &serviceFixture{datasetFixture: f, svc: svc, cfg: cfg, authService: authService, ts: ts}
