@@ -38,6 +38,17 @@ const (
 	// (ICEBERG_CATALOG_PLAN.md §6.3).
 	DefaultUncommittedGCGrace = 24 * time.Hour
 
+	// UncommittedGCGraceProtectAll is the value of iceberg.uncommitted_gc_grace that switches the
+	// grace off in favour of maximum protection: every object under <storage_namespace>/_iceberg/
+	// stays out of the uncommitted-GC report, however old it is (gc.go UncommittedGCProtected,
+	// spike S-I2 §6). It is the escape hatch for installations that keep staged branches for
+	// weeks; the cost is that a table file no commit ever staged is never collected, so the area
+	// grows until the value is lowered.
+	//
+	// Zero is only reachable when the key is set explicitly: an absent key means "use
+	// DefaultUncommittedGCGrace", which setDefaults applies.
+	UncommittedGCGraceProtectAll time.Duration = 0
+
 	// DefaultIgnoreCompactionCommits is the default of the iceberg.ignore_compaction_commits
 	// setting: a commit that only re-points metadata at rewritten (compacted) data files is
 	// merged into a concurrent change instead of conflicting with it (§6.4, phase I-5).
@@ -69,7 +80,15 @@ type Config struct {
 
 	// UncommittedGCGrace protects client-written objects under the table location from the
 	// uncommitted GC for this long, until the catalog commit stages them as entries (§6.3).
+	// UncommittedGCGraceProtectAll (0) protects them regardless of age; a negative value is
+	// rejected by Validate.
 	UncommittedGCGrace time.Duration `mapstructure:"uncommitted_gc_grace"`
+
+	// gcGraceExplicit reports that uncommitted_gc_grace was set by the installation, so that an
+	// explicit 0 - which means UncommittedGCGraceProtectAll - is not replaced by the 24h default.
+	// It is unexported: the distinction is a property of how the configuration was read, not a
+	// setting an operator can see or write.
+	gcGraceExplicit bool
 
 	// IgnoreCompactionCommits enables the compaction auto-resolve of §6.4 (phase I-5).
 	IgnoreCompactionCommits bool `mapstructure:"ignore_compaction_commits"`
@@ -117,6 +136,9 @@ func (c *Config) applyViperOverrides() {
 	}
 	if viper.IsSet(uncommittedGCGraceKey) {
 		c.UncommittedGCGrace = viper.GetDuration(uncommittedGCGraceKey)
+		// An explicit 0 is UncommittedGCGraceProtectAll, not "unset": setDefaults must not
+		// replace it with the 24h default.
+		c.gcGraceExplicit = true
 	}
 	// The default is true, so the zero value cannot mean "unset": viper.IsSet is what
 	// distinguishes an explicit `ignore_compaction_commits: false` from an absent key.
@@ -139,7 +161,9 @@ func (c *Config) setDefaults() {
 	if c.MaxRequestBody == 0 {
 		c.MaxRequestBody = DefaultMaxRequestBody
 	}
-	if c.UncommittedGCGrace == 0 {
+	// Zero means "unset" only for a key the installation did not write; an explicit 0 is the
+	// protect-everything value of gc.go.
+	if c.UncommittedGCGrace == 0 && !c.gcGraceExplicit {
 		c.UncommittedGCGrace = DefaultUncommittedGCGrace
 	}
 }
@@ -160,8 +184,13 @@ func (c *Config) Validate() error {
 	if c.MaxRequestBody < 0 {
 		return fmt.Errorf("%w: max_request_body must not be negative, got %d", ErrInvalidConfig, c.MaxRequestBody)
 	}
-	if c.UncommittedGCGrace <= 0 {
-		return fmt.Errorf("%w: uncommitted_gc_grace must be positive, got %s", ErrInvalidConfig, c.UncommittedGCGrace)
+	// Negative is a configuration bug: a negative window would protect nothing under any reading,
+	// and silently treating it as "protect everything" (what gc.go does, because the fail-safe
+	// direction is to protect) would hide the typo. Zero is the documented protect-everything
+	// value; absent is 24h.
+	if c.UncommittedGCGrace < 0 {
+		return fmt.Errorf("%w: uncommitted_gc_grace must be positive, or %s to protect every %s/ object, got %s",
+			ErrInvalidConfig, UncommittedGCGraceProtectAll, DataPrefix, c.UncommittedGCGrace)
 	}
 	return nil
 }
