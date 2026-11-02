@@ -79,6 +79,11 @@ const (
 	// remote signing.
 	RemoteSigningDelegation = "remote-signing"
 
+	// VendedCredentialsDelegation is the value of AccessDelegationHeader that asks the server to
+	// vend storage credentials for the table (§8, creds.go). Both clients in the spike send it:
+	// PyIceberg on every request, DuckDB on the table-scoped ones (ICEBERG_SPIKE_S-I4.md §4.1).
+	VendedCredentialsDelegation = "vended-credentials" //nolint:gosec // a protocol value of the data-access header, not a credential
+
 	// RemoteSigningEnabledProperty is the LoadTableResult config property that tells an S3 client
 	// to send its requests to the signing endpoint (§8). It is only set while
 	// RemoteSigningSupported reports true and the client requested remote signing.
@@ -257,8 +262,15 @@ func (s *remoteSigningService) TableConfig(delegation string) map[string]string 
 // value names remote-signing. Comparison is case-insensitive and whitespace-tolerant, so a client
 // that sends "vended-credentials, remote-signing" is understood.
 func delegationRequestsRemoteSigning(header string) bool {
-	for _, mechanism := range strings.Split(header, ",") {
-		if strings.EqualFold(strings.TrimSpace(mechanism), RemoteSigningDelegation) {
+	return delegationRequests(header, RemoteSigningDelegation)
+}
+
+// delegationRequests reports whether a comma-separated X-Iceberg-Access-Delegation value names
+// one mechanism of §2.1. The header is a client capability list, so every mechanism of it has to
+// be matched the same way; creds.go matches VendedCredentialsDelegation with this function.
+func delegationRequests(header, mechanism string) bool {
+	for _, requested := range strings.Split(header, ",") {
+		if strings.EqualFold(strings.TrimSpace(requested), mechanism) {
 			return true
 		}
 	}
