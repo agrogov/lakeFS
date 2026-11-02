@@ -7,6 +7,7 @@ import {
     datasets,
     getDatasetNames,
     isDatasetsDisabledError,
+    isForbiddenError,
     isRebaseRequiredError,
     listDatasetNames,
 } from './datasets';
@@ -123,13 +124,27 @@ describe('datasets client error mapping', () => {
     });
 
     it('throws AuthenticationError on 401 so the shared auth redirect still runs', async () => {
-        fetchMock.mockResolvedValue(jsonResponse(401, { message: 'user not found' }));
+        fetchMock.mockResolvedValue(jsonResponse(401, { message: 'error authenticating request' }));
 
         const error = await datasets.getConfig().catch((e) => e);
 
         expect(error).toBeInstanceOf(AuthenticationError);
         expect(error.status).toBe(401);
-        expect(error.message).toBe('user not found');
+        expect(error.message).toBe('error authenticating request');
+    });
+
+    it('treats a 401 permission denial as forbidden, not as a missing session', async () => {
+        fetchMock.mockResolvedValue(
+            jsonResponse(401, {
+                message: 'forbidden: user u insufficient permissions: not allowed to dataset:ListDatasets',
+            }),
+        );
+
+        const error = await datasets.list().catch((e) => e);
+
+        expect(error).toBeInstanceOf(DatasetsError);
+        expect(error).not.toBeInstanceOf(AuthenticationError);
+        expect(isForbiddenError(error)).toBe(true);
     });
 
     it('resolves to undefined for a 204 response', async () => {

@@ -76,9 +76,17 @@ export const isRebaseRequiredError = (error: unknown): error is DatasetsError =>
 export const isDatasetsDisabledError = (error: unknown): boolean =>
     error instanceof DatasetsError && (error.status === 404 || error.status === 501);
 
-/** True for a `403`: the caller is authenticated but does not hold the required permission. */
+/**
+ * True when the caller is authenticated but does not hold the required permission. That is a
+ * `403`, or a `401` when the server runs with auth.authorization_failure_status: 401 (the
+ * default): `datasetsRequest` only lets a real authentication failure through as
+ * `AuthenticationError`, so a `DatasetsError` with status 401 is always a permission denial.
+ */
 export const isForbiddenError = (error: unknown): error is DatasetsError =>
-    error instanceof DatasetsError && error.status === 403;
+    error instanceof DatasetsError && (error.status === 403 || error.status === 401);
+
+/** The 401 messages that mean "no valid session": the core API's and the control plane's own. */
+const UNAUTHENTICATED_MESSAGES = ['error authenticating request', 'authentication required'];
 
 const parseErrorBody = async (
     response: Response,
@@ -106,8 +114,14 @@ const datasetsRequest = async <T>(path: string, requestData: RequestInit = {}): 
 
     if (response.status === 401) {
         // Keep the shared auth flow working: useAPI() redirects to the login page on this class.
-        const { message } = await parseErrorBody(response);
-        throw new AuthenticationError(message, response.status);
+        // Like apiRequest() in index.js, only a real authentication failure takes that path: with
+        // auth.authorization_failure_status: 401 a permission denial is also a 401, and sending a
+        // signed-in user to the login page for it would loop (SSO signs them straight back in).
+        const { message, errors } = await parseErrorBody(response);
+        if (UNAUTHENTICATED_MESSAGES.includes(message)) {
+            throw new AuthenticationError(message, response.status);
+        }
+        throw new DatasetsError(message, response.status, errors);
     }
     if (!response.ok) {
         const { message, errors, latestVersion } = await parseErrorBody(response);
