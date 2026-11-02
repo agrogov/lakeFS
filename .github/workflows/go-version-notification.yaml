@@ -1,0 +1,126 @@
+name: Go Version Change Notification
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'go.mod'
+
+jobs:
+  check-go-version:
+    name: Check Go version change and notify
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check-out code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - name: Extract Go versions
+        id: versions
+        run: |
+          CURRENT=$(awk '/^go [0-9]/ { print $2; exit }' go.mod)
+          PREVIOUS=$(git show HEAD~1:go.mod | awk '/^go [0-9]/ { print $2; exit }')
+
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "previous=$PREVIOUS" >> "$GITHUB_OUTPUT"
+
+          if [ "$CURRENT" != "$PREVIOUS" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate notification message
+        if: steps.versions.outputs.changed == 'true'
+        id: random_message
+        env:
+          OLD: ${{ steps.versions.outputs.previous }}
+          NEW: ${{ steps.versions.outputs.current }}
+        run: |
+          MESSAGES=(
+            "🚀 Go version upgraded! Time to go-go-go with the new features!"
+            "🐹 The Go gopher just got an upgrade! Hope it doesn't break anything, or we'll have a panic!"
+            "Go version change detected! $OLD is out, $NEW is in. Don't worry, it's just a minor version... said every developer ever."
+            "Breaking news: Go version evolved! Darwin would be proud."
+            "Fingers crossed this doesn't introduce any goroutine leaks!"
+            "The build might take longer, but at least the code will run faster!"
+            "Because why fix what ain't broke? Oh wait, we just did."
+          )
+          RANDOM_INDEX=$((RANDOM % ${#MESSAGES[@]}))
+          # emit as a JSON string so any character in the message is safely escaped
+          jq -rn --arg m "${MESSAGES[$RANDOM_INDEX]}" '"message=" + ($m | tojson)' >> "$GITHUB_OUTPUT"
+
+      - name: Notify Slack on Go version change
+        if: steps.versions.outputs.changed == 'true'
+        uses: slackapi/slack-github-action@v4.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          errors: true
+          payload: |
+            {
+              "text": "lakeFS Community - Go version updated: ${{ steps.versions.outputs.previous }} → ${{ steps.versions.outputs.current }}",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": ":arrow_up: lakeFS Community - Go version updated",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ${{ steps.random_message.outputs.message }}
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Previous*\n`${{ steps.versions.outputs.previous }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Current*\n`${{ steps.versions.outputs.current }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Repository*\n<${{ github.server_url }}/${{ github.repository }}|${{ github.repository }}>"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Branch*\n`${{ github.ref_name }}`"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View commit",
+                        "emoji": true
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "Changed in `go.mod` by ${{ github.actor }} · commit <${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
+                    }
+                  ]
+                }
+              ]
+            }

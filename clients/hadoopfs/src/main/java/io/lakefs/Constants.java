@@ -1,0 +1,72 @@
+package io.lakefs;
+
+import org.apache.commons.io.FileUtils;
+
+public class Constants {
+    public static final String DEFAULT_SCHEME = "lakefs";
+    public static final String DEFAULT_CLIENT_ENDPOINT = "http://localhost:8000/api/v1";
+    public static final String DEFAULT_AUTH_PROVIDER_SERVER_ID_HEADER = "X-Lakefs-Server-ID";
+    public static final String ACCESS_KEY_KEY_SUFFIX = "access.key";
+    public static final String SECRET_KEY_KEY_SUFFIX = "secret.key";
+    public static final String ENDPOINT_KEY_SUFFIX = "endpoint";
+    public static final String LIST_AMOUNT_KEY_SUFFIX = "list.amount";
+    public static final String ACCESS_MODE_KEY_SUFFIX = "access.mode";
+
+    // Experiment: commit every num-deletes with probability prob.  Enabled
+    // when num-deletes > 0.  Count deletes, and after every num-deletes of
+    // commit with probability prob.  num-deleted should be in the low
+    // thousands, prob should be approximately 1/num_executors running
+    // lakeFSFS on the branch.  Count recursive deletes as more, because
+    // contiguous deletes are particularly relevant for compaction.
+    //
+    // Why recursive deletes?  lakeFS compaction is useful (only) for
+    // consecutive deletes, which is recursive in FileOutputCommitter.
+    public static final String COMMIT_EVERY_NUM_DELETES = "experimental.commit-every.num-deletes";
+    public static final String COMMIT_EVERY_PROBABILITY = "experimental.commit-every.prob";
+    // Recursive deletes are necessarily contiguous, and contiguous
+    // tombstones particularly harm performance.  Multiply their weight by some factor.
+    public static final int CONTIGUOUS_DELETION_FACTOR = 3;
+
+    // io.lakefs.auth.TemporaryAWSCredentialsLakeFSTokenProvider, io.lakefs.auth.InstanceProfileAWSCredentialsLakeFSTokenProvider
+    public static final String LAKEFS_AUTH_PROVIDER_KEY_SUFFIX = "auth.provider";
+
+    // TODO(isan) document all configuration fields before merge.
+    public static final String LAKEFS_AUTH_TOKEN_TTL_KEY_SUFFIX = "token.duration_seconds";
+    public static final String TOKEN_AWS_CREDENTIALS_PROVIDER_ACCESS_KEY_SUFFIX = "token.aws.access.key";
+    public static final String TOKEN_AWS_CREDENTIALS_PROVIDER_SECRET_KEY_SUFFIX = "token.aws.secret.key";
+    public static final String TOKEN_AWS_CREDENTIALS_PROVIDER_SESSION_TOKEN_KEY_SUFFIX = "token.aws.session.token";
+    public static final String TOKEN_AWS_CREDENTIALS_PROVIDER_TOKEN_DURATION_SECONDS = "token.aws.sts.duration_seconds";
+    public static final String TOKEN_AWS_CREDENTIALS_PROVIDER_ADDITIONAL_HEADERS = "token.sts.additional_headers";
+    public static final String TOKEN_AWS_STS_ENDPOINT = "token.aws.sts.endpoint";
+
+    public static final String SESSION_ID = "session_id";
+
+    // Timeout configuration
+    public static final String CONNECT_TIMEOUT_KEY_SUFFIX = "api.connect.timeout.ms";
+    public static final String READ_TIMEOUT_KEY_SUFFIX = "api.read.timeout.ms";
+    public static final String WRITE_TIMEOUT_KEY_SUFFIX = "api.write.timeout.ms";
+    public static final int DEFAULT_CONNECT_TIMEOUT_MS = 10000; // 10 seconds
+    public static final int DEFAULT_READ_TIMEOUT_MS = 30000;    // 30 seconds
+    public static final int DEFAULT_WRITE_TIMEOUT_MS = 30000;   // 30 seconds
+
+    // Retry configuration
+    public static final String RETRY_MAX_RETRIES_KEY_SUFFIX = "api.retry.max-retries";
+    public static final String RETRY_INITIAL_BACKOFF_MS_KEY_SUFFIX = "api.retry.initial-backoff.ms";
+    public static final String RETRY_MAX_BACKOFF_MS_KEY_SUFFIX = "api.retry.max-backoff.ms";
+    public static final String RETRY_JITTER_FACTOR_KEY_SUFFIX = "api.retry.jitter-factor";
+    public static final int DEFAULT_RETRY_MAX_RETRIES = 5;
+    public static final int DEFAULT_RETRY_INITIAL_BACKOFF_MS = 1000; // 1 second
+    public static final int DEFAULT_RETRY_MAX_BACKOFF_MS = 20000;    // 20 seconds
+    public static final double DEFAULT_RETRY_JITTER_FACTOR = 0.25;
+
+    public static enum AccessMode {
+        SIMPLE,
+        PRESIGNED;
+    }
+
+
+    public static final int DEFAULT_LIST_AMOUNT = 1000;
+    public static final String SEPARATOR = "/";
+
+    public static final long DEFAULT_BLOCK_SIZE = 32 * FileUtils.ONE_MB;
+}

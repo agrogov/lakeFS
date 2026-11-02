@@ -1,0 +1,6 @@
+
+ID:            <COMMIT_ID>
+Author:        ${AUTHOR}
+Date:          ${DATE}
+
+	${MESSAGE}

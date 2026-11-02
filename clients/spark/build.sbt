@@ -1,0 +1,277 @@
+lazy val projectVersion = "0.22.0"
+ThisBuild / version := projectVersion
+lazy val hadoopVersion = "3.3.6"
+ThisBuild / isSnapshot := false
+ThisBuild / scalaVersion := "2.12.18"
+lazy val scala212 = "2.12.18"
+lazy val scala213 = "2.13.14"
+crossScalaVersions := Seq(scala212, scala213)
+
+name := "lakefs-spark-client"
+organization := "io.lakefs"
+organizationName := "Treeverse Labs"
+organizationHomepage := Some(url("http://treeverse.io"))
+description := "Spark client for lakeFS object metadata."
+licenses := List(
+  "Apache 2" -> url("http://www.apache.org/licenses/LICENSE-2.0.txt")
+)
+homepage := Some(url("https://lakefs.io"))
+
+javacOptions ++= Seq("-source", "1.11", "-target", "1.8")
+scalacOptions ++= (CrossVersion.partialVersion(scalaVersion.value) match {
+  case Some((2, 12)) => Seq("-target:jvm-1.8", "-Ywarn-unused-import")
+  case _             => Seq("-Wunused:imports")
+})
+semanticdbEnabled := true // enable SemanticDB
+semanticdbVersion := scalafixSemanticdb.revision
+Compile / PB.includePaths += (Compile / resourceDirectory).value
+Compile / PB.protoSources += (Compile / resourceDirectory).value
+Compile / PB.targets := Seq(
+  scalapb.gen() -> (Compile / sourceManaged).value / "scalapb"
+)
+
+// ScalaMeter uses URLClassLoader introspection which is incompatible with Java 17+
+testFrameworks ++= {
+  if (scala.util.Properties.isJavaAtLeast("17")) Seq.empty
+  else Seq(new TestFramework("org.scalameter.ScalaMeterFramework"))
+}
+Test / logBuffered := false
+Test / fork := true
+
+// Java 17+ module access flags required by Spark (from Spark 4.0's JavaModuleOptions)
+Test / javaOptions ++= {
+  if (scala.util.Properties.isJavaAtLeast("17"))
+    Seq(
+      "-XX:+IgnoreUnrecognizedVMOptions",
+      "--add-opens=java.base/java.lang=ALL-UNNAMED",
+      "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED",
+      "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
+      "--add-opens=java.base/java.io=ALL-UNNAMED",
+      "--add-opens=java.base/java.net=ALL-UNNAMED",
+      "--add-opens=java.base/java.nio=ALL-UNNAMED",
+      "--add-opens=java.base/java.util=ALL-UNNAMED",
+      "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED",
+      "--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED",
+      "--add-opens=java.base/jdk.internal.ref=ALL-UNNAMED",
+      "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
+      "--add-opens=java.base/sun.nio.cs=ALL-UNNAMED",
+      "--add-opens=java.base/sun.security.action=ALL-UNNAMED",
+      "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED",
+      "--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED",
+      "-Djdk.reflect.useDirectMethodHandle=false",
+      "-Dio.netty.tryReflectionSetAccessible=true"
+    )
+  else Seq.empty
+}
+
+// Uncomment to get accurate benchmarks with just "sbt test".
+// Otherwise tell sbt to
+//     "testOnly io.treeverse.clients.ReadSSTableBenchmark"
+// (or similar).
+//
+//     Test / parallelExecution := false,
+
+// Uncomment to get (very) full stacktraces in test:
+//      Test / testOptions += Tests.Argument("-oF"),
+buildInfoKeys := Seq[BuildInfoKey](name, version, scalaVersion, sbtVersion)
+buildInfoPackage := "io.treeverse.clients"
+
+enablePlugins(BuildInfoPlugin)
+
+// Jackson overrides only needed for Scala 2.12
+dependencyOverrides ++= (CrossVersion.partialVersion(scalaVersion.value) match {
+  case Some((2, 12)) =>
+    Seq(
+      "com.fasterxml.jackson.core" % "jackson-databind" % "2.12.7",
+      "com.fasterxml.jackson.core" % "jackson-core" % "2.12.7",
+      "com.fasterxml.jackson.core" % "jackson-annotations" % "2.12.7",
+      "com.fasterxml.jackson.module" %% "jackson-module-scala" % "2.12.7"
+    )
+  case _ => Seq.empty
+})
+
+libraryDependencies ++= Seq(
+  "io.lakefs" % "sdk" % "1.72.0",
+  "org.apache.spark" %% "spark-sql" % (CrossVersion.partialVersion(scalaVersion.value) match {
+    case Some((2, 12)) => "3.1.2"
+    case _             => "4.0.0"
+  }) % "provided",
+  "org.scala-lang.modules" %% "scala-collection-compat" % "2.12.0",
+  "com.thesamet.scalapb" %% "scalapb-runtime" % scalapb.compiler.Version.scalapbVersion % "protobuf",
+  "org.apache.hadoop" % "hadoop-aws" % hadoopVersion % "provided",
+  "org.apache.hadoop" % "hadoop-common" % hadoopVersion % "provided",
+  "org.apache.hadoop" % "hadoop-azure" % hadoopVersion % "provided",
+  "org.json4s" %% "json4s-native" % (CrossVersion.partialVersion(scalaVersion.value) match {
+    case Some((2, 12)) => "3.6.12"
+    case _             => "4.0.7"
+  }),
+  "org.rogach" %% "scallop" % "4.0.3",
+  "com.azure" % "azure-core" % "1.10.0",
+  "com.azure" % "azure-storage-blob" % "12.9.0",
+  "com.azure" % "azure-storage-blob-batch" % "12.7.0",
+  "com.azure" % "azure-identity" % "1.2.0",
+  "com.amazonaws" % "aws-java-sdk-bundle" % "1.12.569" % "provided",
+  "com.google.cloud.bigdataoss" % "gcs-connector" % "hadoop3-2.2.18",
+  "com.google.cloud" % "google-cloud-storage" % "2.35.0",
+  // Snappy is JNI :-(.  However it does claim to work with
+  // ClassLoaders, and (even more importantly!) using a preloaded JNI
+  // version will probably continue to work because the C language API
+  // is quite stable.  Take the version documented in DataBricks
+  // Runtime 7.6, and note that it changes in 8.3 :-(
+  "org.xerial.snappy" % "snappy-java" % "1.1.8.4",
+  "dev.failsafe" % "failsafe" % "3.2.4",
+  "com.squareup.okhttp3" % "mockwebserver" % "4.10.0" % "test",
+  "xerces" % "xercesImpl" % "2.12.2" % "test",
+  "org.scalatest" %% "scalatest" % "3.2.16" % "test",
+  "org.scalatestplus" %% "scalacheck-1-17" % "3.2.16.0" % "test",
+  "org.scalatestplus" %% "mockito-4-11" % "3.2.16.0" % "test",
+  "com.dimafeng" %% "testcontainers-scala-scalatest" % "0.41.8" % "test",
+  "com.lihaoyi" %% "upickle" % "1.4.0" % "test",
+  "com.lihaoyi" %% "os-lib" % "0.7.8" % "test",
+  "com.storm-enroute" %% "scalameter" % "0.19" % "test"
+)
+
+def rename(prefix: String) = ShadeRule.rename(prefix -> "io.lakefs.spark.shade.@0")
+
+assembly / assemblyJarName := s"${name.value}_${scalaBinaryVersion.value}-assembly-${version.value}.jar"
+
+assembly / assemblyShadeRules := Seq(
+  rename("org.apache.http.**").inAll,
+  rename("scalapb.**").inAll,
+  rename("com.google.protobuf.**").inAll,
+  // Shade proto-google-common-protos classes (com.google.api, com.google.type, etc.)
+  // to prevent conflicts with versions on the Spark classpath (e.g., Dataproc's GCS connector).
+  // Without this, these classes reference shaded protobuf internally but are loaded from
+  // Spark's classpath which expects unshaded protobuf, causing NoSuchMethodError.
+  // See: https://github.com/treeverse/lakeFS/issues/10136
+  rename("com.google.api.**").inAll,
+  // Shade google-cloud-storage SDK and its internal dependencies, but NOT
+  // com.google.cloud.hadoop which is the GCS Hadoop connector — Spark loads
+  // it by class name (fs.gs.impl=com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystem).
+  rename("com.google.cloud.storage.**").inAll,
+  rename("com.google.type.**").inAll,
+  rename("com.google.rpc.**").inAll,
+  rename("com.google.longrunning.**").inAll,
+  rename("com.google.iam.**").inAll,
+  rename("com.google.logging.**").inAll,
+  rename("com.google.common.**")
+    .inLibrary("com.google.guava" % "guava" % "30.1-jre",
+               "com.google.guava" % "failureaccess" % "1.0.1"
+              )
+    .inProject,
+  rename("scala.collection.compat.**").inAll,
+  rename("okio.**").inAll,
+  rename("okhttp3.**").inAll,
+  rename("reactor.netty.**").inAll,
+  rename("reactor.util.**").inAll
+)
+
+// Safe upload: put-object with If-None-Match to prevent overwriting an existing key.
+// Using AWS SDK v2, fails the build on any error.
+lazy val s3Upload = taskKey[Unit]("Upload JAR to S3 without override existing")
+val publishBucket = settingKey[String]("Target S3 bucket for publishing the JAR")
+
+// Overridable via -Dpublish.bucket
+publishBucket := sys.props.get("publish.bucket").filter(_.nonEmpty).getOrElse("treeverse-clients-us-east")
+
+s3Upload := {
+  import software.amazon.awssdk.core.sync.RequestBody
+  import software.amazon.awssdk.services.s3.S3Client
+  import software.amazon.awssdk.services.s3.model.{PutObjectRequest, S3Exception}
+
+  val log = streams.value.log
+  val bucket = publishBucket.value
+  val jarFile = (assembly / assemblyOutputPath).value
+  val key = s"${name.value}/${version.value}/${(assembly / assemblyJarName).value}"
+
+  val s3 = S3Client.builder().build()
+  try {
+    val req = PutObjectRequest.builder()
+      .bucket(bucket)
+      .key(key)
+      .ifNoneMatch("*")
+      .build()
+
+    s3.putObject(req, RequestBody.fromFile(jarFile))
+    log.info(s"Uploaded to S3 successfully: s3://$bucket/$key")
+  } catch {
+    case e: S3Exception if e.statusCode() == 412 =>
+      throw new RuntimeException(s"Artifact already exists: s3://$bucket/$key", e)
+    case e: S3Exception =>
+      throw new RuntimeException(s"S3 upload failed: ${e.awsErrorDetails().errorMessage()} (status=${e.statusCode()})", e)
+  } finally {
+    s3.close()
+  }
+}
+
+// Verify that the assembly jar has no shading leaks: classes that reference
+// unshaded com.google.protobuf when they should reference the shaded version.
+// This catches issues like https://github.com/treeverse/lakeFS/issues/10136
+// where com.google.api.* classes end up in the jar with references to the
+// original (unshaded) protobuf, causing NoSuchMethodError at runtime when
+// a GCS environment has its own protobuf on the classpath.
+val verifyShading = taskKey[Unit]("Verify assembly jar has no unshaded protobuf references")
+
+verifyShading := {
+  import java.util.jar.JarFile
+  import scala.jdk.CollectionConverters._
+
+  val log = streams.value.log
+  val jarPath = (assembly / assemblyOutputPath).value
+  val jar = new JarFile(jarPath)
+
+  // These Google packages must be shaded (relocated) in the assembly jar.
+  // If any .class files remain at the original (unshaded) paths, the jar will
+  // break on environments where the same classes exist on the Spark classpath
+  // (e.g., Dataproc), because Spark's classloader will load its version first.
+  val mustBeShaded = Seq(
+    "com/google/api/",
+    "com/google/cloud/storage/",
+    "com/google/type/",
+    "com/google/rpc/",
+    "com/google/longrunning/",
+    "com/google/iam/",
+    "com/google/logging/",
+    "com/google/protobuf/"
+  )
+
+  val unshadedClasses = jar.entries().asScala
+    .map(_.getName)
+    .filter(n => n.endsWith(".class") && mustBeShaded.exists(n.startsWith))
+    .toList
+
+  jar.close()
+
+  if (unshadedClasses.nonEmpty) {
+    log.error(s"Found ${unshadedClasses.size} unshaded Google classes in assembly jar:")
+    unshadedClasses.take(20).foreach(c => log.error(s"  $c"))
+    if (unshadedClasses.size > 20) log.error(s"  ... and ${unshadedClasses.size - 20} more")
+    throw new MessageOnlyException(
+      "Assembly jar shading verification failed: Google classes found at original (unshaded) paths. " +
+      "Add the missing packages to assemblyShadeRules in build.sbt. " +
+      "See: https://github.com/treeverse/lakeFS/issues/10136"
+    )
+  } else {
+    log.success("Shading verification passed: all checked Google packages are properly relocated.")
+  }
+}
+
+assembly / assemblyMergeStrategy := {
+  case PathList("META-INF", xs @ _*) =>
+    (xs map { _.toLowerCase }) match {
+      case ("manifest.mf" :: Nil) | ("index.list" :: Nil) | ("dependencies" :: Nil) =>
+        MergeStrategy.discard
+      case ps @ (x :: xs) if ps.last.endsWith(".sf") || ps.last.endsWith(".dsa") =>
+        MergeStrategy.discard
+      case "plexus" :: xs =>
+        MergeStrategy.discard
+      case "services" :: xs =>
+        MergeStrategy.filterDistinctLines
+      case ("spring.schemas" :: Nil) | ("spring.handlers" :: Nil) =>
+        MergeStrategy.filterDistinctLines
+      case _ => MergeStrategy.first
+    }
+  case _ => MergeStrategy.first
+}
+
+ThisBuild / versionScheme := Some("early-semver")

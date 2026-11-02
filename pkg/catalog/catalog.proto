@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package catalog;
+
+import "google/protobuf/timestamp.proto";
+import "graveler/graveler.proto";
+
+option go_package = "github.com/treevese/lakefs/catalog";
+
+message Entry {
+  string address = 1;
+  google.protobuf.Timestamp last_modified = 2;
+  int64 size = 3;
+  string e_tag = 4;
+  map<string, string> metadata = 5;
+  enum AddressType {
+    // Deprecated.
+    // Unknown address type (should only exist for old commits)
+    // is resolved (to Relative or Full) by the prefix of the address.
+    BY_PREFIX_DEPRECATED = 0;
+    RELATIVE = 1;
+    FULL = 2;
+  }
+  AddressType address_type = 6;
+  string content_type = 7;
+}
+
+// Task is a generic task status message
+message Task {
+  string id = 1;
+  bool done = 2;
+  google.protobuf.Timestamp updated_at = 3;
+  int64 progress = 4;
+  string error_msg = 5;
+  int32 status_code = 6;
+  string operation = 7;
+  string owner_instance_id = 8;
+}
+
+// InstanceHeartbeat tracks the liveness of a lakeFS server instance.
+// One entry per instance is written periodically to the KV store.
+// The instance ID is encoded in the KV key (instances/{instanceID}).
+message InstanceHeartbeat {
+  google.protobuf.Timestamp updated_at = 1;
+}
+
+// RepositoryDumpInfo holds the metarange IDs for a repository dump
+message RepositoryDumpInfo {
+  string commits_metarange_id = 1;
+  string tags_metarange_id = 2;
+  string branches_metarange_id = 3;
+}
+
+// RepositoryDumpStatus holds the status of a repository dump
+message RepositoryDumpStatus {
+  Task task = 1;
+  RepositoryDumpInfo info = 2;
+}
+
+// RepositoryRestoreStatus holds the status of a repository restore
+message RepositoryRestoreStatus {
+  Task task = 1;
+}
+
+// GarbageCollectionPrepareCommitsInfo holds the result of a GC prepare
+// operation
+message GarbageCollectionPrepareCommitsInfo {
+  string run_id = 1;
+  string gc_commits_location = 2;
+  string gc_addresses_location = 3;
+}
+
+// GarbageCollectionPrepareStatus holds the status of a GC prepare operation
+message GarbageCollectionPrepareStatus {
+  Task task = 1;
+  GarbageCollectionPrepareCommitsInfo info = 2;
+}
+
+message CommitAsyncStatusData {
+  Task task = 1;
+  io.treeverse.lakefs.graveler.CommitData info = 2;
+}
+
+message MergeData {
+  string reference = 1;
+}
+
+message MergeAsyncStatusData {
+  Task task = 1;
+  MergeData info = 2;
+}
+
+// TaskMsg described generic message with Task field
+// used for all status messages and for cleanup messages
+message TaskMsg {
+  Task task = 1;
+}

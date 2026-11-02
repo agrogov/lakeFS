@@ -1,0 +1,455 @@
+package logging
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"maps"
+	"os"
+	"reflect"
+	"runtime"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/sirupsen/logrus"
+	"gopkg.in/natefinch/lumberjack.v2"
+)
+
+type contextKey string
+
+const (
+	LogFieldsContextKey = contextKey("log_fields")
+
+	ProjectDirectoryName = "lakefs"
+	ModuleName           = "github.com/treeverse/lakefs"
+
+	// durationStr is the suffix for the field holding a Duration as a
+	// string.
+	durationStr = "_str"
+)
+
+// log_fields keys
+const (
+	// RepositoryFieldKey repository name (string)
+	RepositoryFieldKey = "repository"
+	// MatchedHostFieldKey matched host (bool) true when domain extracted from host
+	MatchedHostFieldKey = "matched_host"
+	// RefHostFieldKey reference id (string)
+	RefHostFieldKey = "ref"
+	// PathFieldKey path / request URI (string)
+	PathFieldKey = "path"
+	// UploadIDFieldKey s3 multipart upload ID (string) "upload_id"
+	UploadIDFieldKey = "upload_id"
+	// ListTypeFieldKey s3 list type version (string, ex: v1 or v2)
+	ListTypeFieldKey = "list_type"
+	// PhysicalAddressFieldKey object physical address (string)
+	PhysicalAddressFieldKey = "physical_address"
+	// PartNumberFieldKey s3 multipart upload part number (string)
+	PartNumberFieldKey = "part_number"
+	// RequestIDFieldKey request ID (string) based on the request ID found on context
+	RequestIDFieldKey = "request_id"
+	// HostFieldKey request's host (string)
+	HostFieldKey = "host"
+	// MethodFieldKey request's method (string)
+	MethodFieldKey = "method"
+	// UserFieldKey user's name associated with the request (string)
+	UserFieldKey = "user"
+	// ServiceNameFieldKey service name (string, ex: rest_api)
+	ServiceNameFieldKey = "service_name"
+	// LogAudit kind of information to audit (string, ex: API)
+	LogAudit = "log_audit"
+)
+
+var (
+	formatterInitOnce sync.Once
+	defaultLogger     = logrus.New()
+	openLoggers       []io.Closer
+	syslogOnce        sync.Once
+)
+
+func Level() string {
+	return defaultLogger.GetLevel().String()
+}
+
+type Fields map[string]any
+
+// logCallerTrimmer is used to trim the caller paths to be relative to the project root
+func logCallerTrimmer(frame *runtime.Frame) (function string, file string) {
+	indexOfModule := strings.Index(strings.ToLower(frame.File), ProjectDirectoryName)
+	if indexOfModule != -1 {
+		// Find the next path separator after the project directory name match
+		remainingPath := frame.File[indexOfModule+len(ProjectDirectoryName):]
+		separatorIdx := strings.Index(remainingPath, string(os.PathSeparator))
+		if separatorIdx != -1 {
+			file = remainingPath[separatorIdx:]
+		} else {
+			file = remainingPath
+		}
+	} else {
+		file = frame.File
+	}
+	file = fmt.Sprintf("%s:%d", strings.TrimPrefix(file, string(os.PathSeparator)), frame.Line)
+
+	// For function name, find the module and then capture until the next separator
+	indexOfModuleName := strings.Index(frame.Function, ModuleName)
+	if indexOfModuleName != -1 {
+		remainingFunc := frame.Function[indexOfModuleName+len(ModuleName):]
+		if _, after, found := strings.Cut(remainingFunc, "/"); found {
+			function = after
+		} else {
+			// Handle case where there's no "/" but might have a "." (e.g., module.Function)
+			function = strings.TrimPrefix(remainingFunc, "/")
+		}
+	} else {
+		function = frame.Function
+	}
+	return
+}
+
+func SetLevel(level string) {
+	switch strings.ToLower(level) {
+	case "trace":
+		defaultLogger.SetLevel(logrus.TraceLevel)
+	case "debug":
+		defaultLogger.SetLevel(logrus.DebugLevel)
+	case "info":
+		defaultLogger.SetLevel(logrus.InfoLevel)
+	case "warn", "warning":
+		defaultLogger.SetLevel(logrus.WarnLevel)
+	case "error":
+		defaultLogger.SetLevel(logrus.ErrorLevel)
+	case "panic":
+		defaultLogger.SetLevel(logrus.PanicLevel)
+	case "null", "none":
+		defaultLogger.SetLevel(logrus.PanicLevel)
+		defaultLogger.SetOutput(io.Discard)
+	}
+}
+
+func CloseWriters() error {
+	for _, c := range openLoggers {
+		if err := c.Close(); err != nil {
+			return fmt.Errorf("close log writer: %w", err)
+		}
+	}
+	openLoggers = nil
+	return nil
+}
+
+func SetOutputs(outputs []string, fileMaxSizeMB, filesKeep int) error {
+	var writers []io.Writer
+	if err := CloseWriters(); err != nil {
+		return fmt.Errorf("close previous log writers: %w", err)
+	}
+	for _, output := range outputs {
+		var w io.Writer
+		switch output {
+		case "":
+			continue
+		case "-":
+			w = os.Stdout
+		case "=":
+			w = os.Stderr
+		default:
+			l := &lumberjack.Logger{
+				Filename:   output,
+				MaxSize:    fileMaxSizeMB,
+				MaxBackups: filesKeep,
+			}
+			w = l
+			openLoggers = append(openLoggers, l)
+		}
+		writers = append(writers, w)
+	}
+	if len(writers) == 1 {
+		defaultLogger.SetOutput(writers[0])
+	} else if len(writers) > 1 {
+		defaultLogger.SetOutput(io.MultiWriter(writers...))
+	}
+	return nil
+}
+
+func HasLogFileOutput(outputs []string) bool {
+	return slices.ContainsFunc(outputs, func(e string) bool {
+		return e != "" && e != "-" && e != "="
+	})
+}
+
+func GetLogFileOutputPath(outputs []string) string {
+	outFileIdx := slices.IndexFunc(outputs, func(e string) bool {
+		return e != "" && e != "-" && e != "="
+	})
+	return outputs[outFileIdx]
+}
+
+type OutputFormatOptions struct {
+	CallerPrettyfier func(*runtime.Frame) (function string, file string)
+}
+
+type OutputFormatOptionFunc func(options *OutputFormatOptions)
+
+func SetOutputFormat(format string, opts ...OutputFormatOptionFunc) {
+	// setup options
+	var options OutputFormatOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+	if options.CallerPrettyfier == nil {
+		options.CallerPrettyfier = logCallerTrimmer
+	}
+
+	// setup formatter
+	var formatter logrus.Formatter
+	switch strings.ToLower(format) {
+	case "text":
+		disableColors := false
+		noColor := os.Getenv("NO_COLOR")
+		if noColor != "" && noColor != "0" {
+			disableColors = true
+		}
+		formatter = &logrus.TextFormatter{
+			FullTimestamp:          true,
+			DisableLevelTruncation: true,
+			PadLevelText:           true,
+			QuoteEmptyFields:       true,
+			CallerPrettyfier:       options.CallerPrettyfier,
+			DisableColors:          disableColors,
+		}
+	case "json":
+		formatter = &logrus.JSONFormatter{
+			CallerPrettyfier: options.CallerPrettyfier,
+			PrettyPrint:      false,
+		}
+	default:
+		return // no known formatter found
+	}
+
+	// wrap it with our caller formatter
+	defaultLogger.SetFormatter(logrusCallerFormatter{formatter})
+}
+
+type Logger interface {
+	WithContext(ctx context.Context) Logger
+	WithField(key string, value any) Logger
+	WithFields(fields Fields) Logger
+	WithError(err error) Logger
+	Trace(args ...any)
+	Debug(args ...any)
+	Info(args ...any)
+	Warn(args ...any)
+	Warning(args ...any)
+	Error(args ...any)
+	Fatal(args ...any)
+	Panic(args ...any)
+	Log(level logrus.Level, args ...any)
+	Tracef(format string, args ...any)
+	Debugf(format string, args ...any)
+	Infof(format string, args ...any)
+	Warnf(format string, args ...any)
+	Warningf(format string, args ...any)
+	Errorf(format string, args ...any)
+	Fatalf(format string, args ...any)
+	Panicf(format string, args ...any)
+	Logf(level logrus.Level, format string, args ...any)
+	IsTracing() bool
+	IsDebugging() bool
+	IsInfo() bool
+	IsError() bool
+	IsWarn() bool
+}
+
+type logrusEntryWrapper struct {
+	e *logrus.Entry
+}
+
+func (l *logrusEntryWrapper) WithContext(ctx context.Context) Logger {
+	return addFromContext(
+		&logrusEntryWrapper{l.e.WithContext(ctx)},
+		ctx,
+	)
+}
+
+var durationType = reflect.TypeFor[time.Duration]()
+
+// splitDurationFields modifies fields to split every field of type
+// time.Duration into 2 fields, one "_nsecs" and one "_str".
+func (l *logrusEntryWrapper) WithFields(fields Fields) Logger {
+	var durationKeys []string
+	for key, value := range fields {
+		if value != nil && reflect.TypeOf(value).AssignableTo(durationType) {
+			durationKeys = append(durationKeys, key)
+		}
+	}
+
+	for _, key := range durationKeys {
+		duration := fields[key].(time.Duration)
+		fields[key] = duration.Nanoseconds()
+		fields[key+durationStr] = duration.String()
+	}
+
+	return &logrusEntryWrapper{l.e.WithFields(logrus.Fields(fields))}
+}
+
+func (l *logrusEntryWrapper) WithField(key string, value any) Logger {
+	return l.WithFields(Fields{key: value})
+}
+
+func (l *logrusEntryWrapper) WithError(err error) Logger {
+	return &logrusEntryWrapper{l.e.WithError(err)}
+}
+
+func (l *logrusEntryWrapper) Trace(args ...any) {
+	l.e.Trace(args...)
+}
+
+func (l *logrusEntryWrapper) Debug(args ...any) {
+	l.e.Debug(args...)
+}
+
+func (l *logrusEntryWrapper) Info(args ...any) {
+	l.e.Info(args...)
+}
+
+func (l *logrusEntryWrapper) Warn(args ...any) {
+	l.e.Warn(args...)
+}
+
+func (l *logrusEntryWrapper) Warning(args ...any) {
+	l.e.Warning(args...)
+}
+
+func (l *logrusEntryWrapper) Error(args ...any) {
+	l.e.Error(args...)
+}
+
+func (l *logrusEntryWrapper) Fatal(args ...any) {
+	l.e.Fatal(args...)
+}
+
+func (l *logrusEntryWrapper) Panic(args ...any) {
+	l.e.Panic(args...)
+}
+
+func (l *logrusEntryWrapper) Log(level logrus.Level, args ...any) {
+	l.e.Log(level, args...)
+}
+
+func (l *logrusEntryWrapper) Tracef(format string, args ...any) {
+	l.e.Tracef(format, args...)
+}
+
+func (l *logrusEntryWrapper) Debugf(format string, args ...any) {
+	l.e.Debugf(format, args...)
+}
+
+func (l *logrusEntryWrapper) Infof(format string, args ...any) {
+	l.e.Infof(format, args...)
+}
+
+func (l *logrusEntryWrapper) Warnf(format string, args ...any) {
+	l.e.Warnf(format, args...)
+}
+
+func (l *logrusEntryWrapper) Warningf(format string, args ...any) {
+	l.e.Warningf(format, args...)
+}
+
+func (l *logrusEntryWrapper) Errorf(format string, args ...any) {
+	l.e.Errorf(format, args...)
+}
+
+func (l *logrusEntryWrapper) Fatalf(format string, args ...any) {
+	l.e.Fatalf(format, args...)
+}
+
+func (l *logrusEntryWrapper) Panicf(format string, args ...any) {
+	l.e.Panicf(format, args...)
+}
+
+func (l *logrusEntryWrapper) Logf(level logrus.Level, format string, args ...any) {
+	l.e.Logf(level, format, args...)
+}
+
+func (l *logrusEntryWrapper) IsTracing() bool {
+	return l.e.Logger.IsLevelEnabled(logrus.TraceLevel)
+}
+
+func (l *logrusEntryWrapper) IsDebugging() bool {
+	return l.e.Logger.IsLevelEnabled(logrus.DebugLevel)
+}
+
+func (l *logrusEntryWrapper) IsInfo() bool {
+	return l.e.Logger.IsLevelEnabled(logrus.InfoLevel)
+}
+
+func (l *logrusEntryWrapper) IsError() bool {
+	return l.e.Logger.IsLevelEnabled(logrus.ErrorLevel)
+}
+
+func (l *logrusEntryWrapper) IsWarn() bool {
+	return l.e.Logger.IsLevelEnabled(logrus.WarnLevel)
+}
+
+type logrusCallerFormatter struct {
+	f logrus.Formatter
+}
+
+func (lf logrusCallerFormatter) Format(e *logrus.Entry) ([]byte, error) {
+	e.Caller = getCaller()
+	return lf.f.Format(e)
+}
+
+// ContextUnavailable returns a Logger when no context is available.  It
+// should be used only in code during startup, teardown, or tests.  Prefer
+// to use Default().
+func ContextUnavailable() Logger {
+	// wrap formatter with our own formatter that overrides caller
+	formatterInitOnce.Do(func() {
+		defaultLogger.SetReportCaller(true)
+		defaultLogger.SetNoLock()
+		defaultLogger.Formatter = logrusCallerFormatter{defaultLogger.Formatter}
+	})
+	return &logrusEntryWrapper{
+		e: logrus.NewEntry(defaultLogger),
+	}
+}
+
+// GetFieldsFromContext returns the logging fields on ctx or nil.
+func GetFieldsFromContext(ctx context.Context) Fields {
+	fields := ctx.Value(LogFieldsContextKey)
+	if fields == nil {
+		return nil
+	}
+	return fields.(Fields)
+}
+
+func addFromContext(log Logger, ctx context.Context) Logger {
+	loggerFields := GetFieldsFromContext(ctx)
+	return log.WithFields(loggerFields)
+}
+
+// FromContext returns a Logger for reporting logs during ctx.  This logger
+// will typically include request IDs from the context.
+func FromContext(ctx context.Context) Logger {
+	return addFromContext(ContextUnavailable(), ctx)
+}
+
+func AddFields(ctx context.Context, fields Fields) context.Context {
+	ctxFields := ctx.Value(LogFieldsContextKey)
+	loggerFields := Fields{}
+	if ctxFields != nil {
+		loggerFields = ctxFields.(Fields)
+	}
+	maps.Copy(loggerFields, fields)
+	return context.WithValue(ctx, LogFieldsContextKey, loggerFields)
+}
+
+// CopyFieldsFromContext copies logging fields from srcCtx to dstCtx.
+func CopyFieldsFromContext(srcCtx, dstCtx context.Context) context.Context {
+	if fields := GetFieldsFromContext(srcCtx); fields != nil {
+		return context.WithValue(dstCtx, LogFieldsContextKey, fields)
+	}
+	return dstCtx
+}

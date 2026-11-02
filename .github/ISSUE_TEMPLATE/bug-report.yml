@@ -1,0 +1,67 @@
+name: Bug Report
+description: File a bug report
+title: "[Bug]: "
+labels: ["bug", "contributor"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for contributing to the lakeFS project.
+        The following fields help us properly address your issue:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      value: |
+        What actually happened, including error codes if applies.
+                
+        Steps to Reproduce:
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+      placeholder: |  
+        Expected behavior:
+    validations:
+      required: false
+  - type: input
+    id: lakefs_version
+    attributes:
+      label: lakeFS version
+      description: What version of lakeFS are you running?
+  - type: input
+    id: deployment
+    attributes:
+      label: How lakeFS is installed
+      description: How and where you installed lakeFS
+      placeholder: ex. AWS EC2, Docker or Kubernetes, locally
+    validations:
+      required: false
+  - type: input
+    id: clients
+    attributes:
+      label: Affected clients
+      description: If applicable, provide the lakeFS client and version that was used
+      placeholder: Python lakeFS client 0.89.0
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Please copy and paste any relevant log output (server/client).
+      render: shell
+  - type: input
+    id: contact
+    attributes:
+      label: Contact details
+      description: How can we get in touch with you if we need more info?
+      placeholder: email@example.com
+    validations:
+      required: false

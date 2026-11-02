@@ -1,0 +1,107 @@
+import React, { useCallback, useEffect } from 'react';
+import { useState } from 'react';
+import { API_ENDPOINT, setup, SETUP_STATE_INITIALIZED } from '../../lib/api';
+import { useRouter } from '../../lib/hooks/router';
+import { useAPI } from '../../lib/hooks/api';
+import { SetupComplete } from './setupComplete';
+import { UserConfiguration } from './userConfiguration';
+import capitalize from 'lodash/capitalize';
+
+const SetupContents = () => {
+    const [setupError, setSetupError] = useState(null);
+    const [setupData, setSetupData] = useState(null);
+    const [disabled, setDisabled] = useState(false);
+    const [currentStep, setCurrentStep] = useState(null);
+    const [commPrefsMissing, setCommPrefsMissing] = useState(false);
+    const router = useRouter();
+    const { response, error, loading } = useAPI(() => {
+        return setup.getState();
+    });
+
+    useEffect(() => {
+        // Set initial state
+        if (!error && response) {
+            setCurrentStep(response.state);
+            setCommPrefsMissing(response.comm_prefs_missing === true);
+        }
+    }, [error, response]);
+
+    const notInitialized = currentStep !== SETUP_STATE_INITIALIZED;
+
+    const onSubmitUserConfiguration = useCallback(
+        async (adminUser, firstName, lastName, userEmail, companyName, checked, country) => {
+            if (notInitialized && !adminUser) {
+                setSetupError('Please enter your admin username.');
+                return;
+            }
+            if (commPrefsMissing && !userEmail) {
+                setSetupError('Please enter your email address.');
+                return;
+            }
+            if (commPrefsMissing && !country) {
+                setSetupError('Please select your country.');
+                return;
+            }
+
+            const commPrefs = {
+                email: userEmail,
+                firstName,
+                lastName,
+                companyName,
+                featureUpdates: checked,
+                country,
+            };
+
+            setDisabled(true);
+            try {
+                if (currentStep !== SETUP_STATE_INITIALIZED) {
+                    const response = await setup.lakeFS({ username: adminUser, ...commPrefs });
+                    setSetupData(response);
+                } else if (commPrefsMissing) {
+                    await setup.commPrefs(commPrefs);
+                }
+                setCommPrefsMissing(false);
+                setSetupError(null);
+            } catch (error) {
+                setSetupError(capitalize(error.message));
+            } finally {
+                setDisabled(false);
+            }
+        },
+        // TODO: Review and remove this eslint-disable once dependencies are validated
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [setDisabled, setSetupError, setup, currentStep, commPrefsMissing],
+    );
+
+    if (error || loading) {
+        return null;
+    }
+
+    if (setupData && setupData.access_key_id) {
+        return (
+            <SetupComplete
+                accessKeyId={setupData.access_key_id}
+                secretAccessKey={setupData.secret_access_key}
+                apiEndpoint={API_ENDPOINT}
+            />
+        );
+    }
+
+    if (notInitialized || commPrefsMissing) {
+        return (
+            <UserConfiguration
+                onSubmit={onSubmitUserConfiguration}
+                setupError={setupError}
+                disabled={disabled}
+                requireAdmin={notInitialized}
+                requireCommPrefs={commPrefsMissing}
+            />
+        );
+    }
+
+    return router.push({ pathname: '/', query: router.query });
+};
+
+const SetupPage = () => <SetupContents />;
+
+export default SetupPage;
