@@ -948,3 +948,227 @@ func TestUpdates(t *testing.T) {
 		require.True(t, ok, "case names %q, which is not a TableUpdate action in the REST spec", action)
 	}
 }
+
+// forkSide commits body on a new branch forked from main's committed head, and returns the pointer
+// that branch answers with: the state of one side of a merge, built by the same Commit the server
+// runs. The main branch must be committed first, because a new branch starts from a commit, not
+// from main's staging area.
+func (f *commitFixture) forkSide(t *testing.T, branch, body string) TablePointer {
+	t.Helper()
+	_, err := f.catalog.CreateBranch(f.ctx, storeTestRepo, branch, f.headRef(t))
+	require.NoError(t, err, "create branch %s", branch)
+
+	addr := f.addr
+	addr.Ref = branch
+	request, err := DecodeTableCommitRequest([]byte(body))
+	require.NoError(t, err, "decode commit request %s", body)
+	result, err := f.store.Commit(f.ctx, addr, request)
+	require.NoError(t, err, "commit on branch %s", branch)
+	return result.Pointer
+}
+
+// compactionBody is a commit of the shape a compaction makes: it moves the pointer (and would
+// rewrite data files), without changing the table's logical contents. What the resolver reads is
+// the metadata-log chain, so the payload need not model rewritten files - and must not: the point
+// of §6.4 is that no code inspects snapshots to resolve a conflict.
+const compactionBody = `{"requirements":[],"updates":[
+	{"action":"set-properties","updates":{"compaction":"rewritten"}}]}`
+
+// logicalBody is a commit that changes the table logically: an append with its properties.
+const logicalBody = `{"requirements":[],"updates":[
+	{"action":"set-properties","updates":{"owner":"analytics"}}]}`
+
+// detachedPointer writes a metadata.json that does not descend from any other file - what a table
+// dropped and recreated, or reset to a third history, would name - and returns the pointer. distinct
+// keeps two of them apart, so that a test with two detached sides is a real two-value conflict.
+func (f *commitFixture) detachedPointer(t *testing.T, distinct string) TablePointer {
+	t.Helper()
+	location := f.putMetadata(t,
+		"_iceberg/"+storeTestUUID+"/metadata/00001-detached-"+distinct+".metadata.json",
+		storeTestMetadata(t, storeTestUUID, f.tableLocation))
+	return TablePointer{MetadataLocation: location, TableUUID: storeTestUUID, FormatVersion: 2}
+}
+
+// TestCompactionAutoResolve covers the compaction auto-resolve of §6.4 (phase I-5): the commit
+// message detection, the three-way decision on a table pointer, the iceberg.ignore_compaction_commits
+// default and its switch-off, and the ancestry guard that stops the resolver from guessing.
+func TestCompactionAutoResolve(t *testing.T) {
+	const (
+		compactionMessage = "compaction of inventory.books.orders\nlakefs.compaction.operation-id=4f0c1a2e"
+		logicalMessage    = "append 12 rows to inventory.books.orders"
+	)
+
+	t.Run("a message carrying the marker is a compaction commit", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			message string
+			want    bool
+		}{
+			{name: "operation id as a key=value", message: "lakefs.compaction.operation-id=abc123", want: true},
+			{name: "marker inside a multi-line message", message: "compaction\nlakefs.compaction.operation-id: abc123\n", want: true},
+			{name: "an ordinary commit", message: logicalMessage, want: false},
+			{name: "an empty message", message: "", want: false},
+			{name: "a message that merely mentions compaction", message: "compaction of orders", want: false},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				require.Equal(t, tc.want, IsCompactionCommit(tc.message))
+			})
+		}
+	})
+
+	// newThreeWay builds one table on main, commits it, and returns the merge-base pointer plus
+	// one pointer per side: feature changes the table logically, compaction only compacts it.
+	newThreeWay := func(t *testing.T) (f *commitFixture, base, feature, compaction TablePointer) {
+		t.Helper()
+		f = newCommitFixture(t)
+		f.storeFixture.commit(t, "create the table")
+		base = f.currentPointer(t)
+		feature = f.forkSide(t, "feature", logicalBody)
+		compaction = f.forkSide(t, "compaction", compactionBody)
+		require.NotEqual(t, base, feature)
+		require.NotEqual(t, base, compaction)
+		require.NotEqual(t, feature, compaction)
+		return f, base, feature, compaction
+	}
+
+	t.Run("a compaction commit on the source branch is ignored", func(t *testing.T) {
+		f, base, feature, compaction := newThreeWay(t)
+
+		resolution, err := f.store.ResolvePointerConflict(f.ctx, storeTestRepo, PointerConflict{
+			Base:        base,
+			Destination: PointerRevision{Pointer: feature, CommitMessage: logicalMessage},
+			Source:      PointerRevision{Pointer: compaction, CommitMessage: compactionMessage},
+		}, nil)
+		require.NoError(t, err)
+		require.NotNil(t, resolution, "a conflict caused only by a compaction commit is auto-resolved")
+		require.Equal(t, feature, resolution.Pointer, "the logical change wins; the compaction is a no-op")
+		require.Equal(t, compaction, resolution.IgnoredCompaction)
+
+		// The kept pointer is a readable table that still carries the logical change.
+		keptAddress := f.addr
+		keptAddress.Ref = "feature"
+		kept, err := f.store.GetTable(f.ctx, keptAddress)
+		require.NoError(t, err)
+		require.Equal(t, feature, kept.Pointer, "the kept pointer is the destination's own pointer, unchanged")
+		require.Equal(t, "analytics", kept.Metadata.Properties()["owner"])
+	})
+
+	t.Run("a compaction commit on the destination branch is ignored", func(t *testing.T) {
+		f, base, feature, compaction := newThreeWay(t)
+
+		resolution, err := f.store.ResolvePointerConflict(f.ctx, storeTestRepo, PointerConflict{
+			Base:        base,
+			Destination: PointerRevision{Pointer: compaction, CommitMessage: compactionMessage},
+			Source:      PointerRevision{Pointer: feature, CommitMessage: logicalMessage},
+		}, nil)
+		require.NoError(t, err)
+		require.NotNil(t, resolution)
+		require.Equal(t, feature, resolution.Pointer, "the logical change wins whichever side it is on")
+		require.Equal(t, compaction, resolution.IgnoredCompaction)
+	})
+
+	t.Run("two logical changes are a conflict", func(t *testing.T) {
+		f := newCommitFixture(t)
+		f.storeFixture.commit(t, "create the table")
+		base := f.currentPointer(t)
+		destination := f.forkSide(t, "feature", logicalBody)
+		source := f.forkSide(t, "hotfix", `{"requirements":[],"updates":[
+			{"action":"set-properties","updates":{"owner":"finance"}}]}`)
+
+		resolution, err := f.store.ResolvePointerConflict(f.ctx, storeTestRepo, PointerConflict{
+			Base:        base,
+			Destination: PointerRevision{Pointer: destination, CommitMessage: logicalMessage},
+			Source:      PointerRevision{Pointer: source, CommitMessage: "fix a typo in a property"},
+		}, nil)
+		require.NoError(t, err)
+		require.Nil(t, resolution, "neither side is a compaction commit, so the conflict is reported")
+	})
+
+	t.Run("with iceberg.ignore_compaction_commits off the conflict is reported", func(t *testing.T) {
+		f, base, feature, compaction := newThreeWay(t)
+
+		resolution, err := f.store.ResolvePointerConflict(f.ctx, storeTestRepo, PointerConflict{
+			Base:        base,
+			Destination: PointerRevision{Pointer: feature, CommitMessage: logicalMessage},
+			Source:      PointerRevision{Pointer: compaction, CommitMessage: compactionMessage},
+		}, &Config{IgnoreCompactionCommits: false})
+		require.NoError(t, err)
+		require.Nil(t, resolution, "the flag off means the documented behaviour: report the conflict")
+	})
+
+	t.Run("both sides compacted: the destination is kept", func(t *testing.T) {
+		f, base, destination, source := newThreeWay(t)
+
+		resolution, err := f.store.ResolvePointerConflict(f.ctx, storeTestRepo, PointerConflict{
+			Base:        base,
+			Destination: PointerRevision{Pointer: destination, CommitMessage: compactionMessage},
+			Source:      PointerRevision{Pointer: source, CommitMessage: compactionMessage + " (other op)"},
+		}, nil)
+		require.NoError(t, err)
+		require.NotNil(t, resolution, "two compactions are two logical no-ops, so there is nothing to report")
+		require.Equal(t, destination, resolution.Pointer)
+	})
+
+	t.Run("one side did not move: the moved side wins without ignoring anything", func(t *testing.T) {
+		f, base, feature, _ := newThreeWay(t)
+
+		resolution, err := f.store.ResolvePointerConflict(f.ctx, storeTestRepo, PointerConflict{
+			Base:        base,
+			Destination: PointerRevision{Pointer: base},
+			Source:      PointerRevision{Pointer: feature, CommitMessage: logicalMessage},
+		}, &Config{IgnoreCompactionCommits: false})
+		require.NoError(t, err)
+		require.NotNil(t, resolution, "a fast-forward is not a conflict, whatever the flag says")
+		require.Equal(t, feature, resolution.Pointer)
+		require.Equal(t, TablePointer{}, resolution.IgnoredCompaction, "nothing was ignored")
+	})
+
+	// The three-way guard: a compaction commit is only ignorable while the merge base is still an
+	// ancestor of both sides. A destructively rewritten side is not "base plus a compaction".
+	t.Run("three-way: a side that no longer descends from the base is not resolved", func(t *testing.T) {
+		t.Run("the compaction side was reset", func(t *testing.T) {
+			f := newCommitFixture(t)
+			f.storeFixture.commit(t, "create the table")
+			base := f.currentPointer(t)
+			destination := f.forkSide(t, "feature", logicalBody)
+
+			resolution, err := f.store.ResolvePointerConflict(f.ctx, storeTestRepo, PointerConflict{
+				Base:        base,
+				Destination: PointerRevision{Pointer: destination, CommitMessage: logicalMessage},
+				Source:      PointerRevision{Pointer: f.detachedPointer(t, "source"), CommitMessage: compactionMessage},
+			}, nil)
+			require.NoError(t, err)
+			require.Nil(t, resolution,
+				"a pointer whose metadata-log does not reach the base is not a compaction of it")
+		})
+
+		t.Run("the kept side was reset", func(t *testing.T) {
+			f := newCommitFixture(t)
+			f.storeFixture.commit(t, "create the table")
+			base := f.currentPointer(t)
+			source := f.forkSide(t, "compaction", compactionBody)
+
+			resolution, err := f.store.ResolvePointerConflict(f.ctx, storeTestRepo, PointerConflict{
+				Base:        base,
+				Destination: PointerRevision{Pointer: f.detachedPointer(t, "destination"), CommitMessage: logicalMessage},
+				Source:      PointerRevision{Pointer: source, CommitMessage: compactionMessage},
+			}, nil)
+			require.NoError(t, err)
+			require.Nil(t, resolution,
+				"the side that would win does not descend from the base either, so nothing is proven")
+		})
+
+		t.Run("a new table on both sides is a conflict", func(t *testing.T) {
+			f := newCommitFixture(t)
+			// No commit and no fork from a base table: base is the zero pointer.
+			resolution, err := f.store.ResolvePointerConflict(f.ctx, storeTestRepo, PointerConflict{
+				Base:        TablePointer{},
+				Destination: PointerRevision{Pointer: f.detachedPointer(t, "ours"), CommitMessage: logicalMessage},
+				Source:      PointerRevision{Pointer: f.detachedPointer(t, "theirs"), CommitMessage: compactionMessage},
+			}, nil)
+			require.NoError(t, err)
+			require.Nil(t, resolution, "both branches created the table: there is no base to descend from")
+		})
+	})
+}

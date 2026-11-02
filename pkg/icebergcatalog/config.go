@@ -149,6 +149,18 @@ func (c *Config) applyViperOverrides() {
 	}
 }
 
+// IgnoresCompactionCommits reports whether a table-pointer conflict that a compaction commit
+// alone caused is auto-resolved instead of reported (§6.4, phase I-5). A nil *Config answers with
+// the documented default, DefaultIgnoreCompactionCommits, so a caller that has no configuration in
+// hand still gets the behaviour of the public lakeFS Iceberg documentation; the decision itself is
+// Store.ResolvePointerConflict (commit.go).
+func (c *Config) IgnoresCompactionCommits() bool {
+	if c == nil {
+		return DefaultIgnoreCompactionCommits
+	}
+	return c.IgnoreCompactionCommits
+}
+
 // setDefaults fills every unset field with its documented default. Zero values mean "unset"
 // here: a value that is set but not positive is rejected by Validate instead of defaulted.
 func (c *Config) setDefaults() {
