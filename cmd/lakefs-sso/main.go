@@ -8,6 +8,9 @@
 //     installation from BasicAuthService to acl.AuthService.
 //  4. Adds an "rbac-migrate" subcommand to migrate simplified ACL groups to
 //     policy-based RBAC groups.
+//  5. Mounts the datasets control plane (/api/v1/datasets) and the Apache Iceberg
+//     REST catalog (/iceberg/api, /iceberg/relative_to) by registering extra route
+//     builders, each of which is disabled unless its config section is enabled.
 //
 // Merge-friendliness: the upstream cmd/lakefs directory is untouched except for
 // cmd/lakefs/cmd/hooks.go (new file) and 2 lines in cmd/lakefs/cmd/run.go.
@@ -26,6 +29,7 @@ import (
 	authparams "github.com/treeverse/lakefs/pkg/auth/params"
 	"github.com/treeverse/lakefs/pkg/config"
 	"github.com/treeverse/lakefs/pkg/datasets"
+	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/kv/kvparams"
 	logging "github.com/treeverse/lakefs/pkg/logging"
@@ -44,6 +48,12 @@ func main() {
 	// Mount the datasets control plane on /api/v1/datasets (DATASETS_DESIGN.md §4.4). The
 	// builder mounts a 501 handler when datasets.enabled is false.
 	lakefsCmd.AddExtraRoutesBuilder(datasets.RoutesBuilder)
+
+	// Mount the Apache Iceberg REST catalog on /iceberg/api (and the relative_to form on
+	// /iceberg/relative_to) (ICEBERG_CATALOG_PLAN.md §4.1). The builder mounts the catalog's own
+	// 501 handler when iceberg.enabled is false, so the prefixes stay answered in the Iceberg
+	// error envelope in either case.
+	lakefsCmd.AddExtraRoutesBuilder(icebergcatalog.RoutesBuilder)
 
 	lakefsCmd.Execute()
 }
