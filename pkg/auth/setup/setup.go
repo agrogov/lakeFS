@@ -20,21 +20,79 @@ const (
 	ViewersGroup    = "Viewers"
 )
 
-// Built-in datasets policies (DATASETS_DESIGN.md §9.5).
+// Built-in datasets policies (DATASETS_DESIGN.md §9.5). They are the four policies the public
+// RBAC documentation says a new installation includes, all scoped to the datasets namespace.
 const (
-	DatasetsFullAccessPolicy = "DatasetsFullAccess"
-	DatasetsReadAllPolicy    = "DatasetsReadAll"
+	DatasetsFullAccessPolicy         = "DatasetsFullAccess"
+	DatasetsReadWriteAllPolicy       = "DatasetsReadWriteAll"
+	DatasetsReadAllPolicy            = "DatasetsReadAll"
+	DatasetsManageMetadataKeysPolicy = "DatasetsManageMetadataKeys"
+
+	datasetsPolicyResource = "arn:lakefs:dataset:::dataset/*"
 )
 
-// defaultDatasetsEnabled is the production default of the datasets feature switch: off.
+// datasetsBuiltinPolicies builds the four datasets policies of §9.5. Their statements are the
+// public documentation's action lists, byte-for-byte the ones pkg/datasets.Bootstrap writes, so
+// the RBAC template and the datasets bootstrap cannot disagree about a managed policy.
+func datasetsBuiltinPolicies(ts time.Time) []*model.Policy {
+	return []*model.Policy{
+		{
+			CreatedAt:   ts,
+			DisplayName: DatasetsFullAccessPolicy,
+			Statement: model.Statements{{
+				Action:   []string{"dataset:*"},
+				Resource: datasetsPolicyResource,
+				Effect:   model.StatementEffectAllow,
+			}},
+		},
+		{
+			CreatedAt:   ts,
+			DisplayName: DatasetsReadWriteAllPolicy,
+			Statement: model.Statements{{
+				Action: []string{
+					"dataset:ListDatasets", "dataset:ReadDataset", "dataset:CreateDataset",
+					"dataset:UpdateDataset", "dataset:DeleteDataset",
+					"dataset:ListMetadataKeys", "dataset:ReadMetadataKey",
+				},
+				Resource: datasetsPolicyResource,
+				Effect:   model.StatementEffectAllow,
+			}},
+		},
+		{
+			CreatedAt:   ts,
+			DisplayName: DatasetsReadAllPolicy,
+			Statement: model.Statements{{
+				Action: []string{
+					"dataset:ListDatasets", "dataset:ReadDataset",
+					"dataset:ListMetadataKeys", "dataset:ReadMetadataKey",
+				},
+				Resource: datasetsPolicyResource,
+				Effect:   model.StatementEffectAllow,
+			}},
+		},
+		{
+			CreatedAt:   ts,
+			DisplayName: DatasetsManageMetadataKeysPolicy,
+			Statement: model.Statements{{
+				Action: []string{
+					"dataset:ListMetadataKeys", "dataset:ReadMetadataKey", "dataset:CreateMetadataKey",
+					"dataset:UpdateMetadataKey", "dataset:DeleteMetadataKey",
+				},
+				Resource: datasetsPolicyResource,
+				Effect:   model.StatementEffectAllow,
+			}},
+		},
+	}
+}
+
+// defaultDatasetsEnabled is the default of the datasets feature switch when no option is passed:
+// off.
 //
-// The datasets feature is not part of this binary yet, so nothing can turn it on: the
-// production bootstrap (pkg/sso.EnsureRBACBase) calls the bootstrap without options and
-// therefore gets the off behaviour. When the feature lands, the flag has to be plumbed from
-// configuration into EnsureRBACBaseGroups, and that wiring has to be coordinated with
-// RBACBootstrapVersion in pkg/sso/rbac_bootstrap.go: the version guard skips the bootstrap
-// once a version has been recorded, so a later switch from off to on must either bump the
-// version or bypass the guard, otherwise the datasets policies are never created.
+// The production bootstrap (pkg/sso.EnsureRBACBase) passes WithDatasetsEnabled with the datasets
+// configuration. That bootstrap is version-gated (RBACBootstrapVersion in
+// pkg/sso/rbac_bootstrap.go) and does not run again when datasets is enabled later, so
+// pkg/datasets.Bootstrap, which runs on every start of a datasets-enabled server, also creates
+// the datasets policies and attaches them to these base groups.
 const defaultDatasetsEnabled = false
 
 // BaseGroupsOption configures optional parts of the RBAC bootstrap.
@@ -174,18 +232,7 @@ func CreateRBACBasePolicies(ctx context.Context, authService auth.Service, ts ti
 	if cfg.datasetsEnabled {
 		// Datasets control-plane policies (DATASETS_DESIGN.md §9.5). Created only when the datasets feature is
 		// enabled, together with their attachments in EnsureRBACBaseGroups.
-		policies = append(policies,
-			&model.Policy{
-				CreatedAt:   ts,
-				DisplayName: DatasetsFullAccessPolicy,
-				Statement:   auth.MakeStatementForPolicyTypeOrDie("DatasetsFull", all),
-			},
-			&model.Policy{
-				CreatedAt:   ts,
-				DisplayName: DatasetsReadAllPolicy,
-				Statement:   auth.MakeStatementForPolicyTypeOrDie("DatasetsRead", all),
-			},
-		)
+		policies = append(policies, datasetsBuiltinPolicies(ts)...)
 	}
 
 	return createPolicies(ctx, authService, policies)
@@ -239,11 +286,13 @@ func EnsureRBACBaseGroups(ctx context.Context, authService auth.Service, ts time
 	}
 
 	if cfg.datasetsEnabled {
-		// Datasets control-plane access: admins manage every dataset, the other base groups may only list and read.
-		// Data-plane (fs:) access to dataset repositories is granted separately by the datasets service.
+		// Datasets control-plane access follows the public documentation: Admins manage every
+		// dataset, SuperUsers and Developers may read and write every dataset, Viewers may only
+		// list and read. Data-plane (fs:) access to dataset repositories is granted separately
+		// by the datasets service.
 		attachments[0].policies = append(attachments[0].policies, DatasetsFullAccessPolicy)
-		attachments[1].policies = append(attachments[1].policies, DatasetsFullAccessPolicy)
-		attachments[2].policies = append(attachments[2].policies, DatasetsReadAllPolicy)
+		attachments[1].policies = append(attachments[1].policies, DatasetsReadWriteAllPolicy)
+		attachments[2].policies = append(attachments[2].policies, DatasetsReadWriteAllPolicy)
 		attachments[3].policies = append(attachments[3].policies, DatasetsReadAllPolicy)
 	}
 

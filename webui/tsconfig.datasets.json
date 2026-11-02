@@ -1,0 +1,15 @@
+{
+    "extends": "./tsconfig.json",
+    "compilerOptions": {
+        "skipLibCheck": true,
+        "types": ["node", "vite/client"]
+    },
+    "include": [
+        "src/**/*.d.ts",
+        "src/pages/datasets/**/*.ts",
+        "src/pages/datasets/**/*.tsx",
+        "src/lib/components/datasets/**/*.ts",
+        "src/lib/components/datasets/**/*.tsx"
+    ],
+    "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
+}

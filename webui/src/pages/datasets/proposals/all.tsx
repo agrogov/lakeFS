@@ -2,7 +2,7 @@ import React, { FC } from 'react';
 import { GitPullRequestIcon } from '@primer/octicons-react';
 
 import { MAX_LISTING_AMOUNT } from '../../../lib/api';
-import { Proposal, ProposalStatus, datasets, getDatasetNames } from '../../../lib/api/datasets';
+import { Proposal, ProposalStatus, datasets } from '../../../lib/api/datasets';
 import { AlertError, Loading } from '../../../lib/components/controls';
 import {
     ProposalStatusFilter,
@@ -25,28 +25,13 @@ export interface DatasetProposal extends Proposal {
 /**
  * Every pull request of every dataset (DATASETS_DESIGN.md §11.2), newest first.
  *
- * There is no cross-dataset proposals endpoint (§10.1), so this composes one: it lists the
- * dataset names, then asks each dataset for its proposals of the selected status and merges the
- * results. A dataset whose proposals cannot be read (deleted between the two requests, or not
- * readable by this caller) is skipped rather than failing the whole page, so one unavailable
- * dataset never hides everyone else's reviews.
+ * `GET /datasets/pulls` is the documented cross-dataset listing (§10.1). The server filters the
+ * rows by `dataset:ReadDataset`, so a pull request of a dataset this caller cannot read never
+ * reaches the page.
  */
 export const listAllProposals = async (status: ProposalStatus): Promise<DatasetProposal[]> => {
-    const names = [...(await getDatasetNames())];
-    if (names.length === 0) return [];
-
-    const perDataset = await Promise.all(
-        names.map(async (name): Promise<DatasetProposal[]> => {
-            try {
-                const response = await datasets.listProposals(name, { status, amount: MAX_LISTING_AMOUNT });
-                return response.results.map((proposal) => ({ ...proposal, dataset: proposal.dataset || name }));
-            } catch {
-                return [];
-            }
-        }),
-    );
-
-    return perDataset.flat().sort((left, right) => right.created_at - left.created_at);
+    const response = await datasets.listPullRequests({ status, amount: MAX_LISTING_AMOUNT });
+    return response.results.map((pull) => ({ ...pull, dataset: pull.dataset }));
 };
 
 /**

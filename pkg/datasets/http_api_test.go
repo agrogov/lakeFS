@@ -3,9 +3,11 @@ package datasets
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -14,6 +16,7 @@ import (
 	"github.com/treeverse/lakefs/contrib/auth/acl"
 	"github.com/treeverse/lakefs/pkg/api"
 	"github.com/treeverse/lakefs/pkg/auth/model"
+	"github.com/treeverse/lakefs/pkg/config"
 	"github.com/treeverse/lakefs/pkg/datasets/apigen"
 )
 
@@ -82,9 +85,21 @@ func newControlPlaneWithDeps(t *testing.T) (*chi.Mux, cmdpkg.ServerDeps, string,
 // configuration section, for tests that need a different sync_publish_max_objects and so on.
 func newControlPlaneWithConfig(t *testing.T, datasetsConfig string) (*chi.Mux, cmdpkg.ServerDeps, string, string) {
 	t.Helper()
+	return newControlPlaneWithConfigAndAuthzStatus(t, datasetsConfig, 0)
+}
+
+// newControlPlaneWithConfigAndAuthzStatus additionally sets
+// auth.authorization_failure_status, for the DOC-17 tests. Zero keeps the core default (401).
+func newControlPlaneWithConfigAndAuthzStatus(t *testing.T, datasetsConfig string, authzFailureStatus int) (*chi.Mux, cmdpkg.ServerDeps, string, string) {
+	t.Helper()
 	useConfig(t, datasetsConfig)
 
 	deps := testDeps(t)
+	if authzFailureStatus != 0 {
+		deps.Config = &config.ConfigImpl{
+			Auth: config.Auth{BaseAuth: config.BaseAuth{AuthorizationFailureStatus: authzFailureStatus}},
+		}
+	}
 	ctx := t.Context()
 	_, err := deps.AuthService.CreateUser(ctx, &model.User{Username: testUsername})
 	require.NoError(t, err)
@@ -146,16 +161,19 @@ func TestDatasetsSpecLoadsAndValidates(t *testing.T) {
 		endpoints := map[string][]string{
 			"/":                             {http.MethodGet, http.MethodPost},
 			"/config":                       {http.MethodGet},
-			"/metadata-keys":                {http.MethodGet, http.MethodPost},
-			"/metadata-keys/{key}":          {http.MethodGet, http.MethodPut, http.MethodDelete},
-			"/{dataset}":                    {http.MethodGet, http.MethodDelete},
+			"/metadata":                     {http.MethodGet, http.MethodPost},
+			"/metadata/{key}":               {http.MethodGet, http.MethodPut, http.MethodDelete},
+			"/{dataset}":                    {http.MethodGet, http.MethodPut, http.MethodDelete},
 			"/{dataset}/validate":           {http.MethodPost},
 			"/{dataset}/versions":           {http.MethodGet, http.MethodPost},
 			"/{dataset}/versions/{version}": {http.MethodGet},
-			"/{dataset}/refs/{leftRef}/diff/{rightRef}":         {http.MethodGet},
-			"/{dataset}/proposals":                              {http.MethodGet, http.MethodPost},
-			"/{dataset}/proposals/{id}":                         {http.MethodGet, http.MethodPatch},
-			"/{dataset}/proposals/{id}/merge":                   {http.MethodPost},
+			"/{dataset}/refs/{ref}":         {http.MethodGet},
+			"/{dataset}/refs/{leftRef}/diff/{rightRef}": {http.MethodGet},
+			"/pulls":                                            {http.MethodGet},
+			"/{dataset}/pulls":                                  {http.MethodGet, http.MethodPost},
+			"/{dataset}/pulls/{pullRequest}":                    {http.MethodGet, http.MethodPatch, http.MethodDelete},
+			"/{dataset}/pulls/{pullRequest}/diff":               {http.MethodGet},
+			"/{dataset}/pulls/{pullRequest}/merge":              {http.MethodPost},
 			"/{dataset}/access":                                 {http.MethodGet, http.MethodPost},
 			"/{dataset}/access/{principal_type}/{principal_id}": {http.MethodDelete},
 			"/{dataset}/tasks/{task_id}":                        {http.MethodGet},
@@ -171,8 +189,8 @@ func TestDatasetsSpecLoadsAndValidates(t *testing.T) {
 
 	t.Run("core schemas of §10.2 are declared", func(t *testing.T) {
 		for _, name := range []string{
-			"Dataset", "DatasetDefinition", "DataItem", "Version", "DatasetStats",
-			"DefinitionDiff", "DataDiffList", "Proposal", "MetadataKey", "Task", "Error",
+			"Dataset", "DatasetDefinition", "DataItem", "DatasetVersion", "DatasetStats",
+			"DatasetDiff", "DataDiffList", "DatasetPullRequest", "MetadataKey", "Task", "Error",
 		} {
 			require.Contains(t, swagger.Components.Schemas, name, "schema %q is missing", name)
 		}
@@ -225,7 +243,7 @@ func TestGeneratedDefinitionTypes(t *testing.T) {
 	var def apigen.DatasetDefinition
 	require.NoError(t, json.Unmarshal([]byte(enterpriseDefinition), &def))
 
-	require.Equal(t, 1, def.FormatVersion)
+	require.Equal(t, 1, derefInt(def.FormatVersion))
 	require.NotNil(t, def.Description)
 	require.Equal(t, "Curated customer view for analytics", *def.Description)
 	require.Len(t, def.Data, 2)
@@ -278,7 +296,7 @@ func TestDatasetsUnauthenticated401(t *testing.T) {
 		{"publish version", http.MethodPost, "/customer-360/versions", validPublishBody},
 		{"delete dataset", http.MethodDelete, "/customer-360", ""},
 		{"config", http.MethodGet, "/config", ""},
-		{"list metadata keys", http.MethodGet, "/metadata-keys", ""},
+		{"list metadata keys", http.MethodGet, "/metadata", ""},
 		{"diff", http.MethodGet, "/customer-360/refs/v1/diff/v2?type=data", ""},
 		{"task", http.MethodGet, "/customer-360/tasks/01J8Z", ""},
 	}
@@ -356,7 +374,7 @@ func TestDatasetsBadRequest400(t *testing.T) {
 		{
 			name:   "invalid metadata key in path",
 			method: http.MethodGet,
-			path:   "/metadata-keys/Bad-Key",
+			path:   "/metadata/Bad-Key",
 		},
 		{
 			name:   "invalid access principal type",
@@ -390,36 +408,6 @@ func TestDatasetsBadRequest400(t *testing.T) {
 func TestDatasetsNotImplemented501(t *testing.T) {
 	handler, accessKey, secret := newControlPlane(t)
 
-	cases := []struct {
-		operation string
-		method    string
-		path      string
-		body      string
-	}{
-		{"GetDatasetsConfig", http.MethodGet, "/config", ""},
-		{"ListMetadataKeys", http.MethodGet, "/metadata-keys", ""},
-		{"CreateMetadataKey", http.MethodPost, "/metadata-keys", validMetadataKeyBody},
-		{"GetMetadataKey", http.MethodGet, "/metadata-keys/classification", ""},
-		{"UpdateMetadataKey", http.MethodPut, "/metadata-keys/classification", `{"required": true}`},
-		{"DeleteMetadataKey", http.MethodDelete, "/metadata-keys/classification", ""},
-		// The version and task routes of §10.1 are implemented; their HTTP contract is covered
-		// by versions_http_test.go. The DiffRefs route of §10.3 is implemented too; its HTTP
-		// contract is covered by TestDatasetsHTTPDiff in diff_test.go. The proposal routes of
-		// §5.6 are implemented too; their HTTP contract is covered by proposals_http_test.go.
-		// None of them answer 501 any more, so none has a row here.
-	}
-	for _, tc := range cases {
-		t.Run(tc.operation, func(t *testing.T) {
-			rec := doRequest(t, handler, tc.method, tc.path, tc.body, accessKey, secret)
-			require.Equal(t, http.StatusNotImplemented, rec.Code, "body: %s", rec.Body.String())
-			require.Equal(t, "application/json", rec.Header().Get("Content-Type"))
-			message := decodeError(t, rec).Message
-			// Clearly marked not-implemented error naming the operation.
-			require.True(t, strings.HasPrefix(message, ErrNotImplemented.Error()+": "), "message: %q", message)
-			require.Contains(t, message, tc.operation)
-		})
-	}
-
 	t.Run("validation runs before the stub", func(t *testing.T) {
 		rec := doRequest(t, handler, http.MethodPost, "/customer-360/versions", `{"message": "x"}`, accessKey, secret)
 		require.Equal(t, http.StatusBadRequest, rec.Code)
@@ -445,7 +433,7 @@ func validCreateBodyWithItemType(itemType string) string {
 // because no principal can be authenticated.
 func TestNewRouterWithoutAuthMiddleware(t *testing.T) {
 	// A server with no service is enough: requireUser answers 401 before any handler runs.
-	handler, err := NewRouter(nil, newServer(nil, nil))
+	handler, err := NewRouter(nil, newServer(nil, nil, 0), DefaultMaxRequestBody)
 	require.NoError(t, err)
 
 	// NewRouter returns the sub-router; the validator resolves paths through the spec server
@@ -488,5 +476,102 @@ func TestDatasetsUnknownRoute404And405(t *testing.T) {
 	t.Run("unsupported method on a parametrised path", func(t *testing.T) {
 		rec := doRequest(t, handler, http.MethodPatch, "/customer-360", "", accessKey, secret)
 		require.Equal(t, http.StatusNotFound, rec.Code, "body: %s", rec.Body.String())
+	})
+}
+
+// oversizedBody is a large body that records whether anything read it, so a test can assert
+// that a rejected request was never buffered.
+type oversizedBody struct {
+	read      atomic.Bool
+	remaining int64
+}
+
+func (b *oversizedBody) Read(p []byte) (int, error) {
+	b.read.Store(true)
+	if b.remaining <= 0 {
+		return 0, io.EOF
+	}
+	n := int64(len(p))
+	if n > b.remaining {
+		n = b.remaining
+	}
+	for i := int64(0); i < n; i++ {
+		p[i] = ' '
+	}
+	b.remaining -= n
+	return int(n), nil
+}
+
+func (b *oversizedBody) Close() error { return nil }
+
+// TestDatasetsRequestBodyLimit is SEC-5: authentication and the authenticated-user requirement
+// run before the body is read, and an authenticated body over datasets.max_request_body is
+// answered 413 instead of being buffered.
+func TestDatasetsRequestBodyLimit(t *testing.T) {
+	t.Run("unauthenticated oversized POST is 401 without reading the body", func(t *testing.T) {
+		handler, _, _ := newControlPlane(t)
+		body := &oversizedBody{remaining: 10 << 20}
+		req := httptest.NewRequest(http.MethodPost, APIBasePath+"/customer-360/versions", nil)
+		req.Body = body
+		req.ContentLength = body.remaining
+		req.Header.Set("Content-Type", "application/json")
+
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		require.Equal(t, http.StatusUnauthorized, rec.Code, "body: %s", rec.Body.String())
+		require.JSONEq(t, `{"message":"`+ErrAuthenticationRequired.Error()+`"}`, rec.Body.String())
+		require.False(t, body.read.Load(), "the 401 must not read the body")
+	})
+
+	t.Run("authenticated body over the limit is 413", func(t *testing.T) {
+		handler, _, accessKey, secret := newControlPlaneWithConfig(t,
+			"datasets:\n  enabled: true\n  storage_namespace_prefix: \"mem://datasets\"\n  max_request_body: 1024\n")
+
+		rec := doRequest(t, handler, http.MethodPost, "", strings.Repeat(" ", 2048), accessKey, secret)
+		require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code, "body: %s", rec.Body.String())
+		require.Contains(t, decodeError(t, rec).Message, "exceeds")
+	})
+
+	t.Run("a small body still reaches the validator", func(t *testing.T) {
+		handler, _, accessKey, secret := newControlPlaneWithConfig(t,
+			"datasets:\n  enabled: true\n  storage_namespace_prefix: \"mem://datasets\"\n  max_request_body: 1024\n")
+
+		rec := doRequest(t, handler, http.MethodPost, "/any-set/versions", `{"message": "x"}`, accessKey, secret)
+		require.Equal(t, http.StatusBadRequest, rec.Code, "the limit must not turn a small body into a 413: %s", rec.Body.String())
+	})
+}
+
+// TestDatasetsSpecBounds is SEC-5: the spec bounds of api/datasets.yml are enforced by the
+// request validator, so an oversized string never reaches a handler (and never a KV record).
+func TestDatasetsSpecBounds(t *testing.T) {
+	handler, accessKey, secret := newControlPlane(t)
+
+	t.Run("description over maxLength", func(t *testing.T) {
+		tooLong := strings.Repeat("x", 4097)
+		body := marshalBody(t, apigen.DatasetValidateRequest{Definition: apigen.DatasetDefinition{
+			FormatVersion: ptr(1),
+			Description:   &tooLong,
+		}})
+		rec := doRequest(t, handler, http.MethodPost, "/bounds-set/validate", body, accessKey, secret)
+		require.Equal(t, http.StatusBadRequest, rec.Code, "body: %s", rec.Body.String())
+		require.Contains(t, rec.Body.String(), "description")
+	})
+
+	t.Run("path over maxLength", func(t *testing.T) {
+		tooLong := strings.Repeat("x", 1025)
+		def := apigen.DatasetDefinition{
+			FormatVersion: ptr(1),
+			Data: []apigen.DataItem{{
+				Target:     "t",
+				Repository: "src",
+				Ref:        apigen.SourceRef{Type: "commit", Id: "0123456789abcdef0123456789abcdef01234567"},
+				Type:       "prefix",
+				Prefix:     &apigen.PathSource{Path: tooLong},
+			}},
+		}
+		rec := doRequest(t, handler, http.MethodPost, "/bounds-set/validate", marshalBody(t, apigen.DatasetValidateRequest{Definition: def}), accessKey, secret)
+		require.Equal(t, http.StatusBadRequest, rec.Code, "body: %s", rec.Body.String())
+		require.Contains(t, rec.Body.String(), "path")
 	})
 }

@@ -93,7 +93,7 @@ const DefinitionTab: FC<{ datasetId: string; left: string; right: string }> = ({
 
     if (loading) return <Loading />;
     if (error) return <AlertError error={error as Error} />;
-    return <DefinitionDiffTable diff={(response as DefinitionDiff | null) ?? { items: [] }} />;
+    return <DefinitionDiffTable diff={(response as DefinitionDiff | null) ?? { data: [] }} />;
 };
 
 /** What `ObjectsDiff` reads from the ref context to resolve the storage configuration. */
@@ -188,7 +188,7 @@ const DatasetComparePage: FC = () => {
     const { datasetId = '' } = useParams();
     const router = useRouter();
     const state = useDatasetVersion(datasetId, 'latest');
-    const latest = state.dataset?.latest_version ?? 0;
+    const latest = state.dataset?.version ?? 0;
     const defaults = defaultCompareRefs(latest);
     const leftParam = router.query[COMPARE_QUERY_KEYS.left];
     const rightParam = router.query[COMPARE_QUERY_KEYS.right];

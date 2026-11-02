@@ -60,6 +60,68 @@ func partitionKeys(t *testing.T, kvs kv.Store, ctx context.Context) []string {
 	return keys
 }
 
+// partitionEntries returns every key and value stored in the datasets partition, in key
+// order, so a test can assert the size of an individual KV item.
+func partitionEntries(t *testing.T, kvs kv.Store, ctx context.Context) map[string][]byte {
+	t.Helper()
+	it, err := kvs.Scan(ctx, []byte(PartitionKey), kv.ScanOptions{})
+	require.NoError(t, err)
+	defer it.Close()
+	entries := make(map[string][]byte)
+	for it.Next() {
+		entry := it.Entry()
+		require.NotNil(t, entry)
+		entries[string(entry.Key)] = entry.Value
+	}
+	require.NoError(t, it.Err())
+	return entries
+}
+
+// TestStorePinReferencesAreSeparateItems is BUG-15: the pin of one commit must not grow into
+// a single KV item as datasets pin it, because DynamoDB caps an item at 400KB. Every
+// reference is its own record under the pin's prefix, so no item grows with the pin.
+func TestStorePinReferencesAreSeparateItems(t *testing.T) {
+	store, kvs, ctx := newTestStore(t)
+	const (
+		repository = "lakehouse-repo"
+		commitID   = "30f9eb1c"
+		references = 500
+	)
+	for i := 0; i < references; i++ {
+		_, err := store.AddPinReference(ctx, repository, commitID, PinReference(fmt.Sprintf("customer-%d", i), 1))
+		require.NoError(t, err)
+	}
+
+	// One record per reference, all under pins/<repo>/<commit>/, and no single record that
+	// carries the whole set.
+	entries := partitionEntries(t, kvs, ctx)
+	prefix := "pins/" + repository + "/" + commitID + "/"
+	require.Len(t, entries, references)
+	largest := 0
+	for key, value := range entries {
+		require.Contains(t, key, prefix)
+		if len(value) > largest {
+			largest = len(value)
+		}
+	}
+	require.Less(t, largest, 1024, "a pin reference record must stay a small fixed-size item")
+
+	// The assembled view still reports the whole set, sorted.
+	pin, _, err := store.GetPin(ctx, repository, commitID)
+	require.NoError(t, err)
+	require.Len(t, pin.References, references)
+	require.IsIncreasing(t, pin.References)
+	require.Equal(t, PinReference("customer-0", 1), pin.References[0])
+
+	// Releasing one reference removes exactly its item; the rest of the pin stays.
+	deleted, err := store.RemovePinReference(ctx, repository, commitID, PinReference("customer-7", 1))
+	require.NoError(t, err)
+	require.False(t, deleted)
+	entries = partitionEntries(t, kvs, ctx)
+	require.Len(t, entries, references-1)
+	require.NotContains(t, entries, prefix+PinReference("customer-7", 1))
+}
+
 func TestStoreKeyLayout(t *testing.T) {
 	// The §5.3 table, key for key.
 	tests := []struct {
@@ -78,9 +140,11 @@ func TestStoreKeyLayout(t *testing.T) {
 			want: "versions/customer-360/0000000007",
 		},
 		{
+			// BUG-14: the id segment is encoded so that key order is newest-first, which is
+			// what lets the listing page with a forward scan.
 			name: "proposal",
 			key:  func() ([]byte, error) { return proposalKey("customer-360", "01J9Z6Q0K8") },
-			want: "proposals/customer-360/01J9Z6Q0K8",
+			want: "proposals/customer-360/" + descendingKeySegment("01J9Z6Q0K8"),
 		},
 		{
 			name: "metadata key",
@@ -88,9 +152,17 @@ func TestStoreKeyLayout(t *testing.T) {
 			want: "metadata_keys/retention",
 		},
 		{
+			// BUG-15: a pin is a prefix, and each of its references is a record below it.
 			name: "pin",
 			key:  func() ([]byte, error) { return pinKey("lakehouse-repo", "30f9eb1c") },
 			want: "pins/lakehouse-repo/30f9eb1c",
+		},
+		{
+			name: "pin reference",
+			key: func() ([]byte, error) {
+				return pinReferenceKey("lakehouse-repo", "30f9eb1c", PinReference("customer-360", 2))
+			},
+			want: "pins/lakehouse-repo/30f9eb1c/customer-360@v2",
 		},
 		{
 			name: "grant",
@@ -222,8 +294,7 @@ func TestStoreRoundTrip(t *testing.T) {
 
 	t.Run("dataset", func(t *testing.T) {
 		want := newDatasetRecord()
-		_, err := store.CreateDataset(ctx, want)
-		require.NoError(t, err)
+		require.NoError(t, store.CreateDataset(ctx, want))
 		got, _, err := store.GetDataset(ctx, want.Name)
 		require.NoError(t, err)
 		requireJSONEq(t, want, got)
@@ -271,7 +342,7 @@ func TestStoreRoundTrip(t *testing.T) {
 			CreatedAt:     testTime(),
 			CreatedBy:     "alice",
 		}
-		require.NoError(t, store.PutMetadataKey(ctx, want))
+		require.NoError(t, store.PutMetadataKey(ctx, want, nil))
 		got, err := store.GetMetadataKey(ctx, want.Name)
 		require.NoError(t, err)
 		requireJSONEq(t, want, got)
@@ -400,9 +471,9 @@ func TestStoreNotFound(t *testing.T) {
 	require.ErrorIs(t, err, kv.ErrNotFound)
 
 	// Deleting a missing record is not an error.
-	require.NoError(t, store.DeleteDataset(ctx, "customer-360", nil))
+	require.NoError(t, store.DeleteDataset(ctx, "customer-360", nil, nil))
 	require.NoError(t, store.DeleteProposal(ctx, "customer-360", "01J9Z6Q0K8"))
-	require.NoError(t, store.DeleteMetadataKey(ctx, "tier"))
+	require.NoError(t, store.DeleteMetadataKey(ctx, "tier", nil))
 	require.NoError(t, store.DeletePin(ctx, "lakehouse-repo", "30f9eb1c"))
 	require.NoError(t, store.DeleteGrant(ctx, "customer-360", PrincipalTypeUser, "alice"))
 }
@@ -412,50 +483,52 @@ func TestStoreDatasetCAS(t *testing.T) {
 
 	// Create is a CAS with a nil predicate, so it fails when the record exists.
 	record := newDatasetRecord()
-	created, err := store.CreateDataset(ctx, record)
-	require.NoError(t, err)
-	_, err = store.CreateDataset(ctx, newDatasetRecord())
+	require.NoError(t, store.CreateDataset(ctx, record))
+	err := store.CreateDataset(ctx, newDatasetRecord())
 	require.ErrorIs(t, err, kv.ErrPredicateFailed, "two creates cannot both win")
-	current, currentPredicate, err := store.GetDataset(ctx, "customer-360")
+	current, predicate, err := store.GetDataset(ctx, "customer-360")
 	require.NoError(t, err)
 	require.Equal(t, DatasetStateActive, current.State, "the losing create left the record untouched")
 
-	// §5.4 step 3: CAS the record read above to the publishing state, without re-reading it:
-	// the predicate the create returned is the one a conditional write must present.
+	// §5.4 step 3: CAS the record read above to the publishing state.
 	publishing := *current
 	publishing.State = DatasetStatePublishing
 	publishing.PendingVersion = current.LatestVersion + 1
-	publishingPredicate, err := store.PutDatasetIf(ctx, &publishing, created)
-	require.NoError(t, err)
+	require.NoError(t, store.PutDatasetIf(ctx, &publishing, current, predicate))
 
-	// The predicate of the read before that write is stale: the CAS fails and keeps the
-	// stored value.
+	// Re-using the stale record as the predicate fails and keeps the stored value.
 	stale := *current
-	stale.State = DatasetStateActive
-	_, err = store.PutDatasetIf(ctx, &stale, currentPredicate)
+	stale.State = DatasetStatePublishing
+	err = store.PutDatasetIf(ctx, &stale, current, predicate)
 	require.ErrorIs(t, err, kv.ErrPredicateFailed)
 
-	// The predicate the winning CAS returned is the one that works.
+	// The record written by the winning CAS is the predicate that works.
 	active := publishing
 	active.State = DatasetStateActive
 	active.LatestVersion = publishing.PendingVersion
 	active.PendingVersion = 0
-	_, err = store.PutDatasetIf(ctx, &active, publishingPredicate)
-	require.NoError(t, err)
+	require.NoError(t, store.PutDatasetIf(ctx, &active, &publishing, nil))
 
-	got, gotPredicate, err := store.GetDataset(ctx, "customer-360")
+	got, _, err := store.GetDataset(ctx, "customer-360")
 	require.NoError(t, err)
 	require.Equal(t, DatasetStateActive, got.State)
 	require.Equal(t, 3, got.LatestVersion)
 
-	// A conditional delete with a stale predicate fails and leaves the record.
-	err = store.DeleteDataset(ctx, "customer-360", publishingPredicate)
+	// The predicate must belong to the record being written: a previous record of a
+	// different dataset is a programming error, not a lost race.
+	other := newDatasetRecord()
+	other.Name = "other-dataset"
+	err = store.PutDatasetIf(ctx, other, current, nil)
+	require.ErrorIs(t, err, ErrRecordMismatch)
+
+	// A conditional delete with a stale record fails and leaves the record.
+	err = store.DeleteDataset(ctx, "customer-360", current, nil)
 	require.ErrorIs(t, err, kv.ErrPredicateFailed)
 	_, _, err = store.GetDataset(ctx, "customer-360")
 	require.NoError(t, err)
 
-	// A conditional delete with the current predicate succeeds.
-	require.NoError(t, store.DeleteDataset(ctx, "customer-360", gotPredicate))
+	// A conditional delete with the current record succeeds.
+	require.NoError(t, store.DeleteDataset(ctx, "customer-360", got, nil))
 	_, _, err = store.GetDataset(ctx, "customer-360")
 	require.ErrorIs(t, err, kv.ErrNotFound)
 }
@@ -466,10 +539,9 @@ func TestStoreDatasetCAS(t *testing.T) {
 // what the handler maps to 409 (§5.4 step 3).
 func TestStoreConcurrentPublishCAS(t *testing.T) {
 	store, _, ctx := newTestStore(t)
-	_, err := store.CreateDataset(ctx, newDatasetRecord())
-	require.NoError(t, err)
+	require.NoError(t, store.CreateDataset(ctx, newDatasetRecord()))
 
-	previous, previousPredicate, err := store.GetDataset(ctx, "customer-360")
+	previous, predicate, err := store.GetDataset(ctx, "customer-360")
 	require.NoError(t, err)
 
 	const publishers = 8
@@ -484,7 +556,7 @@ func TestStoreConcurrentPublishCAS(t *testing.T) {
 			next.State = DatasetStatePublishing
 			next.PendingVersion = previous.LatestVersion + 1
 			<-start
-			_, results[i] = store.PutDatasetIf(ctx, &next, previousPredicate)
+			results[i] = store.PutDatasetIf(ctx, &next, previous, predicate)
 		}(i)
 	}
 	close(start)
@@ -742,8 +814,7 @@ func TestStorePinReferencesConcurrent(t *testing.T) {
 func TestStorePartitionLayout(t *testing.T) {
 	store, kvs, ctx := newTestStore(t)
 
-	_, err := store.CreateDataset(ctx, newDatasetRecord())
-	require.NoError(t, err)
+	require.NoError(t, store.CreateDataset(ctx, newDatasetRecord()))
 	for _, version := range []int{1, 2} {
 		rec := newVersionRecord()
 		rec.Version = version
@@ -756,24 +827,25 @@ func TestStorePartitionLayout(t *testing.T) {
 		Status:    ProposalStatusOpen,
 		CreatedAt: testTime(),
 	}))
-	require.NoError(t, store.PutMetadataKey(ctx, MetadataKey{Name: "tier", Type: MetadataTypeString}))
+	require.NoError(t, store.PutMetadataKey(ctx, MetadataKey{Name: "tier", Type: MetadataTypeString}, nil))
 	require.NoError(t, store.PutGrant(ctx, &GrantRecord{
 		Dataset:       "customer-360",
 		PrincipalType: PrincipalTypeUser,
 		PrincipalID:   "carol",
 		GrantedAt:     testTime(),
 	}))
-	_, err = store.AddPinReference(ctx, "lakehouse-repo", "30f9eb1c", PinReference("customer-360", 2))
+	_, err := store.AddPinReference(ctx, "lakehouse-repo", "30f9eb1c", PinReference("customer-360", 2))
 	require.NoError(t, err)
 
 	// Everything the control plane stores lives in the one dedicated partition, under
-	// the §5.3 prefixes.
+	// the §5.3 prefixes. A pin is one item per reference (BUG-15), and a proposal's id
+	// segment is encoded newest-first so the listing can page (BUG-14).
 	require.Equal(t, []string{
 		"datasets/customer-360",
 		"grants/customer-360/user/carol",
 		"metadata_keys/tier",
-		"pins/lakehouse-repo/30f9eb1c",
-		"proposals/customer-360/01J9Z6Q0K8",
+		"pins/lakehouse-repo/30f9eb1c/customer-360@v2",
+		"proposals/customer-360/" + descendingKeySegment("01J9Z6Q0K8"),
 		"versions/customer-360/0000000001",
 		"versions/customer-360/0000000002",
 	}, partitionKeys(t, kvs, ctx))

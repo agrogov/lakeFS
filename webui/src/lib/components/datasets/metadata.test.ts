@@ -47,23 +47,23 @@ describe('isDatasetName', () => {
 
 describe('globMatch', () => {
     it('matches actions and ARNs with wildcards', () => {
-        expect(globMatch('datasets:CreateDataset', 'datasets:CreateDataset')).toBe(true);
-        expect(globMatch('datasets:*', 'datasets:CreateDataset')).toBe(true);
-        expect(globMatch('*', 'arn:lakefs:datasets:::dataset/x')).toBe(true);
-        expect(globMatch('arn:lakefs:datasets:::dataset/*', 'arn:lakefs:datasets:::dataset/customer-360')).toBe(true);
-        expect(globMatch('datasets:ReadDataset', 'datasets:CreateDataset')).toBe(false);
-        expect(globMatch('arn:lakefs:fs:::repository/*', 'arn:lakefs:datasets:::dataset/x')).toBe(false);
+        expect(globMatch('dataset:CreateDataset', 'dataset:CreateDataset')).toBe(true);
+        expect(globMatch('dataset:*', 'dataset:CreateDataset')).toBe(true);
+        expect(globMatch('*', 'arn:lakefs:dataset:::dataset/x')).toBe(true);
+        expect(globMatch('arn:lakefs:dataset:::dataset/*', 'arn:lakefs:dataset:::dataset/customer-360')).toBe(true);
+        expect(globMatch('dataset:ReadDataset', 'dataset:CreateDataset')).toBe(false);
+        expect(globMatch('arn:lakefs:fs:::repository/*', 'arn:lakefs:dataset:::dataset/x')).toBe(false);
     });
 });
 
 describe('policiesAllow', () => {
-    const CREATE = 'datasets:CreateDataset';
-    const RESOURCE = 'arn:lakefs:datasets:::dataset/sample';
+    const CREATE = 'dataset:CreateDataset';
+    const RESOURCE = 'arn:lakefs:dataset:::dataset/sample';
 
     it('allows through a wildcard statement', () => {
         expect(
             policiesAllow(
-                [{ statement: [{ effect: 'allow', action: ['datasets:*'], resource: ['*'] }] }],
+                [{ statement: [{ effect: 'allow', action: ['dataset:*'], resource: ['*'] }] }],
                 CREATE,
                 RESOURCE,
             ),
@@ -73,7 +73,7 @@ describe('policiesAllow', () => {
     it('allows through a statement naming the action', () => {
         expect(
             policiesAllow(
-                [{ statement: [{ effect: 'allow', action: CREATE, resource: 'arn:lakefs:datasets:::dataset/*' }] }],
+                [{ statement: [{ effect: 'allow', action: CREATE, resource: 'arn:lakefs:dataset:::dataset/*' }] }],
                 CREATE,
                 RESOURCE,
             ),
@@ -84,7 +84,7 @@ describe('policiesAllow', () => {
         expect(policiesAllow([], CREATE, RESOURCE)).toBe(false);
         expect(
             policiesAllow(
-                [{ statement: [{ effect: 'allow', action: ['datasets:ReadDataset'], resource: ['*'] }] }],
+                [{ statement: [{ effect: 'allow', action: ['dataset:ReadDataset'], resource: ['*'] }] }],
                 CREATE,
                 RESOURCE,
             ),
@@ -94,7 +94,7 @@ describe('policiesAllow', () => {
                 [
                     {
                         statement: [
-                            { effect: 'allow', action: ['datasets:*'], resource: ['arn:lakefs:fs:::repository/x'] },
+                            { effect: 'allow', action: ['dataset:*'], resource: ['arn:lakefs:fs:::repository/x'] },
                         ],
                     },
                 ],
@@ -108,7 +108,7 @@ describe('policiesAllow', () => {
         expect(
             policiesAllow(
                 [
-                    { statement: [{ effect: 'allow', action: ['datasets:*'], resource: ['*'] }] },
+                    { statement: [{ effect: 'allow', action: ['dataset:*'], resource: ['*'] }] },
                     { statement: [{ effect: 'deny', action: [CREATE], resource: [RESOURCE] }] },
                 ],
                 CREATE,

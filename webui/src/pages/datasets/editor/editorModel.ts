@@ -3,6 +3,7 @@ import {
     DatasetDefinition,
     ErrorDetail,
     MetadataKey,
+    MetadataScalarValue,
     MetadataValue,
     SourceRefType,
 } from '../../../lib/api/datasets';
@@ -202,8 +203,13 @@ export const buildDefinition = (
     }),
 });
 
-/** Parses a stored definition back into editor rows (edit mode). */
-export const itemsFromDefinition = (definition: DatasetDefinition | undefined): EditorItem[] => {
+/**
+ * Parses a stored definition back into editor rows (edit mode).
+ *
+ * The record's `definition` is the published state (`DatasetDefinitionState`, whose
+ * `format_version` is a plain number), so only the item list is required here.
+ */
+export const itemsFromDefinition = (definition: { data?: DataItem[] } | undefined): EditorItem[] => {
     const data = definition?.data ?? [];
     return data.map((item, index) => ({
         key: `item-${index}`,
@@ -303,7 +309,7 @@ const isBlank = (value: string | string[] | undefined): boolean =>
     value === undefined || (Array.isArray(value) ? value.length === 0 : value.trim() === '');
 
 /** Converts one scalar draft value to the JSON value the definition carries. */
-const scalarValue = (key: MetadataKey, raw: string): MetadataValue => {
+const scalarValue = (key: MetadataKey, raw: string): MetadataScalarValue => {
     if (key.type === 'number') return Number(raw);
     if (key.type === 'boolean') return raw === 'true';
     return raw;
@@ -353,7 +359,7 @@ export const buildMetadata = (keys: MetadataKey[], draft: MetadataDraft): Record
         const value = draft[key.name];
         if (isBlank(value)) continue;
         if (key.allow_multiple) {
-            metadata[key.name] = (value as string[]).map((raw) => scalarValue(key, raw));
+            metadata[key.name] = (value as string[]).map((raw): MetadataScalarValue => scalarValue(key, raw));
         } else {
             metadata[key.name] = scalarValue(key, value as string);
         }

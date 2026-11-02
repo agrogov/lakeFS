@@ -148,7 +148,7 @@ const DatasetDataPage: FC = () => {
                     <span className="text-muted small">Version</span>
                     <DatasetVersionPicker
                         versions={versionNumbers(state.versions)}
-                        latest={dataset.latest_version}
+                        latest={dataset.version ?? 0}
                         value={selection}
                         onChange={onSelectVersion}
                         label="Version"

@@ -85,7 +85,7 @@ const EditorBreadcrumb: FC<{ mode: DatasetEditorMode; datasetId: string }> = ({ 
                 {datasetId}
             </Link>
         )}
-        <Breadcrumb.Item active>{mode === 'edit' ? 'Edit' : 'Create dataset'}</Breadcrumb.Item>
+        <Breadcrumb.Item active>{mode === 'edit' ? 'Edit' : 'Create Dataset'}</Breadcrumb.Item>
     </Breadcrumb>
 );
 
@@ -117,8 +117,12 @@ const parseRawDefinition = (text: string): { definition?: DatasetDefinition; err
         return { error: `Invalid JSON: ${(error as Error).message}` };
     }
     const definition = parsed as DatasetDefinition;
-    if (!definition || typeof definition !== 'object' || definition.format_version !== 1) {
-        return { error: 'A definition needs "format_version": 1' };
+    // format_version is set by the server on write (DOC-12), so it may be omitted here.
+    if (!definition || typeof definition !== 'object') {
+        return { error: 'A definition must be a JSON object' };
+    }
+    if (definition.format_version !== undefined && definition.format_version !== 1) {
+        return { error: 'A definition needs "format_version": 1 or no format_version at all' };
     }
     if (!Array.isArray(definition.data)) {
         return { error: 'A definition needs a "data" array' };
@@ -213,8 +217,8 @@ const EditorForm: FC<EditorFormProps> = ({ mode, datasetId, dataset, metadataKey
         });
     }, [currentResolution, rawMode, items]);
 
-    const latestVersion = dataset?.latest_version ?? 0;
-    const publishLabel = `Publish as v${latestVersion + 1}`;
+    const latestVersion = dataset?.version ?? 0;
+    const publishLabel = 'Publish directly';
 
     const serverBlocked = validation.errors.length > 0;
     const canSubmit =
@@ -250,12 +254,12 @@ const EditorForm: FC<EditorFormProps> = ({ mode, datasetId, dataset, metadataKey
         setSubmitError(null);
         try {
             if (action === 'proposal') {
-                await datasets.createProposal(datasetId, {
+                await datasets.createPullRequest(datasetId, {
                     definition: definitionForSubmit,
                     title: message.trim(),
                     description: description.trim() === '' ? undefined : description.trim(),
                 });
-                navigate(`/datasets/${datasetId}/proposals`);
+                navigate(`/datasets/${encodeURIComponent(datasetId)}/pulls`);
                 return;
             }
             if (mode === 'create') {
@@ -264,7 +268,7 @@ const EditorForm: FC<EditorFormProps> = ({ mode, datasetId, dataset, metadataKey
                     definition: definitionForSubmit,
                     publish: { message: message.trim() },
                 });
-                navigate(`/datasets/${effectiveName}/overview`);
+                navigate(`/datasets/${encodeURIComponent(effectiveName)}/overview`);
                 return;
             }
             await datasets.publishVersion(datasetId, {
@@ -272,7 +276,7 @@ const EditorForm: FC<EditorFormProps> = ({ mode, datasetId, dataset, metadataKey
                 message: message.trim(),
                 expected_version: latestVersion,
             });
-            navigate(`/datasets/${datasetId}/overview`);
+            navigate(`/datasets/${encodeURIComponent(datasetId)}/overview`);
         } catch (error) {
             setSubmitError(error instanceof DatasetsError ? new Error(error.message) : (error as Error));
         } finally {
@@ -353,7 +357,7 @@ const EditorForm: FC<EditorFormProps> = ({ mode, datasetId, dataset, metadataKey
                         type="switch"
                         id="dataset-raw-json"
                         className="ms-auto"
-                        label="Raw JSON"
+                        label="JSON mode"
                         checked={rawMode}
                         onChange={(e) => applyRawText(e.target.checked)}
                     />
@@ -445,7 +449,7 @@ const EditorForm: FC<EditorFormProps> = ({ mode, datasetId, dataset, metadataKey
                     {mode === 'edit' && (
                         <Button variant="outline-primary" disabled={!canSubmit} onClick={() => void submit('proposal')}>
                             <GitPullRequestIcon className="me-2" />
-                            Open proposal
+                            Open Pull Request
                         </Button>
                     )}
                     <span className="ms-auto small">{status}</span>
@@ -483,7 +487,7 @@ const DatasetEditor: FC<{ mode: DatasetEditorMode; datasetId: string }> = ({ mod
             mode={mode}
             datasetId={datasetId}
             dataset={(datasetResponse as Dataset | null) ?? null}
-            metadataKeys={(metadataKeys as MetadataKey[] | undefined) ?? []}
+            metadataKeys={metadataKeys ?? []}
             repositoryIds={repositories}
         />
     );
@@ -496,7 +500,7 @@ const DatasetEditorPage: FC<{ mode: DatasetEditorMode }> = ({ mode }) => {
             <Container fluid="xl">
                 <EditorBreadcrumb mode={mode} datasetId={datasetId} />
                 <div className="mt-4">
-                    <h4 className="mb-4">{mode === 'edit' ? `Edit ${datasetId}` : 'Create dataset'}</h4>
+                    <h4 className="mb-4">{mode === 'edit' ? `Edit ${datasetId}` : 'Create Dataset'}</h4>
                     <DatasetEditor mode={mode} datasetId={datasetId} />
                 </div>
             </Container>

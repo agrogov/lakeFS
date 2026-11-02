@@ -1,467 +1,359 @@
-// Package datasets implements the lakeFS OSS Datasets control plane (see DATASETS_DESIGN.md).
-//
-// immutability_guard.go enforces the §9.4 immutability guarantee in the authorizer instead of
-// through per-group policy attachments (SEC-2 of DATASETS_REVIEW.md).
-//
-// Why the authorizer and not a policy attachment: the per-dataset deny policy of §9.4
-// (ImmutabilityPolicy) only protects the principals the bootstrap knows about - the base groups of
-// the two group templates plus datasets.immutable_guard_groups. Under `internal` RBAC, write power
-// also comes from custom groups, from groups created by the SSO group sync (pkg/sso/group_sync.go)
-// and from policies attached directly to a user. None of those were covered, so a member of, say, a
-// custom `data-eng` group holding FSFullAccess could upload into <dataset>/latest/..., move a
-// dataset tag, delete the `latest` branch or drop the lakefs.dataset repository metadata. That
-// breaks the "a published version is immutable" guarantee every consumer relies on.
-//
-// What the guard does: WrapAuthService decorates the auth.Service the server hands to the core API
-// and the S3 gateway. Every authorization request that asks for one of
-// immutabilityDeniedActions on a resource under a dataset repository is answered with a denial,
-// whoever the caller is and however the permission was granted. The service itself is not
-// affected: it writes with graveler.WithForce(true) and never authorizes as a principal
-// (pkg/datasets/service.go, §4.6), so there is no service principal to exempt.
-//
-// Which repositories are datasets: the guard keeps a cached set of dataset names read from the
-// datasets KV partition (DatasetsPartitionKey). The cache is refreshed lazily with a TTL and is
-// updated immediately by the service when it creates or deletes a dataset, so a dataset repository
-// is protected from the moment it exists. A failed refresh keeps the last known set (and waits for
-// the TTL before retrying, so a KV outage does not turn every upload into a KV scan).
-//
-// The per-group attachment machinery of authz.go is kept as defence in depth: it denies through
-// the ordinary policy engine, and it is what protects an installation whose authorizer is not
-// wrapped (a stock lakeFS binary, or a test that builds the router without the decorator).
-//
-// Clean-room note (§2): written from DATASETS_DESIGN.md and the public lakeFS documentation only.
-// No code, SQL, protobuf or UI asset from lakeFS Enterprise, and nothing from upstream
-// lakeFS >= 1.87, was used.
 package datasets
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/treeverse/lakefs/pkg/auth"
-	"github.com/treeverse/lakefs/pkg/auth/wildcard"
 	"github.com/treeverse/lakefs/pkg/kv"
-	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/permissions"
 )
 
-const (
-	// DefaultDatasetRepoIndexTTL bounds how stale the cached set of dataset names may be. The
-	// service updates the set synchronously on create and delete, so the TTL only matters for a
-	// dataset created by another node in a multi-node deployment.
-	DefaultDatasetRepoIndexTTL = 30 * time.Second
+// SEC-2: dataset repositories are immutable for every principal, whatever groups or policies
+// grant them. The deny policy attached to well-known groups (ImmutabilityPolicy) is only a
+// defence in depth, because write power also comes from custom groups, SSO-synced groups and
+// policies attached directly to users. The authoritative enforcement lives here, in an
+// auth.Service decorator: every Authorize call that requires an immutabilityDeniedActions action
+// on a dataset repository is refused before the wrapped service is consulted.
 
-	// fsRepositoryArnPrefix is the resource prefix the core API authorizes repository, branch,
-	// tag and object permissions against (pkg/permissions RepoArn/ObjectArn/BranchArn/TagArn).
-	fsRepositoryArnPrefix = "arn:lakefs:fs:::repository/"
+// fsRepositoryArnPrefix is the ARN prefix of every repository-scoped fs resource.
+var fsRepositoryArnPrefix = permissions.RepoArn("")
 
-	// catalogArnPrefix is the prefix of the Iceberg catalog resources (pkg/permissions
-	// CatalogNamespaceArn and friends), whose first path segment is the repository.
-	catalogArnPrefix = "arn:lakefs:catalog:::"
-)
+// catalogRepositoryArnPrefix is the ARN prefix of every repository-scoped catalog resource
+// (ICEBERG_CATALOG_PLAN.md §7.2). Catalog ARNs carry the repository as the first path segment
+// after the resource kind: namespace/<repo>/<ns>, table/<repo>/<ns>/<table> and
+// view/<repo>/<ns>/<view>.
+const catalogRepositoryArnPrefix = "arn:lakefs:catalog:::"
 
-// --- the cached set of dataset repositories ------------------------------------------------
+// errNoDatasetRepoSet is returned by Authorize when the guard was built without a name set. It
+// is a failure to decide, never an allow: the immutability guarantee must not depend on the
+// caller having wired the set correctly.
+var errNoDatasetRepoSet = errors.New("datasets: no dataset repository set configured for the immutability guard")
 
-// DatasetRepoIndex is the cached set of repository names that hold datasets. It is read on the
-// authorization path, so it never blocks on the KV store more than one goroutine at a time and
-// never fails: a stale set is always preferable to an authorization failure.
+// errDatasetRepoSetNotLoaded is returned when the set is asked to decide before any load ever
+// completed. Like errNoDatasetRepoSet it is a failure to decide, never an allow.
+var errDatasetRepoSetNotLoaded = errors.New("datasets: dataset repository set was never loaded")
+
+// datasetRepoCacheTTL bounds how stale the dataset-repository name set may be. The set is
+// refreshed lazily - only when a denied action on a repository is being authorized - so
+// ordinary read traffic never touches the KV store.
+const datasetRepoCacheTTL = 2 * time.Second
+
+// datasetRepoLoadTimeout bounds one reload of the set. The reload is detached from the request
+// that triggered it (see refresh), so it needs a bound of its own.
+const datasetRepoLoadTimeout = 30 * time.Second
+
+// errDatasetRepoSetLoadPanicked is recorded when the loader panicked, so the attempt counts as a
+// failed refresh rather than leaving the set in the middle of one.
+var errDatasetRepoSetLoadPanicked = errors.New("datasets: dataset repository set loader panicked")
+
+// serviceCallerKey is the context key of the service-caller marker, and it is deliberately
+// unexported. The marker only ever exempts a caller from the SEC-2 guard, and the guard's value
+// is that a caller cannot switch it off, so nothing outside this package may build it: no
+// exported helper sets it, and its only builder (withServiceCaller) lives in
+// immutability_guard_test.go.
 //
-// The zero DatasetRepoIndex is unusable: build one with NewDatasetRepoIndex.
-type DatasetRepoIndex struct {
-	mu       sync.RWMutex
-	names    map[string]struct{}
-	loaded   bool
-	loadedAt time.Time
-	// added and removed hold the changes the service made since the last successful load. A
-	// refresh replays them on top of what it read, so a dataset the service created while a scan
-	// was in flight is not forgotten, and one it deleted is not resurrected.
-	added   map[string]struct{}
-	removed map[string]struct{}
+// Production does not build it either, because it does not need to. The datasets service writes
+// the dataset repository with ReadOnly + force and never routes those writes through Authorize
+// (DATASETS_DESIGN.md §4.6, §9.4), so the only bypass the design sanctions is the force flag
+// itself, not a context value.
+type serviceCallerKey struct{}
 
-	refreshing atomic.Bool
-	// firstLoad runs the initial load once and makes the callers that arrive while it is in flight
-	// wait for it: before the set has ever been read, "not a dataset" is not an answer the guard
-	// may act on.
-	firstLoad sync.Once
-
-	ttl    time.Duration
-	now    func() time.Time
-	load   func(ctx context.Context) ([]string, error)
-	logger logging.Logger
+func isServiceCaller(ctx context.Context) bool {
+	v, _ := ctx.Value(serviceCallerKey{}).(bool)
+	return v
 }
 
-// NewDatasetRepoIndex returns an index that reads the dataset names from store, a Store over the
-// datasets KV partition. logger reports a failed refresh; it may be nil.
-func NewDatasetRepoIndex(store *Store, logger logging.Logger) *DatasetRepoIndex {
-	return newDatasetRepoIndex(func(ctx context.Context) ([]string, error) {
-		if store == nil {
-			return nil, nil
-		}
-		records, err := store.ListDatasets(ctx)
+// DatasetRepoSet is a cached set of dataset repository names, refreshed from a loader.
+//
+// Contains sits on the authorization path of every write in the installation: every object
+// write, commit, branch and repository mutation that names an immutability-denied action asks
+// this set whether the repository is a dataset. It must therefore neither hold a lock across
+// the loader - in production a full scan of the datasets/ KV partition (Store.ListDatasets) -
+// nor turn a KV hiccup into an authorization error, because either one would stall or fail
+// writes to unrelated repositories.
+//
+// Hence: the loader runs outside s.mu and only its result is swapped in under it, and a
+// single-flight gate lets one goroutine reload while the rest wait for that one reload instead
+// of starting scans of their own.
+type DatasetRepoSet struct {
+	load func(ctx context.Context) ([]string, error)
+	ttl  time.Duration
+	now  func() time.Time
+
+	mu sync.Mutex
+	// names is the most recent successfully loaded set. It is replaced, never mutated in place.
+	names map[string]struct{}
+	// fetched is the time of the last load attempt, successful or not. Counting failed attempts
+	// against the TTL keeps a slow or failing store from being hit on every authorization.
+	fetched time.Time
+	// loaded reports that a load succeeded at least once, so names is meaningful. It survives
+	// Invalidate: the last known set is what a failed refresh falls back to.
+	loaded bool
+	// stale asks the next Contains to reload before the TTL runs out (Invalidate). It is
+	// cleared by the attempt it asked for, successful or not.
+	stale bool
+	// generation counts Invalidate calls, so a load that was already running when one landed
+	// does not clear the flag: its scan may predate the record the invalidation is about.
+	generation uint64
+	// lastErr is the error of the last failed load. It is only answered while nothing was ever
+	// loaded: then the guard has no set to compare against and must fail closed.
+	lastErr error
+	// refreshing is non-nil while a load runs and is closed when its result is visible. Callers
+	// that find it set wait for it rather than reload.
+	refreshing chan struct{}
+}
+
+// NewDatasetRepoSet builds a set that lists dataset names from the datasets KV partition.
+func NewDatasetRepoSet(kvs kv.Store) *DatasetRepoSet {
+	store := NewStore(kvs)
+	return newDatasetRepoSet(func(ctx context.Context) ([]string, error) {
+		recs, err := store.ListDatasets(ctx)
 		if err != nil {
 			return nil, err
 		}
-		names := make([]string, 0, len(records))
-		for _, rec := range records {
-			if rec != nil {
-				names = append(names, rec.Name)
-			}
+		names := make([]string, 0, len(recs))
+		for _, rec := range recs {
+			names = append(names, rec.Name)
 		}
 		return names, nil
-	}, DefaultDatasetRepoIndexTTL, time.Now, logger)
+	}, datasetRepoCacheTTL, time.Now)
 }
 
-// newDatasetRepoIndex is the testable constructor: load, the TTL and the clock are injected.
-func newDatasetRepoIndex(load func(ctx context.Context) ([]string, error), ttl time.Duration, now func() time.Time, logger logging.Logger) *DatasetRepoIndex {
-	if ttl <= 0 {
-		ttl = DefaultDatasetRepoIndexTTL
-	}
-	if now == nil {
-		now = time.Now
-	}
-	if logger == nil {
-		logger = logging.ContextUnavailable()
-	}
-	return &DatasetRepoIndex{
-		names:  make(map[string]struct{}),
-		ttl:    ttl,
-		now:    now,
-		load:   load,
-		logger: logger,
-	}
+func newDatasetRepoSet(load func(context.Context) ([]string, error), ttl time.Duration, now func() time.Time) *DatasetRepoSet {
+	return &DatasetRepoSet{load: load, ttl: ttl, now: now}
 }
 
-// IsDatasetRepo reports whether repo is the name of a dataset repository.
-//
-// The first call loads the set and every concurrent first caller waits for it, so the guard never
-// treats "the set is still empty because nobody read it yet" as "this repository is not a dataset".
-// After that it refreshes when the TTL expired, at most once concurrently: a caller that arrives
-// during a refresh keeps using the previous snapshot. The lookup is done under the read lock,
-// because Add and Remove mutate the map the service shares with the guard.
-func (i *DatasetRepoIndex) IsDatasetRepo(ctx context.Context, repo string) bool {
-	if i == nil || repo == "" {
-		return false
+// Contains reports whether repo is a dataset repository. When the refresh fails it falls back to
+// the last known set; with no known set at all it returns an error, so the caller fails closed.
+func (s *DatasetRepoSet) Contains(ctx context.Context, repo string) (bool, error) {
+	s.mu.Lock()
+	if s.fresh() {
+		ok, err := s.cached(repo)
+		s.mu.Unlock()
+		return ok, err
 	}
-	i.firstLoad.Do(func() { i.refresh(ctx) })
-	if i.contains(repo) {
-		return true
+	done := s.refreshing
+	leader := done == nil
+	if leader {
+		// Single flight: the caller that got here first reloads, everyone else joins its load.
+		done = make(chan struct{})
+		s.refreshing = done
 	}
-	if !i.stale() {
-		return false
-	}
-	i.refresh(ctx)
-	return i.contains(repo)
-}
+	s.mu.Unlock()
 
-// contains reports whether repo is in the current set.
-func (i *DatasetRepoIndex) contains(repo string) bool {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	_, ok := i.names[repo]
-	return ok
-}
-
-// stale reports whether the set must be reloaded before it can be trusted to answer "no".
-func (i *DatasetRepoIndex) stale() bool {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	return !i.loaded || i.now().Sub(i.loadedAt) >= i.ttl
-}
-
-// Add records that repo is a dataset repository. It is what makes a dataset immutable from the
-// moment the service created its repository, without waiting for a refresh.
-func (i *DatasetRepoIndex) Add(repo string) {
-	if i == nil || repo == "" {
-		return
-	}
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	i.initLocked()
-	i.names[repo] = struct{}{}
-	i.added[repo] = struct{}{}
-	delete(i.removed, repo)
-}
-
-// Remove forgets repo, after the service deleted it.
-func (i *DatasetRepoIndex) Remove(repo string) {
-	if i == nil || repo == "" {
-		return
-	}
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	i.initLocked()
-	delete(i.names, repo)
-	i.removed[repo] = struct{}{}
-	delete(i.added, repo)
-}
-
-// initLocked makes the maps usable. The caller holds the write lock.
-func (i *DatasetRepoIndex) initLocked() {
-	if i.names == nil {
-		i.names = make(map[string]struct{})
-	}
-	if i.added == nil {
-		i.added = make(map[string]struct{})
-	}
-	if i.removed == nil {
-		i.removed = make(map[string]struct{})
-	}
-}
-
-// refresh reloads the set from the source of truth and replays the local changes made since the
-// last successful load. Only one goroutine refreshes at a time; the others keep the previous
-// snapshot, which is what keeps a burst of requests from scanning the datasets partition. It never
-// fails: a failed load leaves the last known set in place.
-func (i *DatasetRepoIndex) refresh(ctx context.Context) {
-	if i == nil {
-		return
-	}
-	if !i.refreshing.CompareAndSwap(false, true) {
-		return
-	}
-	defer i.refreshing.Store(false)
-
-	names, err := i.load(ctx)
-
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	i.initLocked()
-	i.loadedAt = i.now()
-	if err != nil {
-		// Keep the last known set, and do not retry before the TTL: a KV outage must not turn
-		// every authorization decision into a KV round trip.
-		i.logger.WithError(err).Debug("datasets: cannot refresh the dataset repository set; keeping the last known set")
-		return
-	}
-
-	next := make(map[string]struct{}, len(names)+len(i.added))
-	for _, name := range names {
-		if name != "" {
-			next[name] = struct{}{}
+	if leader {
+		s.refresh(ctx, done)
+	} else {
+		// No lock is held while waiting, so a burst of authorizations queues on the one scan
+		// (bounded by its duration) instead of serialising behind a global mutex.
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return false, ctx.Err()
 		}
 	}
-	for name := range i.added {
-		next[name] = struct{}{}
-	}
-	for name := range i.removed {
-		delete(next, name)
-	}
-	i.names, i.loaded = next, true
-	i.added = make(map[string]struct{})
-	i.removed = make(map[string]struct{})
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cached(repo)
 }
 
-// --- the process-wide index ----------------------------------------------------------------
-
-// installedDatasetRepoIndex is the index shared between the authorizer decorator built by
-// WrapAuthService and the Service started by RoutesBuilder. The decorator is built while the auth
-// service is constructed, before the datasets routes exist, so the two cannot pass the index to
-// each other through a constructor argument.
-var installedDatasetRepoIndex atomic.Pointer[DatasetRepoIndex]
-
-// installDatasetRepoIndex replaces the process-wide index, so the last installation wins.
-func installDatasetRepoIndex(index *DatasetRepoIndex) *DatasetRepoIndex {
-	installedDatasetRepoIndex.Store(index)
-	return index
-}
-
-// InstalledDatasetRepoIndex returns the index the authorizer decorator installed, or nil when no
-// decorator was installed in this process.
-func InstalledDatasetRepoIndex() *DatasetRepoIndex {
-	return installedDatasetRepoIndex.Load()
-}
-
-// installedOrNewDatasetRepoIndex returns the index the authorizer decorator installed, or installs a
-// fresh one built from kvs. RoutesBuilder uses it so the datasets Service always updates the set the
-// guard reads, including on an installation (or a test) whose auth service was not wrapped.
-func installedOrNewDatasetRepoIndex(kvs kv.Store, logger logging.Logger) *DatasetRepoIndex {
-	if index := InstalledDatasetRepoIndex(); index != nil {
-		return index
-	}
-	return installDatasetRepoIndex(NewDatasetRepoIndex(NewStore(kvs), logger))
-}
-
-// WrapAuthService decorates authService with the §9.4 immutability guard and installs the dataset
-// repository index the returned service consults, so the datasets Service can keep it up to date
-// (InstalledDatasetRepoIndex).
+// refresh runs the loader outside s.mu and swaps its result in under it. Only the goroutine that
+// won the single-flight gate calls it; it closes done once the new state is visible, so the
+// waiters in Contains answer from the same load.
 //
-// It is called by the lakefs-sso auth-service builder (cmd/lakefs-sso/main.go), which is the only
-// place that sees the auth service the core API and the S3 gateway use. A nil service or a nil KV
-// store leaves the service unwrapped: a build without a KV store has no datasets either.
-func WrapAuthService(authService auth.Service, kvs kv.Store, logger logging.Logger) auth.Service {
-	if authService == nil {
-		return nil
-	}
-	if kvs == nil {
-		return authService
-	}
-	index := installDatasetRepoIndex(NewDatasetRepoIndex(NewStore(kvs), logger))
-	return NewImmutabilityGuardService(authService, index, logger)
+// The load runs on a context detached from the leader's cancellation and bounded by
+// datasetRepoLoadTimeout: the leader's result is shared with every waiter, so one cancelled
+// request must not hand its context.Canceled to the others. The state is published and done
+// closed in a deferred call, so a panicking loader cannot leave the gate set and every later
+// authorization waiting on a channel nobody closes.
+func (s *DatasetRepoSet) refresh(ctx context.Context, done chan struct{}) {
+	s.mu.Lock()
+	generation := s.generation
+	s.mu.Unlock()
+
+	var names []string
+	err := errDatasetRepoSetLoadPanicked // replaced unless the loader panics
+	defer func() {
+		s.mu.Lock()
+		s.fetched = s.now()
+		if s.generation == generation {
+			// No Invalidate landed while the load ran, so this attempt is the one that was owed
+			// and its result is not known to be incomplete.
+			s.stale = false
+		}
+		if err != nil {
+			// Failed refresh: keep the last known set, if any. A KV hiccup must not fail every
+			// write in the installation, and the attempt counts against the TTL, so the store is
+			// retried on the next TTL rather than on every authorization.
+			s.lastErr = err
+		} else {
+			set := make(map[string]struct{}, len(names))
+			for _, n := range names {
+				set[n] = struct{}{}
+			}
+			s.names, s.loaded, s.lastErr = set, true, nil
+		}
+		s.refreshing = nil
+		s.mu.Unlock()
+		close(done)
+	}()
+
+	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), datasetRepoLoadTimeout)
+	defer cancel()
+	names, err = s.load(loadCtx)
 }
 
-// NewImmutabilityGuardService returns authService with the §9.4 immutability guard in front of
-// Authorize. The returned service forwards every other method of auth.Service unchanged.
-//
-// A nil index disables the guard (the service is returned as-is), which is what keeps the wrapper
-// from denying anything before the dataset set is known.
-func NewImmutabilityGuardService(authService auth.Service, index *DatasetRepoIndex, logger logging.Logger) auth.Service {
-	if authService == nil || index == nil {
-		return authService
+// fresh reports whether the cached set may answer without a load: no invalidation is pending and
+// the TTL has not run out since the last attempt. The zero fetched time makes the first call
+// load.
+func (s *DatasetRepoSet) fresh() bool {
+	return !s.stale && s.now().Sub(s.fetched) < s.ttl
+}
+
+// cached answers repo from the current set. With no successful load ever it returns the loader's
+// error instead of a set, so a guard that cannot name the dataset repositories refuses to decide
+// rather than allowing the write.
+func (s *DatasetRepoSet) cached(repo string) (bool, error) {
+	if !s.loaded {
+		if s.lastErr != nil {
+			return false, s.lastErr
+		}
+		return false, errDatasetRepoSetNotLoaded
 	}
-	if logger == nil {
-		logger = logging.ContextUnavailable()
-	}
-	return &immutabilityGuardedAuthService{
-		Service: authService,
-		index:   index,
-		logger:  logger,
+	_, ok := s.names[repo]
+	return ok, nil
+}
+
+// Invalidate forces the next Contains to reload while keeping the last known set: if that reload
+// fails, the set still answers instead of failing every authorization in the installation.
+func (s *DatasetRepoSet) Invalidate() {
+	s.mu.Lock()
+	s.stale = true
+	s.generation++
+	s.mu.Unlock()
+}
+
+// invalidateGuardedRepos drops the cached dataset names of the SEC-2 guard, when the service's
+// auth service is the guard (cmd/lakefs-sso wraps it so). Other nodes keep their copy until its
+// TTL (datasetRepoCacheTTL) runs out.
+func (s *Service) invalidateGuardedRepos() {
+	if guard, ok := s.authService.(*ImmutabilityAuthService); ok && guard.repos != nil {
+		guard.repos.Invalidate()
 	}
 }
 
-// immutabilityGuardedAuthService denies the §9.4 write actions on dataset repositories, after the
-// underlying service has had no say: the guard only ever turns "allowed" into "denied", never the
-// other way round.
-type immutabilityGuardedAuthService struct {
+// immutableActionSet is immutabilityDeniedActions as a set.
+var immutableActionSet = func() map[string]struct{} {
+	m := make(map[string]struct{}, len(immutabilityDeniedActions))
+	for _, a := range immutabilityDeniedActions {
+		m[a] = struct{}{}
+	}
+	return m
+}()
+
+// ImmutabilityAuthService decorates an auth.Service: Authorize refuses every
+// immutabilityDeniedActions action on a dataset repository (SEC-2).
+type ImmutabilityAuthService struct {
 	auth.Service
-	index  *DatasetRepoIndex
-	logger logging.Logger
+	repos *DatasetRepoSet
 }
 
-// Authorize implements auth.Authorizer. A request that asks for a denied action on a dataset
-// repository is answered with auth.ErrInsufficientPermissions - the same error a DENY statement
-// produces - so the core API maps it to the configured authorization-failure status exactly as it
-// maps a policy denial.
-func (s *immutabilityGuardedAuthService) Authorize(ctx context.Context, req *auth.AuthorizationRequest) (*auth.AuthorizationResponse, error) {
-	if req == nil || !s.denied(ctx, req.RequiredPermissions) {
+// NewImmutabilityAuthService wraps inner with the immutability guard. repos names the dataset
+// repositories; use NewDatasetRepoSet(kvStore) in production.
+func NewImmutabilityAuthService(inner auth.Service, repos *DatasetRepoSet) *ImmutabilityAuthService {
+	return &ImmutabilityAuthService{Service: inner, repos: repos}
+}
+
+// Authorize implements auth.Service. There is no context in which a caller can switch the guard
+// off: the service-caller marker (see serviceCallerKey) is unexported and built only by the
+// package's tests, and production relies on the force flag of §4.6/§9.4 instead.
+func (s *ImmutabilityAuthService) Authorize(ctx context.Context, req *auth.AuthorizationRequest) (*auth.AuthorizationResponse, error) {
+	if req == nil || isServiceCaller(ctx) {
 		return s.Service.Authorize(ctx, req)
 	}
-	// The audit trail of a policy denial names the denied action, which is what an operator
-	// reading the lakeFS log expects to see for a refusal.
-	denied := deniedActions(ctx, req.RequiredPermissions, s.index)
-	s.logger.WithFields(logging.Fields{
-		"user":    req.Username,
-		"actions": denied,
-	}).Debug("datasets: denied a write to an immutable dataset repository")
-	return &auth.AuthorizationResponse{
-		Allowed: false,
-		Error: fmt.Errorf("%w: dataset repositories are immutable: %s is denied on a dataset repository",
-			auth.ErrInsufficientPermissions, strings.Join(denied, ", ")),
-	}, nil
+	denied, err := s.denies(ctx, req.RequiredPermissions)
+	if err != nil {
+		return nil, err
+	}
+	if denied {
+		return &auth.AuthorizationResponse{Allowed: false, Error: auth.ErrInsufficientPermissions}, nil
+	}
+	return s.Service.Authorize(ctx, req)
 }
 
-// denied reports whether node asks for a denied action on a dataset repository.
-//
-// The node is evaluated with the deny semantics of the policy engine (pkg/auth/service.go
-// CheckPermissions): a Deny statement that matches one required permission denies the whole
-// request, and an And is denied as soon as one of its children is denied.
-//
-// An Or is denied when any of its branches is, exactly like the engine, which returns CheckDeny as
-// soon as one branch is denied (pkg/auth/service.go, NodeTypeOr). Anything narrower would let a
-// caller reach a dataset repository through a branch of an Or, which is precisely the hole the
-// guard exists to close.
-func (s *immutabilityGuardedAuthService) denied(ctx context.Context, node permissions.Node) bool {
+// denies reports whether the requirement cannot be satisfied: an And node with a forbidden leaf
+// is unsatisfiable, and an Or node is unsatisfiable only when every alternative is forbidden.
+func (s *ImmutabilityAuthService) denies(ctx context.Context, node permissions.Node) (bool, error) {
 	switch node.Type {
 	case permissions.NodeTypeNode:
-		return permissionDeniedOnDatasetRepo(ctx, s.index, node.Permission)
-	case permissions.NodeTypeAnd, permissions.NodeTypeOr:
+		return s.leafForbidden(ctx, node.Permission)
+	case permissions.NodeTypeAnd:
 		for _, child := range node.Nodes {
-			if s.denied(ctx, child) {
-				return true
+			d, err := s.denies(ctx, child)
+			if err != nil || d {
+				return d, err
 			}
 		}
-		return false
+		return false, nil
+	case permissions.NodeTypeOr:
+		if len(node.Nodes) == 0 {
+			return false, nil
+		}
+		for _, child := range node.Nodes {
+			d, err := s.denies(ctx, child)
+			if err != nil {
+				return false, err
+			}
+			if !d {
+				return false, nil
+			}
+		}
+		return true, nil
 	default:
-		return false
+		return false, nil
 	}
 }
 
-// deniedActions lists the actions of node the guard refuses, for the log line and the error.
-func deniedActions(ctx context.Context, node permissions.Node, index *DatasetRepoIndex) []string {
-	seen := make(map[string]struct{})
-	var out []string
-	var walk func(permissions.Node)
-	walk = func(n permissions.Node) {
-		switch n.Type {
-		case permissions.NodeTypeNode:
-			if permissionDeniedOnDatasetRepo(ctx, index, n.Permission) {
-				if _, ok := seen[n.Permission.Action]; !ok {
-					seen[n.Permission.Action] = struct{}{}
-					out = append(out, n.Permission.Action)
-				}
-			}
-		default:
-			for _, child := range n.Nodes {
-				walk(child)
-			}
-		}
+func (s *ImmutabilityAuthService) leafForbidden(ctx context.Context, p permissions.Permission) (bool, error) {
+	if _, ok := immutableActionSet[p.Action]; !ok {
+		return false, nil
 	}
-	walk(node)
-	return out
-}
-
-// permissionDeniedOnDatasetRepo reports whether permission is a §9.4 write action on a resource of
-// a dataset repository.
-func permissionDeniedOnDatasetRepo(ctx context.Context, index *DatasetRepoIndex, permission permissions.Permission) bool {
-	if index == nil || !isImmutabilityDeniedAction(permission.Action) {
-		return false
-	}
-	repo, ok := RepositoryFromResource(permission.Resource)
+	repo, ok := repositoryOfArn(p.Resource)
 	if !ok {
-		return false
+		return false, nil
 	}
-	return index.IsDatasetRepo(ctx, repo)
+	if s.repos == nil {
+		return false, errNoDatasetRepoSet
+	}
+	return s.repos.Contains(ctx, repo)
 }
 
-// isImmutabilityDeniedAction reports whether action is denied on a dataset repository. The list
-// contains exact action names and action patterns (catalog:Create* and friends), and it is matched
-// the way the policy engine matches a statement action against a requested action.
-func isImmutabilityDeniedAction(action string) bool {
-	if action == "" {
-		return false
-	}
-	for _, pattern := range immutabilityDeniedActions {
-		if wildcard.Match(pattern, action) {
-			return true
-		}
-	}
-	return false
-}
-
-// RepositoryFromResource returns the repository name a lakeFS fs or catalog resource ARN belongs
-// to, and whether the resource names one at all.
-//
-//   - arn:lakefs:fs:::repository/<repo>[/object|/branch|/tag/...] -> <repo>
-//   - arn:lakefs:catalog:::namespace/<repo>/<namespace>            -> <repo>
-//   - arn:lakefs:catalog:::table/<repo>/<namespace>/<table>        -> <repo>
-//   - arn:lakefs:catalog:::view/<repo>/<namespace>/<view>          -> <repo>
-//
-// A resource that is not one of those shapes - "*", an auth ARN, a wildcard ARN - reports false:
-// the guard must never deny on a resource it cannot attribute to a single repository, and every
-// authorization request the core API makes carries a concrete ARN.
-func RepositoryFromResource(resource string) (string, bool) {
+// repositoryOfArn returns the repository an fs or catalog resource ARN belongs to. Catalog
+// actions are included because immutabilityDeniedActions covers the catalog writes of
+// ICEBERG_CATALOG_PLAN.md §7.2; an fs-only parser would silently leave them unguarded.
+func repositoryOfArn(resource string) (string, bool) {
 	if rest, ok := strings.CutPrefix(resource, fsRepositoryArnPrefix); ok {
-		return pathSegment(rest)
+		repo, _, _ := strings.Cut(rest, "/")
+		return repo, repo != ""
 	}
-	if rest, ok := strings.CutPrefix(resource, catalogArnPrefix); ok {
-		// Drop the object type: namespace, table or view.
-		_, rest, ok = strings.Cut(rest, "/")
-		if !ok {
-			return "", false
-		}
-		return pathSegment(rest)
-	}
-	return "", false
-}
-
-// pathSegment returns the first non-empty path segment of path.
-func pathSegment(path string) (string, bool) {
-	segment, _, _ := strings.Cut(path, "/")
-	if segment == "" || strings.ContainsAny(segment, "*?") {
+	rest, ok := strings.CutPrefix(resource, catalogRepositoryArnPrefix)
+	if !ok {
 		return "", false
 	}
-	return segment, true
+	kind, tail, ok := strings.Cut(rest, "/")
+	if !ok {
+		return "", false
+	}
+	switch kind {
+	case "namespace", "table", "view":
+		repo, _, _ := strings.Cut(tail, "/")
+		return repo, repo != ""
+	default:
+		return "", false
+	}
 }

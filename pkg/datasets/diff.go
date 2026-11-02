@@ -14,13 +14,13 @@
 //     ref diff). It is paginated like the core API diff and filters out the synthetic
 //     _dataset/ entries of §6.4, which are bookkeeping, not data.
 //
-// Ref forms (§10.3): `vN` (also accepted as plain `N` and `VN`, matching the pattern of
-// api/datasets.yml), `latest` and `proposal-<id>`. A version resolves to the version
-// tag `vN` in the dataset repository and its VersionRecord definition; `latest`
-// resolves to the dataset branch DefaultBranch; a proposal resolves to its hidden
-// preview branch `_proposal-<id>` (§5.6) and the resolved definition stored in the
-// proposal record. Ref resolution is catalog-free for definition diffs and needs the
-// catalog only for a version whose definition is stored behind DefinitionRef (§5.3).
+// Ref forms (§10.3, DOC-19): `latest`, `v<N>` and the `source_ref` of a pull request,
+// `pr/<id>`. A version resolves to the version tag `vN` in the dataset repository and its
+// VersionRecord definition; `latest` resolves to the dataset branch DefaultBranch; a pull
+// request resolves to its hidden preview branch `_proposal-<id>` (§5.6) and the resolved
+// definition stored in the pull-request record. Ref resolution is catalog-free for
+// definition diffs and needs the catalog only for a version whose definition is stored
+// behind DefinitionRef (§5.3).
 //
 // Clean-room note (§2): written from DATASETS_DESIGN.md and the public lakeFS
 // documentation only. No code, SQL, protobuf or UI asset from lakeFS Enterprise, and
@@ -53,13 +53,20 @@ var ErrRefNotFound = errors.New("dataset ref not found")
 // RefNameLatest is the "latest" ref form of §10.3: the newest published version.
 const RefNameLatest = "latest"
 
-// Ref-form prefixes. A proposal ref is `proposal-<id>`; the hidden branch the proposal
-// is materialised on (and therefore the graveler ref a data diff of a proposal uses) is
-// `_proposal-<id>` (§5.6, §10.3).
+// Ref-form prefixes. A pull request is addressed as `pr/<id>` (§10.2 source_ref); the hidden
+// branch it is materialised on (and therefore the graveler ref a data diff of a pull request
+// uses) stays `_proposal-<id>` for compatibility with already materialised previews (§5.6,
+// §10.3).
 const (
-	ProposalRefPrefix           = "proposal-"
+	// PullRequestRefPrefix is the documented pull-request ref form (§10.3): `pr/<id>`.
+	PullRequestRefPrefix        = "pr/"
 	proposalPreviewBranchPrefix = "_proposal-"
 )
+
+// PullRequestRef returns the ref of a pull request, `pr/<id>` (§10.2 source_ref).
+func PullRequestRef(id string) string {
+	return PullRequestRefPrefix + id
+}
 
 // ProposalPreviewBranch returns the hidden dataset-repository branch a proposal is
 // materialised on (§5.6). It is also what ProposalRecord.PreviewBranch holds.
@@ -226,7 +233,7 @@ func itemSourceKey(item DataItem) string {
 		}
 	case ItemTypeNamespace:
 		if item.Namespace != nil {
-			return item.Namespace.Name
+			return *item.Namespace
 		}
 	}
 	return ""
@@ -457,7 +464,7 @@ func paginationAmount(amount int) int {
 // ref is resolved only as part of Service.Diff, which is where the caller is authorized.
 type diffRef struct {
 	// Ref is the ref as the client wrote it, for error messages: "v3", "latest" or
-	// "proposal-<id>".
+	// "pr/<id>".
 	Ref string
 	// Version is the version number the ref names, 0 when it names a proposal.
 	Version int
@@ -477,9 +484,11 @@ type refTarget struct {
 	proposalID string
 }
 
-// parseRefTarget parses one of the three ref forms of §10.3. The accepted grammar matches
-// the leftRef/rightRef pattern of api/datasets.yml: `latest`, an optional `v`/`V` followed
-// by 1..9 digits, or `proposal-` followed by alphanumerics.
+// parseRefTarget parses one of the documented ref forms of §10.3. The accepted grammar
+// matches the leftRef/rightRef pattern of api/datasets.yml and the documentation: `latest`,
+// `v<N>` with 1..9 digits, or the `source_ref` of a pull request, `pr/<id>` (DOC-19). The
+// bare `3` and `V3` aliases and the old `proposal-<id>` form are deliberately gone: they are
+// not documented, and accepting them silently keeps clients on a private dialect.
 //
 // A ref that does not parse is a client problem and is reported as a *ValidationError with
 // the given field path (left_ref/right_ref), which the API answers with 400 (§10.4); a ref
@@ -493,26 +502,25 @@ func parseRefTarget(field, ref string) (refTarget, error) {
 		return invalid("must not be empty")
 	case ref == RefNameLatest:
 		return refTarget{latest: true}, nil
-	case strings.HasPrefix(ref, ProposalRefPrefix):
-		id := strings.TrimPrefix(ref, ProposalRefPrefix)
-		if !isAlphanumeric(id) {
-			return invalid(fmt.Sprintf("must be %q followed by the proposal id", ProposalRefPrefix))
+	case strings.HasPrefix(ref, PullRequestRefPrefix):
+		id := strings.TrimPrefix(ref, PullRequestRefPrefix)
+		if !isAlphanumeric(id) || len(id) > 64 {
+			return invalid(fmt.Sprintf("must be %q followed by the pull request id", PullRequestRefPrefix))
 		}
 		return refTarget{proposalID: id}, nil
+	case strings.HasPrefix(ref, "v"):
+		digits := strings.TrimPrefix(ref, "v")
+		if !isDigits(digits) || len(digits) > 9 {
+			return invalid(`must be "latest", a version ("v<N>") or a pull request ("pr/<id>")`)
+		}
+		version, err := strconv.Atoi(digits)
+		if err != nil || version <= 0 {
+			return invalid("version must be a positive number")
+		}
+		return refTarget{version: version}, nil
+	default:
+		return invalid(`must be "latest", a version ("v<N>") or a pull request ("pr/<id>")`)
 	}
-
-	digits := ref
-	if len(digits) > 0 && (digits[0] == 'v' || digits[0] == 'V') {
-		digits = digits[1:]
-	}
-	if !isDigits(digits) {
-		return invalid(`must be "latest", a version ("v3", "3") or a proposal ("proposal-<id>")`)
-	}
-	version, err := strconv.Atoi(digits)
-	if err != nil || version <= 0 {
-		return invalid("version must be a positive number")
-	}
-	return refTarget{version: version}, nil
 }
 
 // isDigits reports whether s is a non-empty run of decimal digits.
@@ -619,7 +627,7 @@ func (s *Service) resolveProposalRef(ctx context.Context, rec *DatasetRecord, id
 	}
 	def := cloneDefinition(proposal.Definition)
 	return &diffRef{
-		Ref:         ProposalRefPrefix + proposal.ID,
+		Ref:         PullRequestRef(proposal.ID),
 		ProposalID:  proposal.ID,
 		GravelerRef: branch,
 		Definition:  &def,
@@ -717,7 +725,7 @@ type DiffResult struct {
 // Reading a dataset is gated by ActionReadDataset on the dataset itself (§9.1), not on its
 // sources: a consumer with a dataset grant can diff it without access to the repositories
 // it was curated from. Both sides are resolved through the same resolver, so `vN`,
-// `latest` and `proposal-<id>` behave identically on either side.
+// `latest` and `pr/<id>` behave identically on either side.
 func (s *Service) Diff(ctx context.Context, caller Caller, req DiffRequest) (*DiffResult, error) {
 	if err := s.authorizer.CheckDataset(ctx, caller, ActionReadDataset, req.Dataset); err != nil {
 		return nil, err

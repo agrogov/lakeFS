@@ -22,7 +22,7 @@ import { humanSize } from '../../lib/components/repository/tree';
 
 dayjs.extend(relativeTime);
 
-export const CREATE_DATASET_BUTTON_TEXT = 'Create dataset';
+export const CREATE_DATASET_BUTTON_TEXT = 'Create Dataset';
 export const EMPTY_DATASETS_TEXT = 'No datasets yet';
 
 /** Query-parameter prefix of the metadata filters (`metadata.<key>=<value>`, §10.1). */
@@ -64,7 +64,7 @@ const StateBadge: FC<{ state: Dataset['state'] }> = ({ state }) => {
 };
 
 const DatasetRow: FC<{ dataset: Dataset }> = ({ dataset }) => {
-    const updatedAt = dataset.updated_at ?? dataset.created_at;
+    const updatedAt = dataset.updated_at ?? dataset.creation_date * 1000;
     const stats = dataset.stats;
     return (
         <tr>
@@ -72,17 +72,17 @@ const DatasetRow: FC<{ dataset: Dataset }> = ({ dataset }) => {
                 <Link
                     href={{
                         pathname: '/datasets/:datasetId/overview',
-                        params: { datasetId: dataset.name },
+                        params: { datasetId: dataset.id },
                     }}
                 >
-                    {dataset.name}
+                    {dataset.id}
                 </Link>
                 <StateBadge state={dataset.state} />
             </td>
             <td className="text-truncate dataset-description-cell" title={dataset.description}>
                 {dataset.description || <Na />}
             </td>
-            <td>{dataset.latest_version > 0 ? `v${dataset.latest_version}` : <Na />}</td>
+            <td>{dataset.version && dataset.version > 0 ? `v${dataset.version}` : <Na />}</td>
             <td title={stats ? `${stats.bytes.toLocaleString()} bytes` : undefined}>
                 {stats ? `${stats.objects.toLocaleString()} / ${humanSize(stats.bytes)}` : <Na />}
             </td>
@@ -198,7 +198,7 @@ const DatasetsListPage: FC = () => {
                     </thead>
                     <tbody>
                         {results.map((dataset: Dataset) => (
-                            <DatasetRow key={dataset.name} dataset={dataset} />
+                            <DatasetRow key={dataset.id} dataset={dataset} />
                         ))}
                     </tbody>
                 </Table>

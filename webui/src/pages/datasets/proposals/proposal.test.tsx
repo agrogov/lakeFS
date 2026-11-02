@@ -4,7 +4,7 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 
-import { Proposal, Version } from '../../../lib/api/datasets';
+import { Proposal } from '../../../lib/api/datasets';
 import DatasetProposalPage from './proposal';
 
 // `lib/api` caches the current user in `localStorage`, which this happy-dom setup does not
@@ -40,10 +40,10 @@ const jsonResponse = (body: unknown, status = 200) => ({
 });
 
 const dataset = (latest: number) => ({
-    name: 'customer-360',
-    created_at: Date.UTC(2026, 0, 1),
+    id: 'customer-360',
+    creation_date: Date.UTC(2026, 0, 1) / 1000,
     created_by: 'creator',
-    latest_version: latest,
+    version: latest,
     state: 'active' as const,
 });
 
@@ -55,9 +55,13 @@ const proposal = (overrides: Partial<Proposal> = {}): Proposal => ({
     description: 'Adds the customers prefix',
     author: 'alice',
     status: 'open',
-    created_at: Date.UTC(2026, 0, 2),
+    latest_version: 2,
+    stale: false,
+    conflicted: false,
+    source_ref: 'pr/p1',
+    creation_date: Date.UTC(2026, 0, 2) / 1000,
     preview_branch: '_proposal-p1',
-    diff: { description: { from: 'old', to: 'new' }, items: [] },
+    diff: { description: { left: 'old', right: 'new' }, data: [] },
     data_diff: {
         results: [
             { path: 'customers/a.parquet', type: 'added', size_bytes: 2048 },
@@ -69,20 +73,13 @@ const proposal = (overrides: Partial<Proposal> = {}): Proposal => ({
     ...overrides,
 });
 
-const version = (number: number): Version => ({
-    version: number,
-    publisher: 'reviewer',
-    published_at: Date.UTC(2026, 0, number),
-    commit_id: `${number}`.repeat(40),
-});
-
 /** An allow statement for the given actions on `*`, the shape `listUserPolicies` returns. */
 const policies = (actions: string[]) => ({
     results: [{ statement: [{ effect: 'allow', action: actions, resource: '*' }] }],
 });
 
-const MANAGE_READ = policies(['datasets:ReadDataset']);
-const MANAGE_PUBLISH = policies(['datasets:ReadDataset', 'datasets:PublishVersion', 'datasets:CreateProposal']);
+const MANAGE_READ = policies(['dataset:ReadDataset']);
+const MANAGE_PUBLISH = policies(['dataset:ReadDataset', 'dataset:UpdateDataset', 'dataset:CreateProposal']);
 
 describe('DatasetProposalPage', () => {
     let fetchMock: ReturnType<typeof vi.fn>;
@@ -94,20 +91,20 @@ describe('DatasetProposalPage', () => {
         render(
             <MemoryRouter
                 future={{ v7_startTransition: true, v7_relativeSplatPath: true }}
-                initialEntries={['/datasets/customer-360/proposals/p1']}
+                initialEntries={['/datasets/customer-360/pulls/p1']}
             >
                 <Routes>
-                    <Route path="/datasets/:datasetId/proposals/:proposalId" element={<DatasetProposalPage />} />
+                    <Route path="/datasets/:datasetId/pulls/:proposalId" element={<DatasetProposalPage />} />
                 </Routes>
             </MemoryRouter>,
         );
 
-    const mergeCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/proposals/p1/merge'));
+    const mergeCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/pulls/p1/merge'));
 
     beforeEach(() => {
         currentProposal = proposal();
         currentPolicies = MANAGE_PUBLISH;
-        mergeResponse = () => jsonResponse(version(2), 201);
+        mergeResponse = () => jsonResponse({ version: 2, reference: 'v2' }, 200);
 
         fetchMock = vi.fn(async (url: unknown, init: RequestInit = {}) => {
             const path = String(url);
@@ -115,10 +112,10 @@ describe('DatasetProposalPage', () => {
 
             if (path.endsWith('/api/v1/user')) return jsonResponse({ user: { id: 'reviewer' } });
             if (path.includes('/auth/users/reviewer/policies')) return jsonResponse(currentPolicies);
-            if (path.endsWith('/proposals/p1/merge')) return mergeResponse();
-            if (path.endsWith('/proposals/p1')) {
+            if (path.endsWith('/pulls/p1/merge')) return mergeResponse();
+            if (path.endsWith('/pulls/p1')) {
                 if (method === 'PATCH') {
-                    // "Update proposal" is the explicit rebase: the base moves to latest (§5.6).
+                    // "Update pull request" is the explicit rebase: the base moves to latest (§5.6).
                     currentProposal = { ...currentProposal, base_version: 2 };
                     return jsonResponse(currentProposal);
                 }
@@ -142,7 +139,7 @@ describe('DatasetProposalPage', () => {
         expect(banner).toHaveTextContent(/Rebase required/i);
         expect(banner).toHaveTextContent(/made against v1/i);
         expect(banner).toHaveTextContent(/now at v2/i);
-        expect(screen.getByRole('button', { name: /Update proposal/i })).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /Update pull request/i })).toBeInTheDocument();
         // A stale base cannot be merged: the button would only produce the same 409.
         expect(screen.getByRole('button', { name: /Merge/i })).toBeDisabled();
     });
@@ -154,7 +151,7 @@ describe('DatasetProposalPage', () => {
             const path = String(url);
             if (path.endsWith('/api/v1/user')) return jsonResponse({ user: { id: 'reviewer' } });
             if (path.includes('/auth/users/reviewer/policies')) return jsonResponse(MANAGE_PUBLISH);
-            if (path.endsWith('/proposals/p1/merge')) {
+            if (path.endsWith('/pulls/p1/merge')) {
                 return jsonResponse(
                     {
                         message:
@@ -164,7 +161,7 @@ describe('DatasetProposalPage', () => {
                     409,
                 );
             }
-            if (path.endsWith('/proposals/p1')) return jsonResponse(currentProposal);
+            if (path.endsWith('/pulls/p1')) return jsonResponse(currentProposal);
             if (path.endsWith('/datasets/customer-360')) return jsonResponse(dataset(1));
             return jsonResponse({ message: 'not found' }, 404);
         });
@@ -184,16 +181,15 @@ describe('DatasetProposalPage', () => {
         expect(mergeCalls()).toHaveLength(1);
     });
 
-    it('offers Update proposal as the explicit rebase of the conflict', async () => {
+    it('offers Update pull request as the explicit rebase of the conflict', async () => {
         renderPage();
 
         await screen.findByTestId('dataset-proposal-conflict');
-        await userEvent.click(screen.getByRole('button', { name: /Update proposal/i }));
+        await userEvent.click(screen.getByRole('button', { name: /Update pull request/i }));
 
         await waitFor(() => expect(screen.queryByTestId('dataset-proposal-conflict')).not.toBeInTheDocument());
         const patch = fetchMock.mock.calls.filter(
-            ([url, init]) =>
-                String(url).endsWith('/proposals/p1') && (init as RequestInit | undefined)?.method === 'PATCH',
+            ([url, init]) => String(url).endsWith('/pulls/p1') && (init as RequestInit | undefined)?.method === 'PATCH',
         );
         expect(patch).toHaveLength(1);
     });
@@ -206,7 +202,7 @@ describe('DatasetProposalPage', () => {
             const path = String(url);
             if (path.endsWith('/api/v1/user')) return jsonResponse({ user: { id: 'reviewer' } });
             if (path.includes('/auth/users/reviewer/policies')) return jsonResponse(MANAGE_READ);
-            if (path.endsWith('/proposals/p1')) return jsonResponse(currentProposal);
+            if (path.endsWith('/pulls/p1')) return jsonResponse(currentProposal);
             if (path.endsWith('/datasets/customer-360')) return jsonResponse(dataset(2));
             return jsonResponse({ message: 'not found' }, 404);
         });
@@ -215,7 +211,7 @@ describe('DatasetProposalPage', () => {
 
         const merge = await screen.findByRole('button', { name: /Merge/i });
         expect(merge).toBeDisabled();
-        expect(merge.getAttribute('title') ?? '').toContain('datasets:PublishVersion');
+        expect(merge.getAttribute('title') ?? '').toContain('dataset:UpdateDataset');
         // Close is still offered: an author may close their own review.
         expect(screen.getByRole('button', { name: /Close/i })).toBeInTheDocument();
     });
@@ -226,7 +222,7 @@ describe('DatasetProposalPage', () => {
             const path = String(url);
             if (path.endsWith('/api/v1/user')) return jsonResponse({ user: { id: 'reviewer' } });
             if (path.includes('/auth/users/reviewer/policies')) return jsonResponse(MANAGE_PUBLISH);
-            if (path.endsWith('/proposals/p1')) return jsonResponse(currentProposal);
+            if (path.endsWith('/pulls/p1')) return jsonResponse(currentProposal);
             if (path.endsWith('/datasets/customer-360')) return jsonResponse(dataset(2));
             return jsonResponse({ message: 'not found' }, 404);
         });

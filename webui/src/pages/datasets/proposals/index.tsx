@@ -32,14 +32,14 @@ const DatasetProposalsPage: FC = () => {
     const status: ProposalStatus = proposalStatusFromQuery(router.query[PROPOSALS_QUERY_KEYS.status]);
 
     const { response, loading, error } = useAPI(
-        () => datasets.listProposals(datasetId, { status, amount: MAX_LISTING_AMOUNT }),
+        () => datasets.listDatasetPullRequests(datasetId, { status, amount: MAX_LISTING_AMOUNT }),
         [datasetId, status],
     );
     const proposals = ((response as ProposalList | null)?.results ?? []) as Proposal[];
 
     const onSelectStatus = (next: ProposalStatus) =>
         router.push({
-            pathname: '/datasets/:datasetId/proposals',
+            pathname: '/datasets/:datasetId/pulls',
             params: { datasetId },
             query: proposalStatusQuery(next),
         });

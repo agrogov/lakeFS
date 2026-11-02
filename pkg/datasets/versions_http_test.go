@@ -58,32 +58,30 @@ func TestDatasetsHTTPPublishAndReadVersions(t *testing.T) {
 	commit := seedHandlerSource(t, deps.Catalog)
 	def := objectDefinition("handler-src", commit.String(), "reference/countries.csv", "geo/countries.csv")
 
-	created := doRequest(t, handler, http.MethodPost, "", createDatasetBody(t, "http-versions", def, false), accessKey, secret)
+	// DOC-14: the create publishes v1, so the 201 already carries a version.
+	created := doRequest(t, handler, http.MethodPost, "", createDatasetBody(t, "http-versions", def, true), accessKey, secret)
 	require.Equal(t, http.StatusCreated, created.Code, "body: %s", created.Body.String())
+	var createdDataset apigen.Dataset
+	require.NoError(t, json.Unmarshal(created.Body.Bytes(), &createdDataset))
+	require.Equal(t, 1, derefInt(createdDataset.Version), "the create publishes v1")
 
-	// 201 with the version, not 202: the publish is below sync_publish_max_objects.
-	published := doRequest(t, handler, http.MethodPost, "/http-versions/versions",
-		publishBody(def, "initial publish", nil), accessKey, secret)
-	require.Equal(t, http.StatusCreated, published.Code, "body: %s", published.Body.String())
-	var version apigen.Version
-	require.NoError(t, json.Unmarshal(published.Body.Bytes(), &version))
-	require.Equal(t, 1, version.Version)
-	require.Equal(t, "initial publish", deref(version.Message))
-	require.Equal(t, testUsername, version.Publisher)
-	require.NotEmpty(t, version.CommitId)
-	require.NotNil(t, version.Definition)
-	require.NotNil(t, version.Stats)
-	require.Equal(t, int64(1), version.Stats.Objects)
-
-	// GET /{ds}/versions/{vN|N|latest}.
-	for _, ref := range []string{"v1", "1", "latest"} {
+	// GET /{ds}/versions/{vN|latest} returns v1. The undocumented bare `1` is a 400 (DOC-19).
+	var version apigen.DatasetVersion
+	for _, ref := range []string{"v1", "latest"} {
 		rec := doRequest(t, handler, http.MethodGet, "/http-versions/versions/"+ref, "", accessKey, secret)
 		require.Equal(t, http.StatusOK, rec.Code, "ref %q: %s", ref, rec.Body.String())
-		var got apigen.Version
-		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
-		require.Equal(t, 1, got.Version, "ref %q", ref)
-		require.Equal(t, version.CommitId, got.CommitId, "ref %q", ref)
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &version))
+		require.Equal(t, "v1", version.Id, "ref %q", ref)
+		require.Equal(t, "initial dataset", deref(version.Message))
+		require.Equal(t, testUsername, version.Author)
+		require.NotEmpty(t, deref(version.CommitId))
+		require.NotNil(t, version.Definition)
+		require.NotNil(t, version.Stats)
+		require.Equal(t, int64(1), version.Stats.Objects)
 	}
+	require.Equal(t, http.StatusBadRequest,
+		doRequest(t, handler, http.MethodGet, "/http-versions/versions/1", "", accessKey, secret).Code,
+		"a bare version number is not a documented ref")
 
 	// Publish v2 from a new source commit and check that the list is newest first.
 	secondCommit := seedSecondHandlerSource(t, deps.Catalog)
@@ -95,7 +93,7 @@ func TestDatasetsHTTPPublishAndReadVersions(t *testing.T) {
 	list := doRequest(t, handler, http.MethodGet, "/http-versions/versions?amount=10", "", accessKey, secret)
 	require.Equal(t, http.StatusOK, list.Code, "body: %s", list.Body.String())
 	var versions struct {
-		Results    []apigen.Version `json:"results"`
+		Results    []apigen.DatasetVersion `json:"results"`
 		Pagination struct {
 			HasMore    bool `json:"has_more"`
 			Results    int  `json:"results"`
@@ -104,7 +102,7 @@ func TestDatasetsHTTPPublishAndReadVersions(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(list.Body.Bytes(), &versions))
 	require.Len(t, versions.Results, 2)
-	require.Equal(t, []int{2, 1}, []int{versions.Results[0].Version, versions.Results[1].Version})
+	require.Equal(t, []string{"v2", "v1"}, []string{versions.Results[0].Id, versions.Results[1].Id})
 	require.Equal(t, 2, versions.Pagination.Results)
 	require.False(t, versions.Pagination.HasMore)
 
@@ -113,7 +111,7 @@ func TestDatasetsHTTPPublishAndReadVersions(t *testing.T) {
 	require.Equal(t, http.StatusOK, got.Code)
 	var dataset apigen.Dataset
 	require.NoError(t, json.Unmarshal(got.Body.Bytes(), &dataset))
-	require.Equal(t, 2, dataset.LatestVersion)
+	require.Equal(t, 2, derefInt(dataset.Version))
 
 	// Failures: an unknown version, task and dataset are 404; a malformed version ref is the
 	// 400 of §10.4 (it names the offending parameter).
@@ -166,7 +164,7 @@ func TestDatasetsHTTPAsyncPublish(t *testing.T) {
 	handler, deps, accessKey, secret := newControlPlaneWithConfig(t,
 		"datasets:\n  enabled: true\n  storage_namespace_prefix: \"mem://datasets\"\n  sync_publish_max_objects: 1\n")
 
-	seedHandlerSource(t, deps.Catalog)
+	firstCommit := seedHandlerSource(t, deps.Catalog)
 	commit := seedSecondHandlerSource(t, deps.Catalog)
 	// Two objects: above the limit of 1, so the publish runs asynchronously.
 	def := Definition{
@@ -185,7 +183,10 @@ func TestDatasetsHTTPAsyncPublish(t *testing.T) {
 		},
 	}
 
-	created := doRequest(t, handler, http.MethodPost, "", createDatasetBody(t, "http-async", def, false), accessKey, secret)
+	// DOC-14: the create publishes v1 from a single-object definition; the asynchronous
+	// publish below then produces v2 from the two-object definition.
+	initialDef := objectDefinition("handler-src", firstCommit.String(), "reference/countries.csv", "geo/countries.csv")
+	created := doRequest(t, handler, http.MethodPost, "", createDatasetBody(t, "http-async", initialDef, false), accessKey, secret)
 	require.Equal(t, http.StatusCreated, created.Code, "body: %s", created.Body.String())
 
 	published := doRequest(t, handler, http.MethodPost, "/http-async/versions",
@@ -211,18 +212,26 @@ func TestDatasetsHTTPAsyncPublish(t *testing.T) {
 		require.True(t, time.Now().Before(deadline), "the asynchronous publish did not finish in time")
 		time.Sleep(10 * time.Millisecond)
 	}
-	require.Equal(t, TaskStatusCompleted, final.Status, "task error: %s", deref(final.Error))
+	require.Equal(t, TaskStatusCompleted, final.Status, "task error: %v", final.Error)
+	require.Nil(t, final.Error, "a completed task carries no error")
 	require.NotNil(t, final.Version)
-	require.Equal(t, 1, *final.Version)
+	require.Equal(t, 2, *final.Version)
 
 	got := doRequest(t, handler, http.MethodGet, "/http-async", "", accessKey, secret)
 	require.Equal(t, http.StatusOK, got.Code)
 	var dataset apigen.Dataset
 	require.NoError(t, json.Unmarshal(got.Body.Bytes(), &dataset))
-	require.Equal(t, 1, dataset.LatestVersion)
-	require.Equal(t, DatasetStateActive, dataset.State)
+	require.Equal(t, 2, derefInt(dataset.Version))
+	require.Equal(t, DatasetStateActive, deref(dataset.State))
 	require.NotNil(t, dataset.Definition)
 	require.Equal(t, int64(2), dataset.Stats.Objects)
+}
+
+func derefInt(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func deref(value *string) string {

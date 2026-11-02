@@ -1,11 +1,14 @@
 package cmd
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/manifoldco/promptui"
+	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/require"
 )
 
@@ -45,10 +48,18 @@ func TestListCommand(t *testing.T) {
 		require.Equal(t, []string{"data-platform"}, request.Query["metadata.owner"])
 	})
 
+	t.Run("repeated metadata values are all sent", func(t *testing.T) {
+		// CLI-6: a second --metadata flag for the same key accumulates instead of replacing.
+		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusOK, Body: listBody})
+		mustExecute(t, "list", "--metadata", "tier=gold", "--metadata", "tier=silver")
+
+		require.Equal(t, []string{"gold", "silver"}, fake.OnlyRequest().Query["metadata.tier"])
+	})
+
 	t.Run("json output", func(t *testing.T) {
 		newFakeControlPlane(t, fakeResponse{Status: http.StatusOK, Body: listBody})
 		out := mustExecute(t, "list", "-o", "json")
-		require.Contains(t, out, `"name": "customer-360"`)
+		require.Contains(t, out, `"id": "customer-360"`)
 		require.Contains(t, out, "\n  \"results\"")
 	})
 
@@ -77,7 +88,7 @@ func TestParseListOptions(t *testing.T) {
 		{
 			name: "defaults",
 			args: []string{"list"},
-			want: listOptions{paginationOptions: paginationOptions{Amount: 100}, Metadata: map[string]string{}, Output: outputTable},
+			want: listOptions{paginationOptions: paginationOptions{Amount: 100}, Metadata: map[string][]string{}, Output: outputTable},
 		},
 		{
 			name: "all flags",
@@ -85,7 +96,17 @@ func TestParseListOptions(t *testing.T) {
 			want: listOptions{
 				paginationOptions: paginationOptions{After: "x", Amount: 7},
 				Prefix:            "pre",
-				Metadata:          map[string]string{"a": "1,b=2", "c": ""},
+				Metadata:          map[string][]string{"a": {"1,b=2"}, "c": {""}},
+				Output:            outputTable,
+			},
+		},
+		{
+			// A repeated key accumulates its values instead of keeping only the last one (CLI-6).
+			name: "repeated metadata key",
+			args: []string{"list", "--metadata", "tier=gold", "--metadata", "tier=silver", "--metadata", "owner=data"},
+			want: listOptions{
+				paginationOptions: paginationOptions{Amount: 100},
+				Metadata:          map[string][]string{"tier": {"gold", "silver"}, "owner": {"data"}},
 				Output:            outputTable,
 			},
 		},
@@ -165,10 +186,10 @@ func TestShowCommand(t *testing.T) {
 	t.Run("json output", func(t *testing.T) {
 		newFakeControlPlane(t, fakeResponse{Status: http.StatusOK, Body: testDatasetBody})
 		out := mustExecute(t, "show", "customer-360", "-o", "json")
-		require.Contains(t, out, `"latest_version": 3`)
+		require.Contains(t, out, `"version": 3`)
 	})
 
-	t.Run("invalid version", func(t *testing.T) {
+	t.Run("invalid ref", func(t *testing.T) {
 		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusOK, Body: testVersionBody})
 		_, err := executeCommand(t, "show", "customer-360", "--version", "not-a-ref")
 		require.ErrorContains(t, err, "invalid version")
@@ -181,23 +202,25 @@ func TestShowCommand(t *testing.T) {
 	})
 }
 
-// TestCreateCommand pins the create request of §10.1, including the optional publish envelope.
+// TestCreateCommand pins the create request of §10.1. Every create publishes v1 (DOC-14), so
+// --message is optional and the documented create is synchronous; --async is the extension.
 func TestCreateCommand(t *testing.T) {
 	file := writeDefinitionFile(t, testDefinition)
 
-	t.Run("without publish", func(t *testing.T) {
+	t.Run("publishes v1 by default", func(t *testing.T) {
 		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusCreated, Body: testDatasetBody})
 		mustExecute(t, "create", "customer-360", "--file", file)
 
 		request := fake.OnlyRequest()
 		require.Equal(t, http.MethodPost, request.Method)
 		require.Equal(t, controlPlanePath+"/", request.Path)
+		require.NotContains(t, request.Query, "async", "the documented create is synchronous")
 		requireJSONBody(t, request.Body, `{"name": "customer-360", "definition": `+testDefinition+`}`)
 	})
 
-	t.Run("with publish", func(t *testing.T) {
+	t.Run("with message", func(t *testing.T) {
 		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusCreated, Body: testDatasetBody})
-		mustExecute(t, "create", "customer-360", "--file", file, "--publish", "--message", "initial dataset")
+		mustExecute(t, "create", "customer-360", "--file", file, "--message", "initial dataset")
 
 		request := fake.OnlyRequest()
 		requireJSONBody(t, request.Body,
@@ -223,20 +246,11 @@ func TestCreateCommand(t *testing.T) {
 
 	t.Run("asynchronous publish", func(t *testing.T) {
 		taskBody := `{"id": "task-1", "status": "pending", "created_at": 1767225600000, "updated_at": 1767225600000}`
-		newFakeControlPlane(t, fakeResponse{Status: http.StatusAccepted, Body: taskBody})
-		out := mustExecute(t, "create", "customer-360", "--file", file, "--publish", "--message", "big")
+		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusAccepted, Body: taskBody})
+		out := mustExecute(t, "create", "customer-360", "--file", file, "--async", "--message", "big")
 		require.Contains(t, out, "task-1")
 		require.Contains(t, out, "pending")
-	})
-
-	t.Run("message without publish", func(t *testing.T) {
-		_, err := executeCommand(t, "create", "customer-360", "--file", file, "--message", "nope")
-		require.ErrorContains(t, err, "only used with --publish")
-	})
-
-	t.Run("publish without message", func(t *testing.T) {
-		_, err := executeCommand(t, "create", "customer-360", "--file", file, "--publish")
-		require.ErrorContains(t, err, "requires --message")
+		require.Equal(t, []string{"true"}, fake.OnlyRequest().Query["async"])
 	})
 
 	t.Run("missing file", func(t *testing.T) {
@@ -249,15 +263,23 @@ func TestCreateCommand(t *testing.T) {
 func TestPublishCommand(t *testing.T) {
 	file := writeDefinitionFile(t, testDefinition)
 
-	t.Run("publish", func(t *testing.T) {
-		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusCreated, Body: testVersionBody})
+	t.Run("publish sends the version it read", func(t *testing.T) {
+		// CLI-2: the publish reads the current version first and asserts it, so a replayed POST is
+		// answered with 409 instead of publishing twice.
+		fake := newFakeControlPlane(t,
+			fakeResponse{Status: http.StatusOK, Body: testDatasetBody},
+			fakeResponse{Status: http.StatusCreated, Body: testVersionBody},
+		)
 		out := mustExecute(t, "publish", "customer-360", "--file", file, "--message", "add churn column")
 
-		request := fake.OnlyRequest()
-		require.Equal(t, http.MethodPost, request.Method)
-		require.Equal(t, controlPlanePath+"/customer-360/versions", request.Path)
-		requireJSONBody(t, request.Body,
-			`{"definition": `+testDefinition+`, "message": "add churn column"}`)
+		requests := fake.Requests()
+		require.Len(t, requests, 2)
+		require.Equal(t, http.MethodGet, requests[0].Method)
+		require.Equal(t, controlPlanePath+"/customer-360", requests[0].Path)
+		require.Equal(t, http.MethodPost, requests[1].Method)
+		require.Equal(t, controlPlanePath+"/customer-360/versions", requests[1].Path)
+		requireJSONBody(t, requests[1].Body,
+			`{"definition": `+testDefinition+`, "message": "add churn column", "expected_version": 3}`)
 		require.Contains(t, out, "Version: v3")
 	})
 
@@ -266,6 +288,16 @@ func TestPublishCommand(t *testing.T) {
 		mustExecute(t, "publish", "customer-360", "--file", file, "--message", "msg", "--expected-version", "2")
 		requireJSONBody(t, fake.OnlyRequest().Body,
 			`{"definition": `+testDefinition+`, "message": "msg", "expected_version": 2}`)
+	})
+
+	t.Run("dataset not found", func(t *testing.T) {
+		fake := newFakeControlPlane(t, fakeResponse{
+			Status: http.StatusNotFound,
+			Body:   `{"message": "dataset not found"}`,
+		})
+		_, err := executeCommand(t, "publish", "customer-360", "--file", file, "--message", "msg")
+		require.ErrorContains(t, err, "dataset not found")
+		require.Equal(t, http.MethodGet, fake.OnlyRequest().Method, "the publish must not run")
 	})
 
 	t.Run("version conflict", func(t *testing.T) {
@@ -278,9 +310,10 @@ func TestPublishCommand(t *testing.T) {
 	})
 
 	t.Run("wait for the publish task", func(t *testing.T) {
-		taskPendingBody := `{"id": "task-9", "status": "pending", "created_at": 1767225600000, "updated_at": 1767225600000}`
+		taskPendingBody := `{"id": "task-9", "status": "running", "created_at": 1767225600000, "updated_at": 1767225600000}`
 		taskDoneBody := `{"id": "task-9", "status": "completed", "version": 3, "created_at": 1767225600000, "updated_at": 1767225600000}`
 		fake := newFakeControlPlane(t,
+			fakeResponse{Status: http.StatusOK, Body: testDatasetBody},
 			fakeResponse{Status: http.StatusAccepted, Body: taskPendingBody},
 			fakeResponse{Status: http.StatusOK, Body: taskDoneBody},
 		)
@@ -290,9 +323,9 @@ func TestPublishCommand(t *testing.T) {
 
 		out := mustExecute(t, "publish", "customer-360", "--file", file, "--message", "big", "--wait")
 		requests := fake.Requests()
-		require.Len(t, requests, 2)
-		require.Equal(t, controlPlanePath+"/customer-360/versions", requests[0].Path)
-		require.Equal(t, controlPlanePath+"/customer-360/tasks/task-9", requests[1].Path)
+		require.Len(t, requests, 3)
+		require.Equal(t, controlPlanePath+"/customer-360/versions", requests[1].Path)
+		require.Equal(t, controlPlanePath+"/customer-360/tasks/task-9", requests[2].Path)
 		require.Contains(t, out, "task-9")
 		require.Contains(t, out, "v3")
 	})
@@ -300,6 +333,7 @@ func TestPublishCommand(t *testing.T) {
 	t.Run("wait with json output prints the completed task", func(t *testing.T) {
 		taskDoneBody := `{"id": "task-9", "status": "completed", "version": 3, "created_at": 1, "updated_at": 2}`
 		newFakeControlPlane(t,
+			fakeResponse{Status: http.StatusOK, Body: testDatasetBody},
 			fakeResponse{Status: http.StatusAccepted, Body: `{"id": "task-9", "status": "pending", "created_at": 1, "updated_at": 1}`},
 			fakeResponse{Status: http.StatusOK, Body: taskDoneBody},
 		)
@@ -313,8 +347,10 @@ func TestPublishCommand(t *testing.T) {
 	})
 
 	t.Run("failed publish task", func(t *testing.T) {
-		taskFailedBody := `{"id": "task-9", "status": "failed", "error": "source repository is gone", "created_at": 1767225600000, "updated_at": 1767225600000}`
+		// SEC-8: a failed task carries the sanitised {code, message}, never the raw error.
+		taskFailedBody := `{"id": "task-9", "status": "failed", "error": {"code": "source_unavailable", "message": "a source repository is gone"}, "created_at": 1767225600000, "updated_at": 1767225600000}`
 		newFakeControlPlane(t,
+			fakeResponse{Status: http.StatusOK, Body: testDatasetBody},
 			fakeResponse{Status: http.StatusAccepted, Body: `{"id": "task-9", "status": "pending", "created_at": 1, "updated_at": 1}`},
 			fakeResponse{Status: http.StatusOK, Body: taskFailedBody},
 		)
@@ -324,6 +360,46 @@ func TestPublishCommand(t *testing.T) {
 
 		_, err := executeCommand(t, "publish", "customer-360", "--file", file, "--message", "big", "--wait")
 		require.ErrorContains(t, err, "source repository is gone")
+	})
+
+	t.Run("wait times out", func(t *testing.T) {
+		// CLI-3: --timeout bounds the polling instead of hanging on a task that never finishes.
+		taskRunningBody := `{"id": "task-9", "status": "running", "created_at": 1, "updated_at": 1}`
+		newFakeControlPlane(t,
+			fakeResponse{Status: http.StatusOK, Body: testDatasetBody},
+			fakeResponse{Status: http.StatusAccepted, Body: taskRunningBody},
+			fakeResponse{Status: http.StatusOK, Body: taskRunningBody},
+		)
+		previous := taskPollInterval
+		taskPollInterval = time.Millisecond
+		t.Cleanup(func() { taskPollInterval = previous })
+
+		_, err := executeCommand(t, "publish", "customer-360", "--file", file, "--message", "big",
+			"--wait", "--timeout", "20ms")
+		require.ErrorIs(t, err, ErrTaskTimeout)
+		require.ErrorContains(t, err, "timed out")
+		require.ErrorContains(t, err, "task-9")
+	})
+
+	t.Run("unknown task status", func(t *testing.T) {
+		// CLI-3: a status the spec does not define is an error, not something to poll forever.
+		newFakeControlPlane(t,
+			fakeResponse{Status: http.StatusOK, Body: testDatasetBody},
+			fakeResponse{Status: http.StatusAccepted, Body: `{"id": "task-9", "status": "pending", "created_at": 1, "updated_at": 1}`},
+			fakeResponse{Status: http.StatusOK, Body: `{"id": "task-9", "status": "queued-behind-a-rock", "created_at": 1, "updated_at": 2}`},
+		)
+		previous := taskPollInterval
+		taskPollInterval = time.Millisecond
+		t.Cleanup(func() { taskPollInterval = previous })
+
+		_, err := executeCommand(t, "publish", "customer-360", "--file", file, "--message", "big", "--wait")
+		require.ErrorIs(t, err, ErrInvalidResponse)
+		require.ErrorContains(t, err, "unknown status")
+	})
+
+	t.Run("non-positive timeout", func(t *testing.T) {
+		_, err := executeCommand(t, "publish", "customer-360", "--file", file, "--message", "big", "--timeout", "0s")
+		require.ErrorContains(t, err, "must be positive")
 	})
 
 	t.Run("missing message", func(t *testing.T) {
@@ -388,11 +464,11 @@ func TestVersionsCommand(t *testing.T) {
 // TestDiffCommand pins both diff modes of §10.3.
 func TestDiffCommand(t *testing.T) {
 	definitionDiffBody := `{
-	  "description": {"from": "old", "to": "new"},
-	  "metadata": [{"key": "tier", "change": "added", "to": "gold"}],
-	  "items": [
-	    {"target": "customers", "change": "added", "to": {"target": "customers", "repository": "lakehouse-repo", "ref": {"type": "commit", "id": "30f9eb1c"}, "type": "prefix", "prefix": {"path": "data/customers/"}}},
-	    {"target": "reference/countries.csv", "change": "removed", "from": {"target": "reference/countries.csv", "repository": "ref-data", "ref": {"type": "commit", "id": "a1b2c3"}, "type": "object", "object": {"path": "geo/countries.csv"}}}
+	  "description": {"left": "old", "right": "new"},
+	  "metadata": [{"type": "added", "key": "tier", "right": ["gold"]}],
+	  "data": [
+	    {"type": "added", "target": "customers", "right": {"target": "customers", "repository": "lakehouse-repo", "ref": {"type": "commit", "id": "30f9eb1c"}, "type": "prefix", "prefix": {"path": "data/customers/"}}},
+	    {"type": "removed", "target": "reference/countries.csv", "left": {"target": "reference/countries.csv", "repository": "ref-data", "ref": {"type": "commit", "id": "a1b2c3"}, "type": "object", "object": {"path": "geo/countries.csv"}}}
 	  ]
 	}`
 
@@ -427,13 +503,13 @@ func TestDiffCommand(t *testing.T) {
 	t.Run("json output", func(t *testing.T) {
 		newFakeControlPlane(t, fakeResponse{Status: http.StatusOK, Body: definitionDiffBody})
 		out := mustExecute(t, "diff", "customer-360", "v1", "v2", "-o", "json")
-		require.Contains(t, out, `"change": "added"`)
+		require.Contains(t, out, `"type": "added"`)
 	})
 
 	t.Run("invalid ref", func(t *testing.T) {
 		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusOK, Body: definitionDiffBody})
 		_, err := executeCommand(t, "diff", "customer-360", "v1", "bogus")
-		require.ErrorContains(t, err, "invalid version")
+		require.ErrorContains(t, err, "invalid ref")
 		require.Empty(t, fake.Requests())
 	})
 
@@ -445,11 +521,79 @@ func TestDiffCommand(t *testing.T) {
 
 // TestDeleteCommand pins the delete request of §6.6.
 func TestDeleteCommand(t *testing.T) {
-	fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusNoContent})
-	out := mustExecute(t, "delete", "customer-360", "--yes")
+	t.Run("confirms with --yes", func(t *testing.T) {
+		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusNoContent})
+		stdout, stderr, err := executeCommandStreams(t, "delete", "customer-360", "--yes")
+		require.NoError(t, err)
 
-	request := fake.OnlyRequest()
-	require.Equal(t, http.MethodDelete, request.Method)
-	require.Equal(t, controlPlanePath+"/customer-360", request.Path)
-	require.Contains(t, strings.ToLower(out), "deleted")
+		request := fake.OnlyRequest()
+		require.Equal(t, http.MethodDelete, request.Method)
+		require.Equal(t, controlPlanePath+"/customer-360", request.Path)
+		require.Contains(t, strings.ToLower(stdout), "deleted")
+		// --yes answers without a prompt, so the preamble stays off both streams.
+		require.Empty(t, stderr)
+	})
+
+	t.Run("json output prints the result", func(t *testing.T) {
+		// CLI-8: a 204 has no body, so -o json prints the deleted name instead of nothing.
+		newFakeControlPlane(t, fakeResponse{Status: http.StatusNoContent})
+		stdout, _, err := executeCommandStreams(t, "delete", "customer-360", "--yes", "-o", "json")
+		require.NoError(t, err)
+		require.JSONEq(t, `{"deleted": "customer-360"}`, stdout)
+	})
+
+	t.Run("answering no cancels", func(t *testing.T) {
+		// CLI-1: promptui reports "no" as ErrAbort. That is a cancel: a clear message on stderr, a
+		// non-zero exit and no DELETE.
+		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusNoContent})
+		restore := stubConfirm(t, func(*pflag.FlagSet, string, ...string) (bool, error) { return false, promptui.ErrAbort })
+		defer restore()
+
+		stdout, stderr, err := executeCommandStreams(t, "delete", "customer-360")
+		require.ErrorIs(t, err, ErrDeleteCancelled)
+		require.Empty(t, fake.Requests(), "a cancelled delete must not send a DELETE")
+		require.Empty(t, stdout, "the prompt text must not reach stdout")
+		require.Contains(t, stderr, "Delete cancelled.")
+		require.Contains(t, stderr, "releases the garbage-collection pins")
+	})
+
+	t.Run("declining without an error cancels", func(t *testing.T) {
+		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusNoContent})
+		restore := stubConfirm(t, func(*pflag.FlagSet, string, ...string) (bool, error) { return false, nil })
+		defer restore()
+
+		_, stderr, err := executeCommandStreams(t, "delete", "customer-360")
+		require.ErrorIs(t, err, ErrDeleteCancelled)
+		require.Empty(t, fake.Requests())
+		require.Contains(t, stderr, "Delete cancelled.")
+	})
+
+	t.Run("other prompt errors are reported", func(t *testing.T) {
+		newFakeControlPlane(t, fakeResponse{Status: http.StatusNoContent})
+		restore := stubConfirm(t, func(*pflag.FlagSet, string, ...string) (bool, error) { return false, errPromptBroken })
+		defer restore()
+
+		_, _, err := executeCommandStreams(t, "delete", "customer-360")
+		require.ErrorIs(t, err, errPromptBroken)
+	})
+}
+
+// errPromptBroken stands for a prompt that failed for a reason other than "no".
+var errPromptBroken = errors.New("prompt is broken")
+
+// stubConfirm replaces the confirmation prompt for the duration of one test and returns a
+// function that restores the real one.
+func stubConfirm(t *testing.T, stub func(*pflag.FlagSet, string, ...string) (bool, error)) func() {
+	t.Helper()
+	previous := confirmFunc
+	confirmFunc = stub
+	restored := false
+	restore := func() {
+		if !restored {
+			confirmFunc = previous
+			restored = true
+		}
+	}
+	t.Cleanup(restore)
+	return restore
 }

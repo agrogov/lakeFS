@@ -13,7 +13,9 @@
 //     no version references are removed;
 //  3. the immutability guard and the managed read policies exist and are attached;
 //  4. a dataset whose pinned source repository disappeared is marked degraded, and the
-//     mark is cleared when every source is reachable again.
+//     mark is cleared when every source is reachable again;
+//  5. a proposal whose version was published is marked merged (its commit metadata names
+//     it), and the task records of an interrupted publish are settled completed or failed.
 //
 // Every repair step tolerates "not found", so a crashed operation is finished rather than
 // retried forever (§6.6).
@@ -33,7 +35,6 @@ import (
 	"time"
 
 	"github.com/treeverse/lakefs/pkg/auth"
-	"github.com/treeverse/lakefs/pkg/auth/model"
 	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/graveler"
 	"github.com/treeverse/lakefs/pkg/kv"
@@ -65,23 +66,21 @@ type leaseRecord struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-// getLease reads the reconcile lease together with the predicate a conditional write or
-// delete of the lease key must present.
-//
-// kv.ErrNotFound is returned unchanged when no node ever took the lease. A record that
-// cannot be decoded is returned as a nil record together with the key's predicate: the lease
-// is unusable, but whether that means "overwrite it" or "leave it to expire" is the caller's
-// decision, and the predicate still lets the caller condition its write on the value it saw.
-func (s *Store) getLease(ctx context.Context) (*leaseRecord, kv.Predicate, error) {
-	value, predicate, err := s.getWithPredicate(ctx, []byte(ReconcileLeaseKey))
+// GetLease reads the reconcile lease record and the kv.Predicate that AcquireLease and
+// ReleaseLease condition their writes on. It returns kv.ErrNotFound unchanged when no node
+// holds (or has held) the lease. A record that does not decode returns the predicate with
+// the decode error: its holder is unknown, but the record can still be replaced or left to
+// expire under that predicate.
+func (s *Store) GetLease(ctx context.Context) (*leaseRecord, kv.Predicate, error) {
+	res, err := s.store.Get(ctx, []byte(PartitionKey), []byte(ReconcileLeaseKey))
 	if err != nil {
 		return nil, nil, err
 	}
-	var current leaseRecord
-	if err := json.Unmarshal(value, &current); err != nil {
-		return nil, predicate, nil
+	var rec leaseRecord
+	if err := json.Unmarshal(res.Value, &rec); err != nil {
+		return nil, res.Predicate, fmt.Errorf("datasets: decode reconcile lease: %w", err)
 	}
-	return &current, predicate, nil
+	return &rec, res.Predicate, nil
 }
 
 // AcquireLease tries to take the reconcile lease for owner for ttl. It reports whether this
@@ -89,7 +88,9 @@ func (s *Store) getLease(ctx context.Context) (*leaseRecord, kv.Predicate, error
 //
 // A missing or expired lease is written with SetIf, so two nodes racing for it cannot both
 // win: the loser gets kv.ErrPredicateFailed, re-reads the record and finds a live owner. A
-// live lease held by another owner is left alone.
+// live lease held by another owner is left alone. The SetIf predicate is the one GetLease
+// returned, never a re-encoding of the record: some stores compare it opaquely (CosmosDB
+// uses an ETag, pkg/kv/cosmosdb/store.go).
 func (s *Store) AcquireLease(ctx context.Context, owner string, ttl time.Duration) (bool, error) {
 	if owner == "" {
 		return false, fmt.Errorf("%w: reconcile lease owner is required", ErrInvalidRecordKey)
@@ -99,24 +100,23 @@ func (s *Store) AcquireLease(ctx context.Context, owner string, ttl time.Duratio
 	}
 	key := []byte(ReconcileLeaseKey)
 	for attempt := 0; attempt < pinCASRetries; attempt++ {
-		now := time.Now().UTC()
+		now := s.clock().UTC()
 		var predicate kv.Predicate
-		current, stored, err := s.getLease(ctx)
+		current, stored, err := s.GetLease(ctx)
 		switch {
 		case errors.Is(err, kv.ErrNotFound):
 			// No lease record yet: SetIf with a nil predicate creates it only if it is
 			// still absent.
-		case err != nil:
+		case err != nil && stored == nil:
 			return false, err
+		case err != nil:
+			// A corrupted lease is treated as expired - no owner can be identified - but it
+			// is only replaced under the predicate it was read with.
+			predicate = stored
 		default:
-			// An undecodable lease is treated as expired: it protects nothing, so taking
-			// it over is safe (§12.3).
-			if current != nil && current.ExpiresAt.After(now) && current.Owner != owner {
+			if current.ExpiresAt.After(now) && current.Owner != owner {
 				return false, nil // a live lease owned by somebody else
 			}
-			// The predicate is the store's, never a re-encoding of the lease record: on
-			// CosmosDB it is the document's ETag, and a synthesized value would fail
-			// every acquisition there.
 			predicate = stored
 		}
 		value, err := json.Marshal(leaseRecord{Owner: owner, ExpiresAt: now.Add(ttl)})
@@ -135,25 +135,67 @@ func (s *Store) AcquireLease(ctx context.Context, owner string, ttl time.Duratio
 	return false, kv.ErrPredicateFailed
 }
 
+// RenewLease extends a lease owner already holds, conditioned on the record as it was read
+// (BUG-6). It reports whether owner still holds the lease: false means the lease expired and
+// another node took it over, and the caller must stop its pass instead of racing the new
+// owner. The write is the SetIf of the predicate GetLease returned, never a re-encoding (see
+// AcquireLease).
+//
+// An expired lease that nobody has taken over yet is still renewed: no other pass is running
+// under it, and dropping it would only hand the next pass an expiry delay.
+func (s *Store) RenewLease(ctx context.Context, owner string, ttl time.Duration) (bool, error) {
+	if owner == "" {
+		return false, fmt.Errorf("%w: reconcile lease owner is required", ErrInvalidRecordKey)
+	}
+	if ttl <= 0 {
+		ttl = DefaultReconcileLeaseTTL
+	}
+	key := []byte(ReconcileLeaseKey)
+	for attempt := 0; attempt < pinCASRetries; attempt++ {
+		current, predicate, err := s.GetLease(ctx)
+		switch {
+		case errors.Is(err, kv.ErrNotFound):
+			return false, nil // released (or expired and deleted) under us
+		case err != nil:
+			return false, err
+		}
+		if current.Owner != owner {
+			return false, nil // another node owns the pass now
+		}
+		value, err := json.Marshal(leaseRecord{Owner: owner, ExpiresAt: s.clock().UTC().Add(ttl)})
+		if err != nil {
+			return false, fmt.Errorf("datasets: encode reconcile lease: %w", err)
+		}
+		err = s.store.SetIf(ctx, []byte(PartitionKey), key, value, predicate)
+		switch {
+		case errors.Is(err, kv.ErrPredicateFailed):
+			continue // another node changed the record; re-read and retry
+		case err != nil:
+			return false, err
+		}
+		return true, nil
+	}
+	return false, kv.ErrPredicateFailed
+}
+
 // ReleaseLease drops the lease when owner still holds it, so the next node can run a pass
 // immediately instead of waiting for the expiry. It is a no-op when the lease is already gone
 // or owned by someone else (a crashed node's lease expired and was taken over): releasing
 // another owner's lease would let two nodes run concurrently.
 //
-// The delete is conditioned on the predicate of the lease record that was read, so a lease
-// another node has since taken over is left alone (§12.3).
+// The delete is conditioned on the predicate of the record that was read, so a lease renewed
+// by another owner in between is not deleted.
 func (s *Store) ReleaseLease(ctx context.Context, owner string) error {
-	current, predicate, err := s.getLease(ctx)
+	current, predicate, err := s.GetLease(ctx)
 	switch {
 	case errors.Is(err, kv.ErrNotFound):
 		return nil
-	case err != nil:
-		return err
-	}
-	if current == nil {
+	case err != nil && predicate != nil:
 		// A corrupted lease is left to expire rather than deleted: it may belong to an
 		// owner this node cannot identify.
 		return nil
+	case err != nil:
+		return err
 	}
 	if current.Owner != owner {
 		return nil
@@ -191,6 +233,16 @@ type Reconciler struct {
 	// onPass is a test hook invoked once a pass owns the lease and before it repairs
 	// anything. It is nil in production.
 	onPass func()
+
+	// afterListDatasets is a test hook invoked after the pass has read the dataset records
+	// and before it removes orphan pins. It is nil in production; the BUG-4 tests use it to
+	// create a dataset and a pin inside the window the pass used to race.
+	afterListDatasets func()
+
+	// onDatasetRepaired is a test hook invoked after every dataset the pass repaired, and
+	// before the lease is renewed for the next one. It is nil in production; the BUG-6 tests
+	// use it to cancel the pass or to let its lease expire between two datasets.
+	onDatasetRepaired func(dataset string)
 }
 
 // NewReconciler builds the reconciler of svc, using the service's configuration, store,
@@ -207,11 +259,15 @@ func NewReconciler(svc *Service) *Reconciler {
 			timeout = svc.cfg.PublishTimeout
 		}
 	}
+	clock := time.Now
+	if svc != nil && svc.now != nil {
+		clock = svc.now
+	}
 	owner := reconcileOwnerPrefix
-	if id, err := newULID(time.Now()); err == nil {
+	if id, err := newULID(clock()); err == nil {
 		owner += "-" + id
 	} else {
-		owner += "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+		owner += "-" + strconv.FormatInt(clock().UnixNano(), 36)
 	}
 	r := &Reconciler{
 		svc:      svc,
@@ -294,7 +350,10 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*ReconcileReport, error) {
 	if r.onPass != nil {
 		r.onPass()
 	}
-	return r.repair(releaseCtx), nil
+	// The pass runs on the caller's context (BUG-6): a shutdown must stop it between datasets
+	// instead of letting it hold the lease until every record was repaired. Only the release
+	// above outlives cancellation, so the next node does not wait for the expiry.
+	return r.repair(ctx), nil
 }
 
 // ReconcileReport summarises one repair pass. Every counter is diagnostic; nothing in the
@@ -338,8 +397,27 @@ func (r *ReconcileReport) log(log logging.Logger) {
 }
 
 // repair is the pass itself, without the lease. The caller must hold the lease.
+//
+// Known divergence (§14, docs/datasets.md "Known design divergences"): the pass repairs the
+// commits of the version tags and the head of `latest` while a record is transient, but it
+// does not walk `latest`'s history looking for a commit that lacks the dataset.version
+// metadata on an otherwise active dataset. Such a commit is not detected; the next publish
+// still tags latest + 1 correctly, so the dataset converges.
 func (r *Reconciler) repair(ctx context.Context) *ReconcileReport {
 	report := &ReconcileReport{}
+
+	// Pins are listed BEFORE datasets (BUG-4): the pin scan is the older snapshot, so a pin a
+	// dataset created by this pass's window gets is never in this pass's snapshot and can never
+	// be mistaken for an orphan from it. removeOrphanPins still re-checks existence before it
+	// deletes anything.
+	pins, err := r.store.listAllPins(ctx)
+	if err != nil {
+		report.Errors++
+		dsMetrics.reconcileErrors.Inc()
+		r.log.WithError(err).Warn("datasets: cannot list pins for a reconcile pass; skipping orphan-pin cleanup")
+		pins = nil
+	}
+
 	records, err := r.store.ListDatasets(ctx)
 	if err != nil {
 		report.Errors++
@@ -347,11 +425,19 @@ func (r *Reconciler) repair(ctx context.Context) *ReconcileReport {
 		r.log.WithError(err).Warn("datasets: cannot list datasets for a reconcile pass")
 		return report
 	}
+	if r.afterListDatasets != nil {
+		r.afterListDatasets()
+	}
 	report.Datasets = len(records)
 	dsMetrics.datasetsTotal.Set(float64(len(records)))
 
+	// BUG-14: group the pin snapshot by dataset once for the whole pass. The degraded check
+	// of every dataset then answers "which pins does this dataset hold?" from the index
+	// instead of scanning the pin partition again, which made a pass cost O(datasets x pins).
+	pinIdx := newPinIndex(pins)
+
 	names := make([]string, 0, len(records))
-	for _, rec := range records {
+	for i, rec := range records {
 		if ctx.Err() != nil {
 			return report
 		}
@@ -359,11 +445,38 @@ func (r *Reconciler) repair(ctx context.Context) *ReconcileReport {
 			continue
 		}
 		names = append(names, rec.Name)
-		if err := r.repairDataset(ctx, rec, report); err != nil {
+		if err := r.repairDataset(ctx, rec, pinIdx, report); err != nil {
 			report.Errors++
 			dsMetrics.reconcileErrors.Inc()
 			r.log.WithError(err).WithField("dataset", rec.Name).
 				Warn("datasets: could not repair a dataset; the next pass will retry")
+		}
+		if r.onDatasetRepaired != nil {
+			r.onDatasetRepaired(rec.Name)
+		}
+		if ctx.Err() != nil {
+			return report
+		}
+		// BUG-6: the lease TTL is two intervals, which a pass over many datasets can outlast.
+		// Renew it with a CAS between datasets, and abort when it is no longer ours: a second
+		// node has taken the pass over, and repairing the rest of the list in parallel with it
+		// is exactly what the lease exists to prevent.
+		if i+1 >= len(records) {
+			continue
+		}
+		renewed, renewErr := r.store.RenewLease(ctx, r.owner, r.leaseTTL)
+		switch {
+		case renewErr != nil && ctx.Err() != nil:
+			// The context, not the lease, ended the pass; a shutdown is not a failure.
+			return report
+		case renewErr != nil:
+			report.Errors++
+			dsMetrics.reconcileErrors.Inc()
+			r.log.WithError(renewErr).Warn("datasets: could not renew the reconcile lease; aborting the pass")
+			return report
+		case !renewed:
+			r.log.Warn("datasets: lost the reconcile lease mid-pass; aborting the pass")
+			return report
 		}
 	}
 
@@ -374,39 +487,26 @@ func (r *Reconciler) repair(ctx context.Context) *ReconcileReport {
 		r.log.WithError(err).Warn("datasets: could not repair the installation-wide policies")
 	}
 
-	if err := r.removeOrphanPins(ctx, records, report); err != nil {
-		report.Errors++
-		dsMetrics.reconcileErrors.Inc()
-		r.log.WithError(err).Warn("datasets: could not remove orphan pins")
+	if pins != nil {
+		r.removeOrphanPins(ctx, pins, report)
 	}
 	return report
 }
 
-// repairDataset repairs one dataset record (§12.3 items 1-4).
-func (r *Reconciler) repairDataset(ctx context.Context, rec *DatasetRecord, report *ReconcileReport) error {
+// repairDataset repairs one dataset record (§12.3 items 1-4). pins is the pass's pin index,
+// built once from the pin listing (BUG-14); it is read, never written.
+func (r *Reconciler) repairDataset(ctx context.Context, rec *DatasetRecord, pins pinIndex, report *ReconcileReport) error {
 	switch rec.State {
 	case DatasetStateCreating, DatasetStatePublishing, DatasetStateDeleting:
-		// rec came from the partition scan that opened the pass, and a scan carries no
-		// kv.Predicate, so it is re-read: the CAS that repair performs needs the predicate of
-		// the value it replaces, and the fresh record is also what staleness must be judged
-		// on (§5.4 step 2).
-		fresh, predicate, err := r.store.GetDataset(ctx, rec.Name)
-		if errors.Is(err, kv.ErrNotFound) {
-			return nil // deleted since the scan
-		}
-		if err != nil {
-			return err
-		}
-		rec = fresh
 		if !r.stale(rec) {
 			// An operation is genuinely in flight; its own writer owns the record and the
 			// reconciler must not race it (§5.4).
 			return nil
 		}
 		if rec.State == DatasetStateDeleting {
-			return r.finishDelete(ctx, rec, predicate, report)
+			return r.finishDelete(ctx, rec, report)
 		}
-		if err := r.repairInterrupted(ctx, rec, predicate, report); err != nil {
+		if err := r.repairInterrupted(ctx, rec, report); err != nil {
 			return err
 		}
 		// Re-read: the repair advanced the record to active (or removed it).
@@ -429,8 +529,15 @@ func (r *Reconciler) repairDataset(ctx context.Context, rec *DatasetRecord, repo
 		return nil
 	}
 
-	// §12.3 item 2: every pinned source has its pin branch.
-	recreated, missing, err := r.pins.EnsureDatasetPins(ctx, rec.Name)
+	// BUG-8: a merge publishes the version and only then marks the proposal merged. A failure
+	// in between leaves an open proposal whose version exists, and a preview branch no
+	// proposal points at any more; the version records say which proposals were published.
+	if err := r.reconcileMergedProposals(ctx, rec.Name, report); err != nil {
+		return fmt.Errorf("datasets: repair proposals of %q: %w", rec.Name, err)
+	}
+
+	// §12.3 item 2: every published version holds the pins its definition names.
+	recreated, missing, err := r.ensureDatasetPins(ctx, rec.Name)
 	if len(recreated) > 0 {
 		report.PinsRecreated += len(recreated)
 		dsMetrics.pinsRecreated.Add(float64(len(recreated)))
@@ -448,9 +555,168 @@ func (r *Reconciler) repairDataset(ctx context.Context, rec *DatasetRecord, repo
 		return fmt.Errorf("datasets: repair policies of %q: %w", rec.Name, err)
 	}
 
-	// §12.3 item 4: degraded marking follows source reachability.
-	return r.reconcileDegraded(ctx, rec, len(missing) > 0, report)
+	// §12.3 item 4: degraded marking follows source reachability. The pin records come from
+	// the pass's index, not from another full pin scan per dataset (BUG-14).
+	return r.reconcileDegraded(ctx, rec, len(missing) > 0, pins.forDataset(rec.Name), report)
 }
+
+// ensureDatasetPins is §12.3 item 2, derived from the version records rather than from the pin
+// records it repairs (BUG-5). Every published version's definition names the (source repository,
+// commit) pairs its data lives at, so it is the authority on the pins that version must hold. A
+// pin record that was lost is therefore re-created, not only a pin branch that was deleted, and
+// no reference is invented: the reference is exactly PinReference(dataset, version).
+//
+// It reports the branches it re-created and the sources whose repository has been deleted, so the
+// caller can mark the dataset degraded (§12.3 item 4). Repairs are independent: one unreadable
+// definition does not stop the repair of the other versions, and the next pass retries.
+func (r *Reconciler) ensureDatasetPins(ctx context.Context, dataset string) (recreated, missing []PinnedSource, err error) {
+	versions, err := r.store.ListVersions(ctx, dataset)
+	if err != nil {
+		return nil, nil, err
+	}
+	var errs []error
+	for _, version := range versions {
+		if ctx.Err() != nil {
+			return recreated, missing, ctx.Err()
+		}
+		def, err := r.svc.versionDefinition(ctx, version)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("datasets: definition of %s v%d: %w", dataset, version.Version, err))
+			continue
+		}
+		sources, err := PinSources(*def)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("datasets: pins of %s v%d: %w", dataset, version.Version, err))
+			continue
+		}
+		created, gone, err := r.pins.ensureSources(ctx, sources, PinReference(dataset, version.Version))
+		recreated = append(recreated, created...)
+		missing = append(missing, gone...)
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return recreated, missing, errors.Join(errs...)
+}
+
+// reconcileMergedProposals marks the proposals merged whose version exists (BUG-8).
+//
+// A merge publishes the version first and marks the proposal merged after it, so a failure in
+// between leaves an open proposal whose commit and version record already exist; every retry
+// then answers "rebase required" and the preview branch leaks. The repair is derivable: the
+// commit metadata names the proposal (CommitMetadataProposalKey), and the version record keeps
+// that id (VersionRecord.ProposalID). A proposal that was already marked merged is left alone;
+// its preview branch is deleted again anyway, because a merge that failed after the record
+// write must not leave the branch behind.
+func (r *Reconciler) reconcileMergedProposals(ctx context.Context, dataset string, report *ReconcileReport) error {
+	versions, err := r.store.ListVersions(ctx, dataset)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, version := range versions {
+		if ctx.Err() != nil {
+			return errors.Join(append(errs, ctx.Err())...)
+		}
+		if version.ProposalID == "" {
+			continue
+		}
+		repaired, err := r.markProposalMerged(ctx, dataset, version.ProposalID, version.Version)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if repaired {
+			report.StatesRepaired++
+			r.log.WithFields(logging.Fields{
+				"dataset":  dataset,
+				"proposal": version.ProposalID,
+				"version":  version.Version,
+			}).Warn("datasets: marked the proposal of a published version merged")
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// markProposalMerged writes the merged state of a proposal whose version exists and removes
+// its preview branch. It reports whether it changed the record. A CAS that loses is retried by
+// the next pass, and a proposal that is already merged only has its branch re-checked.
+func (r *Reconciler) markProposalMerged(ctx context.Context, dataset, id string, version int) (bool, error) {
+	proposal, err := r.store.GetProposal(ctx, dataset, id)
+	if errors.Is(err, kv.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if proposal.Status == ProposalStatusMerged {
+		if err := r.svc.removePreviewBranch(ctx, dataset, previewBranchOf(proposal)); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	merged := *proposal
+	now := r.now()
+	merged.Status = ProposalStatusMerged
+	merged.ClosedAt = &now
+	merged.MergedVersion = version
+	if err := r.store.PutProposalIf(ctx, &merged, proposal); err != nil {
+		return false, fmt.Errorf("datasets: mark proposal %s of %q merged: %w", id, dataset, err)
+	}
+	if err := r.svc.removePreviewBranch(ctx, dataset, previewBranchOf(proposal)); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+// settleInterruptedTasks settles the task records of an interrupted publish (BUG-11).
+//
+// An asynchronous publish leaves a pending or running TaskRecord (§6.5). A crashed node never
+// writes its outcome, so the record would stay running forever. The dataset record is the
+// authority: when the version exists the task completed, and when the pass rolled the record
+// back the task failed. A task that already finished is left alone.
+func (r *Reconciler) settleInterruptedTasks(ctx context.Context, dataset string, version int, completed bool, cause string) error {
+	tasks, err := r.store.ListTasks(ctx, dataset)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, task := range tasks {
+		if task.Kind != TaskKindPublish {
+			continue
+		}
+		if task.Status != TaskStatusPending && task.Status != TaskStatusRunning {
+			continue
+		}
+		next := *task
+		next.UpdatedAt = r.now()
+		if completed {
+			next.Status = TaskStatusCompleted
+			next.Version = version
+			next.Error = nil
+		} else {
+			next.Status = TaskStatusFailed
+			next.Version = 0
+			// SEC-8: the task record is readable by every dataset reader, so a failure is the
+			// sanitised {code, message}. cause is the fixed sentence of
+			// interruptedPublishCause, not text derived from an error.
+			next.Error = &TaskError{Code: TaskErrorCodePublishFailed, Message: cause}
+		}
+		if err := r.store.PutTask(ctx, &next); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		r.log.WithFields(logging.Fields{
+			"dataset": dataset,
+			"task":    task.ID,
+			"status":  next.Status,
+		}).Warn("datasets: settled the task of an interrupted publish")
+	}
+	return errors.Join(errs...)
+}
+
+// interruptedPublishCause is what a failed task of an interrupted publish reports.
+const interruptedPublishCause = "datasets: the publish was interrupted and rolled back"
 
 // stale reports whether a transient record has been left alone for longer than
 // datasets.publish_timeout (§5.4 step 2, §12.3 item 1).
@@ -465,9 +731,8 @@ func (r *Reconciler) stale(rec *DatasetRecord) bool {
 // repairInterrupted finishes or rolls back an interrupted create/publish (§12.3 item 1).
 //
 // The order is the one §5.4 makes authoritative: the tag vN first, then the latest HEAD
-// commit carrying dataset.version=N, and only then the rollback. predicate is the predicate
-// of rec as it was read, which every write on the record is conditioned on.
-func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, predicate kv.Predicate, report *ReconcileReport) error {
+// commit carrying dataset.version=N, and only then the rollback.
+func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, report *ReconcileReport) error {
 	dataset := rec.Name
 	version := rec.PendingVersion
 	if version <= 0 {
@@ -479,7 +744,10 @@ func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, 
 	tagCommit, err := r.catalog.GetTag(ctx, dataset, tag)
 	switch {
 	case err == nil:
-		return r.completeVersion(ctx, rec, predicate, version, tagCommit, report)
+		if err := r.completeVersion(ctx, rec, version, tagCommit, report); err != nil {
+			return err
+		}
+		return r.settleInterruptedTasks(ctx, dataset, version, true, "")
 	case !isNotFound(err):
 		return fmt.Errorf("datasets: read tag %s of %q: %w", tag, dataset, err)
 	}
@@ -502,7 +770,10 @@ func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, 
 				"version": version,
 				"commit":  headCommit,
 			}).Warn("datasets: created the missing tag of an interrupted publish")
-			return r.completeVersion(ctx, rec, predicate, version, headCommit, report)
+			if err := r.completeVersion(ctx, rec, version, headCommit, report); err != nil {
+				return err
+			}
+			return r.settleInterruptedTasks(ctx, dataset, version, true, "")
 		}
 	case !isNotFound(err):
 		return fmt.Errorf("datasets: read %s/%s: %w", dataset, DefaultBranch, err)
@@ -513,68 +784,148 @@ func (r *Reconciler) repairInterrupted(ctx context.Context, rec *DatasetRecord, 
 	// removed instead of being promoted to a dataset with no repository.
 	if rec.State == DatasetStateCreating {
 		if _, err := r.catalog.GetRepository(ctx, dataset); isNotFound(err) {
-			err := r.store.DeleteDataset(ctx, dataset, predicate)
-			switch {
-			case errors.Is(err, kv.ErrPredicateFailed):
-				// A live create refreshed the record between the staleness check and here.
-				r.log.WithField("dataset", dataset).
-					Info("datasets: an interrupted create moved while it was being removed; leaving it alone")
+			// rec came from ListDatasets, which returns values without their predicate: a
+			// nil predicate makes DeleteDataset compare against a fresh read. A record that
+			// changed since the pass listed it belongs to a live owner (BUG-3), so the
+			// delete loses the race and the record is left alone.
+			err := r.store.DeleteDataset(ctx, dataset, rec, nil)
+			if errors.Is(err, kv.ErrPredicateFailed) {
 				return nil
-			case err != nil:
+			}
+			if err != nil {
 				return err
 			}
 			report.StatesRepaired++
 			r.log.WithField("dataset", dataset).Warn("datasets: removed the record of an interrupted create")
-			return nil
+			return r.settleInterruptedTasks(ctx, dataset, version, false, interruptedPublishCause)
 		}
 	}
-	// The record CAS comes before the pin release (BUG-3). A publish that is still alive
-	// refreshes UpdatedAt, so the CAS fails and the pass leaves its pins alone; releasing
-	// them first would strip a live publish of its GC protection. Over-retaining a pin until
-	// the next pass is safe (§14); under-retaining it is not.
-	next := *rec
-	next.State = DatasetStateActive
-	next.PendingVersion = 0
-	next.UpdatedAt = r.now()
-	if _, err := r.store.PutDatasetIf(ctx, &next, predicate); err != nil {
-		if errors.Is(err, kv.ErrPredicateFailed) {
-			r.log.WithField("dataset", dataset).
-				Info("datasets: an interrupted publish moved while it was being repaired; leaving it alone")
-			return nil
-		}
-		return fmt.Errorf("datasets: roll %q back to active: %w", dataset, err)
+
+	// BUG-3: the rollback is gated on a fresh read and a CAS. A publish whose owner is still
+	// heartbeating has moved UpdatedAt since this pass listed the record; it is alive, its
+	// commit may still land, and rolling it back - in particular releasing its pins - would
+	// leave a committed version unpinned.
+	rolledBack, err := r.rollbackInterrupted(ctx, rec, version)
+	if err != nil {
+		return err
 	}
-	if err := r.pins.ReleaseVersion(ctx, dataset, version); err != nil {
-		return fmt.Errorf("datasets: release pins of %s@v%d: %w", dataset, version, err)
+	if !rolledBack {
+		r.log.WithFields(logging.Fields{
+			"dataset": dataset,
+			"version": version,
+		}).Info("datasets: skipped the rollback of a publish whose owner is still active")
+		return nil
 	}
 	report.StatesRepaired++
 	r.log.WithFields(logging.Fields{
 		"dataset": dataset,
 		"version": version,
 	}).Warn("datasets: rolled an interrupted publish back to active")
-	return nil
+	// BUG-11: nothing was committed, so the task of the accepted publish did not succeed.
+	return r.settleInterruptedTasks(ctx, dataset, version, false, interruptedPublishCause)
+}
+
+// rollbackInterrupted returns a stale transient record to active and releases the pins of the
+// version it was publishing. It reports whether it won the rollback.
+//
+// The order is the one BUG-3 needs: re-read the record, re-check that it is still stale, win
+// the CAS and only then release the pins. A heartbeat (service.heartbeatPublish) that lands
+// before the CAS makes the CAS fail, so the reconciler never undoes a live publish; and
+// because the pins are released after the record was won, a rollback that loses the race cannot
+// strip the GC protection of a commit that is about to be written. A release that fails after
+// the CAS leaves pins behind, which over-retains source data - safe, and the next pass removes
+// the orphan (§14: never under-retain).
+func (r *Reconciler) rollbackInterrupted(ctx context.Context, rec *DatasetRecord, version int) (bool, error) {
+	current, predicate, err := r.store.GetDataset(ctx, rec.Name)
+	if errors.Is(err, kv.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if current.State != rec.State || current.PendingVersion != rec.PendingVersion {
+		// Another writer (the owner, a takeover or the next pass) already moved the record.
+		return false, nil
+	}
+	if !r.stale(current) {
+		return false, nil
+	}
+	next := *current
+	next.State = DatasetStateActive
+	next.PendingVersion = 0
+	next.UpdatedAt = r.now()
+	if err := r.store.PutDatasetIf(ctx, &next, current, predicate); err != nil {
+		if errors.Is(err, kv.ErrPredicateFailed) {
+			return false, nil
+		}
+		return false, fmt.Errorf("datasets: roll %q back to active: %w", rec.Name, err)
+	}
+	if err := r.pins.ReleaseVersion(ctx, rec.Name, version); err != nil {
+		return true, fmt.Errorf("datasets: release pins of %s@v%d: %w", rec.Name, version, err)
+	}
+	return true, nil
 }
 
 // completeVersion rebuilds the missing VersionRecord of a committed version from the
 // version's _dataset/definition.json and marks the dataset active (§5.4: the tag and the
 // definition object are authoritative, the KV record is derived).
-//
-// The KV writes - the rebuilt record and the head CAS - are the service's finishVersion, so a
-// repair retries them with the same backoff a publish does (BUG-2) instead of leaving a
-// half-finished version behind. predicate is the predicate of rec as it was read, which is what
-// that CAS is conditioned on (BUG-1).
-func (r *Reconciler) completeVersion(ctx context.Context, rec *DatasetRecord, predicate kv.Predicate, version int, commitID string, report *ReconcileReport) error {
-	_, rebuilt, err := r.svc.finishVersion(ctx, rec, predicate, version, commitID)
-	if err != nil {
-		return err
-	}
-	if rebuilt {
+func (r *Reconciler) completeVersion(ctx context.Context, rec *DatasetRecord, version int, commitID string, report *ReconcileReport) error {
+	dataset := rec.Name
+	_, err := r.store.GetVersion(ctx, dataset, version)
+	switch {
+	case err == nil:
+		// The record exists; only the head needs to catch up.
+	case errors.Is(err, kv.ErrNotFound):
+		doc, docErr := r.svc.readDefinitionDocument(ctx, dataset, commitID, DefinitionPath)
+		if docErr != nil {
+			return fmt.Errorf("datasets: rebuild version %d of %q: %w", version, dataset, docErr)
+		}
+		commitLog, commitErr := r.catalog.GetCommit(ctx, dataset, commitID)
+		if commitErr != nil {
+			return fmt.Errorf("datasets: read commit %s of %q: %w", commitID, dataset, commitErr)
+		}
+		stats, statsErr := r.rebuildStats(ctx, dataset, commitID, doc.Definition)
+		if statsErr != nil {
+			return fmt.Errorf("datasets: rebuild stats of %s@v%d: %w", dataset, version, statsErr)
+		}
+		rebuilt := VersionRecord{
+			Dataset:     dataset,
+			Version:     version,
+			Definition:  doc.Definition,
+			Message:     doc.Message,
+			Publisher:   doc.Publisher,
+			PublishedAt: commitLog.CreationDate,
+			CommitID:    commitID,
+			MetaRangeID: commitLog.MetaRangeID,
+			ProposalID:  commitLog.Metadata[CommitMetadataProposalKey],
+			Stats:       stats,
+		}
+		if _, err := r.store.PutVersion(ctx, rebuilt); err != nil {
+			return fmt.Errorf("datasets: write rebuilt version %d of %q: %w", version, dataset, err)
+		}
 		report.VersionsRebuilt++
 		r.log.WithFields(logging.Fields{
-			"dataset": rec.Name,
+			"dataset": dataset,
 			"version": version,
 			"commit":  commitID,
 		}).Warn("datasets: rebuilt a missing version record from the dataset repository")
+	default:
+		return err
+	}
+
+	next := *rec
+	next.State = DatasetStateActive
+	next.PendingVersion = 0
+	if next.LatestVersion < version {
+		next.LatestVersion = version
+	}
+	next.UpdatedAt = r.now()
+	if err := r.store.PutDatasetIf(ctx, &next, rec, nil); err != nil {
+		if errors.Is(err, kv.ErrPredicateFailed) {
+			// Somebody else moved the record; the next pass converges on the new value.
+			return nil
+		}
+		return fmt.Errorf("datasets: activate %q after rebuilding version %d: %w", dataset, version, err)
 	}
 	report.StatesRepaired++
 	return nil
@@ -583,7 +934,13 @@ func (r *Reconciler) completeVersion(ctx context.Context, rec *DatasetRecord, pr
 // finishDelete completes a delete that was interrupted after the record was CASed to
 // "deleting" (§6.6, §12.3 item 1). Every step tolerates not found, so it converges whether
 // the repository, the pins or the records were already removed.
-func (r *Reconciler) finishDelete(ctx context.Context, rec *DatasetRecord, predicate kv.Predicate, report *ReconcileReport) error {
+//
+// The dataset record is deleted LAST (BUG-7). It is the record that makes the retry happen: a
+// delete whose version, proposal, task or grant removal failed leaves it in "deleting", so the
+// next pass starts over. Deleting it first would forget the dataset with its records still
+// there, and a re-create of the same name would then collide on a stale v1 VersionRecord (and
+// inherit the old proposals).
+func (r *Reconciler) finishDelete(ctx context.Context, rec *DatasetRecord, report *ReconcileReport) error {
 	dataset := rec.Name
 	versions, err := r.store.ListVersions(ctx, dataset)
 	if err != nil && !errors.Is(err, kv.ErrNotFound) {
@@ -594,24 +951,17 @@ func (r *Reconciler) finishDelete(ctx context.Context, rec *DatasetRecord, predi
 	if err := r.catalog.DeleteRepository(ctx, dataset, graveler.WithForce(true)); err != nil && !isNotFound(err) {
 		return fmt.Errorf("datasets: finish delete of repository %q: %w", dataset, err)
 	}
-	// §9.4: the repository is gone, so the authorizer guard must stop denying on its name (the
-	// per-dataset immutability policy is dropped a few lines below).
-	r.svc.forgetDatasetRepo(dataset)
 
 	var errs []error
 	// §6.6 step 3: the pins of every version.
 	if err := r.pins.ReleaseDataset(ctx, dataset); err != nil {
 		errs = append(errs, err)
 	}
-	// §6.6 step 4: policies and grants, then the control-plane records.
-	errs = append(errs, r.svc.dropAccessGrants(ctx, dataset)...)
-	errs = append(errs, r.svc.dropImmutabilityGuard(ctx, dataset)...)
-	if err := r.store.DeleteDataset(ctx, dataset, predicate); err != nil && !isNotFound(err) {
-		errs = append(errs, fmt.Errorf("datasets: delete record of %q: %w", dataset, err))
-	}
+	// §6.6 step 4: the control-plane records of the dataset, in the order the next re-create
+	// needs them gone: versions, proposals, tasks (BUG-11) and grants.
 	for _, version := range versions {
 		if err := r.store.DeleteVersion(ctx, dataset, version.Version); err != nil && !isNotFound(err) {
-			errs = append(errs, err)
+			errs = append(errs, fmt.Errorf("datasets: delete version %d of %q: %w", version.Version, dataset, err))
 		}
 	}
 	if proposals, err := r.store.ListProposals(ctx, dataset); err != nil && !errors.Is(err, kv.ErrNotFound) {
@@ -623,14 +973,35 @@ func (r *Reconciler) finishDelete(ctx context.Context, rec *DatasetRecord, predi
 			}
 		}
 	}
-	// §9.5 note: the aggregate read policy must forget the dataset.
+	if tasks, err := r.store.ListTasks(ctx, dataset); err != nil && !errors.Is(err, kv.ErrNotFound) {
+		errs = append(errs, err)
+	} else {
+		for _, task := range tasks {
+			if err := r.store.DeleteTask(ctx, dataset, task.ID); err != nil && !isNotFound(err) {
+				errs = append(errs, err)
+			}
+		}
+	}
+	errs = append(errs, r.svc.dropAccessGrants(ctx, dataset)...)
+	errs = append(errs, r.svc.dropImmutabilityGuard(ctx, dataset)...)
+
+	// The dataset record goes last, and only once everything it refers to is gone.
+	if len(errs) == 0 {
+		if err := r.store.DeleteDataset(ctx, dataset, rec, nil); err != nil && !isNotFound(err) {
+			errs = append(errs, fmt.Errorf("datasets: delete record of %q: %w", dataset, err))
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+
+	// §9.5 note: the aggregate read policy must forget the dataset; it is derived from the
+	// dataset records, so it is rewritten after the record is gone.
 	if err := r.svc.ensureAllReadPolicy(ctx); err != nil {
 		errs = append(errs, err)
 	}
-	if len(errs) == 0 {
-		report.StatesRepaired++
-		r.log.WithField("dataset", dataset).Warn("datasets: finished an interrupted delete")
-	}
+	report.StatesRepaired++
+	r.log.WithField("dataset", dataset).Warn("datasets: finished an interrupted delete")
 	return errors.Join(errs...)
 }
 
@@ -640,21 +1011,34 @@ func (r *Reconciler) finishDelete(ctx context.Context, rec *DatasetRecord, predi
 func (r *Reconciler) ensureDatasetPolicies(ctx context.Context, dataset string, report *ReconcileReport) error {
 	// Immutability guard (§9.4). Written before the first version, so it must exist for
 	// every dataset record, including one created empty.
+	//
+	// SEC-6: existence is not enough. The managed name is predictable, so the statements are
+	// compared with the ones this pass would write; ensureImmutabilityGuard rewrites a mismatch
+	// and logs it, and the report says the policy was repaired.
 	immutabilityName := ImmutabilityPolicyName(dataset)
-	_, policyErr := r.svc.authService.GetPolicy(ctx, immutabilityName)
+	existingGuard, policyErr := r.svc.authService.GetPolicy(ctx, immutabilityName)
 	missingPolicy := errors.Is(policyErr, auth.ErrNotFound)
 	if policyErr != nil && !missingPolicy {
 		return fmt.Errorf("datasets: read policy %s: %w", immutabilityName, policyErr)
 	}
+	tamperedGuard := policyErr == nil &&
+		!statementsEqual(existingGuard.Statement, ImmutabilityPolicy(dataset, r.now()).Statement)
 	if err := r.svc.ensureImmutabilityGuard(ctx, dataset); err != nil {
 		return err
 	}
-	if missingPolicy {
+	switch {
+	case missingPolicy:
 		report.PoliciesReattached++
 		r.log.WithFields(logging.Fields{
 			"dataset": dataset,
 			"policy":  immutabilityName,
 		}).Warn("datasets: re-created a missing immutability guard")
+	case tamperedGuard:
+		report.PoliciesReattached++
+		r.log.WithFields(logging.Fields{
+			"dataset": dataset,
+			"policy":  immutabilityName,
+		}).Warn("datasets: rewrote an immutability guard whose statements did not match")
 	}
 
 	// Consumer read policy (§9.2): only datasets with grants have one; re-attach it to the
@@ -667,20 +1051,31 @@ func (r *Reconciler) ensureDatasetPolicies(ctx context.Context, dataset string, 
 		return nil
 	}
 	consumerName := ConsumerReadPolicyName(dataset)
-	_, policyErr = r.svc.authService.GetPolicy(ctx, consumerName)
+	existingConsumer, policyErr := r.svc.authService.GetPolicy(ctx, consumerName)
 	missingPolicy = errors.Is(policyErr, auth.ErrNotFound)
 	if policyErr != nil && !missingPolicy {
 		return fmt.Errorf("datasets: read policy %s: %w", consumerName, policyErr)
 	}
+	// SEC-6: the managed read policy is the grant, so its statements must be the managed ones.
+	// A pre-created "dataset-<name>-read" with fs:* on * is rewritten here, not trusted.
+	tamperedConsumer := policyErr == nil &&
+		!statementsEqual(existingConsumer.Statement, ConsumerReadPolicy(dataset, r.now()).Statement)
 	if err := r.svc.ensureConsumerPolicy(ctx, dataset); err != nil {
 		return err
 	}
-	if missingPolicy {
+	switch {
+	case missingPolicy:
 		report.PoliciesReattached++
 		r.log.WithFields(logging.Fields{
 			"dataset": dataset,
 			"policy":  consumerName,
 		}).Warn("datasets: re-created a missing consumer read policy")
+	case tamperedConsumer:
+		report.PoliciesReattached++
+		r.log.WithFields(logging.Fields{
+			"dataset": dataset,
+			"policy":  consumerName,
+		}).Warn("datasets: rewrote a consumer read policy whose statements did not match")
 	}
 	for _, grant := range grants {
 		var attachErr error
@@ -712,6 +1107,27 @@ func (r *Reconciler) ensureDatasetPolicies(ctx context.Context, dataset string, 
 // ensureInstallationPolicies keeps the installation-wide managed policies in step with the
 // dataset set and re-attaches them to their groups (§9.5 note, §12.3 item 3).
 func (r *Reconciler) ensureInstallationPolicies(ctx context.Context, names []string, report *ReconcileReport) error {
+	// SEC-6: the built-in policies are managed too. Their names are predictable, so one could
+	// be pre-created or edited by hand; ensureManagedPolicy compares the statements with the
+	// ones this pass would write, rewrites a mismatch and logs a warning.
+	for _, policy := range builtinDatasetPolicies(r.now()) {
+		rewritten, err := ensureManagedPolicy(ctx, r.svc.authService, policy)
+		if err != nil {
+			return err
+		}
+		if rewritten {
+			report.PoliciesReattached++
+			r.log.WithField("policy", policy.DisplayName).
+				Warn("datasets: rewrote a built-in policy whose statements did not match")
+		}
+	}
+	// DOC-1: rewrite managed policies still written with the legacy plural namespace.
+	if migrated, err := MigrateLegacyManagedPolicies(ctx, r.svc.authService); err != nil {
+		return err
+	} else if migrated {
+		report.PoliciesReattached++
+		r.log.Warn("datasets: migrated legacy managed policies to the dataset: namespace")
+	}
 	drift, err := DetectDatasetsAllReadDrift(ctx, r.svc.authService, names, r.now())
 	if err != nil {
 		return err
@@ -731,31 +1147,22 @@ func (r *Reconciler) ensureInstallationPolicies(ctx context.Context, names []str
 		{DatasetConsumersGroup, []string{DatasetsReadAllPolicyName, DatasetsAllReadPolicyName}},
 	}
 	for _, attachment := range attachments {
-		if err := attachDatasetPolicies(ctx, r.svc.authService, r.log, attachment.group, attachment.policies); err != nil {
+		if err := attachDatasetPolicies(ctx, r.svc.authService, attachment.group, attachment.policies); err != nil {
 			return err
 		}
-	}
-
-	// §8.2: re-create and re-attach the installation-wide pin protection too. It is the defence in
-	// depth of the §9.4 authorizer guard (immutability_guard.go): a principal the guard does not
-	// cover is still stopped by the deny policy, so neither a deleted policy nor a detached
-	// attachment may survive a pass. createDatasetPolicies never overwrites an existing policy, so an
-	// administrator's edit is left alone (the same promise the bootstrap makes).
-	if err := createDatasetPolicies(ctx, r.svc.authService, []*model.Policy{PinsProtectPolicy(r.now())}); err != nil {
-		return err
-	}
-	if err := attachPinsProtectPolicy(ctx, r.svc.authService, r.log, r.svc.cfg.ImmutableGuardGroups); err != nil {
-		return err
 	}
 	return nil
 }
 
 // reconcileDegraded applies §12.3 item 4: mark an active dataset degraded when a pinned
 // source repository is gone, and clear the mark when every source is reachable again.
-func (r *Reconciler) reconcileDegraded(ctx context.Context, rec *DatasetRecord, missing bool, report *ReconcileReport) error {
+//
+// pins is the dataset's slice of the pass's pin index (BUG-14), so the check costs no extra
+// pin scan; it is only consulted when ensureDatasetPins already reported a missing source.
+func (r *Reconciler) reconcileDegraded(ctx context.Context, rec *DatasetRecord, missing bool, pins []*PinRecord, report *ReconcileReport) error {
 	switch {
 	case missing && rec.State == DatasetStateActive:
-		_, marked, err := r.pins.CheckDatasetDegraded(ctx, rec.Name)
+		_, marked, err := r.pins.checkDatasetDegraded(ctx, rec.Name, pins)
 		if err != nil {
 			return err
 		}
@@ -776,64 +1183,102 @@ func (r *Reconciler) reconcileDegraded(ctx context.Context, rec *DatasetRecord, 
 	return nil
 }
 
-// removeOrphanPins deletes the pin records, and their branches, that no version references
-// (§12.3 item 2). A pin is an orphan when its reference set is empty, or when every
-// reference names a dataset that no longer exists; a pin held by a dataset that is still
-// being published is left alone, because §12.3 item 1 owns that record.
-func (r *Reconciler) removeOrphanPins(ctx context.Context, records []*DatasetRecord, report *ReconcileReport) error {
-	pins, err := r.store.listAllPins(ctx)
-	if err != nil {
-		return err
-	}
+// removeOrphanPins deletes the pin references, and the pin branches, that no dataset holds
+// (§12.3 item 2). A reference is an orphan when the dataset it names no longer exists; a pin
+// whose references are all orphans is removed with its branch. A pin held by a dataset that
+// is still being published is left alone, because §12.3 item 1 owns that record.
+//
+// pins is the snapshot taken at the start of the pass, before the dataset list. That snapshot
+// alone is not proof of an orphan (BUG-4): a dataset can be created and published while the
+// pass runs. Before deleting anything the pin is re-read and every dataset its references name
+// is looked up in the store, and only the references that are still orphans are deleted - a
+// reference added in the meantime is a different record and survives (BUG-15). The branch is
+// deleted only when the pin is left with no reference at all.
+func (r *Reconciler) removeOrphanPins(ctx context.Context, pins []*PinRecord, report *ReconcileReport) {
 	dsMetrics.pinsTotal.Set(float64(len(pins)))
 
-	known := make(map[string]struct{}, len(records))
-	for _, rec := range records {
-		if rec != nil {
-			known[rec.Name] = struct{}{}
-		}
-	}
-	for _, pin := range pins {
+	for _, listed := range pins {
 		if ctx.Err() != nil {
-			return nil
+			return
 		}
-		if !pinIsOrphan(pin, known) {
+		if listed == nil {
 			continue
 		}
-		src := PinnedSource{Repository: pin.Repository, CommitID: pin.CommitID}
+		src := PinnedSource{Repository: listed.Repository, CommitID: listed.CommitID}
+
+		// Re-read: the listing is a snapshot, and a concurrent Acquire may have added a
+		// reference (or a concurrent pass may have removed the pin) since.
+		pin, _, err := r.store.GetPin(ctx, listed.Repository, listed.CommitID)
+		switch {
+		case errors.Is(err, kv.ErrNotFound):
+			continue // already deleted; its branch is re-checked by its own deleter
+		case err != nil:
+			report.Errors++
+			dsMetrics.reconcileErrors.Inc()
+			r.log.WithError(err).WithField("pin", src.String()).Warn("datasets: could not re-read a pin before orphan cleanup")
+			continue
+		}
+
+		orphans, err := r.orphanReferences(ctx, pin)
+		if err != nil {
+			report.Errors++
+			dsMetrics.reconcileErrors.Inc()
+			r.log.WithError(err).WithField("pin", src.String()).Warn("datasets: could not re-check a pin before orphan cleanup")
+			continue
+		}
+		if len(orphans) == 0 {
+			continue
+		}
+
+		remaining, err := r.store.DeletePinReferences(ctx, pin.Repository, pin.CommitID, orphans)
+		if err != nil {
+			report.Errors++
+			dsMetrics.reconcileErrors.Inc()
+			r.log.WithError(err).WithField("pin", src.String()).Warn("datasets: could not delete orphan pin references")
+			continue
+		}
+		if remaining > 0 {
+			// The pin still protects a dataset: it keeps its branch, and the next pass
+			// re-checks the rest.
+			continue
+		}
 		if err := r.pins.deletePinBranch(ctx, src); err != nil {
 			report.Errors++
 			dsMetrics.reconcileErrors.Inc()
 			r.log.WithError(err).WithField("pin", src.String()).Warn("datasets: could not delete an orphan pin branch")
 			continue
 		}
-		if err := r.store.DeletePin(ctx, pin.Repository, pin.CommitID); err != nil && !errors.Is(err, kv.ErrNotFound) {
-			report.Errors++
-			dsMetrics.reconcileErrors.Inc()
-			r.log.WithError(err).WithField("pin", src.String()).Warn("datasets: could not delete an orphan pin record")
-			continue
-		}
 		report.PinsRemoved++
 		r.log.WithField("pin", src.String()).Info("datasets: removed an orphan GC pin")
 	}
-	return nil
 }
 
-// pinIsOrphan reports whether no existing dataset references pin.
-func pinIsOrphan(pin *PinRecord, known map[string]struct{}) bool {
+// orphanReferences returns the references of pin that no existing dataset holds. It asks the
+// store about every name in the reference set rather than trusting the pass's dataset snapshot
+// (BUG-4): a dataset created after that snapshot is exactly the race an orphan sweep must not
+// lose. A reference it cannot parse, or a store error, is not evidence of an orphan: the pin is
+// left for the next pass.
+func (r *Reconciler) orphanReferences(ctx context.Context, pin *PinRecord) ([]string, error) {
 	if pin == nil || len(pin.References) == 0 {
-		return true
+		return nil, nil
 	}
+	orphans := make([]string, 0, len(pin.References))
 	for _, ref := range pin.References {
 		name, ok := datasetOfPinReference(ref)
 		if !ok {
-			continue // an unparseable reference is not evidence of an orphan
+			continue
 		}
-		if _, exists := known[name]; exists {
-			return false
+		_, _, err := r.store.GetDataset(ctx, name)
+		switch {
+		case err == nil:
+			continue
+		case errors.Is(err, kv.ErrNotFound):
+			orphans = append(orphans, ref)
+		default:
+			return nil, err
 		}
 	}
-	return true
+	return orphans, nil
 }
 
 // datasetOfPinReference splits a "<dataset>@v<n>" memo (PinReference) into the dataset name.
@@ -843,6 +1288,45 @@ func datasetOfPinReference(ref string) (string, bool) {
 		return "", false
 	}
 	return ref[:idx], true
+}
+
+// rebuildStats recomputes the ItemStats of a version from its dataset repository commit
+// (§5.3 VersionRecord.Stats), so a rebuilt record is not left with zeroes. Entries are
+// attributed to the definition item whose target contains them; §5.2 rule 3 keeps targets
+// disjoint, so the attribution is unambiguous. The synthetic definition entry is skipped.
+func (r *Reconciler) rebuildStats(ctx context.Context, dataset, commitID string, def Definition) (ItemStats, error) {
+	items := make([]ItemStat, len(def.Data))
+	for i := range def.Data {
+		items[i].Target = def.Data[i].Target
+	}
+	after := ""
+	for {
+		entries, hasMore, err := r.catalog.ListEntries(ctx, dataset, commitID, "", after, "", catalog.ListEntriesLimitMax)
+		if err != nil {
+			return ItemStats{}, err
+		}
+		for _, entry := range entries {
+			if entry.Path == DefinitionPath {
+				continue
+			}
+			idx := definitionItemIndex(&def, entry.Path)
+			if idx < 0 {
+				continue
+			}
+			items[idx].Objects++
+			items[idx].Bytes += entry.Size
+		}
+		if !hasMore || len(entries) == 0 {
+			break
+		}
+		after = entries[len(entries)-1].Path
+	}
+	stats := ItemStats{Items: items}
+	for _, item := range items {
+		stats.Objects += item.Objects
+		stats.Bytes += item.Bytes
+	}
+	return stats, nil
 }
 
 // definitionItemIndex returns the index of the definition item that owns path, or -1 when no

@@ -108,9 +108,14 @@ export const metadataKeyCreateRequest = (form: MetadataKeyFormState): MetadataKe
     return request;
 };
 
-/** The update request of the form: it never carries `type`, which §5.5 forbids changing. */
+/**
+ * The update request of the form. A PUT is a full replacement and requires `type` (DOC-10), so
+ * the current type is sent back unchanged: the server rejects a change with 409, and the type
+ * selector is disabled while editing.
+ */
 export const metadataKeyUpdateRequest = (form: MetadataKeyFormState): MetadataKeyUpdateRequest => {
     const request: MetadataKeyUpdateRequest = {
+        type: form.type,
         required: form.required,
         allow_multiple: form.allowMultiple,
     };
@@ -282,11 +287,11 @@ const MetadataKeyFormModal: FC<{
  * because §5.5 forbids changing it: existing values keep their type, so a changed type would
  * silently reinterpret them. The intended path is delete and recreate.
  *
- * The page is rendered only for a caller holding `datasets:ManageMetadataKeys`; a `403` from the
+ * The page is rendered only for a caller holding `dataset:CreateMetadataKey`; a `403` from the
  * list is handled the same way as the policy check saying no.
  */
 const DatasetsSettingsPage: FC = () => {
-    // ``datasets:ManageMetadataKeys`` is granted on `metadata-key/*` (§9.1), so any representative
+    // ``dataset:CreateMetadataKey`` is granted on `arn:lakefs:dataset:::dataset/*` (§9.1), so any representative
     // key name resolves the wildcard for the question "may this user manage the keys".
     const permission = usePermission(DATASETS_MANAGE_METADATA_KEYS_ACTION, metadataKeyResource('classification'));
     const [creating, setCreating] = useState(false);

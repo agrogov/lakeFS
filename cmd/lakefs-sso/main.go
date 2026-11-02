@@ -48,17 +48,15 @@ func main() {
 	lakefsCmd.Execute()
 }
 
-// buildAuthService is sso.BuildAuthService with the datasets §9.4 immutability guard in front of
-// it, so that every authorizer decision the server makes - the REST API and the S3 gateway, not
-// only the datasets control plane - refuses a write to a dataset repository, however the caller
-// was granted the write (custom group, SSO-synced group, directly attached policy).
-//
-// SEC-2 of DATASETS_REVIEW.md: the per-dataset deny policy is only attached to the groups the
-// bootstrap knows, so a principal outside that list could upload into <dataset>/latest/..., move a
-// dataset tag or delete the repository. Wrapping here rather than inside pkg/sso also keeps the
-// datasets package out of pkg/sso, which cmd/lakefs/cmd already imports.
+// buildAuthService is sso.BuildAuthService plus, when datasets are enabled, the SEC-2
+// immutability guard: an authorizer-level deny of every write action on dataset repositories,
+// independent of the groups and policies a principal holds.
 func buildAuthService(ctx context.Context, cfg config.Config, logger logging.Logger, kvStore kv.Store, mm *auth.KVMetadataManager) auth.Service {
-	return datasets.WrapAuthService(sso.BuildAuthService(ctx, cfg, logger, kvStore, mm), kvStore, logger)
+	svc := sso.BuildAuthService(ctx, cfg, logger, kvStore, mm)
+	if dcfg, err := datasets.LoadConfig(); err == nil && dcfg.Enabled {
+		return datasets.NewImmutabilityAuthService(svc, datasets.NewDatasetRepoSet(kvStore))
+	}
+	return svc
 }
 
 // newSSOmigrateCmd returns the "sso-migrate" cobra command that copies the existing

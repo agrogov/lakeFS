@@ -48,11 +48,23 @@ Iceberg REST catalog (the routes return 501 via `api.MountNotImplementedServices
 
 ### 1.2 Non-Goals (MVP)
 
-- Iceberg `table` / `namespace` items and `catalog.<ds>.<ref>.<ns>.<table>` addressing (Phase 5, needs an Iceberg REST catalog).
-- Wire compatibility with the Enterprise REST API beyond path shape and definition format (we have no access to its spec).
+- Iceberg `table` / `namespace` items and `catalog.<ds>.<ref>.<ns>.<table>` addressing (Phase 5, needs
+  an Iceberg REST catalog; see [`ICEBERG_CATALOG_PLAN.md`](ICEBERG_CATALOG_PLAN.md)). Those items decode and
+  answer `501`.
+- Wire compatibility with the Enterprise REST API beyond the compatibility target below.
 - Datasets spanning different storage IDs (multi-blockstore) — rejected at validation time.
 - Version deletion / retention policies for dataset versions.
 - Copy-on-publish ("snapshot") mode that physically copies data.
+
+**Compatibility target.** The public Enterprise OpenAPI, **ent-swagger v1.108**
+(`docs.lakefs.io/reference/api/enterprise/v1.108/swagger.yml`), is the specification this control plane
+follows: the definition format, the control-plane paths, the field names and the `dataset:*` RBAC actions.
+The deliberate deviations are `GET /datasets/config`, `POST /{dataset}/validate`, `POST /{dataset}/versions`
+and its asynchronous `202` (also reachable as `?async=true` on create), `GET /{dataset}/tasks/{id}`,
+`GET|POST /{dataset}/access` with `DELETE /{dataset}/access/{principal_type}/{principal_id}`, the
+`?type=data` diff extension, and the `dataset:ManageAccess` action. The request side accepts a superset in
+two places: metadata values may be scalars or arrays (responses always use arrays of strings), and a
+source ref may be a `branch` or `tag` as well as a `commit` (stored definitions only hold commits).
 
 ---
 
@@ -322,7 +334,7 @@ Normalisation rules (applied before validation and storage):
 Validation (`validate.go`):
 
 1. `name` matches `^[a-z0-9][a-z0-9-]{2,62}$` and isn't `reservedNames` (`_datasets`, …).
-2. `format_version == 1`; `1 <= len(data) <= datasets.max_items` (default 1000).
+2. `format_version` is absent on the wire or `1` (the server stores 1, DOC-12); `1 <= len(data) <= datasets.max_items` (default 1000).
 3. Targets must not overlap: no target equal to or a path-prefix of another (`a` vs `a/b` → error). This guarantees
    each output key has exactly one source and makes materialisation a pure merge.
 4. Source repository exists, isn't itself a dataset (no nesting in MVP), and has the same `StorageID` as the dataset
@@ -340,9 +352,9 @@ the rest of lakeFS, so it's covered by existing backup/HA). Values are JSON (no 
 |---|---|---|
 | `datasets/<name>` | `DatasetRecord` | head pointer, CAS target |
 | `versions/<name>/<n:010d>` | `VersionRecord` | immutable after write |
-| `proposals/<name>/<id>` | `ProposalRecord` | |
+| `proposals/<name>/<desc-id>` | `ProposalRecord` | `desc-id` encodes the id so key order is newest-first (the listing pages with a forward scan) |
 | `metadata_keys/<key>` | `MetadataKey` | |
-| `pins/<repo>/<commit>` | `PinRecord` | set of `<dataset>@v<n>` references |
+| `pins/<repo>/<commit>/<dataset>@v<n>` | `PinReferenceRecord` | one item per reference; a pin is the prefix, so no item grows past DynamoDB's 400KB limit |
 | `grants/<name>/<principal-type>/<principal>` | `GrantRecord` | mirror of attached policies, for listing |
 
 ```go
@@ -381,14 +393,18 @@ record keeps only a `definition_ref` (dataset repo commit + path) instead of the
 
 - Versions are dense integers starting at 1. `latest` = `LatestVersion`.
 - Publish uses optimistic concurrency on `datasets/<name>`:
-  1. Read the `DatasetRecord` **together with the `kv.Predicate` that `Get` returned** and carry that predicate to
-     the next `SetIf`. The predicate is opaque: CosmosDB uses the document's ETag, the other backends the stored
-     value, and it changes on every write. A predicate re-derived from the record (re-encoding it, or comparing the
-     stored bytes with it) therefore works on Postgres/DynamoDB/local/mem and fails every write on CosmosDB.
-  2. Require `State == "active"` or the `pending` state to be stale (> `publish_timeout`, default 30m).
+  1. Read the `DatasetRecord` (`predicate = returned value`).
+  2. Require `State == "active"` or the `pending` state to be stale (> `publish_timeout`, default 30m). A stale
+     `publishing(N)` whose tag `vN` already points at a commit carrying `dataset.version=N` is adopted through the
+     reconciler's `completeVersion` instead of publishing N again.
   3. `SetIf` to `State="publishing", PendingVersion=N+1`. On `kv.ErrPredicateFailed` → `409 Conflict`.
-  4. Materialise (§6). On success, write `VersionRecord` then `SetIf` `LatestVersion=N+1, State="active"`.
-  5. On failure, `SetIf` back to `active` (best effort; the reconciler fixes leftovers).
+  4. Materialise (§6). While it runs the owner CAS-refreshes `UpdatedAt` every `publish_timeout/3`; the same CAS runs
+     once more immediately before the commit and the tag, so an attempt that lost the record never commits, and a
+     lost refresh cancels the publish context.
+  5. On success, write `VersionRecord` then `SetIf` `LatestVersion=N+1, State="active"`, retrying both with backoff.
+  6. On failure before the commit, `SetIf` back to `active` (best effort; the reconciler fixes leftovers). A failure
+     after the commit or the tag never rolls back and never releases pins: the record is left in
+     `publishing(PendingVersion=N)` for the reconciler.
 - The client may pass `expected_version` (like an ETag). Mismatch → `409` with `latest_version` in the body.
 - A dataset repo tag `vN` and the `VersionRecord` are the two sources of truth. On disagreement the reconciler (§12.3)
   trusts the tag and rebuilds the record from `_dataset/definition.json`.
@@ -479,9 +495,11 @@ Publish(ctx, name, def, message, publisher, expectedVersion):
   3. authorizeSources(publisher, resolved)                            // §9.3
   4. CAS DatasetRecord → publishing, PendingVersion = N+1             // §5.4
   5. pinSources(resolved, name, N+1)                                  // §8, BEFORE writing data
+     heartbeat: CAS DatasetRecord.UpdatedAt every publish_timeout/3          // §5.4
   6. it := newMergeIterator(resolved) + definition.json entry
   7. mrID := Store.WriteMetaRangeByIterator(ctx, dsRepo, it, WithForce(true))
   8. if N > 0 and mrID == version[N].MetaRangeID → abort 409 "no changes"
+     heartbeat again: the last ownership CAS, immediately before step 9 and 10
   9. commit := Catalog.Commit(ctx, name, "latest", message, publisher,
          metadata{dataset.version: N+1, dataset.proposal: id?}, nil, &mrID, false, WithForce(true))
  10. Catalog.CreateTag(ctx, name, "v<N+1>", commit.Reference, WithForce(true))
@@ -621,8 +639,10 @@ _lakefs_ds_pin_<commit-id>
   (`ref/manager.go:498`, `ShowHidden: true`). Branch HEADs are always retained regardless of retention rules, so the
   whole tree at that commit survives GC.
 - Hidden branches don't show up in default branch listings in the UI/`lakectl`.
-- Refcount: `pins/<repo>/<commit>` holds the set of `dataset@vN` that reference it. The branch is deleted when the set
-  becomes empty (dataset deleted; versions aren't deleted in the MVP, so in practice only on dataset delete).
+- Refcount: every `dataset@vN` that references a commit is one record under `pins/<repo>/<commit>/`, and the pin is the
+  set of records under that prefix (one item per reference, so the pin does not grow into one oversized item). The
+  branch is deleted when the last record is removed (dataset deleted; versions aren't deleted in the MVP, so in practice
+  only on dataset delete).
 - Branch names use the commit ID only (not the dataset name), so many datasets share one pin and dataset names aren't
   leaked to readers of the source repo.
 - Read-only source repos: `Force` bypasses read-only. Protected-branch rules matching `*` would block creation (protection
@@ -630,14 +650,10 @@ _lakefs_ds_pin_<commit-id>
 
 Risks:
 
-- Source repo admins can delete pin branches, and anyone with `fs:CreateBranch` can squat on a pin branch name, which
-  makes every publish that pins the commit fail. Mitigation: deny policy `datasets-pins-protect` with
-  `fs:{DeleteBranch,CreateBranch,CreateCommit,RevertBranch}` on
+- Source repo admins can delete pin branches. Mitigation: deny policy `datasets-pins-protect` with `fs:DeleteBranch` on
   `arn:lakefs:fs:::repository/*/branch/_lakefs_ds_pin_*` attached to all non-service principals (needs ARN wildcard
   support in the middle of the resource; `auth.ArnMatch` uses wildcard matching on the resource part, **verify in S2**).
-  The bootstrap that creates and attaches it runs on every `lakefs-sso` start (`datasets.RoutesBuilder`), and the
-  reconciler re-creates the policy and re-attaches it, so a deleted policy does not stay deleted. The reconciler also
-  recreates missing pins and reports them.
+  The reconciler recreates missing pins and reports them.
 - Deleting a source repository deletes its pins. Dataset reads keep working until the source storage namespace's data is
   removed by someone. The reconciler marks such versions `degraded` and the UI shows a warning.
 
@@ -715,57 +731,36 @@ read is done by the server with its own blockstore credentials. That matches the
 
 On create, publish, and proposal create/update, for every item the service checks **as the caller**:
 
-- `fs:ListObjects` on `RepoArn(src)` - the ARN the core API authorises listing against
-  (`Controller.DiffBranch`, `Controller.ListObjects`),
-- `fs:ReadObject` on `ObjectArn(src, path)` (object) or `ObjectArn(src, prefix+"*")` (prefix) for the item, and
-- `fs:ReadObject` on `ObjectArn(src, <key>)` for **every object** the item materialises.
-
-The per-object check is what makes a `Deny` on a sub-path work. `ArnMatch` treats the policy resource as the pattern, so
-a deny on `arn:lakefs:fs:::repository/hr/object/salaries/*` never matches the literal request
-`arn:lakefs:fs:::repository/hr/object/*`: authorising only the item ARN would copy the denied objects into the dataset.
-Decisions are cached per (policy set, path prefix), and a denial names the item and the first denied path. Source paths
-are literal repository keys - `*` and `?` are rejected in `object.path` and `prefix.path` - so an item cannot widen the
-ARN its own check authorises.
-
-`fs:ReadCommit` is deliberately **not** required: the public documentation asks for `fs:ListObjects` + `fs:ReadObject`
-on the source path, and every object is checked individually anyway.
+- `fs:ReadCommit` on `RepoArn(src)` and
+- `fs:ReadObject` + `fs:ListObjects` on `ObjectArn(src, path)` (object) or `ObjectArn(src, prefix+"*")` (prefix).
 
 Any failure → `403` naming the item. When a proposal is merged, the check runs for the **author** (at creation) and the
 **merger** (at merge) — the merger is publishing the data under their authority.
 
 ### 9.4 Immutability guard
 
-`ReadOnly` + `force=true` is the only bypass. Immutability is enforced in the **authorizer**, not only through
-policies (SEC-2 of `DATASETS_REVIEW.md`): the `lakefs-sso` auth-service builder wraps the `auth.Service` it hands to
-the REST API and the S3 gateway (`datasets.WrapAuthService`, `pkg/datasets/immutability_guard.go`), and that wrapper
-answers every authorization request for a write action on a resource of a **dataset repository** with a denial. The
-set of dataset repositories is a cached name set read from the datasets KV partition, refreshed on a TTL and updated
-by the service on create/delete. The service itself doesn't go through `Authorize` for its own writes (`force`), so
-it isn't affected.
+`ReadOnly` + `force=true` is the only bypass. Per dataset, the service writes `dataset-<name>-immutable`:
+
 ```json
 { "statement": [ { "effect": "deny",
   "action": ["fs:WriteObject", "fs:DeleteObject", "fs:CreateCommit", "fs:CreateBranch", "fs:DeleteBranch",
              "fs:RevertBranch", "fs:CreateTag", "fs:DeleteTag", "fs:UpdateRepository", "fs:DeleteRepository",
-             "fs:ImportFromStorage", "fs:ImportCancel", "fs:AttachStorageNamespace",
-             "branches:SetBranchProtectionRules", "retention:SetGarbageCollectionRules", "pr:WritePullRequest",
-             "catalog:Create*", "catalog:Update*", "catalog:Delete*", "ci:WriteAction"],
+             "fs:ImportFromStorage", "fs:AttachStorageNamespace", "branches:SetBranchProtectionRules",
+             "retention:SetGarbageCollectionRules", "ci:WriteAction"],
   "resource": "arn:lakefs:fs:::repository/customer-360" },
   { "effect": "deny", "action": ["...same list..."],
   "resource": "arn:lakefs:fs:::repository/customer-360/*" } ] }
 ```
 
-As defence in depth, the service also writes the per-dataset deny policy `dataset-<name>-immutable` with the same
-statements and attaches it to the base groups `Admins`, `Supers`, `Writers`, `Readers` plus every group in
-`datasets.immutable_guard_groups`. That policy protects an installation whose authorizer is not wrapped (a stock
-`lakefs` binary), and it denies through the ordinary policy engine.
+and attaches it to the base groups `Admins`, `Supers`, `Writers`, `Readers` plus every group in
+`datasets.immutable_guard_groups`. The service doesn't go through `Authorize` for its own writes, so it isn't affected.
 
 Limits (documented, accepted):
 
 - An admin can detach the deny policy, and then use `force`. That's equivalent to an admin deleting any repo today.
-  The reconciler re-attaches it and logs a warning. The authorizer guard is independent of the attachment.
-- Before the authorizer guard, users who weren't members of a guarded group were not covered. With SSO group sync
-  every interactive user is in a base group, but custom groups, `sso.groups_claim` groups and policies attached
-  directly to a user were not, so the guard no longer relies on group membership.
+  The reconciler re-attaches it and logs a warning.
+- Users who aren't members of a guarded group aren't covered. With SSO group sync every interactive user is in a base
+  group; service accounts must be added to a guarded group.
 - The guard uses two exact resources (`repository/<name>` and `repository/<name>/*`) rather than `repository/<name>*`,
   which would also match an unrelated repository `<name>-something`.
 
@@ -818,13 +813,13 @@ Base path `/api/v1/datasets`. Errors use the core `Error` schema `{"message": ".
 | Method & path | Action | Description |
 |---|---|---|
 | `GET /datasets?prefix=&after=&amount=&search=&metadata.<k>=<v>` | `ListDatasets` (+ `ReadDataset` filter) | Paginated list with latest version summary. Metadata filters match the latest version. |
-| `POST /datasets` | `CreateDataset` | Body = definition envelope (§5.1). Without `publish`, creates an empty dataset (no version; `latest` has only the initial commit). With `publish`, creates `v1`. `201` + `Dataset`; `202` + `Task` for large ones. |
+| `POST /datasets` | `CreateDataset` | Body = definition envelope (§5.1). A create always publishes `v1` (DOC-14); `publish.message` names it and defaults to `Create dataset <name>`. `201` + `Dataset`; `202` + `Task` only with the explicit `?async=true` opt-in. |
 | `GET /datasets/{ds}` | `ReadDataset` | `Dataset` (record + latest definition). |
 | `DELETE /datasets/{ds}` | `DeleteDataset` | `204`. |
 | `POST /datasets/{ds}/validate` | `ReadDataset` | Dry run: normalise, resolve, validate, authorise sources, return resolved definition + stats estimate. No writes. |
 | `POST /datasets/{ds}/versions` | `PublishVersion` | Body `{definition, message, expected_version?}`. `201` + `Version` / `202` + `Task` / `409`. |
 | `GET /datasets/{ds}/versions?after=&amount=` | `ReadDataset` | Newest first. |
-| `GET /datasets/{ds}/versions/{version}` | `ReadDataset` | `version` = `vN` \| `N` \| `latest`. Full definition. |
+| `GET /datasets/{ds}/versions/{version}` | `ReadDataset` | `version` = `latest` \| `vN` (DOC-19: no bare or upper-case form). Full definition. |
 | `GET /datasets/{ds}/refs/{leftRef}/diff/{rightRef}?type=definition\|data&prefix=&after=&amount=` | `ReadDataset` | §10.3. Same path shape as Enterprise. |
 | `GET /datasets/{ds}/proposals?status=&after=&amount=` | `ReadDataset` | |
 | `POST /datasets/{ds}/proposals` | `CreateProposal` | Body `{definition, title, description}`. |
@@ -876,7 +871,7 @@ Task: {id, status, version, error, created_at, updated_at}
 
 ### 10.3 Diff
 
-- `leftRef`/`rightRef` accept `vN`, `latest`, or `proposal-<id>`.
+- `leftRef`/`rightRef` accept `latest`, `vN`, or the pull request `source_ref` `pr/<id>` (DOC-19).
 - `type=definition` (default): structural diff of the two resolved definitions, matched by `target`. An item is
   `changed` when repository, commit, type or source path differs.
 - `type=data`: `Catalog.Diff(ctx, ds, leftGravelerRef, rightGravelerRef, params)` on the dataset repo — native
@@ -966,7 +961,7 @@ credentials) → no change to upstream `cmd/lakectl`:
 ```
 lakectl datasets list [--prefix P] [--metadata k=v]
 lakectl datasets show <ds> [--version vN] [-o json]
-lakectl datasets create <ds> -f definition.json [--publish -m "msg"]
+lakectl datasets create <ds> -f definition.json [-m "msg"] [--async]
 lakectl datasets publish <ds> -f definition.json -m "msg" [--expected-version N] [--wait]
 lakectl datasets validate <ds> -f definition.json
 lakectl datasets versions <ds>
@@ -994,7 +989,9 @@ crashed node only blocks the others until its lease expires:
 1. Datasets stuck in `creating`/`publishing`/`deleting` longer than `publish_timeout` → resume or roll back:
    - if tag `vN` exists → write the missing `VersionRecord` from `_dataset/definition.json`, mark `active`;
    - else if `latest` HEAD has `dataset.version = N` → create the tag, then as above;
-   - else → release the pins added for N and mark `active`.
+   - else → roll back: `SetIf` the record back to `active` and only then release the pins added for N. The record is
+     re-read and re-checked for staleness first, and the CAS fails if the owner refreshed `UpdatedAt` in the meantime,
+     so a publish that is still heartbeating is never undone.
    A `deleting` record is finished instead of resumed: the repository, the pins, the policies/grants and the
    control-plane records are removed, because every delete step tolerates not-found (§6.6).
 2. Pins: every `(repo, commit)` referenced by a version has its pin branch; recreate if missing (log at WARN, metric

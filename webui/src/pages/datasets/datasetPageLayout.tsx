@@ -14,26 +14,34 @@ import {
 
 import { Link } from '../../lib/components/nav';
 import { DatasetsGate } from '../../lib/components/datasets/gate';
+import { DATASETS_MANAGE_ACCESS_ACTION, datasetResource, useCan } from '../../lib/components/datasets/hooks';
 
 /** The pages of one dataset, as the dataset nav presents them (§11.1, §11.2). */
 export const DATASET_PAGES = [
     { key: 'overview', label: 'Overview', icon: BookIcon },
     { key: 'data', label: 'Data', icon: FileDirectoryIcon },
-    { key: 'versions', label: 'Versions', icon: HistoryIcon },
+    { key: 'versions', label: 'History', icon: HistoryIcon },
     { key: 'compare', label: 'Compare', icon: DiffIcon },
-    { key: 'proposals', label: 'Pull Requests', icon: GitPullRequestIcon },
+    { key: 'pulls', label: 'Pull Requests', icon: GitPullRequestIcon },
     { key: 'access', label: 'Access', icon: ShieldIcon },
 ] as const;
 
-/** The dataset page a pathname points at; nested proposal routes belong to `proposals`. */
+/** One entry of `DATASET_PAGES`. */
+type DatasetPage = (typeof DATASET_PAGES)[number];
+
+/** The dataset page a pathname points at; nested pull-request routes belong to `pulls`. */
 export const datasetPageForPath = (pathname: string): string => {
     const match = /^\/datasets\/[^/]+\/([^/]+)/.exec(pathname);
     return match ? match[1] : 'overview';
 };
 
-const DatasetNav: FC<{ datasetId: string; active: string }> = ({ datasetId, active }) => (
+const DatasetNav: FC<{ datasetId: string; active: string; pages: readonly DatasetPage[] }> = ({
+    datasetId,
+    active,
+    pages,
+}) => (
     <Nav variant="tabs" className="datasets-nav-tabs" activeKey={active}>
-        {DATASET_PAGES.map((page) => (
+        {pages.map((page) => (
             <Nav.Item key={page.key}>
                 <Link
                     component={Nav.Link}
@@ -56,6 +64,10 @@ const DatasetPageLayout: FC = () => {
     const { datasetId = '' } = useParams();
     const location = useLocation();
     const active = datasetPageForPath(location.pathname);
+    // The Access tab manages grants, so it is offered only to a caller who may do that (§11.2):
+    // the control plane re-checks the permission and the page itself shows the gate (UI-7).
+    const canManageAccess = useCan(DATASETS_MANAGE_ACCESS_ACTION, datasetResource(datasetId));
+    const pages = DATASET_PAGES.filter((page) => page.key !== 'access' || canManageAccess);
 
     return (
         <DatasetsGate>
@@ -72,7 +84,7 @@ const DatasetPageLayout: FC = () => {
             </Breadcrumb>
             <div className="full-width-tabs-border">
                 <Container fluid="xl">
-                    <DatasetNav datasetId={datasetId} active={active} />
+                    <DatasetNav datasetId={datasetId} active={active} pages={pages} />
                 </Container>
             </div>
             <Container fluid="xl">

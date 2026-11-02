@@ -6,8 +6,11 @@ package datasets
 // service, which is the implementation the lakefs-sso binary runs.
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"sort"
 	"testing"
 	"time"
@@ -37,16 +40,6 @@ type serviceFixture struct {
 
 func newServiceFixture(t *testing.T) *serviceFixture {
 	t.Helper()
-	return newServiceFixtureOnStore(t, nil)
-}
-
-// newServiceFixtureOnStore builds the fixture with the datasets control-plane records on
-// controlPlane, or on the fixture's mem store when it is nil. The catalog, the auth service
-// and the block adapter always use the mem store: in production the datasets partition is a
-// KV store of its own, separate from the auth and graveler data, so putting it on a different
-// backend is the realistic arrangement.
-func newServiceFixtureOnStore(t *testing.T, controlPlane kv.Store) *serviceFixture {
-	t.Helper()
 	f := newDatasetFixture(t)
 	ctx := t.Context()
 
@@ -64,14 +57,14 @@ func newServiceFixtureOnStore(t *testing.T, controlPlane kv.Store) *serviceFixtu
 		StorageNamespacePrefix: "mem://datasets",
 	}
 	cfg.setDefaults()
-	if controlPlane == nil {
-		controlPlane = f.kvStore
-	}
-	svc, err := NewService(cfg, controlPlane, f.cat, authService)
+	svc, err := NewService(cfg, f.kvStore, f.cat, authService)
 	require.NoError(t, err)
 
 	fixture := &serviceFixture{datasetFixture: f, svc: svc, cfg: cfg, authService: authService, ts: ts}
 	fixture.addUser(t, testServiceUser, acl.AdminsGroup, DatasetAdminsGroup)
+	// Tests that drive the internal source walks directly (estimateSourceObjects, publish) read the
+	// sources as the default admin caller, the way resolveAuthorized sets it up for a request.
+	fixture.ctx = withSourceReader(fixture.ctx, svc.authorizer.SourceReader(fixture.caller()))
 	return fixture
 }
 
@@ -168,46 +161,52 @@ func withMetadata(def Definition, metadata map[string]any) Definition {
 	return def
 }
 
-func TestServiceCreateWithoutPublish(t *testing.T) {
+// TestServiceCreateAlwaysPublishesV1 is DOC-14: a create has no "empty dataset" mode. It also
+// pins the repository setup that used to be the whole point of a create without a publish.
+func TestServiceCreateAlwaysPublishesV1(t *testing.T) {
 	f := newServiceFixture(t)
 	commit := f.sourceRepo(t, "src", map[string]string{"data/customers/a.parquet": "a"})
 	def := prefixDefinition("src", commit.String(), "customers", "data/customers/")
 
-	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "empty-set", Definition: def})
+	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "v1-set", Definition: def})
 	require.NoError(t, err)
-	require.Equal(t, "empty-set", view.Record.Name)
+	require.Equal(t, "v1-set", view.Record.Name)
 	require.Equal(t, DatasetStateActive, view.Record.State)
-	require.Zero(t, view.Record.LatestVersion, "no publish means no version")
-	require.Nil(t, view.Version)
+	require.Equal(t, 1, view.Record.LatestVersion, "every create publishes v1")
+	require.NotNil(t, view.Version)
+	require.Equal(t, 1, view.Version.Version)
+	require.Equal(t, DefaultCreateMessage("v1-set"), view.Version.Message,
+		"the default message names the dataset")
 
-	versions, err := f.svc.store.ListVersions(f.ctx, "empty-set")
+	versions, err := f.svc.store.ListVersions(f.ctx, "v1-set")
 	require.NoError(t, err)
-	require.Empty(t, versions)
+	require.Len(t, versions, 1)
+	require.Equal(t, 1, versions[0].Version)
 
 	// §6.1: the backing repository is read-only, defaults to "latest" and carries the
 	// dataset metadata markers.
-	repo, err := f.cat.GetRepository(f.ctx, "empty-set")
+	repo, err := f.cat.GetRepository(f.ctx, "v1-set")
 	require.NoError(t, err)
 	require.True(t, repo.ReadOnly)
 	require.Equal(t, DefaultBranch, repo.DefaultBranch)
-	require.Contains(t, repo.StorageNamespace, "mem://datasets/empty-set-")
-	require.NotEqual(t, "mem://datasets/empty-set", repo.StorageNamespace, "the ULID suffix is required")
+	require.Contains(t, repo.StorageNamespace, "mem://datasets/v1-set-")
+	require.NotEqual(t, "mem://datasets/v1-set", repo.StorageNamespace, "the ULID suffix is required")
 
-	metadata, err := f.cat.GetRepositoryMetadata(f.ctx, "empty-set")
+	metadata, err := f.cat.GetRepositoryMetadata(f.ctx, "v1-set")
 	require.NoError(t, err)
 	require.Equal(t, "true", metadata[RepositoryMetadataIsDatasetKey])
 	require.Equal(t, "1", metadata[RepositoryMetadataFormatKey])
 
 	// §9.4: the immutability guard exists and is attached to the base groups.
-	policy, err := f.authService.GetPolicy(f.ctx, ImmutabilityPolicyName("empty-set"))
+	policy, err := f.authService.GetPolicy(f.ctx, ImmutabilityPolicyName("v1-set"))
 	require.NoError(t, err)
-	require.Equal(t, ImmutabilityPolicyName("empty-set"), policy.DisplayName)
+	require.Equal(t, ImmutabilityPolicyName("v1-set"), policy.DisplayName)
 
 	// §9.5 note: the aggregate read policy lists the new dataset.
 	allRead, err := f.authService.GetPolicy(f.ctx, DatasetsAllReadPolicyName)
 	require.NoError(t, err)
-	require.Contains(t, statementResources(allRead.Statement), permissions.RepoArn("empty-set"))
-	require.Contains(t, statementResources(allRead.Statement), DatasetArn("empty-set"))
+	require.Contains(t, statementResources(allRead.Statement), permissions.RepoArn("v1-set"))
+	require.Contains(t, statementResources(allRead.Statement), DatasetArn("v1-set"))
 }
 
 func TestServiceCreateWithPublish(t *testing.T) {
@@ -222,7 +221,6 @@ func TestServiceCreateWithPublish(t *testing.T) {
 	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       "customer-360",
 		Definition: def,
-		Publish:    true,
 		Message:    "initial dataset",
 	})
 	require.NoError(t, err)
@@ -269,11 +267,15 @@ func TestServiceCreateDuplicateName(t *testing.T) {
 	})
 
 	t.Run("repository", func(t *testing.T) {
+		// SEC-7: the answer is the same generic 409 for a dataset and for a plain repository,
+		// so it never confirms that a repository the caller cannot read exists.
 		_, err := f.cat.CreateRepository(f.ctx, "repo-taken", "", "mem://repo-taken-ns", "main", false)
 		require.NoError(t, err)
 		_, err = f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "repo-taken", Definition: def})
 		require.ErrorIs(t, err, ErrNameTaken)
-		require.Contains(t, err.Error(), "repository")
+		require.NotContains(t, err.Error(), "repository")
+		require.NotContains(t, err.Error(), "dataset")
+		require.Equal(t, "name unavailable: \"repo-taken\"", err.Error())
 	})
 }
 
@@ -281,7 +283,7 @@ func TestServiceGet(t *testing.T) {
 	f := newServiceFixture(t)
 	commit := f.sourceRepo(t, "src", map[string]string{"a.txt": "a"})
 	def := objectDefinition("src", commit.String(), "a.txt", "a.txt")
-	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "get-set", Definition: def, Publish: true})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "get-set", Definition: def})
 	require.NoError(t, err)
 
 	view, err := f.svc.Get(f.ctx, f.caller(), "get-set")
@@ -321,7 +323,7 @@ func TestServiceList(t *testing.T) {
 	} {
 		def := withMetadata(base, ds.metadata)
 		def.Description = "dataset " + ds.name
-		_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: ds.name, Definition: def, Publish: true})
+		_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: ds.name, Definition: def})
 		require.NoError(t, err)
 	}
 
@@ -351,7 +353,7 @@ func TestServiceList(t *testing.T) {
 	})
 
 	t.Run("metadata filter", func(t *testing.T) {
-		result, err := f.svc.List(f.ctx, f.caller(), ListRequest{Metadata: map[string]string{"tier": "gold"}})
+		result, err := f.svc.List(f.ctx, f.caller(), ListRequest{Metadata: map[string][]string{"tier": {"gold"}}})
 		require.NoError(t, err)
 		require.Equal(t, []string{"alpha-one", "beta-three"}, namesOf(result.Datasets))
 	})
@@ -359,14 +361,37 @@ func TestServiceList(t *testing.T) {
 	t.Run("metadata filter and prefix", func(t *testing.T) {
 		result, err := f.svc.List(f.ctx, f.caller(), ListRequest{
 			Prefix:   "alpha-",
-			Metadata: map[string]string{"tier": "gold"},
+			Metadata: map[string][]string{"tier": {"gold"}},
 		})
 		require.NoError(t, err)
 		require.Equal(t, []string{"alpha-one"}, namesOf(result.Datasets))
 	})
 
 	t.Run("metadata filter without match", func(t *testing.T) {
-		result, err := f.svc.List(f.ctx, f.caller(), ListRequest{Metadata: map[string]string{"tier": "bronze"}})
+		result, err := f.svc.List(f.ctx, f.caller(), ListRequest{Metadata: map[string][]string{"tier": {"bronze"}}})
+		require.NoError(t, err)
+		require.Empty(t, result.Datasets)
+	})
+
+	// Review m1: a repeated metadata key keeps every value, so the filter matches any of
+	// them (OR) instead of silently narrowing to the first one.
+	t.Run("repeated metadata values match any of them", func(t *testing.T) {
+		result, err := f.svc.List(f.ctx, f.caller(), ListRequest{Metadata: map[string][]string{"tier": {"gold", "silver"}}})
+		require.NoError(t, err)
+		require.Equal(t, []string{"alpha-one", "alpha-two", "beta-three"}, namesOf(result.Datasets))
+	})
+
+	// Different keys are still ANDed, and a repeated key stays OR inside that AND.
+	t.Run("metadata filters on different keys are ANDed", func(t *testing.T) {
+		result, err := f.svc.List(f.ctx, f.caller(), ListRequest{
+			Metadata: map[string][]string{"tier": {"gold", "silver"}, "owner": {"data-platform"}},
+		})
+		require.NoError(t, err)
+		require.Equal(t, []string{"alpha-two"}, namesOf(result.Datasets))
+
+		result, err = f.svc.List(f.ctx, f.caller(), ListRequest{
+			Metadata: map[string][]string{"tier": {"gold", "silver"}, "owner": {"missing"}},
+		})
 		require.NoError(t, err)
 		require.Empty(t, result.Datasets)
 	})
@@ -428,7 +453,7 @@ func TestServiceDeleteReleasesPinsAndPolicies(t *testing.T) {
 	f := newServiceFixture(t)
 	commit := f.sourceRepo(t, "src", map[string]string{"data/a.txt": "alpha"})
 	def := prefixDefinition("src", commit.String(), "a", "data/")
-	created, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "gone-set", Definition: def, Publish: true})
+	created, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "gone-set", Definition: def})
 	require.NoError(t, err)
 
 	f.addUser(t, "consumer")
@@ -492,7 +517,7 @@ func TestServiceDeleteReleasesPinsAndPolicies(t *testing.T) {
 	})
 
 	t.Run("name can be reused", func(t *testing.T) {
-		view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "gone-set", Definition: def, Publish: true})
+		view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "gone-set", Definition: def})
 		require.NoError(t, err)
 		require.Equal(t, 1, view.Record.LatestVersion)
 		require.NotEqual(t, oldNamespace, view.Record.StorageNS, "a re-created dataset gets a fresh storage namespace")
@@ -507,6 +532,231 @@ func TestServiceDeleteReleasesPinsAndPolicies(t *testing.T) {
 		err := f.svc.Delete(f.ctx, f.caller(), "never-existed")
 		require.ErrorIs(t, err, ErrDatasetNotFound)
 	})
+}
+
+// TestServiceDeleteRejectsLivePublish covers BUG-9: a delete racing a live publish is a 409,
+// while a stale publishing record may be deleted and its resources released.
+func TestServiceDeleteRejectsLivePublish(t *testing.T) {
+	const dataset = "delete-during-publish"
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, "src-delete-publish", map[string]string{"data/a.parquet": "a"})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition("src-delete-publish", commit.String(), "data", "data/"),
+	})
+	require.NoError(t, err)
+
+	current := f.datasetRecord(t, dataset)
+	live := *current
+	live.State = DatasetStatePublishing
+	live.PendingVersion = 2
+	live.UpdatedAt = f.svc.now()
+	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &live, current, nil))
+
+	err = f.svc.Delete(f.ctx, f.caller(), dataset)
+	require.ErrorIs(t, err, ErrPublishInProgress)
+	require.ErrorIs(t, err, ErrDatasetConflict)
+	_, err = f.cat.GetRepository(f.ctx, dataset)
+	require.NoError(t, err, "the repository survives a rejected delete")
+	require.Equal(t, DatasetStatePublishing, f.datasetRecord(t, dataset).State)
+
+	stale := live
+	stale.UpdatedAt = f.svc.now().Add(-f.cfg.PublishTimeout - time.Minute)
+	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &stale, &live, nil))
+	require.NoError(t, f.svc.Delete(f.ctx, f.caller(), dataset))
+	_, err = f.cat.GetRepository(f.ctx, dataset)
+	require.True(t, isNotFound(err), "a stale publishing record is deleted")
+}
+
+// TestServiceDeleteKeepsTheHeadRecordWhenACleanupStepFails covers m2: the head record is
+// deleted last, and only when every record it refers to is gone - the rule
+// reconciler.finishDelete already applied on the crash-repair path. Deleting it after a failed
+// step forgets the leftovers, because nothing would ever converge them again.
+func TestServiceDeleteKeepsTheHeadRecordWhenACleanupStepFails(t *testing.T) {
+	const dataset = "half-deleted"
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, "src-half-deleted", map[string]string{"data/a.parquet": "a"})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition("src-half-deleted", commit.String(), "data", "data/"),
+	})
+	require.NoError(t, err)
+
+	f.svc.store.deleteVersionFn = func(context.Context, string, int) error {
+		return errors.New("injected DeleteVersion failure")
+	}
+	err = f.svc.Delete(f.ctx, f.caller(), dataset)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "injected DeleteVersion failure")
+
+	rec, _, err := f.svc.store.GetDataset(f.ctx, dataset)
+	require.NoError(t, err, "the head record survives a delete that could not finish (m2)")
+	require.Equal(t, DatasetStateDeleting, rec.State, "the record is left for the reconciler to finish")
+	versions, err := f.svc.store.ListVersions(f.ctx, dataset)
+	require.NoError(t, err)
+	require.Len(t, versions, 1, "the version whose cleanup failed is still recorded")
+
+	// The leftover record is what makes the retry (and the reconciler) able to converge.
+	f.svc.store.deleteVersionFn = nil
+	require.NoError(t, f.svc.Delete(f.ctx, f.caller(), dataset))
+	_, _, err = f.svc.store.GetDataset(f.ctx, dataset)
+	require.ErrorIs(t, err, kv.ErrNotFound)
+	versions, err = f.svc.store.ListVersions(f.ctx, dataset)
+	require.NoError(t, err)
+	require.Empty(t, versions)
+}
+
+// TestServiceCreateReleasesLeftoverPinsOfADeletedDataset covers the second half of m2: a delete
+// that failed before releasing the pins leaves "<name>@vN" references under
+// pins/<repo>/<commit>, and cleanupLeftoverRecords now releases them before it removes the
+// version records. Without that step the old source commits stayed pinned - and a rollback of
+// the new dataset's v1 could not release them either - for the whole life of the new dataset.
+func TestServiceCreateReleasesLeftoverPinsOfADeletedDataset(t *testing.T) {
+	const dataset = "recycled"
+	f := newServiceFixture(t)
+
+	oldCommit := f.sourceRepo(t, "src-recycled-old", map[string]string{"data/a.parquet": "a"})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition("src-recycled-old", oldCommit.String(), "data", "data/"),
+	})
+	require.NoError(t, err)
+	require.True(t, datasetPinsInclude(t, f, dataset, 1), "v1 pins the source commit")
+
+	// Reproduce the leftover state a failed delete can leave: the head record and the dataset
+	// repository are gone, the pin reference and the v1 VersionRecord are not.
+	stale, predicate, err := f.svc.store.GetDataset(f.ctx, dataset)
+	require.NoError(t, err)
+	require.NoError(t, f.svc.store.DeleteDataset(f.ctx, dataset, stale, predicate))
+	require.NoError(t, f.cat.DeleteRepository(f.ctx, dataset, graveler.WithForce(true)))
+
+	newCommit := f.sourceRepo(t, "src-recycled-new", map[string]string{"data/a.parquet": "b"})
+	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition("src-recycled-new", newCommit.String(), "data", "data/"),
+	})
+	require.NoError(t, err, "the leftover version record of the old incarnation does not block v1")
+	require.Equal(t, 1, view.Record.LatestVersion)
+
+	t.Run("the old incarnation's pin is released", func(t *testing.T) {
+		_, _, err := f.svc.store.GetPin(f.ctx, "src-recycled-old", oldCommit.String())
+		require.ErrorIs(t, err, kv.ErrNotFound, "no reference of the old dataset survives (m2)")
+		_, err = f.refMgr.GetBranch(f.ctx, f.repositoryRecord(t, "src-recycled-old"),
+			graveler.BranchID(PinBranch(oldCommit.String())))
+		require.Error(t, err, "the orphaned pin branch is deleted with its last reference")
+	})
+
+	t.Run("the new version pins its own source", func(t *testing.T) {
+		_, _, err := f.svc.store.GetPin(f.ctx, "src-recycled-new", newCommit.String())
+		require.NoError(t, err)
+		require.True(t, datasetPinsInclude(t, f, dataset, 1))
+	})
+}
+
+// TestServiceCreateFailureRollsBackInline covers BUG-10: a create that fails after the
+// repository and the guard were written removes them and the record inline, so the name is
+// immediately reusable instead of staying "creating" for a reconcile timeout.
+func TestServiceCreateFailureRollsBackInline(t *testing.T) {
+	const dataset = "create-rollback"
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, "src-create-rollback", map[string]string{"data/a.parquet": "a"})
+	def := prefixDefinition("src-create-rollback", commit.String(), "data", "data/")
+
+	f.svc.publishFn = func(context.Context, *Materializer, PublishRequest) (*PublishResult, error) {
+		return nil, errors.New("metarange write failed")
+	}
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def})
+	require.Error(t, err)
+
+	_, _, err = f.svc.store.GetDataset(f.ctx, dataset)
+	require.ErrorIs(t, err, kv.ErrNotFound)
+	_, err = f.cat.GetRepository(f.ctx, dataset)
+	require.True(t, isNotFound(err), "the repository of a failed create is removed")
+	_, err = f.authService.GetPolicy(f.ctx, ImmutabilityPolicyName(dataset))
+	require.ErrorIs(t, err, auth.ErrNotFound, "the guard of a failed create is removed")
+
+	f.svc.publishFn = publishWithMaterializer
+	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def})
+	require.NoError(t, err)
+	require.Equal(t, 1, view.Record.LatestVersion)
+}
+
+// TestServiceInjectedClock pins BUG-13: publish timestamps, the pin manager's record timestamps
+// and the reconcile lease all follow the service clock instead of time.Now, so fake-clock tests
+// can drive staleness without sleeping.
+func TestServiceInjectedClock(t *testing.T) {
+	const (
+		dataset = "clocked"
+		source  = "src-clocked"
+	)
+	fixed := time.Date(2031, 3, 4, 5, 6, 7, 0, time.UTC)
+	now := fixed
+	f := newServiceFixture(t)
+	f.svc.setClock(func() time.Time { return now })
+
+	// The create publishes v1: both the dataset record and the version record must use the
+	// injected clock, not the wall clock.
+	commit := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       dataset,
+		Definition: prefixDefinition(source, commit.String(), "data", "data/"),
+		Message:    "v1",
+	})
+	require.NoError(t, err)
+	require.True(t, view.Record.CreatedAt.Equal(fixed), "create writes the injected clock")
+	require.True(t, view.Record.UpdatedAt.Equal(fixed), "publish writes the injected clock")
+	require.NotNil(t, view.Version)
+	require.True(t, view.Version.PublishedAt.Equal(fixed), "the version timestamp uses the injected clock")
+	require.True(t, datasetPinsInclude(t, f, dataset, 1), "v1 pins its source")
+
+	// A later publish uses the advanced fake clock for its timestamps.
+	now = fixed.Add(90 * time.Minute)
+	second := f.commitObjects(t, source, "main", testObject{key: "data/a.parquet", content: []byte("b")})
+	outcome, err := f.svc.PublishVersion(f.ctx, f.caller(), dataset, PublishVersionRequest{
+		Definition: prefixDefinition(source, second.String(), "data", "data/"),
+		Message:    "v2",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, outcome.Version)
+	require.True(t, outcome.Version.PublishedAt.Equal(now), "v2 uses the advanced injected clock")
+	require.True(t, f.datasetRecord(t, dataset).UpdatedAt.Equal(now), "the head uses the advanced injected clock")
+	require.True(t, datasetPinsInclude(t, f, dataset, 2), "v2 pins its source")
+
+	// The pin manager's own record writes (markDegraded and ClearDatasetDegraded) use the
+	// same clock.
+	now = fixed.Add(2 * time.Hour)
+	marked, err := f.svc.pins.markDegraded(f.ctx, dataset)
+	require.NoError(t, err)
+	require.True(t, marked)
+	require.True(t, f.datasetRecord(t, dataset).UpdatedAt.Equal(now), "markDegraded writes the injected clock")
+
+	now = fixed.Add(3 * time.Hour)
+	cleared, err := f.svc.pins.ClearDatasetDegraded(f.ctx, dataset)
+	require.NoError(t, err)
+	require.True(t, cleared)
+	require.True(t, f.datasetRecord(t, dataset).UpdatedAt.Equal(now), "ClearDatasetDegraded writes the injected clock")
+
+	// The reconcile lease is stamped and expires on the injected clock.
+	now = fixed.Add(4 * time.Hour)
+	acquired, err := f.svc.store.AcquireLease(f.ctx, "clocked-owner", time.Minute)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	lease, _, err := f.svc.store.GetLease(f.ctx)
+	require.NoError(t, err)
+	require.True(t, lease.ExpiresAt.Equal(now.Add(time.Minute)), "the lease expiry uses the injected clock")
+
+	acquired, err = f.svc.store.AcquireLease(f.ctx, "other-owner", time.Minute)
+	require.NoError(t, err)
+	require.False(t, acquired, "a live lease is not taken over")
+
+	now = now.Add(time.Minute + time.Second)
+	acquired, err = f.svc.store.AcquireLease(f.ctx, "other-owner", time.Minute)
+	require.NoError(t, err)
+	require.True(t, acquired, "the lease expires on the injected clock")
+	lease, _, err = f.svc.store.GetLease(f.ctx)
+	require.NoError(t, err)
+	require.Equal(t, "other-owner", lease.Owner)
+	require.True(t, lease.ExpiresAt.Equal(now.Add(time.Minute)))
 }
 
 func TestServiceValidateReportsEveryProblem(t *testing.T) {
@@ -662,7 +912,7 @@ func TestServiceAccessGrantRoundTrip(t *testing.T) {
 	f := newServiceFixture(t)
 	commit := f.sourceRepo(t, "src", map[string]string{"a.txt": "a"})
 	def := objectDefinition("src", commit.String(), "a.txt", "a.txt")
-	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "shared-set", Definition: def, Publish: true})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "shared-set", Definition: def})
 	require.NoError(t, err)
 
 	f.addUser(t, "alice")
@@ -705,14 +955,18 @@ func TestServiceAccessGrantRoundTrip(t *testing.T) {
 		require.NoError(t, err)
 		_, err = f.svc.GrantAccess(f.ctx, f.caller(), "shared-set", PrincipalTypeGroup, "analysts")
 		require.NoError(t, err)
-		grants, err := f.svc.ListAccess(f.ctx, f.caller(), "shared-set")
+		grants, err := f.svc.ListAccess(f.ctx, f.caller(), "shared-set", "", 0)
 		require.NoError(t, err)
-		require.Len(t, grants, 2)
+		require.Len(t, grants.Grants, 2)
+		require.False(t, grants.HasMore)
 	})
 
 	t.Run("unknown principal is 404", func(t *testing.T) {
 		_, err := f.svc.GrantAccess(f.ctx, f.caller(), "shared-set", PrincipalTypeUser, "nobody")
-		require.ErrorIs(t, err, ErrDatasetNotFound)
+		// m6: the dataset exists, the principal does not, and the two 404s are distinguishable.
+		require.ErrorIs(t, err, ErrPrincipalNotFound)
+		require.NotErrorIs(t, err, ErrDatasetNotFound)
+		require.Contains(t, err.Error(), "nobody")
 	})
 
 	t.Run("invalid principal type is 400", func(t *testing.T) {
@@ -745,8 +999,51 @@ func TestServiceAccessGrantRoundTrip(t *testing.T) {
 
 	t.Run("revoking an unknown grant is 404", func(t *testing.T) {
 		err := f.svc.RevokeAccess(f.ctx, f.caller(), "shared-set", PrincipalTypeUser, "alice")
-		require.ErrorIs(t, err, ErrDatasetNotFound)
+		// m6: the dataset exists, the grant does not.
+		require.ErrorIs(t, err, ErrGrantNotFound)
+		require.NotErrorIs(t, err, ErrDatasetNotFound)
+		require.Contains(t, err.Error(), "shared-set")
 	})
+}
+
+// TestWriteServiceErrorDistinguishesTheNotFoundSentinels covers the HTTP half of m6: a missing
+// grant and an unknown principal are 404s, and neither claims the dataset itself is missing, so
+// the three not-found cases of the access card are distinguishable by the response body.
+func TestWriteServiceErrorDistinguishesTheNotFoundSentinels(t *testing.T) {
+	srv := &server{authzFailureStatus: http.StatusUnauthorized}
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "missing grant",
+			err:  fmt.Errorf("%w: user %q on dataset %q", ErrGrantNotFound, "alice", "shared-set"),
+			want: ErrGrantNotFound.Error(),
+		},
+		{
+			name: "unknown principal",
+			err:  fmt.Errorf("%w: user %q", ErrPrincipalNotFound, "nobody"),
+			want: ErrPrincipalNotFound.Error(),
+		},
+		{
+			name: "unknown dataset",
+			err:  fmt.Errorf("%w: %q", ErrDatasetNotFound, "never-existed"),
+			want: ErrDatasetNotFound.Error(),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodDelete, "/datasets/shared-set/access/user/alice", nil)
+			srv.writeServiceError(rec, req, tc.err)
+			require.Equal(t, http.StatusNotFound, rec.Code, "body: %s", rec.Body.String())
+			require.Contains(t, rec.Body.String(), tc.want)
+			if tc.want != ErrDatasetNotFound.Error() {
+				require.NotContains(t, rec.Body.String(), ErrDatasetNotFound.Error(),
+					"only the dataset itself is missing in the dataset case")
+			}
+		})
+	}
 }
 
 func TestServiceDatasetsAllReadMembership(t *testing.T) {
@@ -759,9 +1056,9 @@ func TestServiceDatasetsAllReadMembership(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, statementResources(policy.Statement), DatasetArn("first-set"))
 
-	_, err = f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "first-set", Definition: def, Publish: true})
+	_, err = f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "first-set", Definition: def})
 	require.NoError(t, err)
-	_, err = f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "second-set", Definition: def, Publish: true})
+	_, err = f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: "second-set", Definition: def})
 	require.NoError(t, err)
 
 	policy, err = f.authService.GetPolicy(f.ctx, DatasetsAllReadPolicyName)
@@ -787,4 +1084,170 @@ func policyNames(policies []*model.Policy) []string {
 		names[i] = policy.DisplayName
 	}
 	return names
+}
+
+// TestRollbackCreate_ModifiedRecordIsStillRemoved: the CAS predicate is the freshly read
+// record, so a record changed since creation does not survive the repository's deletion.
+func TestRollbackCreate_ModifiedRecordIsStillRemoved(t *testing.T) {
+	const dataset = "rollback-modified"
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, "src-rollback", map[string]string{"data/a.parquet": "a"})
+	def := prefixDefinition("src-rollback", commit.String(), "data", "data/")
+	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def})
+	require.NoError(t, err)
+	stale := view.Record
+
+	changed := *stale
+	changed.UpdatedAt = stale.UpdatedAt.Add(time.Minute)
+	require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &changed, stale, nil))
+
+	f.svc.rollbackCreate(f.ctx, stale)
+
+	_, _, err = f.svc.store.GetDataset(f.ctx, dataset)
+	require.ErrorIs(t, err, kv.ErrNotFound)
+}
+
+// failingAllReadAuth fails writes of the aggregate read policy.
+type failingAllReadAuth struct{ auth.Service }
+
+func (a failingAllReadAuth) WritePolicy(ctx context.Context, p *model.Policy, update bool) error {
+	if p.DisplayName == DatasetsAllReadPolicyName {
+		return errors.New("injected all-read policy failure")
+	}
+	return a.Service.WritePolicy(ctx, p, update)
+}
+
+// TestCreate_AllReadPolicyFailureStillReturnsDataset: the dataset is active once the policy
+// sync runs; the reconciler converges the policy, so Create does not fail.
+func TestCreate_AllReadPolicyFailureStillReturnsDataset(t *testing.T) {
+	const dataset = "policy-fails"
+	f := newServiceFixture(t)
+	f.svc.authService = failingAllReadAuth{Service: f.svc.authService}
+	commit := f.sourceRepo(t, "src-policy", map[string]string{"data/a.parquet": "a"})
+	def := prefixDefinition("src-policy", commit.String(), "data", "data/")
+
+	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def})
+	require.NoError(t, err)
+	require.Equal(t, DatasetStateActive, view.Record.State)
+	require.Equal(t, DatasetStateActive, f.datasetRecord(t, dataset).State)
+}
+
+// TestEffectiveAmountClamps is SEC-5: pagination has no "everything" value. A non-positive
+// amount is the default page size and an oversized one is clamped, so a client can never make
+// the server build an unbounded page.
+func TestEffectiveAmountClamps(t *testing.T) {
+	for _, tt := range []struct {
+		amount int
+		want   int
+	}{
+		{-1, DefaultListAmount},
+		{-1000, DefaultListAmount},
+		{0, DefaultListAmount},
+		{1, 1},
+		{MaxListAmount, MaxListAmount},
+		{MaxListAmount + 1, MaxListAmount},
+		{1 << 20, MaxListAmount},
+	} {
+		require.Equal(t, tt.want, effectiveAmount(tt.amount), "effectiveAmount(%d)", tt.amount)
+	}
+}
+
+// TestServiceListNegativeAmountIsDefaultPage is the SEC-5 test of the review: amount=-1 used to
+// mean "everything"; it now returns a default-sized page and reports has_more.
+func TestServiceListNegativeAmountIsDefaultPage(t *testing.T) {
+	f := newServiceFixture(t)
+	// Records without a version are enough: List only reads a version for LatestVersion > 0, so
+	// seeding the store keeps this a pagination test rather than a create test.
+	for i := 0; i <= DefaultListAmount; i++ {
+		name := fmt.Sprintf("bulk-set-%03d", i)
+		err := f.svc.store.CreateDataset(f.ctx, &DatasetRecord{
+			Name:      name,
+			CreatedBy: testServiceUser,
+			CreatedAt: f.ts,
+			UpdatedAt: f.ts,
+			State:     DatasetStateActive,
+			StorageID: f.cfg.StorageID,
+		})
+		require.NoError(t, err, "seed %s", name)
+	}
+
+	result, err := f.svc.List(f.ctx, f.caller(), ListRequest{Amount: -1})
+	require.NoError(t, err)
+	require.Len(t, result.Datasets, DefaultListAmount, "amount=-1 is the default page, not everything")
+	require.True(t, result.HasMore)
+	require.Equal(t, DefaultListAmount, result.MaxPerPage)
+	require.NotEmpty(t, result.NextOffset)
+
+	// The next page exists and is reachable through the cursor.
+	next, err := f.svc.List(f.ctx, f.caller(), ListRequest{Amount: -1, After: result.NextOffset})
+	require.NoError(t, err)
+	require.NotEmpty(t, next.Datasets)
+	require.False(t, next.HasMore)
+}
+
+// TestServiceRewritesPreCreatedManagedPolicies is SEC-6: the per-dataset managed policies have
+// predictable names, so one can be pre-created by a principal that may write policies but holds
+// no datasets permission. The service must compare the statements and rewrite a mismatch
+// instead of trusting the existing policy.
+func TestServiceRewritesPreCreatedManagedPolicies(t *testing.T) {
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, "src-squat", map[string]string{"a.txt": "a"})
+	def := objectDefinition("src-squat", commit.String(), "a.txt", "a.txt")
+
+	t.Run("consumer read policy", func(t *testing.T) {
+		const dataset = "squatted-read"
+		// The squat: fs:* on * under the name GrantAccess manages.
+		require.NoError(t, f.authService.WritePolicy(f.ctx, &model.Policy{
+			CreatedAt:   f.ts,
+			DisplayName: ConsumerReadPolicyName(dataset),
+			Statement: model.Statements{{
+				Effect:   model.StatementEffectAllow,
+				Action:   []string{"fs:*"},
+				Resource: permissions.All,
+			}},
+		}, false))
+
+		_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def})
+		require.NoError(t, err)
+		f.addUser(t, "squatted-reader")
+		grant, err := f.svc.GrantAccess(f.ctx, f.caller(), dataset, PrincipalTypeUser, "squatted-reader")
+		require.NoError(t, err)
+		require.Equal(t, ConsumerReadPolicyName(dataset), grant.PolicyName)
+
+		policy, err := f.authService.GetPolicy(f.ctx, ConsumerReadPolicyName(dataset))
+		require.NoError(t, err)
+		require.True(t, statementsEqual(ConsumerReadPolicy(dataset, f.svc.now()).Statement, policy.Statement),
+			"the managed read policy is rewritten to the managed statements")
+		require.NotContains(t, statementActions(policy.Statement), "fs:*")
+
+		// The grant the user actually holds is the managed one: reading the dataset control
+		// plane is allowed, blanket fs:* is not part of it any more.
+		resp, err := f.authService.Authorize(f.ctx, &auth.AuthorizationRequest{
+			Username:            "squatted-reader",
+			RequiredPermissions: DatasetPermission(ActionReadDataset, dataset),
+		})
+		require.NoError(t, err)
+		require.True(t, resp.Allowed)
+	})
+
+	t.Run("immutability guard", func(t *testing.T) {
+		const dataset = "squatted-guard"
+		// The squat: an empty guard, which would make every write to the dataset repository pass.
+		require.NoError(t, f.authService.WritePolicy(f.ctx, &model.Policy{
+			CreatedAt:   f.ts,
+			DisplayName: ImmutabilityPolicyName(dataset),
+			Statement:   model.Statements{},
+		}, false))
+
+		_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def})
+		require.NoError(t, err)
+
+		policy, err := f.authService.GetPolicy(f.ctx, ImmutabilityPolicyName(dataset))
+		require.NoError(t, err)
+		require.True(t, statementsEqual(ImmutabilityPolicy(dataset, f.svc.now()).Statement, policy.Statement),
+			"the empty guard is rewritten to the managed deny statements")
+		for _, statement := range policy.Statement {
+			require.Equal(t, model.StatementEffectDeny, statement.Effect, "the guard only denies")
+		}
+	})
 }

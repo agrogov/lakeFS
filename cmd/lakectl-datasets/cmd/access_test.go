@@ -65,13 +65,40 @@ func TestAccessGrantCommand(t *testing.T) {
 
 // TestAccessRevokeCommand pins the revoke request: the principal is part of the path (§10.1).
 func TestAccessRevokeCommand(t *testing.T) {
-	fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusNoContent})
-	out := mustExecute(t, "access", "revoke", "customer-360", "--user", "alice")
+	t.Run("revoke", func(t *testing.T) {
+		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusNoContent})
+		out := mustExecute(t, "access", "revoke", "customer-360", "--user", "alice")
 
-	request := fake.OnlyRequest()
-	require.Equal(t, http.MethodDelete, request.Method)
-	require.Equal(t, controlPlanePath+"/customer-360/access/user/alice", request.Path)
-	require.Contains(t, out, "Revoked user")
+		request := fake.OnlyRequest()
+		require.Equal(t, http.MethodDelete, request.Method)
+		require.Equal(t, controlPlanePath+"/customer-360/access/user/alice", request.Path)
+		require.Contains(t, out, "Revoked user")
+	})
+
+	t.Run("json output prints the result", func(t *testing.T) {
+		// CLI-8: a 204 has no body, so -o json prints the revoked principal instead of nothing.
+		newFakeControlPlane(t, fakeResponse{Status: http.StatusNoContent})
+		out := mustExecute(t, "access", "revoke", "customer-360", "--user", "alice", "-o", "json")
+		require.JSONEq(t, `{
+			"revoked": "user/alice",
+			"dataset": "customer-360",
+			"principal_type": "user",
+			"principal_id": "alice"
+		}`, out)
+	})
+
+	t.Run("principal id is escaped once", func(t *testing.T) {
+		// CLI-7: the generated client escapes principal_id into URL.Path, which Go escapes again.
+		// A principal name with a character that needs escaping must reach the server as-is, and
+		// the path must not contain a double escape on the wire.
+		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusNoContent})
+		mustExecute(t, "access", "revoke", "customer-360", "--user", "a b")
+
+		request := fake.OnlyRequest()
+		require.Equal(t, controlPlanePath+"/customer-360/access/user/a b", request.Path)
+		require.Equal(t, controlPlanePath+"/customer-360/access/user/a%20b", request.RequestURI)
+		require.NotContains(t, request.RequestURI, "%2520", "the principal id is escaped twice")
+	})
 }
 
 // TestParseAccessGrantOptions pins the principal parsing of `access grant|revoke`.

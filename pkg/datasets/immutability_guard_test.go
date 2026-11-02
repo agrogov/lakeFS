@@ -1,438 +1,461 @@
-// Package datasets implements the lakeFS OSS Datasets control plane (see DATASETS_DESIGN.md).
-//
-// immutability_guard_test.go covers the §9.4 authorizer guard of immutability_guard.go and the
-// dataset repository index it reads (SEC-2 of DATASETS_REVIEW.md): a principal whose write power
-// does not come from a base group - a custom group, or a policy attached directly to the user -
-// must still be refused every write on a dataset repository, while a repository that is not a
-// dataset, and every read action, stay untouched.
 package datasets
 
 import (
 	"context"
 	"errors"
-	"fmt"
-	"net/http"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"github.com/treeverse/lakefs/contrib/auth/acl"
 	"github.com/treeverse/lakefs/pkg/auth"
-	"github.com/treeverse/lakefs/pkg/auth/crypt"
 	"github.com/treeverse/lakefs/pkg/auth/model"
-	authparams "github.com/treeverse/lakefs/pkg/auth/params"
-	"github.com/treeverse/lakefs/pkg/auth/setup"
-	"github.com/treeverse/lakefs/pkg/kv/kvtest"
-	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/permissions"
 )
 
-const (
-	// guardDataset is the dataset repository every guard test writes to.
-	guardDataset = "customer-360"
-	// guardSibling is a repository whose name starts with guardDataset: the guard must leave it
-	// alone, exactly like the per-dataset deny policy (§9.4).
-	guardSibling = "customer-360-archive"
-)
-
-// guardFixture is the internal-RBAC (policy) installation the guard runs in: the RBAC base groups
-// and policies of pkg/auth/setup plus the datasets bootstrap, on an in-memory KV store.
-type guardFixture struct {
-	svc   *acl.AuthService
-	guard auth.Service
-	index *DatasetRepoIndex
+// withServiceCaller marks ctx as belonging to the datasets service itself, which the immutability
+// guard lets through. It is unexported and lives in the test file on purpose: the guard's value is
+// that a caller cannot switch it off, so the marker must not be buildable outside this package
+// (see serviceCallerKey). Production does not need it - the service writes with ReadOnly + force
+// and never routes its own writes through Authorize (DATASETS_DESIGN.md §4.6, §9.4).
+func withServiceCaller(ctx context.Context) context.Context {
+	return context.WithValue(ctx, serviceCallerKey{}, true)
 }
 
-func newGuardFixture(t *testing.T) *guardFixture {
-	t.Helper()
-	ctx := t.Context()
-	store := kvtest.GetStore(ctx, t)
-	svc := acl.NewAuthService(store, crypt.NewSecretStore([]byte("datasets-guard-test-secret")), authparams.ServiceCache{Enabled: false})
-	ts := time.Now()
-	require.NoError(t, setup.EnsureRBACBaseGroups(ctx, svc, ts))
-	require.NoError(t, Bootstrap(ctx, svc, ts))
+// TestImmutabilityAuthServiceDeniesRegardlessOfGroups is the SEC-2 test: a custom group with
+// FSFullAccess and a user with a directly attached fs:* policy are both refused every write
+// action on a dataset repository, and are still allowed on other repositories and for reads.
+func TestImmutabilityAuthServiceDeniesRegardlessOfGroups(t *testing.T) {
+	f := newAuthzFixture(t)
+	full := model.Statements{{Effect: model.StatementEffectAllow, Action: []string{"fs:*", "pr:*", "catalog:*"}, Resource: "*"}}
+	f.policy(t, "FSFullAccess", full)
+	f.group(t, "data-eng")
+	f.attachToGroup(t, "FSFullAccess", "data-eng")
+	f.user(t, "grouped")
+	f.addToGroup(t, "grouped", "data-eng")
+	f.user(t, "direct")
+	f.attachToUser(t, "FSFullAccess", "direct")
 
-	// Two dataset repositories known to the index, one that is not a dataset.
-	index := newDatasetRepoIndex(func(context.Context) ([]string, error) {
-		return []string{guardDataset, "events"}, nil
-	}, time.Minute, time.Now, logging.ContextUnavailable())
-	return &guardFixture{
-		svc:   svc,
-		guard: NewImmutabilityGuardService(svc, index, logging.ContextUnavailable()),
-		index: index,
+	repos := newDatasetRepoSet(func(context.Context) ([]string, error) { return []string{"foo"}, nil }, time.Hour, time.Now)
+	guard := NewImmutabilityAuthService(f.svc, repos)
+	authz := NewAuthorizer(guard)
+
+	writes := map[string]string{
+		permissions.WriteObjectAction:            permissions.ObjectArn("foo", "latest/a"),
+		permissions.CreateTagAction:              permissions.TagArn("foo", "v3"),
+		permissions.DeleteBranchAction:           permissions.BranchArn("foo", "latest"),
+		permissions.UpdateRepositoryAction:       permissions.RepoArn("foo"),
+		permissions.ImportCancelAction:           permissions.BranchArn("foo", "latest"),
+		permissions.WritePullRequestAction:       permissions.RepoArn("foo"),
+		permissions.CatalogCreateNamespaceAction: permissions.CatalogNamespaceArn("foo", "ns"),
+		permissions.CatalogUpdateTableAction:     permissions.CatalogTableArn("foo", "ns", "t"),
+		permissions.CatalogDeleteViewAction:      permissions.CatalogViewArn("foo", "ns", "v"),
 	}
-}
+	for _, user := range []string{"grouped", "direct"} {
+		caller := Caller{Username: user}
+		for action, resource := range writes {
+			node := permissions.Node{Permission: permissions.Permission{Action: action, Resource: resource}}
+			err := authz.Check(t.Context(), caller, node, "")
+			require.ErrorIsf(t, err, ErrPermissionDenied, "%s %s on dataset repo", user, action)
+			require.Equal(t, 403, asStatus(err))
 
-// userWithGroup creates a user in a fresh custom group that holds the named policies.
-func (f *guardFixture) userWithGroup(t *testing.T, username, group string, policyNames ...string) {
-	t.Helper()
-	ctx := t.Context()
-	_, err := f.svc.CreateUser(ctx, &model.User{Username: username, CreatedAt: time.Now()})
-	require.NoError(t, err)
-	_, err = f.svc.CreateGroup(ctx, &model.Group{DisplayName: group, CreatedAt: time.Now()})
-	require.NoError(t, err)
-	require.NoError(t, f.svc.AddUserToGroup(ctx, username, group))
-	for _, name := range policyNames {
-		require.NoErrorf(t, f.svc.AttachPolicyToGroup(ctx, name, group), "attach %s to %s", name, group)
-	}
-}
+			// The same action on an ordinary repository is untouched.
+			other := permissions.Node{Permission: permissions.Permission{Action: action, Resource: swapRepo(resource, "foo", "plain")}}
+			require.NoErrorf(t, authz.Check(t.Context(), caller, other, ""), "%s %s on plain repo", user, action)
+		}
+		// Reads on the dataset repository stay allowed.
+		read := permissions.Node{Permission: permissions.Permission{Action: permissions.ReadObjectAction, Resource: permissions.ObjectArn("foo", "x")}}
+		require.NoError(t, authz.Check(t.Context(), caller, read, ""))
 
-// userWithPolicy creates a user whose only grant is a policy attached directly to the user.
-func (f *guardFixture) userWithPolicy(t *testing.T, username, policyName string) {
-	t.Helper()
-	ctx := t.Context()
-	_, err := f.svc.CreateUser(ctx, &model.User{Username: username, CreatedAt: time.Now()})
-	require.NoError(t, err)
-	require.NoError(t, f.svc.AttachPolicyToUser(ctx, policyName, username))
-}
-
-// authorize asks the wrapped service, the way the core API does.
-func (f *guardFixture) authorize(t *testing.T, username, action, resource string) (*auth.AuthorizationResponse, error) {
-	t.Helper()
-	return f.guard.Authorize(t.Context(), &auth.AuthorizationRequest{
-		Username:            username,
-		RequiredPermissions: permissions.Node{Permission: permissions.Permission{Action: action, Resource: resource}},
-	})
-}
-
-// requireDenied requires that the guard answers a denial carrying auth.ErrInsufficientPermissions,
-// which is what makes the core API answer with its authorization-failure status instead of a 500.
-func (f *guardFixture) requireDenied(t *testing.T, username, action, resource string) {
-	t.Helper()
-	resp, err := f.authorize(t, username, action, resource)
-	require.NoErrorf(t, err, "%s %s", action, resource)
-	require.Falsef(t, resp.Allowed, "%s %s must be denied", action, resource)
-	require.ErrorIsf(t, resp.Error, auth.ErrInsufficientPermissions, "%s %s must be denied", action, resource)
-}
-
-func (f *guardFixture) requireAllowed(t *testing.T, username, action, resource string) {
-	t.Helper()
-	resp, err := f.authorize(t, username, action, resource)
-	require.NoErrorf(t, err, "%s %s", action, resource)
-	require.Truef(t, resp.Allowed, "%s %s must be allowed: %v", action, resource, resp.Error)
-}
-
-// TestImmutabilityGuardDeniesCustomGroupWithFSFullAccess is the SEC-2 test: a member of a custom
-// group that holds FSFullAccess - a group the per-dataset deny policy is never attached to - is
-// refused every write on a dataset repository, and only there.
-func TestImmutabilityGuardDeniesCustomGroupWithFSFullAccess(t *testing.T) {
-	t.Parallel()
-	f := newGuardFixture(t)
-	f.userWithGroup(t, "data-eng", "data-eng", "FSFullAccess")
-
-	// The four writes of DATASETS_REVIEW.md SEC-2: upload, CreateTag, DeleteBranch and
-	// SetRepositoryMetadata. Every resource shape the core API authorizes them against is covered.
-	denied := []struct{ action, resource string }{
-		{permissions.WriteObjectAction, permissions.ObjectArn(guardDataset, "latest/customers/c1.parquet")},
-		{permissions.CreateTagAction, permissions.TagArn(guardDataset, "v3")},
-		{permissions.DeleteBranchAction, permissions.BranchArn(guardDataset, DefaultBranch)},
-		{permissions.UpdateRepositoryAction, permissions.RepoArn(guardDataset)},
-	}
-	for _, c := range denied {
-		f.requireDenied(t, "data-eng", c.action, c.resource)
+		// The datasets service itself is exempt; only in-package test code can build that marker.
+		svcCtx := withServiceCaller(t.Context())
+		node := permissions.Node{Permission: permissions.Permission{Action: permissions.WriteObjectAction, Resource: permissions.ObjectArn("foo", "x")}}
+		require.NoError(t, authz.Check(svcCtx, caller, node, ""))
 	}
 
-	// The rest of the extended deny list of SEC-2: imports, pull requests and the Iceberg catalog
-	// mutations, plus the actions the §9.4 policy already denied.
-	for _, c := range []struct{ action, resource string }{
-		{permissions.ImportCancelAction, permissions.BranchArn(guardDataset, DefaultBranch)},
-		{permissions.ImportFromStorageAction, permissions.RepoArn(guardDataset)},
-		{permissions.WritePullRequestAction, permissions.RepoArn(guardDataset)},
-		{permissions.CreateCommitAction, permissions.BranchArn(guardDataset, DefaultBranch)},
-		{permissions.DeleteRepositoryAction, permissions.RepoArn(guardDataset)},
-		{permissions.CatalogCreateTableAction, permissions.CatalogTableArn(guardDataset, "analytics", "events")},
-		{permissions.CatalogUpdateNamespaceAction, permissions.CatalogNamespaceArn(guardDataset, "analytics")},
-		{permissions.CatalogDeleteViewAction, permissions.CatalogViewArn(guardDataset, "analytics", "v")},
-		// A catalog action added after this list was written must be denied too: the list holds
-		// patterns, not only the concrete constants.
-		{"catalog:CreateSomethingNew", permissions.CatalogNamespaceArn(guardDataset, "analytics")},
-	} {
-		f.requireDenied(t, "data-eng", c.action, c.resource)
+	// An Or node survives while one alternative is allowed, an And node does not.
+	caller := Caller{Username: "direct"}
+	deniedLeaf := permissions.Node{Permission: permissions.Permission{Action: permissions.DeleteTagAction, Resource: permissions.TagArn("foo", "v1")}}
+	okLeaf := permissions.Node{Permission: permissions.Permission{Action: permissions.ReadTagAction, Resource: permissions.TagArn("foo", "v1")}}
+	require.NoError(t, authz.Check(t.Context(), caller, permissions.Node{Type: permissions.NodeTypeOr, Nodes: []permissions.Node{deniedLeaf, okLeaf}}, ""))
+	require.ErrorIs(t, authz.Check(t.Context(), caller, permissions.Node{Type: permissions.NodeTypeAnd, Nodes: []permissions.Node{deniedLeaf, okLeaf}}, ""), ErrPermissionDenied)
+}
+
+func swapRepo(resource, from, to string) string {
+	if strings.Contains(resource, "repository/"+from) {
+		return strings.Replace(resource, "repository/"+from, "repository/"+to, 1)
 	}
-
-	// Reading a dataset, and every write on a repository that is not a dataset, stay allowed: the
-	// guard only ever adds the dataset-repository denial.
-	f.requireAllowed(t, "data-eng", permissions.ReadObjectAction, permissions.ObjectArn(guardDataset, "v1/customers/c1.parquet"))
-	f.requireAllowed(t, "data-eng", permissions.WriteObjectAction, permissions.ObjectArn(guardSibling, "data/c1.parquet"))
-	f.requireAllowed(t, "data-eng", permissions.WriteObjectAction, permissions.ObjectArn("lakehouse-repo", "data/c1.parquet"))
-	f.requireAllowed(t, "data-eng", permissions.CreateRepositoryAction, permissions.RepoArn("brand-new-repo"))
-}
-
-// TestImmutabilityGuardDeniesDirectlyAttachedPolicy covers the second half of SEC-2: a user with a
-// policy attached directly to the user, in no group at all, is covered as well.
-func TestImmutabilityGuardDeniesDirectlyAttachedPolicy(t *testing.T) {
-	t.Parallel()
-	f := newGuardFixture(t)
-	require.NoError(t, f.svc.WritePolicy(t.Context(), &model.Policy{
-		DisplayName: "in-house-fs-all",
-		CreatedAt:   time.Now(),
-		Statement: model.Statements{{
-			Effect:   model.StatementEffectAllow,
-			Action:   []string{"fs:*", "catalog:*"},
-			Resource: permissions.All,
-		}},
-	}, false))
-	f.userWithPolicy(t, "solo-writer", "in-house-fs-all")
-
-	for _, c := range []struct{ action, resource string }{
-		{permissions.WriteObjectAction, permissions.ObjectArn(guardDataset, "latest/customers/c2.parquet")},
-		{permissions.CreateTagAction, permissions.TagArn(guardDataset, "v4")},
-		{permissions.DeleteBranchAction, permissions.BranchArn(guardDataset, DefaultBranch)},
-		{permissions.UpdateRepositoryAction, permissions.RepoArn(guardDataset)},
-		{permissions.CatalogCreateTableAction, permissions.CatalogTableArn(guardDataset, "analytics", "events")},
-	} {
-		f.requireDenied(t, "solo-writer", c.action, c.resource)
+	for _, kind := range []string{"namespace/", "table/", "view/"} {
+		if strings.Contains(resource, kind+from+"/") {
+			return strings.Replace(resource, kind+from+"/", kind+to+"/", 1)
+		}
 	}
-	// Nothing else changes for them.
-	f.requireAllowed(t, "solo-writer", permissions.WriteObjectAction, permissions.ObjectArn(guardSibling, "data/c1.parquet"))
+	return resource
 }
 
-// TestImmutabilityGuardNodeSemantics pins that the guard follows the policy engine's And/Or
-// semantics instead of denying a whole request because one branch of an Or is a dataset write.
-func TestImmutabilityGuardNodeSemantics(t *testing.T) {
-	t.Parallel()
-	f := newGuardFixture(t)
-	f.userWithGroup(t, "data-eng", "data-eng", "FSFullAccess")
-
-	write := permissions.Node{Permission: permissions.Permission{
-		Action:   permissions.WriteObjectAction,
-		Resource: permissions.ObjectArn(guardDataset, "latest/x"),
-	}}
-	read := permissions.Node{Permission: permissions.Permission{
-		Action:   permissions.ReadObjectAction,
-		Resource: permissions.ObjectArn(guardDataset, "latest/x"),
-	}}
-
-	check := func(node permissions.Node) (*auth.AuthorizationResponse, error) {
-		return f.guard.Authorize(t.Context(), &auth.AuthorizationRequest{
-			Username:            "data-eng",
-			RequiredPermissions: node,
-		})
-	}
-
-	// And: one denied child denies the request.
-	resp, err := check(permissions.Node{Type: permissions.NodeTypeAnd, Nodes: []permissions.Node{read, write}})
-	require.NoError(t, err)
-	require.False(t, resp.Allowed)
-	require.ErrorIs(t, resp.Error, auth.ErrInsufficientPermissions)
-
-	// Or: like the policy engine, one denied branch denies the whole request - a Deny statement
-	// matching any required permission wins, and a narrower rule would be a way around the guard.
-	resp, err = check(permissions.Node{Type: permissions.NodeTypeOr, Nodes: []permissions.Node{read, write}})
-	require.NoError(t, err)
-	require.False(t, resp.Allowed)
-	require.ErrorIs(t, resp.Error, auth.ErrInsufficientPermissions)
-
-	// Or with only allowed branches is decided by the policy engine, as usual.
-	resp, err = check(permissions.Node{Type: permissions.NodeTypeOr, Nodes: []permissions.Node{read, read}})
-	require.NoError(t, err)
-	require.True(t, resp.Allowed)
-}
-
-// TestImmutabilityGuardNilServiceAndIndex pins the fail-safe constructors: wrapping nothing, or
-// wrapping without an index, must never produce a service that denies or panics.
-func TestImmutabilityGuardNilServiceAndIndex(t *testing.T) {
-	t.Parallel()
-	require.Nil(t, WrapAuthService(nil, nil, nil))
-	require.Nil(t, NewImmutabilityGuardService(nil, NewDatasetRepoIndex(nil, nil), nil))
-	f := newGuardFixture(t)
-	f.userWithGroup(t, "data-eng", "data-eng", "FSFullAccess")
-	unwrapped := NewImmutabilityGuardService(f.svc, nil, nil)
-	require.NotNil(t, unwrapped)
-	resp, err := unwrapped.Authorize(t.Context(), &auth.AuthorizationRequest{
-		Username:            "data-eng",
-		RequiredPermissions: permissions.Node{Permission: permissions.Permission{Action: permissions.WriteObjectAction, Resource: permissions.ObjectArn(guardDataset, "latest/x")}},
-	})
-	require.NoError(t, err)
-	require.True(t, resp.Allowed, "without an index the guard adds nothing; FSFullAccess alone decides")
-}
-
-// TestRepositoryFromResource pins the resource parsing of the guard.
-func TestRepositoryFromResource(t *testing.T) {
-	t.Parallel()
+// TestRepositoryOfArn pins the resources the immutability guard recognizes: every fs ARN that
+// names a repository, and the catalog ARNs of ICEBERG_CATALOG_PLAN.md §7.2. A resource that does
+// not belong to a repository (or an unknown catalog kind) must not be attributed to one.
+func TestRepositoryOfArn(t *testing.T) {
 	tests := []struct {
+		name     string
 		resource string
-		want     string
-		ok       bool
+		wantRepo string
+		wantOK   bool
 	}{
-		{permissions.RepoArn("repo"), "repo", true},
-		{permissions.ObjectArn("repo", "latest/data/c1.parquet"), "repo", true},
-		{permissions.BranchArn("repo", "main"), "repo", true},
-		{permissions.TagArn("repo", "v1"), "repo", true},
-		{permissions.CatalogNamespaceArn("repo", "analytics"), "repo", true},
-		{permissions.CatalogTableArn("repo", "analytics", "events"), "repo", true},
-		{permissions.CatalogViewArn("repo", "analytics", "v"), "repo", true},
-		{permissions.All, "", false},
-		{permissions.UserArn("u"), "", false},
-		{permissions.StorageNamespace("mem://x"), "", false},
-		{"", "", false},
-		{"arn:lakefs:fs:::repository/", "", false},
-		{"arn:lakefs:fs:::repository/*", "", false},
-		{"arn:lakefs:catalog:::table", "", false},
+		{"repository", permissions.RepoArn("foo"), "foo", true},
+		{"object", permissions.ObjectArn("foo", "a/b"), "foo", true},
+		{"branch", permissions.BranchArn("foo", "main"), "foo", true},
+		{"tag", permissions.TagArn("foo", "v1"), "foo", true},
+		{"catalog namespace", permissions.CatalogNamespaceArn("foo", "ns"), "foo", true},
+		{"catalog namespace at repository", permissions.CatalogNamespaceArn("foo", ""), "foo", true},
+		{"catalog table", permissions.CatalogTableArn("foo", "ns", "t"), "foo", true},
+		{"catalog view", permissions.CatalogViewArn("foo", "ns", "v"), "foo", true},
+		{"empty fs repository", "arn:lakefs:fs:::repository/", "", false},
+		{"storage namespace", "arn:lakefs:fs:::namespace/ns", "", false},
+		{"catalog unknown kind", "arn:lakefs:catalog:::database/foo/db", "", false},
+		{"catalog missing repository", "arn:lakefs:catalog:::table/", "", false},
+		{"auth resource", "arn:lakefs:auth:::user/bob", "", false},
+		{"wildcard", "*", "", false},
 	}
 	for _, tt := range tests {
-		got, ok := RepositoryFromResource(tt.resource)
-		require.Equalf(t, tt.ok, ok, "ok for %q", tt.resource)
-		require.Equalf(t, tt.want, got, "repository of %q", tt.resource)
+		t.Run(tt.name, func(t *testing.T) {
+			repo, ok := repositoryOfArn(tt.resource)
+			require.Equal(t, tt.wantOK, ok)
+			require.Equal(t, tt.wantRepo, repo)
+		})
 	}
 }
 
-// TestIsImmutabilityDeniedAction pins the action matching, including the catalog patterns.
-func TestIsImmutabilityDeniedAction(t *testing.T) {
-	t.Parallel()
-	for _, action := range []string{
-		permissions.WriteObjectAction,
-		permissions.ImportCancelAction,
-		permissions.WritePullRequestAction,
-		permissions.CatalogCreateTableAction,
-		permissions.CatalogUpdateNamespaceAction,
-		permissions.CatalogDeleteViewAction,
-		"catalog:CreateSomethingNew",
-		ciWriteAction,
-	} {
-		require.Truef(t, isImmutabilityDeniedAction(action), "%s must be denied", action)
-	}
-	for _, action := range []string{
-		"",
-		permissions.ReadObjectAction,
-		permissions.ListObjectsAction,
-		permissions.CatalogReadTableAction,
-		permissions.CatalogListTablesAction,
-		permissions.PrepareGarbageCollectionCommitsAction,
-		ActionReadDataset,
-	} {
-		require.Falsef(t, isImmutabilityDeniedAction(action), "%s must not be denied", action)
-	}
+// TestImmutabilityAuthServiceFailsClosedWithoutRepoSet covers a miswired guard: without a name
+// set it must refuse to decide, never allow a write to a dataset repository.
+func TestImmutabilityAuthServiceFailsClosedWithoutRepoSet(t *testing.T) {
+	guard := NewImmutabilityAuthService(&stubAuthService{}, nil)
+	_, err := guard.Authorize(t.Context(), &auth.AuthorizationRequest{RequiredPermissions: permissions.Node{
+		Permission: permissions.Permission{Action: permissions.WriteObjectAction, Resource: permissions.ObjectArn("a", "x")},
+	}})
+	require.ErrorIs(t, err, errNoDatasetRepoSet)
 }
 
-// TestDatasetRepoIndex covers the cache: initial load, TTL refresh, immediate add/remove, and the
-// promise that a failed refresh keeps the last known set instead of failing open.
-func TestDatasetRepoIndex(t *testing.T) {
-	t.Parallel()
-	var (
-		mu    sync.Mutex
-		names = []string{"d1"}
-		calls int
-		fail  bool
-	)
-	now := time.Now()
-	index := newDatasetRepoIndex(func(context.Context) ([]string, error) {
-		mu.Lock()
-		defer mu.Unlock()
+// TestDatasetRepoSetCacheAndFailClosed covers the cached name set: TTL refresh, stale fallback on
+// a failing refresh, and the error when nothing was ever loaded.
+func TestDatasetRepoSetCacheAndFailClosed(t *testing.T) {
+	now := time.Unix(1000, 0)
+	names := []string{"a"}
+	var failing bool
+	calls := 0
+	set := newDatasetRepoSet(func(context.Context) ([]string, error) {
 		calls++
-		if fail {
+		if failing {
 			return nil, errors.New("kv down")
 		}
-		return append([]string(nil), names...), nil
-	}, time.Minute, func() time.Time { return now }, logging.ContextUnavailable())
+		return names, nil
+	}, time.Second, func() time.Time { return now })
 
-	ctx := t.Context()
-	require.True(t, index.IsDatasetRepo(ctx, "d1"))
-	require.False(t, index.IsDatasetRepo(ctx, "d2"))
-	require.Equal(t, 1, calls, "the set is loaded once and then cached")
-	require.False(t, index.IsDatasetRepo(ctx, ""), "an empty name is never a dataset")
+	ok, err := set.Contains(t.Context(), "a")
+	require.NoError(t, err)
+	require.True(t, ok)
+	names = []string{"a", "b"}
+	ok, _ = set.Contains(t.Context(), "b")
+	require.False(t, ok, "served from cache inside the TTL")
+	require.Equal(t, 1, calls)
+	now = now.Add(2 * time.Second)
+	ok, _ = set.Contains(t.Context(), "b")
+	require.True(t, ok, "refreshed after the TTL")
 
-	// Add/Remove are immediate: the service must not wait for a refresh.
-	index.Add("d2")
-	require.True(t, index.IsDatasetRepo(ctx, "d2"))
-	index.Remove("d2")
-	require.False(t, index.IsDatasetRepo(ctx, "d2"))
-	require.Equal(t, 1, calls, "local updates do not reload")
+	failing = true
+	now = now.Add(2 * time.Second)
+	ok, err = set.Contains(t.Context(), "a")
+	require.NoError(t, err)
+	require.True(t, ok, "stale set used when the refresh fails")
 
-	// A hit is answered from memory; a miss after the TTL reloads, and the local changes made
-	// since the last load survive the reload.
-	now = now.Add(2 * time.Minute)
-	require.Equal(t, 1, calls, "a hit never reloads")
-	require.True(t, index.IsDatasetRepo(ctx, "d1"))
-	require.False(t, index.IsDatasetRepo(ctx, "d3"), "an unknown name is a miss")
-	require.Equal(t, 2, calls, "the set is reloaded once the TTL expired")
-	require.False(t, index.IsDatasetRepo(ctx, "d2"), "a name the service removed must not come back")
-
-	// A failed refresh keeps the last known set, and does not turn every call into a reload.
-	mu.Lock()
-	fail = true
-	mu.Unlock()
-	now = now.Add(2 * time.Minute)
-	require.False(t, index.IsDatasetRepo(ctx, "d4"), "an unknown name is still a miss")
+	// A failed attempt counts against the TTL: the failing store is not hit again on every
+	// authorization, and the last known set keeps answering meanwhile.
+	ok, err = set.Contains(t.Context(), "b")
+	require.NoError(t, err)
+	require.True(t, ok)
 	require.Equal(t, 3, calls)
-	require.True(t, index.IsDatasetRepo(ctx, "d1"), "a KV failure must not forget the datasets we knew about")
-	require.False(t, index.IsDatasetRepo(ctx, "d4"))
-	require.Equal(t, 3, calls, "a failed refresh is retried only after the TTL")
 
-	// Recovery.
-	mu.Lock()
-	fail = false
-	names = []string{"d3"}
-	mu.Unlock()
-	now = now.Add(2 * time.Minute)
-	require.True(t, index.IsDatasetRepo(ctx, "d3"), "a reload picks up the current set")
-	require.False(t, index.IsDatasetRepo(ctx, "d1"), "a reload drops what the source no longer has")
+	cold := newDatasetRepoSet(func(context.Context) ([]string, error) { return nil, errors.New("kv down") }, time.Second, time.Now)
+	_, err = cold.Contains(t.Context(), "a")
+	require.Error(t, err)
+
+	// Authorize fails closed (an error, never an allow) when the set cannot be loaded.
+	guard := NewImmutabilityAuthService(&stubAuthService{}, cold)
+	_, err = guard.Authorize(t.Context(), &auth.AuthorizationRequest{RequiredPermissions: permissions.Node{
+		Permission: permissions.Permission{Action: permissions.WriteObjectAction, Resource: permissions.ObjectArn("a", "x")}}})
+	require.Error(t, err)
 }
 
-// TestDatasetRepoIndexReadsTheStore covers the production loader: the index is built from the
-// datasets KV partition, so a dataset created before this process started is protected at once.
-func TestDatasetRepoIndexReadsTheStore(t *testing.T) {
-	t.Parallel()
-	ctx := t.Context()
-	store := NewStore(kvtest.GetStore(ctx, t))
-	_, err := store.CreateDataset(ctx, &DatasetRecord{Name: guardDataset, State: DatasetStateActive, CreatedAt: time.Now(), UpdatedAt: time.Now()})
+// stubAuthService allows everything.
+type stubAuthService struct{ auth.Service }
+
+func (*stubAuthService) Authorize(context.Context, *auth.AuthorizationRequest) (*auth.AuthorizationResponse, error) {
+	return &auth.AuthorizationResponse{Allowed: true}, nil
+}
+
+// TestCreateInvalidatesGuardedRepos: Create drops the guard's cached dataset names, so a new
+// dataset repository is guarded from its first write instead of after the cache TTL.
+func TestCreateInvalidatesGuardedRepos(t *testing.T) {
+	f := newServiceFixture(t)
+	store := NewStore(f.kvStore)
+	repos := newDatasetRepoSet(func(ctx context.Context) ([]string, error) {
+		recs, err := store.ListDatasets(ctx)
+		if err != nil {
+			return nil, err
+		}
+		names := make([]string, 0, len(recs))
+		for _, rec := range recs {
+			names = append(names, rec.Name)
+		}
+		return names, nil
+	}, time.Hour, time.Now)
+	svc, err := NewService(f.cfg, f.kvStore, f.cat, NewImmutabilityAuthService(f.authService, repos))
 	require.NoError(t, err)
 
-	index := NewDatasetRepoIndex(store, logging.ContextUnavailable())
-	require.True(t, index.IsDatasetRepo(ctx, guardDataset))
-	require.False(t, index.IsDatasetRepo(ctx, "events"))
+	guarded, err := repos.Contains(f.ctx, "guarded-on-create")
+	require.NoError(t, err)
+	require.False(t, guarded)
+
+	commit := f.sourceRepo(t, "src-guarded-on-create", map[string]string{"data/a.csv": "a"})
+	_, err = svc.Create(f.ctx, f.caller(), CreateRequest{
+		Name:       "guarded-on-create",
+		Definition: prefixDefinition("src-guarded-on-create", commit.String(), "data", "data/"),
+		Message:    "v1",
+	})
+	require.NoError(t, err)
+	guarded, err = repos.Contains(f.ctx, "guarded-on-create")
+	require.NoError(t, err)
+	require.True(t, guarded, "the cached set must not hide the new dataset for its TTL")
 }
 
-// TestImmutabilityGuardAnswersForbiddenThroughTheCoreControllerContract pins that a guard denial
-// is shaped like a policy denial: the datasets Authorizer reports it as a 403, and the core
-// controller's authorization failure status (401 by default, 403 when configured) applies.
-func TestImmutabilityGuardAnswersForbiddenThroughTheCoreControllerContract(t *testing.T) {
-	t.Parallel()
-	f := newGuardFixture(t)
-	f.userWithGroup(t, "data-eng", "data-eng", "FSFullAccess")
-	authz := NewAuthorizer(f.guard)
-	err := authz.Check(t.Context(), Caller{Username: "data-eng"}, permissions.Node{Permission: permissions.Permission{
-		Action:   permissions.WriteObjectAction,
-		Resource: permissions.ObjectArn(guardDataset, "latest/x"),
-	}}, "")
-	var permErr *PermissionError
-	require.ErrorAs(t, err, &permErr)
-	require.Equal(t, http.StatusForbidden, permErr.HTTPStatusCode())
-	require.Contains(t, err.Error(), "dataset repositories are immutable")
+// TestDatasetRepoSetInvalidateServesLastKnownSet covers the window after a dataset create: the
+// invalidation owes a reload, but when that reload fails the set still answers from the names it
+// has, so a KV hiccup does not fail every write in the installation. Recovery happens on the next
+// TTL, and a set that never loaded still fails closed (TestDatasetRepoSetCacheAndFailClosed).
+func TestDatasetRepoSetInvalidateServesLastKnownSet(t *testing.T) {
+	now := time.Unix(2000, 0)
+	names := []string{"a"}
+	var failing bool
+	calls := 0
+	set := newDatasetRepoSet(func(context.Context) ([]string, error) {
+		calls++
+		if failing {
+			return nil, errors.New("kv down")
+		}
+		return names, nil
+	}, time.Hour, func() time.Time { return now })
+
+	ok, err := set.Contains(t.Context(), "a")
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	// A dataset was created (Invalidate) and the reload fails: the guard answers from the set it
+	// already has instead of turning the hiccup into an authorization error.
+	failing = true
+	set.Invalidate()
+	ok, err = set.Contains(t.Context(), "a")
+	require.NoError(t, err, "a failed reload must not become an authorization error")
+	require.True(t, ok)
+	ok, err = set.Contains(t.Context(), "plain")
+	require.NoError(t, err, "an unrelated repository is not failed by the guard's KV hiccup")
+	require.False(t, ok)
+	require.Equal(t, 2, calls, "one reload after Invalidate, then the TTL holds off the failing store")
+
+	// At the Authorize level that is the difference between a hiccup and an outage: writes to
+	// unrelated repositories keep working, and the dataset still refuses the write.
+	guard := NewImmutabilityAuthService(&stubAuthService{}, set)
+	res, err := guard.Authorize(t.Context(), &auth.AuthorizationRequest{RequiredPermissions: permissions.Node{
+		Permission: permissions.Permission{Action: permissions.WriteObjectAction, Resource: permissions.ObjectArn("plain", "x")}}})
+	require.NoError(t, err)
+	require.True(t, res.Allowed)
+	res, err = guard.Authorize(t.Context(), &auth.AuthorizationRequest{RequiredPermissions: permissions.Node{
+		Permission: permissions.Permission{Action: permissions.WriteObjectAction, Resource: permissions.ObjectArn("a", "x")}}})
+	require.NoError(t, err)
+	require.False(t, res.Allowed, "the known dataset stays immutable while the set is stale")
+
+	// Recovery: after the TTL the new dataset is picked up.
+	failing = false
+	names = []string{"a", "b"}
+	now = now.Add(2 * time.Hour)
+	ok, err = set.Contains(t.Context(), "b")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, 3, calls)
 }
 
-// TestDatasetRepoIndexConcurrentAccess exercises the cache the way the authorization path does:
-// many readers, a refresh expiring under them, and the service adding and removing names at the
-// same time. It is the -race test for the index.
-func TestDatasetRepoIndexConcurrentAccess(t *testing.T) {
-	t.Parallel()
-	var calls atomic.Int64
-	index := newDatasetRepoIndex(func(context.Context) ([]string, error) {
-		calls.Add(1)
-		return []string{"d1", "d2"}, nil
-	}, time.Millisecond, time.Now, logging.ContextUnavailable())
+// TestDatasetRepoSetInvalidateDuringLoad covers the two properties the loader running outside the
+// mutex must not lose: an Invalidate (a dataset create on another goroutine) does not block until
+// the scan finishes, and it is not masked by that scan - the next Contains reloads and sees the
+// new dataset, so the guard does not hide it for a whole TTL.
+func TestDatasetRepoSetInvalidateDuringLoad(t *testing.T) {
+	now := time.Unix(3000, 0)
+	names := []string{"a"}
+	loading := make(chan struct{})
+	release := make(chan struct{})
 
-	ctx := t.Context()
-	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			for j := 0; j < 50; j++ {
-				switch j % 3 {
-				case 0:
-					index.Add(fmt.Sprintf("local-%d-%d", i, j))
-				case 1:
-					index.Remove(fmt.Sprintf("local-%d-%d", i, j-1))
-				default:
-					require.True(t, index.IsDatasetRepo(ctx, "d1"))
-				}
-			}
-		}(i)
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+	var first sync.Once
+	set := newDatasetRepoSet(func(context.Context) ([]string, error) {
+		mu.Lock()
+		calls++
+		snapshot := append([]string(nil), names...) // what the scan of the store sees right now
+		mu.Unlock()
+		first.Do(func() {
+			close(loading)
+			<-release
+		})
+		return snapshot, nil
+	}, time.Hour, func() time.Time { return now })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := set.Contains(context.Background(), "b"); err != nil {
+			t.Error(err)
+		}
+	}()
+	<-loading
+
+	// The mutex is not held across the load, so a create on another goroutine is not stuck behind
+	// the scan.
+	invalidated := make(chan struct{})
+	go func() {
+		set.Invalidate()
+		close(invalidated)
+	}()
+	select {
+	case <-invalidated:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Invalidate blocked while a load was running: the mutex is held across the scan")
 	}
+
+	// The dataset the invalidation is about lands while the scan is running.
+	mu.Lock()
+	names = []string{"a", "b"}
+	mu.Unlock()
+	close(release)
+	<-done
+
+	ok, err := set.Contains(t.Context(), "b")
+	require.NoError(t, err)
+	require.True(t, ok, "the invalidation must not be masked by the scan that was already running")
+	mu.Lock()
+	require.Equal(t, 2, calls)
+	mu.Unlock()
+
+	// And once the invalidation is served, the cache answers normally again.
+	ok, err = set.Contains(t.Context(), "b")
+	require.NoError(t, err)
+	require.True(t, ok)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 2, calls)
+}
+
+// TestDatasetRepoSetSingleFlight proves that a burst of concurrent authorizations runs exactly one
+// loader - in production a full scan of the datasets/ partition - and that the other callers wait
+// on that load rather than on a lock held across it.
+func TestDatasetRepoSetSingleFlight(t *testing.T) {
+	const callers = 50
+
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+	loading := make(chan struct{})
+	release := make(chan struct{})
+	var started sync.Once
+	set := newDatasetRepoSet(func(context.Context) ([]string, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		started.Do(func() { close(loading) })
+		<-release
+		return []string{"a"}, nil
+	}, time.Hour, time.Now)
+
+	// The load is held open until every caller is in flight, so the burst really is concurrent.
+	var wg sync.WaitGroup
+	results := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ok, err := set.Contains(context.Background(), "a")
+			switch {
+			case err != nil:
+				results <- err
+			case !ok:
+				results <- errors.New("dataset repository not found in the cached set")
+			}
+		}()
+	}
+	<-loading
+	close(release)
 	wg.Wait()
-	require.Positive(t, calls.Load(), "the set must have been loaded")
-	require.True(t, index.IsDatasetRepo(ctx, "d1"))
+	close(results)
+
+	for err := range results {
+		require.NoError(t, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 1, calls, "a burst of authorizations must run one loader, not one per caller")
+}
+
+// TestDatasetRepoSetLoadIgnoresLeaderCancellation: the leader's load is shared with every waiter,
+// so a leader whose request is cancelled must not fail the others with its context.Canceled.
+func TestDatasetRepoSetLoadIgnoresLeaderCancellation(t *testing.T) {
+	set := newDatasetRepoSet(func(ctx context.Context) ([]string, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if _, ok := ctx.Deadline(); !ok {
+			return nil, errors.New("the load must be bounded by a deadline of its own")
+		}
+		return []string{"a"}, nil
+	}, time.Hour, time.Now)
+
+	leaderCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+	ok, err := set.Contains(leaderCtx, "a")
+	require.NoError(t, err, "the load must not inherit the leader's cancellation")
+	require.True(t, ok)
+
+	ok, err = set.Contains(t.Context(), "a")
+	require.NoError(t, err)
+	require.True(t, ok)
+}
+
+// TestDatasetRepoSetLoaderPanicReleasesGate: a panicking loader must not leave the single-flight
+// gate set, or every later authorization would wait on a channel nobody closes.
+func TestDatasetRepoSetLoaderPanicReleasesGate(t *testing.T) {
+	now := time.Unix(4000, 0)
+	panicking := true
+	set := newDatasetRepoSet(func(context.Context) ([]string, error) {
+		if panicking {
+			panic("loader bug")
+		}
+		return []string{"a"}, nil
+	}, time.Second, func() time.Time { return now })
+
+	require.Panics(t, func() { _, _ = set.Contains(t.Context(), "a") })
+
+	// Before the TTL the failed attempt answers; nothing was ever loaded, so it fails closed.
+	_, err := set.Contains(t.Context(), "a")
+	require.ErrorIs(t, err, errDatasetRepoSetLoadPanicked)
+
+	// After the TTL a new load runs instead of waiting on the abandoned gate.
+	panicking = false
+	now = now.Add(time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	ok, err := set.Contains(ctx, "a")
+	require.NoError(t, err)
+	require.True(t, ok)
 }

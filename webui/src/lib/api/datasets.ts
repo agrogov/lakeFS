@@ -59,8 +59,8 @@ export class DatasetsError extends Error {
 }
 
 /**
- * True for the stale-base `409` of §5.6: merging a proposal whose `base_version` is behind
- * the dataset's `latest_version` requires a rebase (an explicit "Update proposal") first.
+ * True for the stale-base `409` of §5.6: merging a pull request whose `base_version` is
+ * behind the dataset's latest version requires an update first.
  * The status is decisive; the message is a fallback for servers that omit `latest_version`.
  */
 export const isRebaseRequiredError = (error: unknown): error is DatasetsError =>
@@ -190,8 +190,18 @@ export interface DataItem {
     prefix?: PathSource;
     /** Reserved for Iceberg `table` items; answered with 501 in this build (§1.2). */
     table?: Record<string, unknown>;
-    /** Reserved for Iceberg `namespace` items; answered with 501 in this build (§1.2). */
-    namespace?: Record<string, unknown>;
+    /**
+     * Reserved for Iceberg `namespace` items; answered with 501 in this build (§1.2).
+     * ent-swagger v1.108 names the namespace as a string (DOC-13).
+     */
+    namespace?: string;
+}
+
+/** Per-item source-resolution status of a published definition (§10.2 DataItemState). */
+export type ItemStatus = 'ok' | 'source_repo_unavailable' | 'source_ref_unavailable' | 'caller_unauthorized';
+
+export interface DataItemState extends DataItem {
+    status?: ItemStatus;
 }
 
 /**
@@ -203,10 +213,23 @@ export type MetadataScalarValue = string | number | boolean;
 export type MetadataValue = MetadataScalarValue | MetadataScalarValue[];
 
 export interface DatasetDefinition {
-    format_version: 1;
+    /** Set by the server on write (DOC-12): an omitted value is stored as 1. */
+    format_version?: 1;
     description?: string;
+    /**
+     * Input accepts a scalar or an array per key; output is always an array of strings
+     * (DOC-11).
+     */
     metadata?: Record<string, MetadataValue>;
     data: DataItem[];
+}
+
+/** The definition of a published version, with the status of every item (§10.2). */
+export interface DatasetDefinitionState {
+    format_version?: number;
+    description?: string;
+    metadata?: Record<string, MetadataValue>;
+    data?: DataItemState[];
 }
 
 export type DatasetState = 'creating' | 'active' | 'publishing' | 'deleting' | 'degraded';
@@ -224,20 +247,21 @@ export interface DatasetStats {
 }
 
 export interface Dataset {
-    name: string;
+    id: string;
+    /** Unix epoch seconds (§10.2). */
+    creation_date: number;
+    /** Latest published version; absent (or 0) when nothing was published yet. */
+    version?: number;
     description?: string;
-    /** Unix epoch milliseconds (§10.2). */
-    created_at: number;
-    created_by: string;
-    /** 0 when no version was published yet. */
-    latest_version: number;
-    state: DatasetState;
-    /** Definition of the latest version, when there is one. */
-    definition?: DatasetDefinition;
+    definition?: DatasetDefinitionState;
     stats?: DatasetStats;
+    /** Extension: the principal that created the dataset. */
+    created_by?: string;
+    /** Extension: the lifecycle state of the dataset record. */
+    state?: DatasetState;
     /**
-     * Unix epoch milliseconds of the last change. The record tracks it (§5.3) and the list
-     * view shows it; the spec only requires `created_at`, so callers must fall back to it.
+     * Extension: Unix epoch milliseconds of the last change. The record tracks it (§5.3) and
+     * the list view shows it; the spec only requires `creation_date`.
      */
     updated_at?: number;
 }
@@ -247,20 +271,23 @@ export interface DatasetList {
     pagination: Pagination;
 }
 
-export interface Version {
-    version: number;
+export interface DatasetVersion {
+    /** Version id, `v<N>`. */
+    id: string;
     message?: string;
-    publisher: string;
-    /** Unix epoch milliseconds. */
-    published_at: number;
-    commit_id: string;
+    author: string;
+    /** Unix epoch seconds. */
+    creation_date: number;
+    /** Extension: the commit in the dataset repository. */
+    commit_id?: string;
+    /** Extension: set when the version was published by merging a pull request. */
     proposal_id?: string;
     definition?: DatasetDefinition;
     stats?: DatasetStats;
 }
 
-export interface VersionList {
-    results: Version[];
+export interface DatasetVersionList {
+    results: DatasetVersion[];
     pagination: Pagination;
 }
 
@@ -268,28 +295,29 @@ export interface VersionList {
 export type ChangeType = 'added' | 'removed' | 'changed';
 
 export interface StringChange {
-    from: string;
-    to: string;
+    left: string;
+    right: string;
 }
 
 export interface MetadataChange {
+    type: ChangeType;
     key: string;
-    change: ChangeType;
-    from?: MetadataValue;
-    to?: MetadataValue;
+    left?: string[];
+    right?: string[];
 }
 
 export interface ItemChange {
+    type: ChangeType;
     target: string;
-    change: ChangeType;
-    from?: DataItem;
-    to?: DataItem;
+    left?: DataItem;
+    right?: DataItem;
 }
 
-export interface DefinitionDiff {
+export interface DatasetDiff {
+    format_version?: number;
     description?: StringChange;
     metadata?: MetadataChange[];
-    items: ItemChange[];
+    data: ItemChange[];
 }
 
 export interface DataDiffEntry {
@@ -303,32 +331,47 @@ export interface DataDiffList {
     pagination: Pagination;
 }
 
-export type ProposalStatus = 'open' | 'closed' | 'merged';
+export type PullRequestStatus = 'open' | 'closed' | 'merged';
 
-export interface Proposal {
+export interface DatasetPullRequest {
     id: string;
     dataset: string;
-    /** Version the proposal was made against; merging requires it to be `latest` (§5.6). */
-    base_version: number;
-    definition?: DatasetDefinition;
     title: string;
     description?: string;
     author: string;
-    status: ProposalStatus;
-    /** Unix epoch milliseconds. */
-    created_at: number;
-    /** Unix epoch milliseconds; set when closed or merged. */
-    closed_at?: number;
+    status: PullRequestStatus;
+    /** Version the pull request was made against; merging requires it to be latest (§5.6). */
+    base_version: number;
+    /** Latest version of the dataset at read time (0 when it does not exist). */
+    latest_version: number;
+    /** `base_version` differs from `latest_version`, so the pull request must be updated first. */
+    stale: boolean;
+    /** The dataset's name is unavailable (it was taken after the pull request was opened). */
+    conflicted: boolean;
+    /** The ref the pull request is materialised on, `pr/<id>`. */
+    source_ref: string;
+    /** Unix epoch seconds. */
+    creation_date: number;
+    /** Unix epoch seconds; set when closed or merged. */
+    closed_date?: number;
+    /** Extension: version produced by the merge. */
     merged_version?: number;
-    /** Hidden branch `_proposal-<id>` holding the materialised definition. */
-    preview_branch: string;
-    diff?: DefinitionDiff;
+    /** Extension: hidden branch `_proposal-<id>` holding the materialised definition. */
+    preview_branch?: string;
+    definition?: DatasetDefinition;
+    diff?: DatasetDiff;
     data_diff?: DataDiffList;
 }
 
-export interface ProposalList {
-    results: Proposal[];
+export interface DatasetPullRequestList {
+    results: DatasetPullRequest[];
     pagination: Pagination;
+}
+
+/** The result of merging a pull request (§5.6). */
+export interface DatasetPullRequestMerge {
+    version: number;
+    reference: string;
 }
 
 export type MetadataKeyType = 'string' | 'enum' | 'number' | 'boolean' | 'date';
@@ -352,12 +395,23 @@ export interface MetadataKeyList {
 
 export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed';
 
+export type TaskErrorCode = 'publish_failed' | 'permission_denied' | 'source_unavailable';
+
+/**
+ * Sanitised failure of a failed task (SEC-8): a stable code and a fixed message. The raw error
+ * stays in the server log, so it is never rendered from here.
+ */
+export interface TaskError {
+    code: TaskErrorCode;
+    message: string;
+}
+
 /** Status of an asynchronous publish (§6.5, §10.1). */
 export interface Task {
     id: string;
     status: TaskStatus;
     version?: number;
-    error?: string;
+    error?: TaskError;
     /** Unix epoch milliseconds. */
     created_at: number;
     /** Unix epoch milliseconds. */
@@ -399,8 +453,17 @@ export interface PublishOptions {
 export interface DatasetCreateRequest {
     name: string;
     definition: DatasetDefinition;
-    /** Without it the dataset is created empty; with it version `v1` is published (§10.1). */
+    /**
+     * The create always publishes `v1` (DOC-14); this only supplies the version message,
+     * which defaults to `Create dataset <name>`.
+     */
     publish?: PublishOptions;
+}
+
+/** Body of `PUT /datasets/{dataset}`: the new definition and its publish message (§10.1). */
+export interface DatasetUpdate {
+    definition: DatasetDefinition;
+    publish: { message: string };
 }
 
 export interface VersionPublishRequest {
@@ -415,21 +478,18 @@ export interface DatasetValidateResponse {
     stats?: DatasetStats;
 }
 
-export interface ProposalCreateRequest {
+export interface DatasetPullRequestCreate {
     definition: DatasetDefinition;
     title: string;
     description?: string;
 }
 
-export interface ProposalUpdateRequest {
+export interface DatasetPullRequestUpdate {
     title?: string;
     description?: string;
     definition?: DatasetDefinition;
+    /** `closed` closes the pull request; the documented way to close is `DELETE`. */
     status?: 'closed';
-}
-
-export interface ProposalMergeRequest {
-    message?: string;
 }
 
 export interface MetadataKeyCreateRequest {
@@ -442,6 +502,8 @@ export interface MetadataKeyCreateRequest {
 }
 
 export interface MetadataKeyUpdateRequest {
+    /** Required: a PUT is a full replacement (DOC-10); changing it answers 409. */
+    type: MetadataKeyType;
     required?: boolean;
     allowed_values?: string[];
     allow_multiple?: boolean;
@@ -494,20 +556,42 @@ class Datasets {
         return datasetsRequest<DatasetList>(`${query}`, { method: 'GET' });
     }
 
-    /** Creates the dataset (and `v1` when `publish` is set). Large ones answer a `Task`. */
+    /**
+     * Creates the dataset and publishes `v1` (DOC-14); `publish.message` only names the
+     * version. The asynchronous answer is the `?async=true` extension, which the UI does not
+     * use; the type still covers it for completeness.
+     */
     async create(request: DatasetCreateRequest): Promise<Dataset | Task> {
-        return datasetsRequest<Dataset | Task>('', {
+        const created = await datasetsRequest<Dataset | Task>('', {
             method: 'POST',
             body: JSON.stringify(request),
         });
+        // The repository views filter on the cached name set: a new dataset must appear in it.
+        clearDatasetNamesCache();
+        return created;
     }
 
     async get(name: string): Promise<Dataset> {
         return datasetsRequest<Dataset>(`/${segment(name)}`, { method: 'GET' });
     }
 
+    /** `ref` is `latest` or `v<N>`. */
+    async getByRef(name: string, ref: string): Promise<Dataset> {
+        return datasetsRequest<Dataset>(`/${segment(name)}/refs/${segment(ref)}`, { method: 'GET' });
+    }
+
+    /** The documented update: publishes the definition synchronously and returns the dataset. */
+    async update(name: string, request: DatasetUpdate): Promise<Dataset> {
+        return datasetsRequest<Dataset>(`/${segment(name)}`, {
+            method: 'PUT',
+            body: JSON.stringify(request),
+        });
+    }
+
     async delete(name: string): Promise<void> {
-        return datasetsRequest<void>(`/${segment(name)}`, { method: 'DELETE' });
+        await datasetsRequest<void>(`/${segment(name)}`, { method: 'DELETE' });
+        // A deleted dataset is no longer a dataset repository; drop the cached name set.
+        clearDatasetNamesCache();
     }
 
     /** Dry run: normalise, resolve, validate and authorise sources without writing (§10.1). */
@@ -521,19 +605,21 @@ class Datasets {
     // --- versions -----------------------------------------------------------
 
     /** Newest first. */
-    async listVersions(name: string, params: { after?: string; amount?: number } = {}): Promise<VersionList> {
+    async listVersions(name: string, params: { after?: string; amount?: number } = {}): Promise<DatasetVersionList> {
         const query = buildQuery({ after: params.after, amount: params.amount ?? DEFAULT_LISTING_AMOUNT });
-        return datasetsRequest<VersionList>(`/${segment(name)}/versions${query}`, { method: 'GET' });
+        return datasetsRequest<DatasetVersionList>(`/${segment(name)}/versions${query}`, { method: 'GET' });
     }
 
-    /** `version` is `vN`, `N` or `latest`. */
-    async getVersion(name: string, version: string | number): Promise<Version> {
-        return datasetsRequest<Version>(`/${segment(name)}/versions/${segment(String(version))}`, { method: 'GET' });
+    /** `version` is `latest` or `v<N>`: the documented ref forms (DOC-19). */
+    async getVersion(name: string, version: string | number): Promise<DatasetVersion> {
+        return datasetsRequest<DatasetVersion>(`/${segment(name)}/versions/${segment(String(version))}`, {
+            method: 'GET',
+        });
     }
 
-    /** `201` + `Version`, `202` + `Task` for large publishes, `409` on a version conflict. */
-    async publishVersion(name: string, request: VersionPublishRequest): Promise<Version | Task> {
-        return datasetsRequest<Version | Task>(`/${segment(name)}/versions`, {
+    /** `201` + `DatasetVersion`, `202` + `Task` for large publishes, `409` on a version conflict. */
+    async publishVersion(name: string, request: VersionPublishRequest): Promise<DatasetVersion | Task> {
+        return datasetsRequest<DatasetVersion | Task>(`/${segment(name)}/versions`, {
             method: 'POST',
             body: JSON.stringify(request),
         });
@@ -541,28 +627,28 @@ class Datasets {
 
     // --- diff ---------------------------------------------------------------
 
-    /** `leftRef`/`rightRef` accept `vN`, `latest` or `proposal-<id>` (§10.3). */
+    /** `leftRef`/`rightRef` accept `vN`, `latest` or `pr/<id>` (§10.3). */
     async diff(
         name: string,
         leftRef: string,
         rightRef: string,
         params: { type?: DiffType; prefix?: string; after?: string; amount?: number } = {},
-    ): Promise<DefinitionDiff | DataDiffList> {
+    ): Promise<DatasetDiff | DataDiffList> {
         const query = buildQuery({
             type: params.type,
             prefix: params.prefix,
             after: params.after,
             amount: params.amount,
         });
-        return datasetsRequest<DefinitionDiff | DataDiffList>(
+        return datasetsRequest<DatasetDiff | DataDiffList>(
             `/${segment(name)}/refs/${segment(leftRef)}/diff/${segment(rightRef)}${query}`,
             { method: 'GET' },
         );
     }
 
     /** Typed wrapper around `diff` for the structural diff, the default `type`. */
-    async diffDefinitions(name: string, leftRef: string, rightRef: string): Promise<DefinitionDiff> {
-        return (await this.diff(name, leftRef, rightRef, { type: 'definition' })) as DefinitionDiff;
+    async diffDefinitions(name: string, leftRef: string, rightRef: string): Promise<DatasetDiff> {
+        return (await this.diff(name, leftRef, rightRef, { type: 'definition' })) as DatasetDiff;
     }
 
     /** Typed wrapper around `diff` for the paginated data diff. */
@@ -578,41 +664,76 @@ class Datasets {
         })) as DataDiffList;
     }
 
-    // --- proposals ----------------------------------------------------------
+    // --- pull requests ------------------------------------------------------
 
-    async listProposals(
-        name: string,
-        params: { status?: ProposalStatus; after?: string; amount?: number } = {},
-    ): Promise<ProposalList> {
-        const query = buildQuery({ status: params.status, after: params.after, amount: params.amount });
-        return datasetsRequest<ProposalList>(`/${segment(name)}/proposals${query}`, { method: 'GET' });
+    /** The global listing (§10.1 `GET /datasets/pulls`). */
+    async listPullRequests(
+        params: {
+            status?: PullRequestStatus | 'all';
+            dataset?: string;
+            after?: string;
+            amount?: number;
+        } = {},
+    ): Promise<DatasetPullRequestList> {
+        const query = buildQuery({
+            status: params.status,
+            dataset: params.dataset,
+            after: params.after,
+            amount: params.amount ?? DEFAULT_LISTING_AMOUNT,
+        });
+        return datasetsRequest<DatasetPullRequestList>(`/pulls${query}`, { method: 'GET' });
     }
 
-    async createProposal(name: string, request: ProposalCreateRequest): Promise<Proposal> {
-        return datasetsRequest<Proposal>(`/${segment(name)}/proposals`, {
+    async listDatasetPullRequests(
+        name: string,
+        params: { status?: PullRequestStatus; after?: string; amount?: number } = {},
+    ): Promise<DatasetPullRequestList> {
+        const query = buildQuery({ status: params.status, after: params.after, amount: params.amount });
+        return datasetsRequest<DatasetPullRequestList>(`/${segment(name)}/pulls${query}`, { method: 'GET' });
+    }
+
+    async createPullRequest(name: string, request: DatasetPullRequestCreate): Promise<DatasetPullRequest> {
+        return datasetsRequest<DatasetPullRequest>(`/${segment(name)}/pulls`, {
             method: 'POST',
             body: JSON.stringify(request),
         });
     }
 
     /** Includes the diff summary against `latest`. */
-    async getProposal(name: string, proposalId: string): Promise<Proposal> {
-        return datasetsRequest<Proposal>(`/${segment(name)}/proposals/${segment(proposalId)}`, { method: 'GET' });
+    async getPullRequest(name: string, pullRequestId: string): Promise<DatasetPullRequest> {
+        return datasetsRequest<DatasetPullRequest>(`/${segment(name)}/pulls/${segment(pullRequestId)}`, {
+            method: 'GET',
+        });
     }
 
-    /** Partial update; `status: 'closed'` closes the proposal. */
-    async updateProposal(name: string, proposalId: string, request: ProposalUpdateRequest): Promise<Proposal> {
-        return datasetsRequest<Proposal>(`/${segment(name)}/proposals/${segment(proposalId)}`, {
+    /** Partial update; the documented way to close a pull request is `closePullRequest`. */
+    async updatePullRequest(
+        name: string,
+        pullRequestId: string,
+        request: DatasetPullRequestUpdate,
+    ): Promise<DatasetPullRequest> {
+        return datasetsRequest<DatasetPullRequest>(`/${segment(name)}/pulls/${segment(pullRequestId)}`, {
             method: 'PATCH',
             body: JSON.stringify(request),
         });
     }
 
-    /** `409` when the proposal's `base_version` is behind `latest` (§5.6). */
-    async mergeProposal(name: string, proposalId: string, request: ProposalMergeRequest = {}): Promise<Version> {
-        return datasetsRequest<Version>(`/${segment(name)}/proposals/${segment(proposalId)}/merge`, {
+    /** Closes the pull request without publishing anything (`DELETE`, 204). */
+    async closePullRequest(name: string, pullRequestId: string): Promise<void> {
+        return datasetsRequest<void>(`/${segment(name)}/pulls/${segment(pullRequestId)}`, { method: 'DELETE' });
+    }
+
+    /** The structural diff between `latest` and what the pull request proposes. */
+    async getPullRequestDiff(name: string, pullRequestId: string): Promise<DatasetDiff> {
+        return datasetsRequest<DatasetDiff>(`/${segment(name)}/pulls/${segment(pullRequestId)}/diff`, {
+            method: 'GET',
+        });
+    }
+
+    /** `409` when the pull request's `base_version` is behind `latest` (§5.6). */
+    async mergePullRequest(name: string, pullRequestId: string): Promise<DatasetPullRequestMerge> {
+        return datasetsRequest<DatasetPullRequestMerge>(`/${segment(name)}/pulls/${segment(pullRequestId)}/merge`, {
             method: 'POST',
-            body: JSON.stringify(request),
         });
     }
 
@@ -644,35 +765,72 @@ class Datasets {
 
     // --- metadata keys ------------------------------------------------------
 
-    async listMetadataKeys(params: { after?: string; amount?: number } = {}): Promise<MetadataKeyList> {
-        const query = buildQuery({ after: params.after, amount: params.amount ?? DEFAULT_LISTING_AMOUNT });
-        return datasetsRequest<MetadataKeyList>(`/metadata-keys${query}`, { method: 'GET' });
+    async listMetadataKeys(
+        params: { prefix?: string; after?: string; amount?: number } = {},
+    ): Promise<MetadataKeyList> {
+        const query = buildQuery({
+            prefix: params.prefix,
+            after: params.after,
+            amount: params.amount ?? DEFAULT_LISTING_AMOUNT,
+        });
+        return datasetsRequest<MetadataKeyList>(`/metadata${query}`, { method: 'GET' });
     }
 
     async createMetadataKey(request: MetadataKeyCreateRequest): Promise<MetadataKey> {
-        return datasetsRequest<MetadataKey>('/metadata-keys', {
+        return datasetsRequest<MetadataKey>('/metadata', {
             method: 'POST',
             body: JSON.stringify(request),
         });
     }
 
     async getMetadataKey(key: string): Promise<MetadataKey> {
-        return datasetsRequest<MetadataKey>(`/metadata-keys/${segment(key)}`, { method: 'GET' });
+        return datasetsRequest<MetadataKey>(`/metadata/${segment(key)}`, { method: 'GET' });
     }
 
     async updateMetadataKey(key: string, request: MetadataKeyUpdateRequest): Promise<MetadataKey> {
-        return datasetsRequest<MetadataKey>(`/metadata-keys/${segment(key)}`, {
+        return datasetsRequest<MetadataKey>(`/metadata/${segment(key)}`, {
             method: 'PUT',
             body: JSON.stringify(request),
         });
     }
 
     async deleteMetadataKey(key: string): Promise<void> {
-        return datasetsRequest<void>(`/metadata-keys/${segment(key)}`, { method: 'DELETE' });
+        return datasetsRequest<void>(`/metadata/${segment(key)}`, { method: 'DELETE' });
     }
 }
 
 export const datasets = new Datasets();
+
+/** Kept for callers that used the pre-pull-request name of the async publish response. */
+export type Version = DatasetVersion;
+/** Kept for callers that used the pre-pull-request name of the version list. */
+export type VersionList = DatasetVersionList;
+/** `DatasetPullRequest` under its pre-pull-request name. */
+export type Proposal = DatasetPullRequest;
+/** `DatasetPullRequestList` under its pre-pull-request name. */
+export type ProposalList = DatasetPullRequestList;
+/** `PullRequestStatus` under its pre-pull-request name. */
+export type ProposalStatus = PullRequestStatus;
+/** `DatasetDiff` under its pre-pull-request name. */
+export type DefinitionDiff = DatasetDiff;
+
+/** The numeric part of a version id, `v<N>`; 0 for a missing version. */
+export const versionNumber = (version: Pick<DatasetVersion, 'id'> | null | undefined): number => {
+    if (!version) return 0;
+    const parsed = Number.parseInt(version.id.replace(/^v/i, ''), 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+};
+
+/** The published definition of a dataset record, in the input definition shape. */
+export const definitionOf = (state: DatasetDefinitionState | undefined): DatasetDefinition | undefined => {
+    if (!state) return undefined;
+    return {
+        format_version: 1,
+        description: state.description,
+        metadata: state.metadata,
+        data: state.data ?? [],
+    };
+};
 
 // ---------------------------------------------------------------------------
 // Dataset repositories
@@ -701,7 +859,7 @@ export const listDatasetNames = async (): Promise<Set<string>> => {
     let after = '';
     for (let page = 0; page < DATASET_NAMES_MAX_PAGES; page++) {
         const response = await datasets.list({ after, amount: MAX_LISTING_AMOUNT });
-        for (const dataset of response.results) names.add(dataset.name);
+        for (const dataset of response.results) names.add(dataset.id);
         const next = response.pagination?.has_more ? response.pagination.next_offset : '';
         if (!next) break;
         after = next;

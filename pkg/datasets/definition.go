@@ -43,17 +43,18 @@ const DatasetNamePattern = `^[a-z0-9][a-z0-9-]{2,62}$`
 var datasetNameRegexp = regexp.MustCompile(DatasetNamePattern)
 
 // reservedNames are names that pass DatasetNamePattern but may not be used as
-// dataset names (§5.2 rule 1). "config" and "metadata-keys" collide with the
+// dataset names (§5.2 rule 1). "config", "metadata" and "pulls" collide with the
 // control-plane routes of §10.1, which are siblings of /datasets/{ds}; "_datasets"
 // is the KV partition of §5.3 and "_dataset" the reserved in-repository directory
 // of §6.4. The two underscore names can never match DatasetNamePattern today;
 // they are listed so that the reservation survives a future loosening of the
 // pattern.
 var reservedNames = map[string]struct{}{
-	"config":        {},
-	"metadata-keys": {},
-	"_datasets":     {},
-	"_dataset":      {},
+	"config":    {},
+	"metadata":  {},
+	"pulls":     {},
+	"_datasets": {},
+	"_dataset":  {},
 }
 
 // IsReservedName reports whether name is reserved and therefore may not be used
@@ -106,14 +107,14 @@ type TableSrc struct {
 	Name      string `json:"name"`
 }
 
-// NsSrc is the reserved source descriptor of a "namespace" item (Iceberg), for
-// the same reason as TableSrc.
-type NsSrc struct {
-	Name string `json:"name"`
-}
-
 // DataItem maps a source location into the dataset repository (§5.1). Exactly one
 // of Object, Prefix, Table and Namespace is set, matching Type.
+//
+// Namespace is a plain string, not an object: ent-swagger v1.108 declares the
+// `namespace` member of a namespace item as a string, so an Enterprise definition
+// such as {"type": "namespace", "namespace": "analytics"} decodes into this model
+// and reaches validation (which answers it with 501, §1.2) instead of failing the
+// JSON decode with a 400.
 type DataItem struct {
 	Target     string      `json:"target"`
 	Repository string      `json:"repository"`
@@ -122,7 +123,7 @@ type DataItem struct {
 	Object     *PathSource `json:"object,omitempty"`
 	Prefix     *PathSource `json:"prefix,omitempty"`
 	Table      *TableSrc   `json:"table,omitempty"`     // reserved
-	Namespace  *NsSrc      `json:"namespace,omitempty"` // reserved
+	Namespace  *string     `json:"namespace,omitempty"` // reserved: Iceberg namespace name
 }
 
 // Definition is the Enterprise-compatible definition body (§5.1). It carries no

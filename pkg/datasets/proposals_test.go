@@ -12,7 +12,9 @@ package datasets
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -33,7 +35,7 @@ func (f *serviceFixture) createProposal(t *testing.T, dataset string, req Create
 // createPublishedDataset creates a dataset with version v1 of def and returns the record.
 func (f *serviceFixture) createPublishedDataset(t *testing.T, name string, def Definition) *DatasetView {
 	t.Helper()
-	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: name, Definition: def, Publish: true, Message: "v1"})
+	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: name, Definition: def, Message: "v1"})
 	require.NoError(t, err, "create dataset %s", name)
 	require.Equal(t, 1, view.Record.LatestVersion)
 	return view
@@ -486,10 +488,10 @@ func TestProposalMergeRequiresSourceReadForMerger(t *testing.T) {
 		Title:      "a",
 	})
 
-	// PublishVersion on this dataset, but no read access to the source repository.
+	// UpdateDataset on this dataset, but no read access to the source repository.
 	f.addPolicyUser(t, "weak-merger", "weak-merger-publish", model.Statements{{
 		Effect:   model.StatementEffectAllow,
-		Action:   []string{ActionPublishVersion},
+		Action:   []string{ActionUpdateDataset},
 		Resource: DatasetArn(dataset),
 	}})
 
@@ -624,15 +626,92 @@ func TestProposalListAndNotFound(t *testing.T) {
 		require.ErrorIs(t, err, ErrProposalNotFound)
 	})
 
-	t.Run("unknown dataset is 404", func(t *testing.T) {
+	t.Run("unknown dataset with no pull requests is 404", func(t *testing.T) {
 		_, err := f.svc.ListProposals(f.ctx, f.caller(), "not-a-dataset", "", "", 0)
 		require.ErrorIs(t, err, ErrDatasetNotFound)
+	})
 
-		_, err = f.svc.CreateProposal(f.ctx, f.caller(), "not-a-dataset", CreateProposalRequest{
+	t.Run("pull request for a dataset that does not exist yet", func(t *testing.T) {
+		opened, err := f.svc.CreateProposal(f.ctx, f.caller(), "not-a-dataset", CreateProposalRequest{
 			Definition: prefixDefinition(source, commit.String(), "data", "data/"),
-			Title:      "nope",
+			Title:      "create it through review",
 		})
-		require.ErrorIs(t, err, ErrDatasetNotFound)
+		require.NoError(t, err)
+		require.Equal(t, 0, opened.Record.BaseVersion)
+		require.False(t, opened.Stale)
+		require.False(t, opened.Conflicted)
+		require.Empty(t, opened.Record.PreviewBranch)
+
+		// The name is still free, so the merge creates the dataset and publishes v1.
+		version, err := f.svc.MergeProposal(f.ctx, f.caller(), "not-a-dataset", opened.Record.ID, MergeProposalRequest{})
+		require.NoError(t, err)
+		require.Equal(t, 1, version.Version)
+		created, err := f.svc.Get(f.ctx, f.caller(), "not-a-dataset")
+		require.NoError(t, err)
+		require.Equal(t, 1, created.Record.LatestVersion)
+	})
+
+	t.Run("pull request for a name taken later is conflicted", func(t *testing.T) {
+		const name = "later-taken"
+		opened, err := f.svc.CreateProposal(f.ctx, f.caller(), name, CreateProposalRequest{
+			Definition: prefixDefinition(source, commit.String(), "data", "data/"),
+			Title:      "create it through review",
+		})
+		require.NoError(t, err)
+		require.False(t, opened.Conflicted)
+
+		// Somebody takes the name after the pull request was opened.
+		_, err = f.svc.catalog.CreateRepository(f.ctx, name, f.svc.cfg.StorageID, "mem://"+name+"-ns", DefaultBranch, false)
+		require.NoError(t, err)
+
+		view, err := f.svc.GetProposal(f.ctx, f.caller(), name, opened.Record.ID)
+		require.NoError(t, err)
+		require.True(t, view.Conflicted, "the dataset name is unavailable")
+
+		_, err = f.svc.MergeProposal(f.ctx, f.caller(), name, opened.Record.ID, MergeProposalRequest{})
+		require.ErrorIs(t, err, ErrDatasetConflict, "merging a conflicted pull request answers 409")
+	})
+
+	t.Run("direct create keeps a pull request opened to create the dataset", func(t *testing.T) {
+		const name = "created-directly"
+		opened, err := f.svc.CreateProposal(f.ctx, f.caller(), name, CreateProposalRequest{
+			Definition: prefixDefinition(source, commit.String(), "data", "data/"),
+			Title:      "create it through review",
+		})
+		require.NoError(t, err)
+		require.True(t, opened.Record.CreatesDataset)
+
+		// The dataset is created directly instead of through the pull request.
+		f.createPublishedDataset(t, name, prefixDefinition(source, commit.String(), "data", "data/"))
+
+		view, err := f.svc.GetProposal(f.ctx, f.caller(), name, opened.Record.ID)
+		require.NoError(t, err, "a direct create must not delete the pull request (DOC-8)")
+		require.True(t, view.Conflicted, "the name is taken by the directly created dataset")
+		list, err := f.svc.ListProposals(f.ctx, f.caller(), name, "", "", 0)
+		require.NoError(t, err)
+		require.Len(t, list.Proposals, 1)
+		require.True(t, list.Exists)
+		require.True(t, list.Conflicted)
+		all, err := f.svc.ListAllPullRequests(f.ctx, f.caller(), PullRequestFilter{Dataset: name})
+		require.NoError(t, err)
+		require.Len(t, all.PullRequests, 1)
+		require.True(t, all.PullRequests[0].Conflicted)
+
+		_, err = f.svc.MergeProposal(f.ctx, f.caller(), name, opened.Record.ID, MergeProposalRequest{})
+		require.ErrorIs(t, err, ErrDatasetConflict, "merging a conflicted pull request answers 409")
+
+		// Updating the pull request rebases it onto the dataset that now exists.
+		updated, err := f.svc.UpdateProposal(f.ctx, f.caller(), name, opened.Record.ID, UpdateProposalRequest{
+			Definition: ptr(prefixDefinition(source, commit.String(), "rebased", "data/")),
+		})
+		require.NoError(t, err)
+		require.False(t, updated.Record.CreatesDataset)
+		require.False(t, updated.Conflicted)
+		require.Equal(t, 1, updated.Record.BaseVersion)
+		require.NotEmpty(t, updated.Record.PreviewBranch)
+		version, err := f.svc.MergeProposal(f.ctx, f.caller(), name, opened.Record.ID, MergeProposalRequest{})
+		require.NoError(t, err)
+		require.Equal(t, 2, version.Version)
 	})
 }
 
@@ -661,11 +740,11 @@ func TestProposalUpdateRequiresProposalAction(t *testing.T) {
 		UpdateProposalRequest{Title: ptr("hijacked")})
 	require.ErrorIs(t, err, ErrPermissionDenied)
 
-	// A principal with PublishVersion may edit somebody else's proposal (§10.1), and the
+	// A principal with UpdateDataset may edit somebody else's proposal (§10.1), and the
 	// source check of §9.3 then runs for them.
 	f.addPolicyUser(t, "proposal-maintainer", "proposal-maintainer", model.Statements{{
 		Effect:   model.StatementEffectAllow,
-		Action:   []string{ActionPublishVersion},
+		Action:   []string{ActionUpdateDataset},
 		Resource: DatasetArn(dataset),
 	}})
 	updated, err := f.svc.UpdateProposal(f.ctx, f.callerFor("proposal-maintainer"), dataset, proposal.Record.ID,
@@ -864,21 +943,158 @@ func TestProposalPreviewBranchReuseOnUpdate(t *testing.T) {
 	result, err := f.svc.Diff(f.ctx, f.caller(), DiffRequest{
 		Dataset:  dataset,
 		LeftRef:  RefNameLatest,
-		RightRef: ProposalRefPrefix + proposal.Record.ID,
+		RightRef: PullRequestRef(proposal.Record.ID),
 		Type:     DiffTypeData,
 	})
 	require.NoError(t, err)
 	require.Equal(t, DiffTypeData, result.Type)
 	require.Contains(t, result.Data.Entries, DataDiffEntry{Path: "data/b.parquet", Type: ChangeAdded, SizeBytes: int64(len("b"))})
 
-	// The proposal id is a valid store key and a valid preview branch name.
+	// The proposal id is a valid store key and a valid preview branch name. The id segment of
+	// the key is encoded newest-first (BUG-14), so the key must be under the dataset's
+	// proposal prefix and must read back the record, not spell the id out.
 	key, err := proposalKey(dataset, proposal.Record.ID)
 	require.NoError(t, err)
-	require.Contains(t, string(key), proposal.Record.ID)
+	require.Contains(t, string(key), "proposals/"+dataset+"/")
+	stored, err := f.svc.store.GetProposal(f.ctx, dataset, proposal.Record.ID)
+	require.NoError(t, err)
+	require.Equal(t, proposal.Record.ID, stored.ID)
 	require.NoError(t, graveler.ValidateBranchID(graveler.BranchID(updated.Record.PreviewBranch)))
 
 	// The record is a plain KV record: deleting it is the only cleanup a proposal needs.
 	require.NoError(t, f.svc.store.DeleteProposal(f.ctx, dataset, proposal.Record.ID))
 	_, err = f.svc.store.GetProposal(f.ctx, dataset, proposal.Record.ID)
 	require.True(t, errors.Is(err, kv.ErrNotFound))
+}
+
+// TestProposalConcurrentCloseAndMerge covers BUG-8 end to end: closing and merging the same
+// proposal race on its record, and exactly one of the two wins - the CAS of PutProposalIf is
+// what makes the final state one of the two, never a mix, and it is what makes every other
+// proposal write in the service conditional on the record it read.
+func TestProposalConcurrentCloseAndMerge(t *testing.T) {
+	const (
+		dataset = "proposal-close-vs-merge"
+		source  = "src-proposal-close-vs-merge"
+	)
+	f := newServiceFixture(t)
+	first := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+	f.createPublishedDataset(t, dataset, prefixDefinition(source, first.String(), "data", "data/"))
+
+	second := f.commitTo(t, source, "main", map[string]string{"data/a.parquet": "b"})
+	proposal := f.createProposal(t, dataset, CreateProposalRequest{
+		Definition: prefixDefinition(source, second.String(), "data", "data/"),
+		Title:      "b",
+	})
+
+	var (
+		wg       sync.WaitGroup
+		closeErr error
+		mergeErr error
+		merged   *VersionRecord
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, closeErr = f.svc.UpdateProposal(f.ctx, f.caller(), dataset, proposal.Record.ID,
+			UpdateProposalRequest{Status: ProposalStatusClosed})
+	}()
+	go func() {
+		defer wg.Done()
+		merged, mergeErr = f.svc.MergeProposal(f.ctx, f.caller(), dataset, proposal.Record.ID, MergeProposalRequest{})
+	}()
+	wg.Wait()
+
+	wins := 0
+	if closeErr == nil {
+		wins++
+	}
+	if mergeErr == nil {
+		wins++
+	}
+	require.Equal(t, 1, wins, "exactly one of close and merge wins: close=%v merge=%v", closeErr, mergeErr)
+
+	final := f.proposalRecord(t, dataset, proposal.Record.ID)
+	if mergeErr == nil {
+		require.NotNil(t, merged)
+		require.Equal(t, ProposalStatusMerged, final.Status)
+		require.Equal(t, merged.Version, final.MergedVersion)
+	} else {
+		require.Equal(t, ProposalStatusClosed, final.Status)
+	}
+}
+
+// TestUpdateProposalAuthorizesBeforeLoading is SEC-7: a caller without dataset:UpdateDataset
+// gets the same 403 for a real proposal, an unknown proposal id and an unknown dataset, so the
+// endpoint is not an oracle for proposal ids or for dataset existence.
+func TestUpdateProposalAuthorizesBeforeLoading(t *testing.T) {
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, "src-sec7", map[string]string{"data/a.txt": "alpha"})
+	def := prefixDefinition("src-sec7", commit.String(), "data", "data/")
+	f.createPublishedDataset(t, "sec7-set", def)
+	proposal := f.createProposal(t, "sec7-set", CreateProposalRequest{Definition: def, Title: "tighten the definition"})
+
+	f.addUser(t, "proposal-outsider")
+	caller := f.callerFor("proposal-outsider")
+	title := "changed"
+
+	for name, target := range map[string]struct{ dataset, id string }{
+		"existing proposal": {"sec7-set", proposal.Record.ID},
+		"unknown proposal":  {"sec7-set", "01Jnosuchproposal000000000"},
+		"unknown dataset":   {"no-such-set", "01Jnosuchproposal000000000"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := f.svc.UpdateProposal(f.ctx, caller, target.dataset, target.id, UpdateProposalRequest{Title: &title})
+			require.ErrorIs(t, err, ErrPermissionDenied)
+			status, body := statusOf(t, err)
+			require.Equal(t, http.StatusForbidden, status)
+			require.NotContains(t, body, "not found", "the answer must not disclose whether the record exists")
+		})
+	}
+}
+
+// TestCreateProposalRequiresAnActiveOrPublishingDataset is BUG-16: a pull request may only be
+// opened against a dataset that can serve a current version, i.e. one that is active or
+// publishing. Every other state is a conflict, not a silently accepted review of nothing.
+func TestCreateProposalRequiresAnActiveOrPublishingDataset(t *testing.T) {
+	const (
+		dataset = "proposal-state"
+		source  = "src-proposal-state"
+	)
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+	def := prefixDefinition(source, commit.String(), "data", "data/")
+	f.createDatasetV1(t, dataset, def)
+	req := CreateProposalRequest{Definition: def, Title: "state"}
+
+	// setState CASes the dataset record into state, as the publish or delete path would.
+	setState := func(state string) {
+		t.Helper()
+		rec, predicate, err := f.svc.store.GetDataset(f.ctx, dataset)
+		require.NoError(t, err)
+		next := *rec
+		next.State = state
+		require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &next, rec, predicate))
+	}
+
+	// active: accepted.
+	view, err := f.svc.CreateProposal(f.ctx, f.caller(), dataset, req)
+	require.NoError(t, err)
+	require.Equal(t, ProposalStatusOpen, view.Record.Status)
+
+	// publishing: accepted (the preview branch is a branch of its own, and §12.3 owns the
+	// record's transition, not the reviewer).
+	setState(DatasetStatePublishing)
+	_, err = f.svc.CreateProposal(f.ctx, f.caller(), dataset, CreateProposalRequest{Definition: def, Title: "publishing"})
+	require.NoError(t, err)
+
+	for _, state := range []string{DatasetStateCreating, DatasetStateDeleting, DatasetStateDegraded} {
+		t.Run(state, func(t *testing.T) {
+			setState(state)
+			_, err := f.svc.CreateProposal(f.ctx, f.caller(), dataset, req)
+			require.ErrorIs(t, err, ErrDatasetStateConflict)
+			require.ErrorIs(t, err, ErrDatasetConflict, "the HTTP layer maps it to 409")
+			status, _ := statusOf(t, err)
+			require.Equal(t, http.StatusConflict, status)
+		})
+	}
 }

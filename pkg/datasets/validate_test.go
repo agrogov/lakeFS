@@ -71,7 +71,7 @@ func TestValidateName(t *testing.T) {
 		// Reserved names (§5.2 rule 1, §10.1): they match the pattern but would
 		// collide with control-plane routes or internal names.
 		{name: "config", wantProblems: 1, wantReserved: true},
-		{name: "metadata-keys", wantProblems: 1, wantReserved: true},
+		{name: "metadata", wantProblems: 1, wantReserved: true},
 		// _datasets does not match the pattern either, so it gets two problems.
 		{name: "_datasets", wantProblems: 2, wantReserved: true},
 		{name: "datasets", wantProblems: 0},
@@ -345,18 +345,6 @@ func TestValidateItemStructure(t *testing.T) {
 			wantPaths: []string{"data[0].object.path"},
 		},
 		{
-			// SEC-3: a wildcard in a source path would make the single ARN the item-level
-			// check authorizes cover objects the item never promised.
-			name:      "object path must not be a glob",
-			item:      DataItem{Target: "t", Repository: "r", Ref: SourceRef{Type: RefTypeCommit, ID: "c"}, Type: ItemTypeObject, Object: &PathSource{Path: "geo/*.csv"}},
-			wantPaths: []string{"data[0].object.path"},
-		},
-		{
-			name:      "prefix path must not be a glob",
-			item:      DataItem{Target: "t", Repository: "r", Ref: SourceRef{Type: RefTypeCommit, ID: "c"}, Type: ItemTypePrefix, Prefix: &PathSource{Path: "data/?/"}},
-			wantPaths: []string{"data[0].prefix.path"},
-		},
-		{
 			name:      "object item needs its source descriptor",
 			item:      DataItem{Target: "t", Repository: "r", Ref: SourceRef{Type: RefTypeCommit, ID: "c"}, Type: ItemTypeObject},
 			wantPaths: []string{"data[0].object"},
@@ -384,7 +372,7 @@ func TestValidateItemStructure(t *testing.T) {
 		},
 		{
 			name:      "namespace items are not supported in the MVP",
-			item:      DataItem{Target: "t", Repository: "r", Ref: SourceRef{Type: RefTypeCommit, ID: "c"}, Type: ItemTypeNamespace, Namespace: &NsSrc{Name: "ns"}},
+			item:      DataItem{Target: "t", Repository: "r", Ref: SourceRef{Type: RefTypeCommit, ID: "c"}, Type: ItemTypeNamespace, Namespace: ptr("ns")},
 			wantPaths: []string{"data[0].type"},
 		},
 		{

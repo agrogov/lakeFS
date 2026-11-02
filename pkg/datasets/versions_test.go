@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -35,14 +36,18 @@ func (f *serviceFixture) publishVersion(t *testing.T, name string, req PublishVe
 	return outcome.Version
 }
 
-// createEmptyDataset creates a dataset with no published version, the starting point of the
-// publish tests that build v1..vN explicitly.
-func (f *serviceFixture) createEmptyDataset(t *testing.T, name string, def Definition) {
+// createDatasetV1 creates a dataset and its v1 (DOC-14: every create publishes v1) and returns
+// the version record. It is the starting point of the publish tests, whose explicit publishes
+// therefore produce v2 and later.
+func (f *serviceFixture) createDatasetV1(t *testing.T, name string, def Definition) *VersionRecord {
 	t.Helper()
 	view, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: name, Definition: def})
 	require.NoError(t, err, "create dataset %s", name)
 	require.Equal(t, DatasetStateActive, view.Record.State)
-	require.Zero(t, view.Record.LatestVersion)
+	require.Equal(t, 1, view.Record.LatestVersion, "create publishes v1")
+	require.NotNil(t, view.Version)
+	require.Equal(t, DefaultCreateMessage(name), view.Version.Message)
+	return view.Version
 }
 
 // commitTo creates the source repository on first use and commits objects onto branch, returning
@@ -66,15 +71,6 @@ func (f *serviceFixture) datasetRecord(t *testing.T, name string) *DatasetRecord
 	rec, _, err := f.svc.store.GetDataset(f.ctx, name)
 	require.NoError(t, err, "get dataset record %s", name)
 	return rec
-}
-
-// datasetRecordAndPredicate reads the current head record of a dataset together with the
-// kv.Predicate its next compare-and-swap must present (§5.4).
-func (f *serviceFixture) datasetRecordAndPredicate(t *testing.T, name string) (*DatasetRecord, kv.Predicate) {
-	t.Helper()
-	rec, predicate, err := f.svc.store.GetDataset(f.ctx, name)
-	require.NoError(t, err, "get dataset record %s", name)
-	return rec, predicate
 }
 
 // latestHead returns the commit the dataset repository's "latest" branch points at.
@@ -101,14 +97,15 @@ func TestPublishVersion_ThreeVersionsPushLatest(t *testing.T) {
 	)
 	f := newServiceFixture(t)
 	commitOne := f.commitTo(t, source, "main", map[string]string{"data/a.parquet": "v1"})
-	f.createEmptyDataset(t, dataset, prefixDefinition(source, commitOne.String(), "data", "data/"))
+	f.createDatasetV1(t, dataset, prefixDefinition(source, commitOne.String(), "data", "data/"))
 
 	commits := map[int]graveler.CommitID{1: commitOne}
 	commits[2] = f.commitTo(t, source, "main", map[string]string{"data/a.parquet": "v2"})
 	commits[3] = f.commitTo(t, source, "main", map[string]string{"data/a.parquet": "v3"})
 
-	heads := make([]string, 0, 3)
-	for version := 1; version <= 3; version++ {
+	// v1 came from the create (DOC-14); the explicit publishes produce v2 and v3.
+	heads := make([]string, 0, 2)
+	for version := 2; version <= 3; version++ {
 		rec := f.publishVersion(t, dataset, PublishVersionRequest{
 			Definition: prefixDefinition(source, commits[version].String(), "data", "data/"),
 			Message:    fmt.Sprintf("version %d", version),
@@ -142,7 +139,6 @@ func TestPublishVersion_ThreeVersionsPushLatest(t *testing.T) {
 	}
 
 	require.NotEqual(t, heads[0], heads[1])
-	require.NotEqual(t, heads[1], heads[2])
 
 	// Older versions keep serving their own data (§7.1).
 	require.Equal(t, []byte("v1"), f.readDatasetObject(t, dataset, VersionTag(1), "data/a.parquet"))
@@ -158,8 +154,8 @@ func TestPublishVersion_ThreeVersionsPushLatest(t *testing.T) {
 		require.False(t, definitionIsZero(version.Definition), "version %d carries its definition", version.Version)
 	}
 
-	// GET /datasets/{ds}/versions/{version} accepts vN, N and latest.
-	for ref, want := range map[string]int{"v2": 2, "2": 2, "latest": 3} {
+	// GET /datasets/{ds}/versions/{version} accepts vN and latest.
+	for ref, want := range map[string]int{"v2": 2, "latest": 3} {
 		version, err := f.svc.GetVersion(f.ctx, f.caller(), dataset, ref)
 		require.NoError(t, err, "get version %q", ref)
 		require.Equal(t, want, version.Version, "get version %q", ref)
@@ -183,7 +179,7 @@ func TestPublishVersion_NoChangesIsConflict(t *testing.T) {
 	commit := f.sourceRepo(t, "src-nochange", map[string]string{"data/a.parquet": "a"})
 	def := prefixDefinition("src-nochange", commit.String(), "data", "data/")
 
-	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def, Publish: true, Message: "v1"})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def, Message: "v1"})
 	require.NoError(t, err)
 
 	_, err = f.svc.PublishVersion(f.ctx, f.caller(), dataset, PublishVersionRequest{Definition: def, Message: "v2"})
@@ -218,7 +214,6 @@ func TestPublishVersion_ExpectedVersion(t *testing.T) {
 	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition("src-etag", first.String(), "data", "data/"),
-		Publish:    true,
 	})
 	require.NoError(t, err)
 
@@ -262,7 +257,6 @@ func TestPublishVersion_ConcurrentPublishesExactlyOneWins(t *testing.T) {
 	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition("src-raced", first.String(), "data", "data/"),
-		Publish:    true,
 	})
 	require.NoError(t, err)
 
@@ -320,7 +314,6 @@ func TestPublishVersion_TakesOverStalePublishingState(t *testing.T) {
 	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition("src-stale", first.String(), "data", "data/"),
-		Publish:    true,
 	})
 	require.NoError(t, err)
 
@@ -330,13 +323,12 @@ func TestPublishVersion_TakesOverStalePublishingState(t *testing.T) {
 	// Simulate a publish that crashed right after the CAS to "publishing".
 	leavePublishing := func(age time.Duration) {
 		t.Helper()
-		current, predicate := f.datasetRecordAndPredicate(t, dataset)
+		current := f.datasetRecord(t, dataset)
 		crashed := *current
 		crashed.State = DatasetStatePublishing
 		crashed.PendingVersion = 2
 		crashed.UpdatedAt = f.svc.now().Add(-age)
-		_, err := f.svc.store.PutDatasetIf(f.ctx, &crashed, predicate)
-		require.NoError(t, err)
+		require.NoError(t, f.svc.store.PutDatasetIf(f.ctx, &crashed, current, nil))
 	}
 
 	// A recent "publishing" record is not stale: the publish is refused.
@@ -369,7 +361,11 @@ func TestPublishVersion_AsyncTaskLifecycle(t *testing.T) {
 		"data/a.parquet": "a",
 		"data/b.parquet": "b",
 	})
-	f.createEmptyDataset(t, dataset, prefixDefinition("src-async", commit.String(), "data", "data/"))
+	f.createDatasetV1(t, dataset, prefixDefinition("src-async", commit.String(), "data", "data/"))
+	second := f.commitTo(t, "src-async", "main", map[string]string{
+		"data/a.parquet": "a2",
+		"data/b.parquet": "b2",
+	})
 
 	// Observe the state machine, and prove the goroutine does not run on the request context.
 	var (
@@ -388,8 +384,8 @@ func TestPublishVersion_AsyncTaskLifecycle(t *testing.T) {
 	}
 
 	outcome, err := f.svc.PublishVersion(requestCtx, f.caller(), dataset, PublishVersionRequest{
-		Definition: prefixDefinition("src-async", commit.String(), "data", "data/"),
-		Message:    "v1",
+		Definition: prefixDefinition("src-async", second.String(), "data", "data/"),
+		Message:    "v2",
 	})
 	require.NoError(t, err)
 	require.True(t, outcome.Accepted(), "a publish above the limit answers 202")
@@ -411,13 +407,13 @@ func TestPublishVersion_AsyncTaskLifecycle(t *testing.T) {
 	task, err := f.svc.GetTask(f.ctx, f.caller(), dataset, outcome.Task.ID)
 	require.NoError(t, err)
 	require.Equal(t, TaskStatusCompleted, task.Status)
-	require.Equal(t, 1, task.Version)
-	require.Empty(t, task.Error)
+	require.Equal(t, 2, task.Version)
+	require.Nil(t, task.Error, "a completed task carries no error")
 
 	head := f.datasetRecord(t, dataset)
 	require.Equal(t, DatasetStateActive, head.State)
-	require.Equal(t, 1, head.LatestVersion)
-	tagCommit, err := f.tagCommit(t, dataset, VersionTag(1))
+	require.Equal(t, 2, head.LatestVersion)
+	tagCommit, err := f.tagCommit(t, dataset, VersionTag(2))
 	require.NoError(t, err)
 	require.Equal(t, f.latestHead(t, dataset), tagCommit)
 
@@ -437,12 +433,12 @@ func TestPublishVersion_AsyncFailureIsRolledBack(t *testing.T) {
 		"data/b.parquet": "b",
 	})
 	def := prefixDefinition("src-async-fail", commit.String(), "data", "data/")
-	f.createEmptyDataset(t, dataset, def)
+	f.createDatasetV1(t, dataset, def)
 
 	f.svc.publishFn = func(context.Context, *Materializer, PublishRequest) (*PublishResult, error) {
 		return nil, errors.New("blockstore unavailable")
 	}
-	outcome, err := f.svc.PublishVersion(f.ctx, f.caller(), dataset, PublishVersionRequest{Definition: def, Message: "v1"})
+	outcome, err := f.svc.PublishVersion(f.ctx, f.caller(), dataset, PublishVersionRequest{Definition: def, Message: "v2"})
 	require.NoError(t, err)
 	require.True(t, outcome.Accepted())
 	f.svc.Wait()
@@ -450,15 +446,20 @@ func TestPublishVersion_AsyncFailureIsRolledBack(t *testing.T) {
 	task, err := f.svc.GetTask(f.ctx, f.caller(), dataset, outcome.Task.ID)
 	require.NoError(t, err)
 	require.Equal(t, TaskStatusFailed, task.Status)
-	require.Contains(t, task.Error, "blockstore unavailable")
+	// SEC-8: the task record is readable by every dataset reader, so it carries a sanitised
+	// {code, message} and never the raw error, which can name block and physical addresses.
+	require.NotNil(t, task.Error)
+	require.Equal(t, TaskErrorCodePublishFailed, task.Error.Code)
+	require.NotEmpty(t, task.Error.Message)
+	require.NotContains(t, task.Error.Message, "blockstore unavailable")
 	require.Zero(t, task.Version)
 
 	head := f.datasetRecord(t, dataset)
 	require.Equal(t, DatasetStateActive, head.State)
-	require.Zero(t, head.LatestVersion)
-	_, err = f.svc.store.GetVersion(f.ctx, dataset, 1)
+	require.Equal(t, 1, head.LatestVersion, "the failed v2 publish did not move the head")
+	_, err = f.svc.store.GetVersion(f.ctx, dataset, 2)
 	require.ErrorIs(t, err, kv.ErrNotFound)
-	_, err = f.tagCommit(t, dataset, VersionTag(1))
+	_, err = f.tagCommit(t, dataset, VersionTag(2))
 	require.ErrorIs(t, err, graveler.ErrNotFound)
 }
 
@@ -472,7 +473,6 @@ func TestPublishVersion_FailedMaterialisationRollsBack(t *testing.T) {
 	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{
 		Name:       dataset,
 		Definition: prefixDefinition("src-rollback", first.String(), "data", "data/"),
-		Publish:    true,
 	})
 	require.NoError(t, err)
 	headBefore := f.latestHead(t, dataset)
@@ -524,7 +524,7 @@ func TestPublishVersion_RequiresPermission(t *testing.T) {
 	f := newServiceFixture(t)
 	commit := f.sourceRepo(t, "src-authz", map[string]string{"data/a.parquet": "a"})
 	def := prefixDefinition("src-authz", commit.String(), "data", "data/")
-	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def, Publish: true})
+	_, err := f.svc.Create(f.ctx, f.caller(), CreateRequest{Name: dataset, Definition: def})
 	require.NoError(t, err)
 
 	f.addUser(t, "watcher")
@@ -553,9 +553,10 @@ func TestVersions_PaginationAndRefs(t *testing.T) {
 	)
 	f := newServiceFixture(t)
 	commit := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "v0"})
-	f.createEmptyDataset(t, dataset, prefixDefinition(source, commit.String(), "data", "data/"))
+	f.createDatasetV1(t, dataset, prefixDefinition(source, commit.String(), "data", "data/"))
 
-	for version := 1; version <= 5; version++ {
+	// v1 came from the create (DOC-14); v2..v5 are explicit publishes.
+	for version := 2; version <= 5; version++ {
 		commit = f.commitTo(t, source, "main", map[string]string{"data/a.parquet": fmt.Sprintf("v%d", version)})
 		rec := f.publishVersion(t, dataset, PublishVersionRequest{
 			Definition: prefixDefinition(source, commit.String(), "data", "data/"),
@@ -605,7 +606,13 @@ func TestVersions_PaginationAndRefs(t *testing.T) {
 	})
 
 	t.Run("dataset without versions", func(t *testing.T) {
-		f.createEmptyDataset(t, "no-versions", prefixDefinition(source, commit.String(), "data", "data/"))
+		// DOC-14 makes an empty dataset unrepresentable through the API; the read path still
+		// has to answer for a record the reconciler left behind before its first version.
+		now := f.svc.now()
+		require.NoError(t, f.svc.store.CreateDataset(f.ctx, &DatasetRecord{
+			Name: "no-versions", CreatedBy: testServiceUser, CreatedAt: now, UpdatedAt: now,
+			State: DatasetStateActive, StorageID: f.svc.cfg.StorageID, StorageNS: "mem://no-versions",
+		}))
 		_, err := f.svc.GetVersion(f.ctx, f.caller(), "no-versions", "latest")
 		require.ErrorIs(t, err, ErrVersionNotFound)
 		result, err := f.svc.ListVersions(f.ctx, f.caller(), "no-versions", "", 0)
@@ -630,8 +637,7 @@ func TestVersions_OutOfLineDefinition(t *testing.T) {
 	f := newServiceFixture(t)
 	commit := f.sourceRepo(t, "src-large", map[string]string{"data/a.parquet": "a"})
 	def := prefixDefinition("src-large", commit.String(), "data", "data/")
-	f.createEmptyDataset(t, dataset, def)
-	version := f.publishVersion(t, dataset, PublishVersionRequest{Definition: def, Message: "v1"})
+	version := f.createDatasetV1(t, dataset, def)
 
 	// Rewrite v1 in the out-of-line form that Store.PutVersion produces above
 	// MaxInlineDefinitionBytes (§5.3).
@@ -664,7 +670,7 @@ func TestVersions_OutOfLineDefinition(t *testing.T) {
 	broken.DefinitionRef = &DefinitionRef{CommitID: stored.CommitID, Path: DefinitionPath + ".missing"}
 	_, err = f.svc.store.PutVersion(f.ctx, broken)
 	require.NoError(t, err)
-	degraded, err := f.svc.GetVersion(f.ctx, f.caller(), dataset, "1")
+	degraded, err := f.svc.GetVersion(f.ctx, f.caller(), dataset, "v1")
 	require.NoError(t, err)
 	require.True(t, definitionIsZero(degraded.Definition))
 	require.Equal(t, stored.CommitID, degraded.CommitID)
@@ -694,13 +700,13 @@ func TestEstimateSourceObjects(t *testing.T) {
 	require.NoError(t, Validate(&def, ValidateOptions{}))
 
 	t.Run("capped at the threshold", func(t *testing.T) {
-		stats, err := f.svc.estimateSourceObjects(f.ctx, f.caller(), &def, 3)
+		stats, err := f.svc.estimateSourceObjects(f.ctx, &def, 3)
 		require.NoError(t, err)
 		require.Equal(t, int64(4), stats.Objects, "counting stops just past the threshold")
 	})
 
 	t.Run("exact when uncapped", func(t *testing.T) {
-		stats, err := f.svc.sourceStats(f.ctx, f.caller(), &def)
+		stats, err := f.svc.sourceStats(f.ctx, &def)
 		require.NoError(t, err)
 		require.Equal(t, int64(count), stats.Objects)
 		require.Equal(t, int64(count*len("payload")), stats.Bytes)
@@ -728,7 +734,7 @@ func TestEstimateSourceObjects(t *testing.T) {
 			},
 		}
 		require.NoError(t, Validate(&withEmpty, ValidateOptions{}))
-		_, err := f.svc.estimateSourceObjects(f.ctx, f.caller(), &withEmpty, 3)
+		_, err := f.svc.estimateSourceObjects(f.ctx, &withEmpty, 3)
 		require.Error(t, err, "the empty item must fail even though the cap was passed already")
 		var validation *ValidationError
 		require.ErrorAs(t, err, &validation)
@@ -745,3 +751,142 @@ func versionNumbers(versions []*VersionRecord) []int {
 }
 
 func ptr[T any](value T) *T { return &value }
+
+// TestTaskErrorForIsSanitised is SEC-8: the sanitised task error carries a stable code and a
+// fixed message, never text derived from the failure, whatever internal path it names.
+func TestTaskErrorForIsSanitised(t *testing.T) {
+	const internal = "s3://bucket/_lakefs/data/3f2a/objects/0001/part.parquet"
+	for _, tt := range []struct {
+		name string
+		err  error
+		code string
+	}{
+		{"permission denied", fmt.Errorf("%w: user u may not read x", ErrPermissionDenied), TaskErrorCodePermissionDenied},
+		{"source read denied", fmt.Errorf("%w: %s", ErrSourceReadDenied, internal), TaskErrorCodePermissionDenied},
+		{"missing source repository", fmt.Errorf("%w: %s", ErrSourceRepositoryNotFound, internal), TaskErrorCodeSourceUnavailable},
+		{"missing source key", fmt.Errorf("%w: %s", ErrSourceKeyNotFound, internal), TaskErrorCodeSourceUnavailable},
+		{"anything else", errors.New("blockstore unavailable reading " + internal), TaskErrorCodePublishFailed},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := taskErrorFor(tt.err)
+			require.Equal(t, tt.code, got.Code)
+			require.NotEmpty(t, got.Message)
+			require.NotContains(t, got.Message, internal)
+			require.NotContains(t, got.Message, "s3://")
+			require.NotContains(t, got.Message, "blockstore")
+		})
+	}
+}
+
+// TestPublishManyVersionsOnOneCommitKeepsPinItemsSmall is BUG-15 end to end: every version of
+// a dataset pins the same source commit, so one pin accumulates one reference per version.
+// Each reference is its own KV item under the pin prefix, so no item grows with the number of
+// versions, while the assembled pin still holds them all.
+func TestPublishManyVersionsOnOneCommitKeepsPinItemsSmall(t *testing.T) {
+	const (
+		dataset  = "many-versions-one-commit"
+		source   = "src-many-versions"
+		versions = 12
+	)
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, source, map[string]string{"data/a.parquet": "a"})
+	def := prefixDefinition(source, commit.String(), "data", "data/")
+	// DOC-14: the create publishes v1, so the explicit publishes below produce v2..v12. A
+	// distinct target per version makes every publish differ from the previous data (a publish
+	// that reproduces it is the no-op of §6.2 step 8) while every version still pins the same
+	// source commit.
+	f.createDatasetV1(t, dataset, def)
+	for i := 2; i <= versions; i++ {
+		version := f.publishVersion(t, dataset, PublishVersionRequest{
+			Definition: prefixDefinition(source, commit.String(), fmt.Sprintf("target%d", i), "data/"),
+			Message:    fmt.Sprintf("v%d", i),
+		})
+		require.Equal(t, i, version.Version)
+	}
+
+	// One reference per version, assembled from one record per reference.
+	pin, _, err := f.svc.store.GetPin(f.ctx, source, commit.String())
+	require.NoError(t, err)
+	require.Len(t, pin.References, versions)
+
+	prefix, err := pinPrefix(source, commit.String())
+	require.NoError(t, err)
+	largest, records := 0, 0
+	for key, value := range partitionEntries(t, f.kvStore, f.ctx) {
+		if !strings.HasPrefix(key, string(prefix)) {
+			continue
+		}
+		records++
+		if len(value) > largest {
+			largest = len(value)
+		}
+	}
+	require.Equal(t, versions, records, "one item per (commit, dataset@vN)")
+	require.Less(t, largest, 1024, "no item grows with the number of versions")
+
+	// Deleting the dataset releases every reference and removes the pin.
+	require.NoError(t, f.svc.Delete(f.ctx, f.caller(), dataset))
+	_, _, err = f.svc.store.GetPin(f.ctx, source, commit.String())
+	require.ErrorIs(t, err, kv.ErrNotFound)
+}
+
+// TestAsyncPublishIsCancelledAndDrainedOnShutdown is BUG-12: an accepted publish runs on the
+// server's context, so cancelling it stops the materialisation, and drainOnShutdown (started
+// by RoutesBuilder) waits for the goroutine before the process exits. The task reports the
+// outcome even though the context that ran it was cancelled.
+func TestAsyncPublishIsCancelledAndDrainedOnShutdown(t *testing.T) {
+	const dataset = "async-shutdown"
+	f := newServiceFixture(t)
+	commit := f.sourceRepo(t, "src-async-shutdown", map[string]string{
+		"data/a.parquet": "a",
+		"data/b.parquet": "b",
+	})
+	def := prefixDefinition("src-async-shutdown", commit.String(), "data", "data/")
+	// DOC-14: the create publishes v1 in the request, on the real materialiser.
+	f.createDatasetV1(t, dataset, def)
+	f.cfg.SyncPublishMaxObjects = 1 // more than one object per version means asynchronous
+
+	// The server's lifetime context, as run.go hands it to RoutesBuilder.
+	serverCtx, shutdown := context.WithCancel(t.Context())
+	f.svc.SetBackgroundContext(serverCtx)
+
+	started := make(chan struct{})
+	f.svc.publishFn = func(ctx context.Context, _ *Materializer, _ PublishRequest) (*PublishResult, error) {
+		close(started)
+		<-ctx.Done() // a materialisation that listens to the server's lifetime
+		return nil, ctx.Err()
+	}
+
+	outcome, err := f.svc.PublishVersion(f.ctx, f.caller(), dataset, PublishVersionRequest{
+		Definition: prefixDefinition("src-async-shutdown", commit.String(), "v2", "data/"),
+		Message:    "v2",
+	})
+	require.NoError(t, err)
+	require.True(t, outcome.Accepted())
+	<-started
+
+	drained := drainOnShutdown(serverCtx, f.svc, nil)
+	select {
+	case <-drained:
+		t.Fatal("the drain returned while a publish was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Shutdown: the publish is cancelled and the drain waits for it to finish.
+	shutdown()
+	select {
+	case <-drained:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the drain did not finish after shutdown")
+	}
+
+	// The publish failed on its own, left no v2 behind, and its task says so.
+	task, err := f.svc.GetTask(f.ctx, f.caller(), dataset, outcome.Task.ID)
+	require.NoError(t, err)
+	require.Equal(t, TaskStatusFailed, task.Status)
+	require.NotNil(t, task.Error)
+	_, err = f.svc.store.GetVersion(f.ctx, dataset, 2)
+	require.ErrorIs(t, err, kv.ErrNotFound)
+	require.Equal(t, DatasetStateActive, f.datasetRecord(t, dataset).State)
+	require.Equal(t, 1, f.datasetRecord(t, dataset).LatestVersion, "v1 of the create is untouched")
+}

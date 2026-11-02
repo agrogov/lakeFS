@@ -3,9 +3,8 @@ import Table from 'react-bootstrap/Table';
 import Badge from 'react-bootstrap/Badge';
 import { ArrowRightIcon, PlusIcon, TrashIcon, PencilIcon } from '@primer/octicons-react';
 
-import { ChangeType, DataItem, DefinitionDiff, MetadataChange, MetadataValue } from '../../api/datasets';
+import { ChangeType, DataItem, DatasetDiff, MetadataChange } from '../../api/datasets';
 import { Link } from '../nav';
-import { formatMetadataValue } from './metadataBadges';
 import { itemSourcePath } from './definitionDiff';
 import { sourceObjectUrl } from './definitionItemsTable';
 
@@ -33,8 +32,12 @@ const itemSummary = (item: DataItem | undefined) => {
     );
 };
 
-const metadataSummary = (value: MetadataValue | undefined) =>
-    value === undefined ? <span className="text-muted">&mdash;</span> : <code>{formatMetadataValue(value)}</code>;
+const metadataSummary = (values: string[] | undefined) =>
+    values === undefined || values.length === 0 ? (
+        <span className="text-muted">&mdash;</span>
+    ) : (
+        <code>{values.join(', ')}</code>
+    );
 
 const MetadataChangeRow: FC<{ change: MetadataChange }> = ({ change }) => (
     <tr>
@@ -42,18 +45,18 @@ const MetadataChangeRow: FC<{ change: MetadataChange }> = ({ change }) => (
             <code>{change.key}</code>
         </td>
         <td>
-            <ChangeBadge change={change.change} />
+            <ChangeBadge change={change.type} />
         </td>
-        <td>{metadataSummary(change.from)}</td>
+        <td>{metadataSummary(change.left)}</td>
         <td>
             <ArrowRightIcon className="text-muted" />
         </td>
-        <td>{metadataSummary(change.to)}</td>
+        <td>{metadataSummary(change.right)}</td>
     </tr>
 );
 
 export interface DefinitionDiffTableProps {
-    diff: DefinitionDiff;
+    diff: DatasetDiff;
 }
 
 /**
@@ -64,7 +67,7 @@ export interface DefinitionDiffTableProps {
  * now points at.
  */
 export const DefinitionDiffTable: FC<DefinitionDiffTableProps> = ({ diff }) => {
-    const items = diff.items ?? [];
+    const items = diff.data ?? [];
     const metadata = diff.metadata ?? [];
     const nothing = items.length === 0 && metadata.length === 0 && diff.description === undefined;
 
@@ -82,11 +85,11 @@ export const DefinitionDiffTable: FC<DefinitionDiffTableProps> = ({ diff }) => {
                             <td>
                                 <ChangeBadge change="changed" />
                             </td>
-                            <td className="text-muted">{diff.description.from || <em>empty</em>}</td>
+                            <td className="text-muted">{diff.description.left || <em>empty</em>}</td>
                             <td>
                                 <ArrowRightIcon className="text-muted" />
                             </td>
-                            <td>{diff.description.to || <em>empty</em>}</td>
+                            <td>{diff.description.right || <em>empty</em>}</td>
                         </tr>
                     </tbody>
                 </Table>
@@ -136,10 +139,10 @@ export const DefinitionDiffTable: FC<DefinitionDiffTableProps> = ({ diff }) => {
                                     <code>{change.target}</code>
                                 </td>
                                 <td>
-                                    <ChangeBadge change={change.change} />
+                                    <ChangeBadge change={change.type} />
                                 </td>
-                                <td>{itemSummary(change.from) ?? <span className="text-muted">&mdash;</span>}</td>
-                                <td>{itemSummary(change.to) ?? <span className="text-muted">&mdash;</span>}</td>
+                                <td>{itemSummary(change.left) ?? <span className="text-muted">&mdash;</span>}</td>
+                                <td>{itemSummary(change.right) ?? <span className="text-muted">&mdash;</span>}</td>
                             </tr>
                         ))}
                     </tbody>

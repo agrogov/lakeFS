@@ -88,6 +88,12 @@ export const Na = () => {
     return <span>&mdash;</span>;
 };
 
+/**
+ * A dismissible danger alert. `onDismiss` makes the alert closable: without it the alert cannot
+ * be dismissed, which is what the callers that only report a fetched error rely on.
+ *
+ * @param {{ error: any, onDismiss?: (() => void) | null, className?: string | null }} props
+ */
 export const AlertError = ({ error, onDismiss = null, className = null }) => {
     let content = React.isValidElement(error) ? error : error.toString();
     // handle wrapped errors

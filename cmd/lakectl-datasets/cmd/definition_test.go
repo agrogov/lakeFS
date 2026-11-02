@@ -21,7 +21,7 @@ func TestParseDefinitionDocument(t *testing.T) {
 			name:     "bare definition",
 			document: testDefinition,
 			wantDef: apigen.DatasetDefinition{
-				FormatVersion: 1,
+				FormatVersion: ptr(1),
 				Description:   ptr("Curated customer view"),
 				Metadata:      &apigen.DatasetMetadata{"tier": "gold"},
 				Data: []apigen.DataItem{{
@@ -38,7 +38,7 @@ func TestParseDefinitionDocument(t *testing.T) {
 			document: `{"name": "customer-360", "definition": ` + testDefinition + `}`,
 			wantName: "customer-360",
 			wantDef: apigen.DatasetDefinition{
-				FormatVersion: 1,
+				FormatVersion: ptr(1),
 				Description:   ptr("Curated customer view"),
 				Metadata:      &apigen.DatasetMetadata{"tier": "gold"},
 				Data: []apigen.DataItem{{
@@ -53,7 +53,7 @@ func TestParseDefinitionDocument(t *testing.T) {
 		{
 			name:     "envelope without a name",
 			document: `{"definition": {"format_version": 1, "data": []}}`,
-			wantDef:  apigen.DatasetDefinition{FormatVersion: 1, Data: []apigen.DataItem{}},
+			wantDef:  apigen.DatasetDefinition{FormatVersion: ptr(1), Data: []apigen.DataItem{}},
 		},
 		{
 			name:      "invalid JSON",
@@ -85,14 +85,14 @@ func TestReadDefinitionFile(t *testing.T) {
 	path := writeDefinitionFile(t, testDefinition)
 	loaded, err := readDefinitionFile(path)
 	require.NoError(t, err)
-	require.Equal(t, 1, loaded.Definition.FormatVersion)
+	require.Equal(t, ptr(1), loaded.Definition.FormatVersion)
 	require.Empty(t, loaded.Name)
 
 	_, err = readDefinitionFile(path + ".missing")
 	require.ErrorContains(t, err, "open definition file")
 }
 
-// TestParseVersionRef pins the accepted dataset refs (§10.1, §10.3).
+// TestParseVersionRef pins the version refs of api/datasets.yml (DOC-19): latest and v<N>.
 func TestParseVersionRef(t *testing.T) {
 	tests := []struct {
 		value   string
@@ -101,18 +101,62 @@ func TestParseVersionRef(t *testing.T) {
 		{value: "latest"},
 		{value: "v1"},
 		{value: "v42"},
-		{value: "3"},
-		{value: "proposal-01J8Z3Q4X5"},
 		{value: "", wantErr: true},
+		{value: "3", wantErr: true},
 		{value: "V3", wantErr: true},
 		{value: "main", wantErr: true},
 		{value: "v", wantErr: true},
-		{value: "proposal-", wantErr: true},
+		{value: "proposal-01J8Z3Q4X5", wantErr: true},
+		{value: "pr/01J8Z3Q4X5", wantErr: true},
 		{value: "v1 ", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run("value="+tt.value, func(t *testing.T) {
 			got, err := parseVersionRef(tt.value)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.value, got)
+		})
+	}
+}
+
+// TestRefPatternsMatchTheSpec pins the CLI ref patterns to api/datasets.yml (CLI-4): the version
+// commands copy the VersionRef parameter and the diff command copies LeftRef/RightRef, so a
+// pattern change in the spec has to reach the CLI as well.
+func TestRefPatternsMatchTheSpec(t *testing.T) {
+	// The documented patterns, verbatim from api/datasets.yml VersionRef and LeftRef/RightRef.
+	const (
+		specVersionRef = "^(latest|v[0-9]{1,9})$"
+		specDiffRef    = "^(latest|v[0-9]{1,9}|pr/[0-9A-Za-z]{1,64})$"
+	)
+	require.Equal(t, specVersionRef, versionRefPatternSource)
+	require.Equal(t, specDiffRef, diffRefPatternSource)
+	require.Equal(t, specVersionRef, versionRefPattern.String())
+	require.Equal(t, specDiffRef, diffRefPattern.String())
+}
+
+// TestParseDiffRef pins the diff refs of api/datasets.yml (DOC-19): latest, v<N>, pr/<id>.
+func TestParseDiffRef(t *testing.T) {
+	tests := []struct {
+		value   string
+		wantErr bool
+	}{
+		{value: "latest"},
+		{value: "v1"},
+		{value: "pr/01J8Z3Q4X5"},
+		{value: "", wantErr: true},
+		{value: "3", wantErr: true},
+		{value: "V3", wantErr: true},
+		{value: "proposal-01J8Z3Q4X5", wantErr: true},
+		{value: "pr/", wantErr: true},
+		{value: "pr/a/b", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run("value="+tt.value, func(t *testing.T) {
+			got, err := parseDiffRef(tt.value)
 			if tt.wantErr {
 				require.Error(t, err)
 				return

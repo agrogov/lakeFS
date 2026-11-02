@@ -13,8 +13,10 @@ package datasets
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/treeverse/lakefs/pkg/auth"
@@ -26,12 +28,11 @@ import (
 // Built-in datasets policies, DATASETS_DESIGN.md §9.5. The display names are the policy IDs the
 // service writes and attaches.
 const (
-	// DatasetsFullAccessPolicyName is "datasets:*" on "*"; the data-plane read of every dataset
+	// DatasetsFullAccessPolicyName is "dataset:*" on "*"; the data-plane read of every dataset
 	// is granted by the managed DatasetsAllReadPolicyName policy below, not by this one.
 	DatasetsFullAccessPolicyName = "DatasetsFullAccess"
-	// DatasetsReadWriteAllPolicyName covers listing, creating, reading, publishing and
-	// proposing on every dataset. It intentionally does not include DeleteDataset,
-	// ManageAccess or ManageMetadataKeys.
+	// DatasetsReadWriteAllPolicyName covers listing, creating, reading and updating every
+	// dataset. It intentionally does not include DeleteDataset or ManageAccess.
 	DatasetsReadWriteAllPolicyName = "DatasetsReadWriteAll"
 	// DatasetsReadAllPolicyName covers listing and reading datasets.
 	DatasetsReadAllPolicyName = "DatasetsReadAll"
@@ -66,19 +67,15 @@ func datasetsFullAccessPolicy(ts time.Time) *model.Policy {
 		Statement: model.Statements{
 			{
 				Effect:   model.StatementEffectAllow,
-				Action:   []string{"datasets:*"},
-				Resource: permissions.All,
+				Action:   []string{"dataset:*"},
+				Resource: DatasetArn("*"),
 			},
 		},
 	}
 }
 
-// datasetsReadWriteAllPolicy is the §9.5 DatasetsReadWriteAll policy:
-// datasets:{ListDatasets, CreateDataset, ReadDataset, PublishVersion, CreateProposal} on "*".
-// The design writes the action set in brace notation with a trailing "*"; it is expanded here to
-// the five exact action names, because those are the only actions with those prefixes and an
-// exact list cannot silently grow when a later phase adds an action (for example
-// datasets:DeleteDataset).
+// datasetsReadWriteAllPolicy is the §9.5 DatasetsReadWriteAll policy: list, read, create and
+// update every dataset, plus reading the shared metadata keys.
 func datasetsReadWriteAllPolicy(ts time.Time) *model.Policy {
 	return &model.Policy{
 		CreatedAt:   ts,
@@ -88,12 +85,13 @@ func datasetsReadWriteAllPolicy(ts time.Time) *model.Policy {
 				Effect: model.StatementEffectAllow,
 				Action: []string{
 					ActionListDatasets,
-					ActionCreateDataset,
 					ActionReadDataset,
-					ActionPublishVersion,
-					ActionCreateProposal,
+					ActionCreateDataset,
+					ActionUpdateDataset,
+					ActionListMetadataKeys,
+					ActionReadMetadataKey,
 				},
-				Resource: permissions.All,
+				Resource: DatasetArn("*"),
 			},
 		},
 	}
@@ -110,8 +108,10 @@ func datasetsReadAllPolicy(ts time.Time) *model.Policy {
 				Action: []string{
 					ActionListDatasets,
 					ActionReadDataset,
+					ActionListMetadataKeys,
+					ActionReadMetadataKey,
 				},
-				Resource: permissions.All,
+				Resource: DatasetArn("*"),
 			},
 		},
 	}
@@ -126,9 +126,13 @@ func datasetsManageMetadataKeysPolicy(ts time.Time) *model.Policy {
 			{
 				Effect: model.StatementEffectAllow,
 				Action: []string{
-					ActionManageMetadataKeys,
+					ActionListMetadataKeys,
+					ActionReadMetadataKey,
+					ActionCreateMetadataKey,
+					ActionUpdateMetadataKey,
+					ActionDeleteMetadataKey,
 				},
-				Resource: permissions.All,
+				Resource: DatasetArn("*"),
 			},
 		},
 	}
@@ -254,6 +258,144 @@ func normalizeStatements(statements model.Statements) model.Statements {
 	return out
 }
 
+// legacyDatasetArnPrefix and legacyActionPrefix are the plural names used before the service
+// was renamed to match the public RBAC documentation. They are read only by the migration below.
+const (
+	legacyDatasetArnPrefix = "arn:lakefs:datasets:::"
+	legacyActionPrefix     = "datasets:"
+)
+
+// IsLegacyManagedPolicy reports whether name is one of the policies this package manages and
+// whose statements may still carry the pre-rename dataset actions or ARNs.
+func IsLegacyManagedPolicy(name string) bool {
+	switch name {
+	case DatasetsFullAccessPolicyName, DatasetsReadWriteAllPolicyName, DatasetsReadAllPolicyName,
+		DatasetsManageMetadataKeysPolicyName, DatasetsAllReadPolicyName, DatasetsPinsProtectPolicyName:
+		return true
+	}
+	return strings.HasPrefix(name, "dataset-") &&
+		(strings.HasSuffix(name, "-read") || strings.HasSuffix(name, "-immutable"))
+}
+
+// MigrateLegacyManagedPolicies rewrites the legacy plural datasets actions and ARN prefix in the
+// managed policies (the built-ins and the per-dataset read / immutability policies) to their
+// singular dataset names. It reports whether any policy was written.
+//
+// The migration is idempotent: it rewrites only statements that still contain a legacy action or
+// resource, so a policy that has already been migrated is not touched.
+func MigrateLegacyManagedPolicies(ctx context.Context, authService auth.Service) (bool, error) {
+	if authService == nil {
+		return false, ErrNoAuthorizer
+	}
+	policies, _, err := authService.ListPolicies(ctx, &model.PaginationParams{Amount: -1})
+	if err != nil {
+		return false, err
+	}
+	changed := false
+	for _, policy := range policies {
+		if !IsLegacyManagedPolicy(policy.DisplayName) {
+			continue
+		}
+		statements, migrated := migrateLegacyStatements(policy.Statement)
+		if !migrated {
+			continue
+		}
+		policy.Statement = statements
+		if err := authService.WritePolicy(ctx, policy, true /* update */); err != nil {
+			return changed, err
+		}
+		changed = true
+	}
+	return changed, nil
+}
+
+// migrateLegacyStatements returns a migrated copy of statements and reports whether anything
+// changed.
+func migrateLegacyStatements(statements model.Statements) (model.Statements, bool) {
+	if statements == nil {
+		return nil, false
+	}
+	out := make(model.Statements, len(statements))
+	changed := false
+	for i, statement := range statements {
+		statement.Action, changed = mergeMigration(statement.Action, migrateLegacyActions(statement.Action), changed)
+		if resource := migrateLegacyResource(statement.Resource); resource != statement.Resource {
+			statement.Resource = resource
+			changed = true
+		}
+		out[i] = statement
+	}
+	return out, changed
+}
+
+// migrateLegacyActions maps one statement's legacy action list to the singular namespace. A
+// legacy PublishVersion or CreateProposal becomes UpdateDataset; the coarse ManageMetadataKeys
+// action expands to the five documented metadata-key actions.
+func migrateLegacyActions(actions []string) []string {
+	out := make([]string, 0, len(actions))
+	seen := make(map[string]struct{}, len(actions))
+	add := func(items ...string) {
+		for _, item := range items {
+			if _, ok := seen[item]; ok {
+				continue
+			}
+			seen[item] = struct{}{}
+			out = append(out, item)
+		}
+	}
+	for _, action := range actions {
+		switch action {
+		case legacyActionPrefix + "*":
+			add("dataset:*")
+		case legacyActionPrefix + "PublishVersion", legacyActionPrefix + "CreateProposal":
+			add(ActionUpdateDataset)
+		case legacyActionPrefix + "ManageMetadataKeys":
+			add(ActionListMetadataKeys, ActionReadMetadataKey,
+				ActionCreateMetadataKey, ActionUpdateMetadataKey, ActionDeleteMetadataKey)
+		default:
+			if strings.HasPrefix(action, legacyActionPrefix) {
+				add("dataset:" + strings.TrimPrefix(action, legacyActionPrefix))
+				continue
+			}
+			add(action)
+		}
+	}
+	return out
+}
+
+// migrateLegacyResource maps a legacy datasets ARN to the singular prefix. A legacy metadata-key
+// ARN becomes the documented dataset/* resource.
+func migrateLegacyResource(resource string) string {
+	resource = strings.ReplaceAll(resource, legacyDatasetArnPrefix+"metadata-key/", datasetArnPrefix+"dataset/*")
+	return strings.ReplaceAll(resource, legacyDatasetArnPrefix, datasetArnPrefix)
+}
+
+// mergeMigration returns migrated and reports whether it differs from original.
+func mergeMigration(original, migrated []string, changed bool) ([]string, bool) {
+	if len(original) != len(migrated) {
+		return migrated, true
+	}
+	for i := range original {
+		if original[i] != migrated[i] {
+			return migrated, true
+		}
+	}
+	return original, changed
+}
+
+// builtinDatasetPolicies is the installation-wide policy set of §9.5 plus the §8.2
+// datasets-pins-protect deny policy, as Bootstrap creates it and the reconciler re-ensures it.
+// The list is one function so the two callers cannot drift apart (SEC-6).
+func builtinDatasetPolicies(ts time.Time) []*model.Policy {
+	return []*model.Policy{
+		datasetsFullAccessPolicy(ts),
+		datasetsReadWriteAllPolicy(ts),
+		datasetsReadAllPolicy(ts),
+		datasetsManageMetadataKeysPolicy(ts),
+		PinsProtectPolicy(ts),
+	}
+}
+
 // BootstrapConfig holds the optional inputs of Bootstrap.
 type BootstrapConfig struct {
 	// Datasets are the datasets that exist right now. They seed the managed datasets-all-read
@@ -265,10 +407,6 @@ type BootstrapConfig struct {
 	// in addition to the base groups of both group templates. The server passes
 	// datasets.immutable_guard_groups, the same list that extends the immutability guard.
 	PinsProtectGroups []string
-
-	// Logger reports the attachments that are skipped because the group does not exist in this
-	// installation's group template. The zero value is replaced by logging.FromContext(ctx).
-	Logger logging.Logger
 }
 
 // BootstrapOption configures Bootstrap.
@@ -290,14 +428,6 @@ func WithPinsProtectGroups(groups []string) BootstrapOption {
 	}
 }
 
-// WithBootstrapLogger passes the server logger, so a skipped attachment can be logged instead of
-// being silent.
-func WithBootstrapLogger(logger logging.Logger) BootstrapOption {
-	return func(c *BootstrapConfig) {
-		c.Logger = logger
-	}
-}
-
 // Bootstrap creates the built-in datasets policies and groups of DATASETS_DESIGN.md §9.5, plus the
 // installation-wide datasets-pins-protect deny policy of §8.2:
 //
@@ -311,6 +441,9 @@ func WithBootstrapLogger(logger logging.Logger) BootstrapOption {
 //	DatasetPublishers DatasetsReadWriteAll
 //	DatasetConsumers  DatasetsReadAll, datasets-all-read
 //
+// On an RBAC installation it also attaches the built-ins to the RBAC base groups, as the RBAC
+// template does (see attachRBACBaseGroupPolicies).
+//
 // datasets-pins-protect is not attached to a dataset group: it protects *source* repositories, so
 // it goes to the base groups of both group templates (§9.4's non-service principals) plus the
 // extra groups of datasets.immutable_guard_groups. Attaching it to a group that does not exist in
@@ -321,25 +454,18 @@ func WithBootstrapLogger(logger logging.Logger) BootstrapOption {
 // reading the data it publishes is a separate grant - per dataset through the consumer read
 // policy of §9.2, or installation-wide by putting the publisher in DatasetAdmins.
 //
-// Bootstrap is idempotent: it is safe to run on every startup. RoutesBuilder calls it on every
-// start of the server (SEC-1 of DATASETS_REVIEW.md), because without it the installation-wide
-// datasets-pins-protect deny policy and the built-in groups simply do not exist: a plain member of
-// Developers could delete pin branches, which lets GC collect data published dataset versions
-// still serve.
+// Bootstrap is idempotent: it is safe to run on every startup.
 //
-//   - Policies and groups are created with "create if absent" semantics and auth.ErrAlreadyExists
-//     is treated as success, so a second run creates nothing. Existing built-in policies are
-//     never overwritten: an installation that edited DatasetsReadAll keeps its edit, and the
-//     reconciler reports drift instead of fighting the administrator (the RBAC bootstrap in
-//     pkg/auth/setup makes the same promise).
+//   - Policies are created when absent and rewritten when their statements differ from the
+//     built-in ones (SEC-6: a pre-created "dataset-foo-read" with fs:* must not survive), and a
+//     rewrite is logged as a warning. Groups are created with "create if absent" semantics and
+//     auth.ErrAlreadyExists is treated as success, so a second run changes nothing that already
+//     matches.
 //   - Attachments likewise tolerate auth.ErrAlreadyExists, so re-running re-creates attachments
 //     that were detached by hand - including the datasets-all-read attachment - without
-//     duplicating anything. A group that does not exist in this installation's group template
-//     (the simplified ACL template and the RBAC template ship different base groups) is skipped at
-//     debug level rather than reported as a failure: the reconciler calls the same helper and must
-//     still reach its pin repair.
-//   - The one exception is datasets-all-read, which is machine-managed: it is rewritten only when
-//     its statement set differs from the current dataset list (see EnsureDatasetsAllReadPolicy).
+//     duplicating anything.
+//   - datasets-all-read is machine-managed in the same sense: it is rewritten when its statement
+//     set differs from the current dataset list (see EnsureDatasetsAllReadPolicy).
 //
 // Because nothing here is a no-op that depends on ordering, a partially failed run can simply be
 // retried.
@@ -354,18 +480,12 @@ func Bootstrap(ctx context.Context, authService auth.Service, ts time.Time, opts
 	for _, opt := range opts {
 		opt(cfg)
 	}
-	log := cfg.Logger
-	if log == nil {
-		log = logging.FromContext(ctx)
+
+	if _, err := MigrateLegacyManagedPolicies(ctx, authService); err != nil {
+		return err
 	}
 
-	if err := createDatasetPolicies(ctx, authService, []*model.Policy{
-		datasetsFullAccessPolicy(ts),
-		datasetsReadWriteAllPolicy(ts),
-		datasetsReadAllPolicy(ts),
-		datasetsManageMetadataKeysPolicy(ts),
-		PinsProtectPolicy(ts),
-	}); err != nil {
+	if err := createDatasetPolicies(ctx, authService, builtinDatasetPolicies(ts)); err != nil {
 		return err
 	}
 
@@ -390,11 +510,50 @@ func Bootstrap(ctx context.Context, authService auth.Service, ts time.Time, opts
 		{DatasetConsumersGroup, []string{DatasetsReadAllPolicyName, DatasetsAllReadPolicyName}},
 	}
 	for _, attachment := range attachments {
-		if err := attachDatasetPolicies(ctx, authService, log, attachment.group, attachment.policies); err != nil {
+		if err := attachDatasetPolicies(ctx, authService, attachment.group, attachment.policies); err != nil {
 			return err
 		}
 	}
-	return attachPinsProtectPolicy(ctx, authService, log, cfg.PinsProtectGroups)
+	if err := attachRBACBaseGroupPolicies(ctx, authService); err != nil {
+		return err
+	}
+	return attachPinsProtectPolicy(ctx, authService, cfg.PinsProtectGroups)
+}
+
+// rbacBaseGroupAttachments are the datasets built-ins the RBAC template gives its base groups
+// (DOC-3, pkg/auth/setup.EnsureRBACBaseGroups with WithDatasetsEnabled(true)).
+var rbacBaseGroupAttachments = []struct {
+	group    string
+	policies []string
+}{
+	{"Admins", []string{DatasetsFullAccessPolicyName}},
+	{"SuperUsers", []string{DatasetsReadWriteAllPolicyName}},
+	{"Developers", []string{DatasetsReadWriteAllPolicyName}},
+	{"Viewers", []string{DatasetsReadAllPolicyName}},
+}
+
+// attachRBACBaseGroupPolicies attaches the datasets built-ins to the RBAC base groups (DOC-3).
+//
+// The RBAC bootstrap does the same when datasets is enabled, but it is version-gated
+// (pkg/sso.RBACBootstrapVersion): an installation that recorded the current version before
+// datasets was turned on never runs it again, and its base groups would never get the datasets
+// policies. Doing it here, on every start, closes that gap. It only applies to an RBAC
+// installation, recognised by its SuperUsers group: the simplified ACL template also has an
+// "Admins" group, which the RBAC mapping must not touch.
+func attachRBACBaseGroupPolicies(ctx context.Context, authService auth.Service) error {
+	_, err := authService.GetGroup(ctx, "SuperUsers")
+	switch {
+	case errors.Is(err, auth.ErrNotFound):
+		return nil
+	case err != nil:
+		return err
+	}
+	for _, attachment := range rbacBaseGroupAttachments {
+		if err := attachDatasetPolicies(ctx, authService, attachment.group, attachment.policies); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // attachPinsProtectPolicy attaches datasets-pins-protect (§8.2) to the non-service groups of the
@@ -405,32 +564,62 @@ func Bootstrap(ctx context.Context, authService auth.Service, ts time.Time, opts
 // runs both, so most of the names are expected to be absent. Tolerating auth.ErrNotFound keeps the
 // deny policy out of the way of a template the installation does not use, while still covering every
 // principal that is a member of a group the installation does have.
-func attachPinsProtectPolicy(ctx context.Context, authService auth.Service, log logging.Logger, extraGroups []string) error {
+func attachPinsProtectPolicy(ctx context.Context, authService auth.Service, extraGroups []string) error {
 	for _, group := range PinsProtectGroups(extraGroups) {
 		err := authService.AttachPolicyToGroup(ctx, DatasetsPinsProtectPolicyName, group)
-		switch {
-		case err == nil, errors.Is(err, auth.ErrAlreadyExists):
-		case errors.Is(err, auth.ErrNotFound):
-			log.WithFields(logging.Fields{
-				"policy": DatasetsPinsProtectPolicyName,
-				"group":  group,
-			}).Debug("datasets: group does not exist in this installation's group template; not attaching the pins-protect policy")
-		default:
+		if err != nil && !errors.Is(err, auth.ErrAlreadyExists) && !errors.Is(err, auth.ErrNotFound) {
 			return err
 		}
 	}
 	return nil
 }
 
-// createDatasetPolicies writes every policy that does not exist yet, ignoring auth.ErrAlreadyExists.
+// createDatasetPolicies creates every managed policy that does not exist yet and rewrites the
+// ones whose statements differ from policy.Statement (SEC-6).
 func createDatasetPolicies(ctx context.Context, authService auth.Service, policies []*model.Policy) error {
 	for _, policy := range policies {
-		err := authService.WritePolicy(ctx, policy, false /* create only */)
-		if err != nil && !errors.Is(err, auth.ErrAlreadyExists) {
+		if _, err := ensureManagedPolicy(ctx, authService, policy); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// ensureManagedPolicy makes the managed policy exist with exactly its statements: it creates it
+// when it is missing and rewrites it when the statements differ. It reports whether an existing
+// policy was rewritten.
+//
+// A managed policy name is predictable ("dataset-<name>-read", "dataset-<name>-immutable",
+// "datasets-*"), so without this check a principal that may write policies but holds no
+// datasets permission could pre-create "dataset-foo-read" with fs:* on * - or the immutability
+// guard with no statements - and every later grant or publish would inherit it (SEC-6). The
+// reconciler calls this on every pass, so a hand-edited managed policy is repaired rather than
+// trusted.
+//
+// Comparison ignores an empty Conditions map versus nil (see statementsEqual), so a policy that
+// merely round-tripped through the KV encoding is not rewritten on every startup.
+func ensureManagedPolicy(ctx context.Context, authService auth.Service, policy *model.Policy) (bool, error) {
+	existing, err := authService.GetPolicy(ctx, policy.DisplayName)
+	switch {
+	case err == nil:
+		if statementsEqual(existing.Statement, policy.Statement) {
+			return false, nil
+		}
+		if err := authService.WritePolicy(ctx, policy, true /* update */); err != nil {
+			return false, fmt.Errorf("datasets: rewrite managed policy %s: %w", policy.DisplayName, err)
+		}
+		logging.FromContext(ctx).WithField("policy", policy.DisplayName).
+			Warn("datasets: rewrote a managed policy whose statements did not match")
+		return true, nil
+	case errors.Is(err, auth.ErrNotFound):
+		err := authService.WritePolicy(ctx, policy, false /* create */)
+		if err != nil && !errors.Is(err, auth.ErrAlreadyExists) {
+			return false, err
+		}
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
 // createDatasetGroups creates every group that does not exist yet, ignoring auth.ErrAlreadyExists.
@@ -448,20 +637,17 @@ func createDatasetGroups(ctx context.Context, authService auth.Service, ts time.
 // re-attach, not a replace: detaching a built-in policy from a built-in group is undone on the
 // next bootstrap, which is what the reconciler promises for the immutability guard too (§12.3).
 //
-// A group that does not exist is skipped at debug level instead of failing the caller. Under RBAC a
-// group is only missing when the installation does not use that template, and failing here would
-// stop Reconcile before it repairs pins and guards (SEC-1 of DATASETS_REVIEW.md) - the very repair
-// that keeps GC from collecting published dataset data.
-func attachDatasetPolicies(ctx context.Context, authService auth.Service, log logging.Logger, group string, policies []string) error {
+// A group that does not exist in this installation's template (the ACL groups vs the RBAC
+// groups, §9.4) is skipped with a debug log rather than failing the whole bootstrap: the
+// datasets-pins-protect attachment already does the same for the base groups.
+func attachDatasetPolicies(ctx context.Context, authService auth.Service, group string, policies []string) error {
 	for _, policy := range policies {
 		err := authService.AttachPolicyToGroup(ctx, policy, group)
 		switch {
 		case err == nil, errors.Is(err, auth.ErrAlreadyExists):
 		case errors.Is(err, auth.ErrNotFound):
-			log.WithFields(logging.Fields{
-				"policy": policy,
-				"group":  group,
-			}).Debug("datasets: group does not exist in this installation's group template; not attaching the managed policy")
+			logging.FromContext(ctx).WithError(err).WithField("group", group).
+				Debug("datasets: group is not part of this installation's template; skipping policy attachment")
 		default:
 			return err
 		}

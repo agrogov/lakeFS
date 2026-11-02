@@ -5,6 +5,7 @@ import {
     clearDatasetNamesCache,
     DatasetsError,
     datasets,
+    getDatasetNames,
     isDatasetsDisabledError,
     isRebaseRequiredError,
     listDatasetNames,
@@ -93,7 +94,7 @@ describe('datasets client error mapping', () => {
             }),
         );
 
-        const error = await datasets.mergeProposal('d', 'p1').catch((e) => e);
+        const error = await datasets.mergePullRequest('d', 'p1').catch((e) => e);
 
         expect(error).toBeInstanceOf(DatasetsError);
         expect(error.status).toBe(409);
@@ -104,7 +105,7 @@ describe('datasets client error mapping', () => {
     it('does not treat a 409 without a rebase indication as a rebase', async () => {
         fetchMock.mockResolvedValue(jsonResponse(409, { message: 'proposal is not open' }));
 
-        const error = await datasets.mergeProposal('d', 'p1').catch((e) => e);
+        const error = await datasets.mergePullRequest('d', 'p1').catch((e) => e);
 
         expect(error.status).toBe(409);
         expect(isRebaseRequiredError(error)).toBe(false);
@@ -153,6 +154,77 @@ describe('isDatasetsDisabledError', () => {
     });
 });
 
+describe('dataset names cache (UI-3)', () => {
+    let fetchMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+        fetchMock = vi.fn();
+        vi.stubGlobal('fetch', fetchMock);
+        clearDatasetNamesCache();
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        clearDatasetNamesCache();
+    });
+
+    const page = (ids: string[]) =>
+        jsonResponse(200, {
+            results: ids.map((id) => ({ id, creation_date: 1 })),
+            pagination: { has_more: false, next_offset: '', results: ids.length, max_per_page: 1000 },
+        });
+
+    it('reads the names once and then serves them from the cache', async () => {
+        fetchMock.mockResolvedValueOnce(page(['customer-360']));
+
+        expect(await getDatasetNames()).toEqual(new Set(['customer-360']));
+        expect(await getDatasetNames()).toEqual(new Set(['customer-360']));
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('drops the cache after a successful create', async () => {
+        fetchMock.mockResolvedValueOnce(page(['customer-360']));
+        expect(await getDatasetNames()).toEqual(new Set(['customer-360']));
+
+        fetchMock.mockResolvedValueOnce(jsonResponse(201, { id: 'created', creation_date: 2 }));
+        await datasets.create({ name: 'created', definition: { data: [] } });
+
+        fetchMock.mockResolvedValueOnce(page(['customer-360', 'created']));
+        expect(await getDatasetNames()).toEqual(new Set(['customer-360', 'created']));
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+
+    it('drops the cache after a successful delete', async () => {
+        fetchMock.mockResolvedValueOnce(page(['customer-360', 'sales']));
+        expect(await getDatasetNames()).toEqual(new Set(['customer-360', 'sales']));
+
+        fetchMock.mockResolvedValueOnce({
+            status: 204,
+            ok: true,
+            statusText: 'No Content',
+            headers: { get: () => null },
+            json: async () => ({}),
+            text: async () => '',
+        });
+        await datasets.delete('sales');
+
+        fetchMock.mockResolvedValueOnce(page(['customer-360']));
+        expect(await getDatasetNames()).toEqual(new Set(['customer-360']));
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+
+    it('keeps the cache when the create fails', async () => {
+        fetchMock.mockResolvedValueOnce(page(['customer-360']));
+        expect(await getDatasetNames()).toEqual(new Set(['customer-360']));
+
+        fetchMock.mockResolvedValueOnce(jsonResponse(409, { message: 'name unavailable' }));
+        await datasets.create({ name: 'taken', definition: { data: [] } }).catch(() => null);
+
+        expect(await getDatasetNames()).toEqual(new Set(['customer-360']));
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+});
+
 describe('datasets client requests', () => {
     let fetchMock: ReturnType<typeof vi.fn>;
 
@@ -192,13 +264,13 @@ describe('datasets client requests', () => {
         fetchMock
             .mockResolvedValueOnce(
                 jsonResponse(200, {
-                    results: [{ name: 'customer-360' }],
+                    results: [{ id: 'customer-360' }],
                     pagination: { has_more: true, next_offset: 'customer-360', results: 1, max_per_page: 1000 },
                 }),
             )
             .mockResolvedValueOnce(
                 jsonResponse(200, {
-                    results: [{ name: 'sales' }],
+                    results: [{ id: 'sales' }],
                     pagination: { has_more: false, next_offset: '', results: 1, max_per_page: 1000 },
                 }),
             );

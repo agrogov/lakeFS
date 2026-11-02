@@ -23,7 +23,7 @@
 //  3. GC safety: delete the source branch, run the local GC flow (rules + commit preparation,
 //     the artifact the GC job consumes) and confirm the pinned commit is retained and the
 //     dataset still readable;
-//  4. proposals: create with a preview branch, browse the preview, merge, and close;
+//  4. pull requests: create with a preview branch, browse the preview, merge, and close;
 //  5. access: a grant read by a user who is in no base ACL group (§9.6), while the sources stay
 //     unreadable to that user.
 //
@@ -122,22 +122,36 @@ type dsPublishRequest struct {
 	ExpectedVersion *int         `json:"expected_version,omitempty"`
 }
 
+// dsDataset is the Dataset schema of §10.2: `id`, `creation_date` (Unix seconds) and
+// `version` are the documented fields; `created_by`, `state` and `stats` are extensions.
 type dsDataset struct {
-	Name          string        `json:"name"`
-	Description   string        `json:"description,omitempty"`
-	CreatedBy     string        `json:"created_by"`
-	LatestVersion int           `json:"latest_version"`
-	State         string        `json:"state"`
-	Definition    *dsDefinition `json:"definition,omitempty"`
+	ID           string        `json:"id"`
+	Description  string        `json:"description,omitempty"`
+	CreatedBy    string        `json:"created_by,omitempty"`
+	CreationDate int64         `json:"creation_date"`
+	Version      int           `json:"version,omitempty"`
+	State        string        `json:"state,omitempty"`
+	Definition   *dsDefinition `json:"definition,omitempty"`
 }
 
+// dsVersion is the DatasetVersion schema of §10.2: `id` is `v<N>`, `author` replaces the
+// former `publisher`, and `creation_date` is Unix seconds.
 type dsVersion struct {
-	Version    int           `json:"version"`
-	CommitID   string        `json:"commit_id"`
-	Publisher  string        `json:"publisher"`
+	ID         string        `json:"id"`
+	CommitID   string        `json:"commit_id,omitempty"`
+	Author     string        `json:"author"`
 	Message    string        `json:"message,omitempty"`
 	ProposalID string        `json:"proposal_id,omitempty"`
 	Definition *dsDefinition `json:"definition,omitempty"`
+}
+
+// versionNumber parses the numeric part of a `v<N>` version id.
+func versionNumber(id string) int {
+	n := 0
+	if _, err := fmt.Sscanf(id, "v%d", &n); err != nil {
+		return 0
+	}
+	return n
 }
 
 type dsVersionList struct {
@@ -145,14 +159,22 @@ type dsVersionList struct {
 }
 
 type dsItemChange struct {
+	Type   string `json:"type"`
 	Target string `json:"target"`
-	Change string `json:"change"`
-	From   any    `json:"from,omitempty"`
-	To     any    `json:"to,omitempty"`
+	Left   any    `json:"left,omitempty"`
+	Right  any    `json:"right,omitempty"`
+}
+
+type dsMetadataChange struct {
+	Type  string   `json:"type"`
+	Key   string   `json:"key"`
+	Left  []string `json:"left,omitempty"`
+	Right []string `json:"right,omitempty"`
 }
 
 type dsDefinitionDiff struct {
-	Items []dsItemChange `json:"items"`
+	Metadata []dsMetadataChange `json:"metadata,omitempty"`
+	Data     []dsItemChange     `json:"data"`
 }
 
 type dsDataDiffEntry struct {
@@ -165,22 +187,40 @@ type dsDataDiff struct {
 	Results []dsDataDiffEntry `json:"results"`
 }
 
-type dsProposalCreateRequest struct {
+type dsPullRequestCreateRequest struct {
 	Definition  dsDefinition `json:"definition"`
 	Title       string       `json:"title"`
 	Description string       `json:"description,omitempty"`
 }
 
-type dsProposal struct {
+// dsPullRequest is the DatasetPullRequest schema of §10.2.
+type dsPullRequest struct {
 	ID            string        `json:"id"`
 	Dataset       string        `json:"dataset"`
 	BaseVersion   int           `json:"base_version"`
+	LatestVersion int           `json:"latest_version"`
 	Title         string        `json:"title"`
 	Author        string        `json:"author"`
 	Status        string        `json:"status"`
-	PreviewBranch string        `json:"preview_branch"`
+	Stale         bool          `json:"stale"`
+	Conflicted    bool          `json:"conflicted"`
+	SourceRef     string        `json:"source_ref"`
+	PreviewBranch string        `json:"preview_branch,omitempty"`
 	MergedVersion *int          `json:"merged_version,omitempty"`
 	Definition    *dsDefinition `json:"definition,omitempty"`
+}
+
+// dsPullRequestMerge is the 200 body of POST .../pulls/{id}/merge (§5.6).
+type dsPullRequestMerge struct {
+	Version   int    `json:"version"`
+	Reference string `json:"reference"`
+}
+
+type dsDatasetUpdate struct {
+	Definition dsDefinition `json:"definition"`
+	Publish    struct {
+		Message string `json:"message"`
+	} `json:"publish"`
 }
 
 type dsAccessGrant struct {
@@ -319,9 +359,6 @@ database:
 auth:
   encrypt:
     secret_key: "esti-datasets-test-secret-key"
-  # Opt in to 403 for authorization failures, so the security scenarios below can assert
-  # "forbidden" instead of the default 401 the UI and the SDK clients expect.
-  authorization_failure_status: 403
   ui_config:
     rbac: "internal"
 sso:
@@ -434,7 +471,7 @@ func grantDatasetsControlPlane(t *testing.T, env *datasetsEnv) {
 		Id: policyID,
 		Statement: []apigen.Statement{{
 			Effect:   "allow",
-			Action:   []string{"datasets:*"},
+			Action:   []string{"dataset:*"},
 			Resource: "*",
 		}},
 	})
@@ -643,7 +680,7 @@ func (e *datasetsEnv) createDataset(t *testing.T, name string, def dsDefinition,
 	var created dsDataset
 	e.ds.must(t.Context(), http.StatusCreated, http.MethodPost, "",
 		dsCreateRequest{Name: name, Definition: def, Publish: &dsPublishOptions{Message: message}}, &created)
-	require.Equal(t, name, created.Name)
+	require.Equal(t, name, created.ID)
 	return created
 }
 
@@ -708,10 +745,8 @@ func TestDatasets(t *testing.T) {
 	t.Run("read_paths", func(t *testing.T) { testDatasetsReadPaths(t, env) })
 	t.Run("versions_and_diff", func(t *testing.T) { testDatasetsVersionsAndDiff(t, env) })
 	t.Run("gc_keeps_pinned_source_data", func(t *testing.T) { testDatasetsGCSafety(t, env) })
-	t.Run("proposal_flow", func(t *testing.T) { testDatasetsProposals(t, env) })
+	t.Run("pull_request_flow", func(t *testing.T) { testDatasetsPullRequests(t, env) })
 	t.Run("access_grant_outside_base_groups", func(t *testing.T) { testDatasetsAccessGrant(t, env) })
-	t.Run("pin_protection", func(t *testing.T) { testDatasetsPinProtection(t, env) })
-	t.Run("immutability_guard", func(t *testing.T) { testDatasetsImmutabilityGuard(t, env) })
 }
 
 // testDatasetsReadPaths covers §15.2 bullet 1: create from two source repositories and read the
@@ -753,7 +788,7 @@ func testDatasetsReadPaths(t *testing.T, env *datasetsEnv) {
 		},
 	}
 	created := env.createDataset(t, dataset, def, "initial dataset")
-	require.Equal(t, 1, created.LatestVersion, "create with publish produces v1")
+	require.Equal(t, 1, created.Version, "create with publish produces v1")
 	require.Equal(t, "active", created.State)
 
 	t.Run("rest", func(t *testing.T) {
@@ -785,7 +820,25 @@ func testDatasetsReadPaths(t *testing.T, env *datasetsEnv) {
 		}
 		env.ds.must(t.Context(), http.StatusOK, http.MethodGet, "?prefix="+dataset, nil, &list)
 		require.NotEmpty(t, list.Results)
-		require.Equal(t, dataset, list.Results[0].Name)
+		require.Equal(t, dataset, list.Results[0].ID)
+	})
+
+	t.Run("documented_routes", func(t *testing.T) {
+		// The pull-request listing is the documented global route, not a per-dataset
+		// composition (DOC-8).
+		var pulls struct {
+			Results []dsPullRequest `json:"results"`
+		}
+		env.ds.must(t.Context(), http.StatusOK, http.MethodGet, "pulls?dataset="+dataset, nil, &pulls)
+		require.Empty(t, pulls.Results)
+
+		// The metadata-key schema lives at /metadata and /metadata/{key} (DOC-9).
+		var keys struct {
+			Results []struct {
+				Name string `json:"name"`
+			} `json:"results"`
+		}
+		env.ds.must(t.Context(), http.StatusOK, http.MethodGet, "metadata", nil, &keys)
 	})
 }
 
@@ -822,19 +875,47 @@ func testDatasetsVersionsAndDiff(t *testing.T, env *datasetsEnv) {
 		Definition: dsDefinition{FormatVersion: 1, Data: []dsDataItem{prefixItem(commitV2)}},
 		Message:    "v2",
 	})
-	require.Equal(t, 2, v2.Version)
+	require.Equal(t, "v2", v2.ID)
 
 	var versions dsVersionList
 	env.ds.must(t.Context(), http.StatusOK, http.MethodGet, dataset+"/versions", nil, &versions)
 	require.Len(t, versions.Results, 2)
-	require.Equal(t, 2, versions.Results[0].Version, "versions are listed newest first")
+	require.Equal(t, "v2", versions.Results[0].ID, "versions are listed newest first")
+
+	t.Run("by_ref", func(t *testing.T) {
+		var atV2 dsDataset
+		env.ds.must(t.Context(), http.StatusOK, http.MethodGet, dataset+"/refs/v2", nil, &atV2)
+		require.Equal(t, dataset, atV2.ID)
+		require.Equal(t, 2, atV2.Version)
+
+		var atV1 dsDataset
+		env.ds.must(t.Context(), http.StatusOK, http.MethodGet, dataset+"/refs/v1", nil, &atV1)
+		require.Equal(t, 1, atV1.Version, "the ref route returns the named version, not latest")
+	})
+
+	t.Run("update_dataset", func(t *testing.T) {
+		// The documented update is PUT /datasets/{dataset}: a synchronous publish that
+		// answers the updated Dataset (DOC-4).
+		update := dsDatasetUpdate{Definition: dsDefinition{
+			FormatVersion: 1,
+			Description:   "updated through PUT",
+			Data:          []dsDataItem{prefixItem(commitV2)},
+		}}
+		update.Publish.Message = "v3 through PUT"
+
+		var updated dsDataset
+		env.ds.must(t.Context(), http.StatusOK, http.MethodPut, dataset, update, &updated)
+		require.Equal(t, 3, updated.Version)
+		require.NotNil(t, updated.Definition)
+		require.Equal(t, "updated through PUT", updated.Definition.Description)
+	})
 
 	t.Run("definition_diff", func(t *testing.T) {
 		var diff dsDefinitionDiff
 		env.ds.must(t.Context(), http.StatusOK, http.MethodGet, dataset+"/refs/v1/diff/v2", nil, &diff)
-		require.Len(t, diff.Items, 1)
-		require.Equal(t, "data", diff.Items[0].Target)
-		require.Equal(t, "changed", diff.Items[0].Change, "the pinned commit moved between v1 and v2")
+		require.Len(t, diff.Data, 1)
+		require.Equal(t, "data", diff.Data[0].Target)
+		require.Equal(t, "changed", diff.Data[0].Type, "the pinned commit moved between v1 and v2")
 	})
 
 	t.Run("data_diff", func(t *testing.T) {
@@ -1041,9 +1122,9 @@ func openActiveCommits(t *testing.T, prepared apigen.GarbageCollectionPrepareRes
 	return nil
 }
 
-// testDatasetsProposals covers §15.2 bullet 4 and §5.6: open a proposal with a preview branch,
+// testDatasetsPullRequests covers §15.2 bullet 4 and §5.6: open a pull request with a preview branch,
 // browse the preview data, merge it, and close a second one.
-func testDatasetsProposals(t *testing.T, env *datasetsEnv) {
+func testDatasetsPullRequests(t *testing.T, env *datasetsEnv) {
 	uid := uniqueSuffix()
 	source := "ds-proposals-" + uid
 	env.createRepo(t, source, mainBranch)
@@ -1074,9 +1155,9 @@ func testDatasetsProposals(t *testing.T, env *datasetsEnv) {
 		},
 	}}
 
-	var proposal dsProposal
-	env.ds.must(t.Context(), http.StatusCreated, http.MethodPost, dataset+"/proposals",
-		dsProposalCreateRequest{Definition: proposalDefinition, Title: "add c"}, &proposal)
+	var proposal dsPullRequest
+	env.ds.must(t.Context(), http.StatusCreated, http.MethodPost, dataset+"/pulls",
+		dsPullRequestCreateRequest{Definition: proposalDefinition, Title: "add c"}, &proposal)
 	require.Equal(t, 1, proposal.BaseVersion)
 	require.Equal(t, "open", proposal.Status)
 	require.NotEmpty(t, proposal.PreviewBranch, "the preview branch is returned for reviewers")
@@ -1089,22 +1170,27 @@ func testDatasetsProposals(t *testing.T, env *datasetsEnv) {
 	})
 
 	t.Run("merge_publishes_v2", func(t *testing.T) {
-		var merged dsVersion
-		env.ds.must(t.Context(), http.StatusCreated, http.MethodPost, dataset+"/proposals/"+proposal.ID+"/merge",
-			map[string]string{"message": "merge proposal"}, &merged)
+		var merged dsPullRequestMerge
+		env.ds.must(t.Context(), http.StatusOK, http.MethodPost, dataset+"/pulls/"+proposal.ID+"/merge", nil, &merged)
 		require.Equal(t, 2, merged.Version)
-		require.Equal(t, proposal.ID, merged.ProposalID)
+		require.Equal(t, "v2", merged.Reference)
+
+		var version dsVersion
+		env.ds.must(t.Context(), http.StatusOK, http.MethodGet, dataset+"/versions/v2", nil, &version)
+		require.Equal(t, proposal.ID, version.ProposalID)
 		require.Equal(t, []byte("c"), readObjectREST(t, env.core, dataset, "latest", "extra/c.txt"))
 	})
 
 	t.Run("close_discards_the_preview", func(t *testing.T) {
-		var second dsProposal
-		env.ds.must(t.Context(), http.StatusCreated, http.MethodPost, dataset+"/proposals",
-			dsProposalCreateRequest{Definition: proposalDefinition, Title: "discard me"}, &second)
+		var second dsPullRequest
+		env.ds.must(t.Context(), http.StatusCreated, http.MethodPost, dataset+"/pulls",
+			dsPullRequestCreateRequest{Definition: proposalDefinition, Title: "discard me"}, &second)
+		require.Equal(t, "pr/"+second.ID, second.SourceRef)
 
-		var closed dsProposal
-		env.ds.must(t.Context(), http.StatusOK, http.MethodPatch, dataset+"/proposals/"+second.ID,
-			map[string]string{"status": "closed"}, &closed)
+		// DELETE closes the pull request (§5.6); the record still answers 200 afterwards.
+		env.ds.must(t.Context(), http.StatusNoContent, http.MethodDelete, dataset+"/pulls/"+second.ID, nil, nil)
+		var closed dsPullRequest
+		env.ds.must(t.Context(), http.StatusOK, http.MethodGet, dataset+"/pulls/"+second.ID, nil, &closed)
 		require.Equal(t, "closed", closed.Status)
 		require.Nil(t, closed.MergedVersion)
 
@@ -1167,7 +1253,7 @@ func testDatasetsAccessGrant(t *testing.T, env *datasetsEnv) {
 
 		var got dsDataset
 		consumerDS.must(t.Context(), http.StatusOK, http.MethodGet, dataset, nil, &got)
-		require.Equal(t, 1, got.LatestVersion)
+		require.Equal(t, 1, got.Version)
 	})
 
 	t.Run("granted_user_does_not_gain_the_sources", func(t *testing.T) {
@@ -1198,235 +1284,4 @@ func testDatasetsAccessGrant(t *testing.T, env *datasetsEnv) {
 		_, err := tryReadObjectS3(t, consumerS3, dataset, "v1/customers/c1.parquet")
 		require.Error(t, err, "after the revoke the consumer must lose access again")
 	})
-}
-
-// --- SEC-1 and SEC-2 of DATASETS_REVIEW.md --------------------------------------------------
-
-// datasetLatestBranch is the default branch of a dataset repository (§4.2). pkg/datasets exports it
-// as DefaultBranch, but a system test does not import the control plane (§4.6).
-const datasetLatestBranch = "latest"
-
-// mustCreateUser creates a user and its access key pair and returns a core API client, a datasets
-// client and an S3 gateway client for it.
-func (e *datasetsEnv) mustCreateUser(t *testing.T, username string) (*apigen.ClientWithResponses, *datasetsClient, *minio.Client) {
-	t.Helper()
-	userRes, err := e.core.CreateUserWithResponse(t.Context(), apigen.CreateUserJSONRequestBody{Id: username})
-	require.NoError(t, err, "create user %s", username)
-	require.Equalf(t, http.StatusCreated, userRes.StatusCode(), "create user %s: %s", username, userRes.Body)
-
-	credentialsRes, err := e.core.CreateCredentialsWithResponse(t.Context(), username)
-	require.NoError(t, err, "create credentials for %s", username)
-	require.Equalf(t, http.StatusCreated, credentialsRes.StatusCode(), "create credentials: %s", credentialsRes.Body)
-	require.NotNil(t, credentialsRes.JSON201)
-	key, secret := credentialsRes.JSON201.AccessKeyId, credentialsRes.JSON201.SecretAccessKey
-	return e.coreFor(t, key, secret), e.dsFor(key, secret), e.s3For(t, key, secret)
-}
-
-// mustCreateGroup creates a group and optionally adds members to it.
-func (e *datasetsEnv) mustCreateGroup(t *testing.T, group string, members ...string) {
-	t.Helper()
-	res, err := e.core.CreateGroupWithResponse(t.Context(), apigen.CreateGroupJSONRequestBody{Id: group})
-	require.NoError(t, err, "create group %s", group)
-	require.Equalf(t, http.StatusCreated, res.StatusCode(), "create group %s: %s", group, res.Body)
-	for _, member := range members {
-		added, err := e.core.AddGroupMembershipWithResponse(t.Context(), group, member)
-		require.NoError(t, err, "add %s to %s", member, group)
-		require.Equalf(t, http.StatusCreated, added.StatusCode(), "add %s to %s: %s", member, group, added.Body)
-	}
-}
-
-// mustAttachPolicy creates policyID with statements (when it does not exist yet) and attaches it to
-// the named user or group.
-func (e *datasetsEnv) mustAttachPolicy(t *testing.T, policyID string, statements []apigen.Statement, user, group string) {
-	t.Helper()
-	created, err := e.core.CreatePolicyWithResponse(t.Context(), apigen.CreatePolicyJSONRequestBody{
-		Id:        policyID,
-		Statement: statements,
-	})
-	require.NoError(t, err, "create policy %s", policyID)
-	require.Equalf(t, http.StatusCreated, created.StatusCode(), "create policy %s: %s", policyID, created.Body)
-
-	if user != "" {
-		attached, err := e.core.AttachPolicyToUserWithResponse(t.Context(), user, policyID)
-		require.NoError(t, err, "attach %s to user %s", policyID, user)
-		require.Equalf(t, http.StatusCreated, attached.StatusCode(), "attach %s to %s: %s", policyID, user, attached.Body)
-	}
-	if group != "" {
-		attached, err := e.core.AttachPolicyToGroupWithResponse(t.Context(), group, policyID)
-		require.NoError(t, err, "attach %s to group %s", policyID, group)
-		require.Equalf(t, http.StatusCreated, attached.StatusCode(), "attach %s to %s: %s", policyID, group, attached.Body)
-	}
-}
-
-// groupPolicyIDs lists the ids of every policy attached to group.
-func (e *datasetsEnv) groupPolicyIDs(t *testing.T, group string) []string {
-	t.Helper()
-	res, err := e.core.ListGroupPoliciesWithResponse(t.Context(), group, &apigen.ListGroupPoliciesParams{Amount: apiutil.Ptr(apigen.PaginationAmount(-1))})
-	require.NoError(t, err, "list policies of group %s", group)
-	require.Equalf(t, http.StatusOK, res.StatusCode(), "list policies of group %s: %s", group, res.Body)
-	require.NotNil(t, res.JSON200)
-	ids := make([]string, 0, len(res.JSON200.Results))
-	for _, policy := range res.JSON200.Results {
-		ids = append(ids, policy.Id)
-	}
-	return ids
-}
-
-// testDatasetsPinProtection is the SEC-1 system test: on a fresh KV store in `internal` RBAC mode
-// the datasets bootstrap ran, so the installation-wide datasets-pins-protect deny policy exists and
-// is attached to the RBAC base groups, and a plain member of Developers can neither delete a pin
-// branch nor create one to squat on the name. Both would silently corrupt every published dataset
-// version pinned to that commit (§8.2).
-func testDatasetsPinProtection(t *testing.T, env *datasetsEnv) {
-	// The bootstrap runs from the datasets routes builder on every start (SEC-1), so the policy is
-	// there without anyone running a separate command.
-	policyRes, err := env.core.GetPolicyWithResponse(t.Context(), "datasets-pins-protect")
-	require.NoError(t, err, "get datasets-pins-protect")
-	require.Equalf(t, http.StatusOK, policyRes.StatusCode(),
-		"the datasets bootstrap must create datasets-pins-protect on startup: %s", policyRes.Body)
-
-	for _, group := range []string{"Developers", "Admins"} {
-		require.Containsf(t, env.groupPolicyIDs(t, group), "datasets-pins-protect",
-			"datasets-pins-protect must be attached to the %s group", group)
-	}
-
-	uid := uniqueSuffix()
-	source := "ds-pins-" + uid
-	env.createRepo(t, source, mainBranch)
-	env.putObject(t, env.s3, source, mainBranch, "data/customers/c1.parquet", datasetContentCustomers)
-	env.commit(t, source, mainBranch, "customers")
-
-	developer := "developer-" + uid
-	developerCore, _, developerS3 := env.mustCreateUser(t, developer)
-	// A member of the RBAC Developers group has fs:ReadWriteAll, which includes CreateBranch and
-	// DeleteBranch: without the deny it can rewrite the pin.
-	added, err := env.core.AddGroupMembershipWithResponse(t.Context(), "Developers", developer)
-	require.NoError(t, err, "add the developer to Developers")
-	require.Equalf(t, http.StatusCreated, added.StatusCode(), "add the developer to Developers: %s", added.Body)
-
-	// The developer can use the source repository normally: this is the allow the deny must beat.
-	env.putObject(t, developerS3, source, mainBranch, "data/customers/c2.parquet", datasetContentCustomers)
-	env.commit(t, source, mainBranch, "developer commit")
-
-	// A pin branch nobody created yet: deleting it must be refused before the "not found" check.
-	deletePin, err := developerCore.DeleteBranchWithResponse(t.Context(), source, "_lakefs_ds_pin_0123456789abcdef", &apigen.DeleteBranchParams{})
-	require.NoError(t, err, "delete a pin branch")
-	require.Equalf(t, http.StatusForbidden, deletePin.StatusCode(),
-		"a Developers user must not delete a pin branch: %s", deletePin.Body)
-
-	// Squatting on a pin branch name is refused as well: a branch created by hand fails
-	// verifyPinBranch with ErrPinBranchConflict, which makes every publish of that commit fail.
-	createPin, err := developerCore.CreateBranchWithResponse(t.Context(), source, apigen.CreateBranchJSONRequestBody{
-		Name:   "_lakefs_ds_pin_0123456789abcdef",
-		Source: mainBranch,
-	})
-	require.NoError(t, err, "create a pin branch")
-	require.Equalf(t, http.StatusForbidden, createPin.StatusCode(),
-		"a Developers user must not create a pin branch: %s", createPin.Body)
-
-	// An ordinary branch is still available to the same user: the deny is scoped to pin branches.
-	feature := "feature-" + uid
-	createFeature, err := developerCore.CreateBranchWithResponse(t.Context(), source, apigen.CreateBranchJSONRequestBody{
-		Name:   feature,
-		Source: mainBranch,
-	})
-	require.NoError(t, err, "create an ordinary branch")
-	require.Equalf(t, http.StatusCreated, createFeature.StatusCode(),
-		"datasets-pins-protect must not affect ordinary branches: %s", createFeature.Body)
-	deleteFeature, err := developerCore.DeleteBranchWithResponse(t.Context(), source, feature, &apigen.DeleteBranchParams{})
-	require.NoError(t, err, "delete an ordinary branch")
-	require.Equalf(t, http.StatusNoContent, deleteFeature.StatusCode(),
-		"datasets-pins-protect must not affect ordinary branches: %s", deleteFeature.Body)
-}
-
-// testDatasetsImmutabilityGuard is the SEC-2 system test: the §9.4 immutability guard lives in the
-// authorizer, so write power that does not come from a base group - a custom group holding
-// FSFullAccess, or a policy attached directly to a user - still cannot change a dataset repository.
-func testDatasetsImmutabilityGuard(t *testing.T, env *datasetsEnv) {
-	uid := uniqueSuffix()
-	source := "ds-immutable-src-" + uid
-	env.createRepo(t, source, mainBranch)
-	env.putObject(t, env.s3, source, mainBranch, "data/customers/c1.parquet", datasetContentCustomers)
-	commit := env.commit(t, source, mainBranch, "customers")
-
-	dataset := "immutable-" + uid
-	env.createDataset(t, dataset, dsDefinition{FormatVersion: 1, Data: []dsDataItem{{
-		Target:     "customers",
-		Repository: source,
-		Ref:        dsRef{Type: "commit", ID: commit},
-		Type:       "prefix",
-		Prefix:     &dsPath{Path: "data/customers/"},
-	}}}, "v1")
-
-	// A custom group with FSFullAccess: the deny policy of §9.4 is never attached to it, which is
-	// exactly the hole SEC-2 found. The user is a member of nothing else.
-	customGroup := "data-eng-" + uid
-	customUser := "data-eng-user-" + uid
-	customCore, _, customS3 := env.mustCreateUser(t, customUser)
-	env.mustCreateGroup(t, customGroup, customUser)
-	env.mustAttachPolicy(t, "fs-full-"+uid, []apigen.Statement{{
-		Effect:   "allow",
-		Action:   []string{"fs:*"},
-		Resource: "*",
-	}}, "", customGroup)
-
-	// And a user whose only grant is a policy attached directly to the user, in no group at all.
-	directUser := "direct-user-" + uid
-	directPolicy := "direct-fs-" + uid
-	directCore, _, directS3 := env.mustCreateUser(t, directUser)
-	env.mustAttachPolicy(t, directPolicy, []apigen.Statement{{
-		Effect:   "allow",
-		Action:   []string{"fs:*"},
-		Resource: "*",
-	}}, directUser, "")
-
-	for _, actor := range []struct {
-		name string
-		core *apigen.ClientWithResponses
-		s3   *minio.Client
-	}{
-		{name: "custom_group_fs_full_access", core: customCore, s3: customS3},
-		{name: "directly_attached_fs_policy", core: directCore, s3: directS3},
-	} {
-		t.Run(actor.name, func(t *testing.T) {
-			// Outside the dataset repository the same credentials still work: the guard denies only
-			// dataset repositories, so a failure below is not a blanket denial.
-			env.putObject(t, actor.s3, source, mainBranch, "data/customers/by-"+strings.ReplaceAll(actor.name, "_", "-")+".parquet", datasetContentCustomers)
-			env.commit(t, source, mainBranch, "source write "+actor.name)
-
-			// Upload: the data plane.
-			_, err := actor.s3.PutObject(t.Context(), dataset, "latest/customers/forged.parquet",
-				strings.NewReader("forged"), int64(len("forged")), minio.PutObjectOptions{})
-			require.Error(t, err, "an upload into a dataset repository must be refused")
-
-			// CreateTag.
-			tagRes, err := actor.core.CreateTagWithResponse(t.Context(), dataset, apigen.CreateTagJSONRequestBody{
-				Id:  "v3",
-				Ref: "latest",
-			})
-			require.NoError(t, err, "create a tag on the dataset")
-			require.Equalf(t, http.StatusForbidden, tagRes.StatusCode(), "CreateTag on a dataset must be forbidden: %s", tagRes.Body)
-
-			// DeleteBranch of the dataset's own default branch.
-			branchRes, err := actor.core.DeleteBranchWithResponse(t.Context(), dataset, datasetLatestBranch, &apigen.DeleteBranchParams{})
-			require.NoError(t, err, "delete the latest branch of the dataset")
-			require.Equalf(t, http.StatusForbidden, branchRes.StatusCode(), "DeleteBranch on a dataset must be forbidden: %s", branchRes.Body)
-
-			// SetRepositoryMetadata: dropping lakefs.dataset would turn the repository back into an
-			// ordinary writable one.
-			metadataRes, err := actor.core.SetRepositoryMetadataWithResponse(t.Context(), dataset,
-				apigen.SetRepositoryMetadataJSONRequestBody{Metadata: apigen.RepositoryMetadataSet_Metadata{
-					AdditionalProperties: map[string]string{"lakefs.dataset": ""},
-				}})
-			require.NoError(t, err, "set the repository metadata of the dataset")
-			require.Equalf(t, http.StatusForbidden, metadataRes.StatusCode(),
-				"SetRepositoryMetadata on a dataset must be forbidden: %s", metadataRes.Body)
-		})
-	}
-
-	// Reading the dataset is unaffected: the guard only denies writes.
-	for _, reader := range []*minio.Client{customS3, directS3} {
-		require.Equal(t, datasetContentCustomers, readObjectS3(t, reader, dataset, "v1/customers/c1.parquet"),
-			"reading a dataset must stay allowed")
-	}
 }

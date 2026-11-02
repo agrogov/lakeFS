@@ -119,7 +119,7 @@ export const ProposalTable: FC<ProposalTableProps> = ({ proposals, datasetId, em
                             <td className="dataset-proposal-title">
                                 <Link
                                     href={{
-                                        pathname: '/datasets/:datasetId/proposals/:proposalId',
+                                        pathname: '/datasets/:datasetId/pulls/:proposalId',
                                         params: { datasetId: dataset, proposalId: proposal.id },
                                     }}
                                 >
@@ -140,9 +140,9 @@ export const ProposalTable: FC<ProposalTableProps> = ({ proposals, datasetId, em
                             </td>
                             <td
                                 className="text-nowrap text-muted small"
-                                title={dayjs(proposal.created_at).toISOString()}
+                                title={dayjs.unix(proposal.creation_date).toISOString()}
                             >
-                                {dayjs(proposal.created_at).fromNow()}
+                                {dayjs.unix(proposal.creation_date).fromNow()}
                             </td>
                         </tr>
                     );

@@ -62,10 +62,10 @@ const definition = (targets: string[]): DatasetDefinition => ({
 });
 
 const version = (number: number, targets: string[]): Version => ({
-    version: number,
+    id: `v${number}`,
     message: `message for v${number}`,
-    publisher: 'publisher',
-    published_at: Date.UTC(2026, 0, number),
+    author: 'publisher',
+    creation_date: Date.UTC(2026, 0, number) / 1000,
     commit_id: `${number}`.repeat(40),
     definition: definition(targets),
     stats: { objects: 10, bytes: 1024, items: [] },
@@ -74,10 +74,10 @@ const version = (number: number, targets: string[]): Version => ({
 const versions = [version(2, ['customers']), version(1, ['customers'])];
 
 const dataset = {
-    name: 'customer-360',
-    created_at: Date.UTC(2026, 0, 1),
+    id: 'customer-360',
+    creation_date: Date.UTC(2026, 0, 1) / 1000,
     created_by: 'creator',
-    latest_version: 2,
+    version: 2,
     state: 'active',
     definition: versions[0].definition,
     stats: versions[0].stats,
@@ -218,7 +218,7 @@ describe('DatasetDataPage', () => {
     });
 
     it('says so when the dataset has no versions', async () => {
-        fetchMock.mockResolvedValueOnce(jsonResponse({ ...dataset, latest_version: 0, definition: undefined }));
+        fetchMock.mockResolvedValueOnce(jsonResponse({ ...dataset, version: 0, definition: undefined }));
         fetchMock.mockResolvedValueOnce(jsonResponse({ results: [], pagination: {} }));
         renderPage();
 

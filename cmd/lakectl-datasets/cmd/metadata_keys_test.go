@@ -27,7 +27,7 @@ func TestMetadataKeysListCommand(t *testing.T) {
 	out := mustExecute(t, "metadata-keys", "list", "--amount", "50")
 	request := fake.OnlyRequest()
 	require.Equal(t, http.MethodGet, request.Method)
-	require.Equal(t, controlPlanePath+"/metadata-keys", request.Path)
+	require.Equal(t, controlPlanePath+"/metadata", request.Path)
 	require.Equal(t, []string{"50"}, request.Query["amount"])
 	require.Contains(t, out, "tier")
 	require.Contains(t, out, "enum")
@@ -44,7 +44,7 @@ func TestMetadataKeysCreateCommand(t *testing.T) {
 
 		request := fake.OnlyRequest()
 		require.Equal(t, http.MethodPost, request.Method)
-		require.Equal(t, controlPlanePath+"/metadata-keys", request.Path)
+		require.Equal(t, controlPlanePath+"/metadata", request.Path)
 		requireJSONBody(t, request.Body, `{
 		  "name": "tier",
 		  "type": "enum",
@@ -110,11 +110,30 @@ func TestMetadataKeysCreateCommand(t *testing.T) {
 
 // TestMetadataKeysDeleteCommand pins the metadata key delete request (§10.1).
 func TestMetadataKeysDeleteCommand(t *testing.T) {
-	fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusNoContent})
-	out := mustExecute(t, "metadata-keys", "delete", "tier")
+	t.Run("delete", func(t *testing.T) {
+		fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusNoContent})
+		out := mustExecute(t, "metadata-keys", "delete", "tier")
 
-	request := fake.OnlyRequest()
-	require.Equal(t, http.MethodDelete, request.Method)
-	require.Equal(t, controlPlanePath+"/metadata-keys/tier", request.Path)
-	require.Contains(t, out, `Metadata key "tier" deleted`)
+		request := fake.OnlyRequest()
+		require.Equal(t, http.MethodDelete, request.Method)
+		require.Equal(t, controlPlanePath+"/metadata/tier", request.Path)
+		require.Contains(t, out, `Metadata key "tier" deleted`)
+	})
+
+	t.Run("json output prints the result", func(t *testing.T) {
+		// CLI-8: a 204 has no body, so -o json prints the deleted name instead of nothing.
+		newFakeControlPlane(t, fakeResponse{Status: http.StatusNoContent})
+		out := mustExecute(t, "metadata-keys", "delete", "tier", "-o", "json")
+		require.JSONEq(t, `{"deleted": "tier"}`, out)
+	})
+}
+
+// TestEnumKeyWithoutAllowedValuesIsAnArgumentError pins CLI-5: a missing flag is a command-line
+// problem, not a bad server answer.
+func TestEnumKeyWithoutAllowedValuesIsAnArgumentError(t *testing.T) {
+	fake := newFakeControlPlane(t, fakeResponse{Status: http.StatusCreated, Body: testMetadataKeyBody})
+	_, err := executeCommand(t, "metadata-keys", "create", "tier", "--type", "enum")
+	require.ErrorIs(t, err, ErrInvalidArguments)
+	require.NotErrorIs(t, err, ErrInvalidResponse)
+	require.Empty(t, fake.Requests())
 }

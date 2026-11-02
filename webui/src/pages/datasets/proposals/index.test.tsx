@@ -27,10 +27,14 @@ const proposal = (id: string, status: Proposal['status'], title: string): Propos
     id,
     dataset: 'customer-360',
     base_version: 1,
+    latest_version: 1,
+    stale: false,
+    conflicted: false,
+    source_ref: `pr/${id}`,
     title,
     author: 'alice',
     status,
-    created_at: Date.UTC(2026, 0, 1),
+    creation_date: Date.UTC(2026, 0, 1) / 1000,
     preview_branch: `_proposal-${id}`,
 });
 
@@ -43,21 +47,21 @@ const proposalsByStatus: Record<string, Proposal[]> = {
 describe('DatasetProposalsPage status filters', () => {
     let fetchMock: ReturnType<typeof vi.fn>;
 
-    const renderPage = (url = '/datasets/customer-360/proposals') =>
+    const renderPage = (url = '/datasets/customer-360/pulls') =>
         render(
             <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }} initialEntries={[url]}>
                 <Routes>
-                    <Route path="/datasets/:datasetId/proposals" element={<DatasetProposalsPage />} />
+                    <Route path="/datasets/:datasetId/pulls" element={<DatasetProposalsPage />} />
                 </Routes>
             </MemoryRouter>,
         );
 
-    const proposalListCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/proposals?'));
+    const proposalListCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/pulls?'));
 
     beforeEach(() => {
         fetchMock = vi.fn(async (url: unknown) => {
             const path = String(url);
-            if (path.includes('/proposals?')) {
+            if (path.includes('/pulls?')) {
                 const status = new URLSearchParams(path.split('?')[1] ?? '').get('status') ?? 'open';
                 return jsonResponse({
                     results: proposalsByStatus[status] ?? [],
@@ -107,7 +111,7 @@ describe('DatasetProposalsPage status filters', () => {
     });
 
     it('reads the filter from the URL so a filtered list can be linked to', async () => {
-        renderPage('/datasets/customer-360/proposals?status=merged');
+        renderPage('/datasets/customer-360/pulls?status=merged');
 
         expect(await screen.findByTestId('dataset-proposal-row-p-merged')).toBeInTheDocument();
         const [url] = proposalListCalls()[0];
@@ -115,7 +119,7 @@ describe('DatasetProposalsPage status filters', () => {
     });
 
     it('falls back to open for an unknown status value', async () => {
-        renderPage('/datasets/customer-360/proposals?status=bogus');
+        renderPage('/datasets/customer-360/pulls?status=bogus');
 
         expect(await screen.findByTestId('dataset-proposal-row-p-open')).toBeInTheDocument();
     });
@@ -126,7 +130,7 @@ describe('DatasetProposalsPage status filters', () => {
         const row = await screen.findByTestId('dataset-proposal-row-p-open');
         expect(screen.getByRole('link', { name: 'Open review' })).toHaveAttribute(
             'href',
-            '/datasets/customer-360/proposals/p-open',
+            '/datasets/customer-360/pulls/p-open',
         );
         expect(row).toBeInTheDocument();
     });

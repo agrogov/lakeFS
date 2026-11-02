@@ -17,14 +17,18 @@ func TestIsValidActionDatasets(t *testing.T) {
 		action  string
 		wantErr error
 	}{
-		{name: "list", action: "datasets:ListDatasets"},
-		{name: "read", action: "datasets:ReadDataset"},
-		{name: "publish", action: "datasets:PublishVersion"},
-		{name: "manage access", action: "datasets:ManageAccess"},
-		{name: "manage metadata keys", action: "datasets:ManageMetadataKeys"},
-		{name: "wildcard", action: "datasets:*"},
-		// The ARN service prefix is plural (DATASETS_DESIGN.md §9.1); the enterprise singular is not a service.
-		{name: "singular service", action: "dataset:ReadDataset", wantErr: permissions.ErrInvalidServiceName},
+		{name: "list", action: "dataset:ListDatasets"},
+		{name: "read", action: "dataset:ReadDataset"},
+		{name: "update", action: "dataset:UpdateDataset"},
+		{name: "manage access", action: "dataset:ManageAccess"},
+		{name: "list metadata keys", action: "dataset:ListMetadataKeys"},
+		{name: "read metadata key", action: "dataset:ReadMetadataKey"},
+		{name: "create metadata key", action: "dataset:CreateMetadataKey"},
+		{name: "update metadata key", action: "dataset:UpdateMetadataKey"},
+		{name: "delete metadata key", action: "dataset:DeleteMetadataKey"},
+		{name: "wildcard", action: "dataset:*"},
+		// The plural is a deprecated alias kept so old policies still validate.
+		{name: "deprecated plural alias", action: "datasets:ReadDataset"},
 		{name: "unknown service", action: "unknown:ReadDataset", wantErr: permissions.ErrInvalidServiceName},
 		{name: "no service", action: "ReadDataset", wantErr: permissions.ErrInvalidAction},
 	}
@@ -41,19 +45,20 @@ func TestIsValidActionDatasets(t *testing.T) {
 	}
 }
 
-// TestDatasetsActionsNotInPicker records the deliberate deferral of the datasets action
-// constants (see the TODO on the "datasets" serviceSet entry in actions.go): the service is
-// validated by prefix, but no datasets:* action is listed in permissions.Actions, so the
-// policy-editor action picker does not offer them. actions.gen.go is generated from the
-// constants in actions.go only. When the datasets feature lands and the constants become
-// visible to the generator, this test must be inverted together with that TODO.
+// TestDatasetsActionsNotInPicker records that the dataset action constants live in
+// pkg/datasets/authz.go rather than actions.go: the service is validated by prefix, but no
+// dataset:* action is listed in permissions.Actions, so the policy-editor action picker does
+// not offer them. actions.gen.go is generated from the constants in actions.go only.
 func TestDatasetsActionsNotInPicker(t *testing.T) {
 	t.Parallel()
 
-	require.NoError(t, permissions.IsValidAction("datasets:ListDatasets"))
+	require.NoError(t, permissions.IsValidAction("dataset:ListDatasets"))
 	for _, action := range permissions.Actions {
-		require.NotEqual(t, "datasets", strings.SplitN(action, ":", 2)[0],
-			"permissions.Actions must not offer datasets actions until the datasets feature lands (see actions.go TODO); got %q", action)
+		service := strings.SplitN(action, ":", 2)[0]
+		require.NotEqual(t, "dataset", service,
+			"permissions.Actions must not offer dataset actions until the constants move to actions.go; got %q", action)
+		require.NotEqual(t, "datasets", service,
+			"permissions.Actions must not offer deprecated datasets actions; got %q", action)
 	}
 }
 

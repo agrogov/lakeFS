@@ -1,10 +1,13 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 
 	"github.com/spf13/cobra"
+	"github.com/treeverse/lakefs/pkg/api/apiutil"
 	"github.com/treeverse/lakefs/pkg/datasets/apigen"
 )
 
@@ -31,7 +34,8 @@ from.`,
 // accessOptions is the parsed command line of `datasets access list`.
 type accessOptions struct {
 	Dataset string
-	Output  outputFormat
+	paginationOptions
+	Output outputFormat
 }
 
 // parseAccessOptions parses and validates the arguments of `datasets access list`.
@@ -39,11 +43,15 @@ func parseAccessOptions(cmd *cobra.Command, args []string) (accessOptions, error
 	if len(args) != 1 {
 		return accessOptions{}, invalidArguments("access list expects exactly one dataset name, got %d arguments", len(args))
 	}
+	pagination, err := parsePaginationOptions(cmd)
+	if err != nil {
+		return accessOptions{}, err
+	}
 	output, err := outputOf(cmd)
 	if err != nil {
 		return accessOptions{}, err
 	}
-	return accessOptions{Dataset: args[0], Output: output}, nil
+	return accessOptions{Dataset: args[0], paginationOptions: pagination, Output: output}, nil
 }
 
 func accessListCmd() *cobra.Command {
@@ -60,6 +68,7 @@ func accessListCmd() *cobra.Command {
 			return runAccessList(cmd, options)
 		},
 	}
+	withPaginationFlags(cmd)
 	return cmd
 }
 
@@ -68,7 +77,11 @@ func runAccessList(cmd *cobra.Command, options accessOptions) error {
 	if err != nil {
 		return err
 	}
-	resp, err := client.ListAccessWithResponse(cmd.Context(), apigen.DatasetName(options.Dataset))
+	params := &apigen.ListAccessParams{Amount: apiutil.Ptr(apigen.Amount(options.Amount))}
+	if options.After != "" {
+		params.After = apiutil.Ptr(apigen.After(options.After))
+	}
+	resp, err := client.ListAccessWithResponse(cmd.Context(), apigen.DatasetName(options.Dataset), params)
 	if err != nil {
 		return err
 	}
@@ -93,7 +106,7 @@ func runAccessList(cmd *cobra.Command, options accessOptions) error {
 	}
 	printTable(cmd,
 		[]any{"Principal Type", "Principal", "Granted By", "Granted At"},
-		rows, resp.JSON200.Pagination, 0)
+		rows, resp.JSON200.Pagination, options.Amount)
 	return nil
 }
 
@@ -224,6 +237,7 @@ func runAccessRevoke(cmd *cobra.Command, options accessGrantOptions) error {
 		apigen.DatasetName(options.Dataset),
 		apigen.PrincipalType(options.PrincipalType),
 		apigen.PrincipalID(options.PrincipalID),
+		pathUnescapeEditor,
 	)
 	if err != nil {
 		return err
@@ -231,10 +245,32 @@ func runAccessRevoke(cmd *cobra.Command, options accessGrantOptions) error {
 	if err := checkResponse(resp.HTTPResponse, resp.Body, http.StatusNoContent); err != nil {
 		return err
 	}
-	if options.Output != outputJSON {
-		fmt.Fprintf(cmd.OutOrStdout(), "Revoked %s %q access to dataset %q.\n",
-			options.PrincipalType, options.PrincipalID, options.Dataset)
+	if options.Output == outputJSON {
+		// The response body is a 204, so the command prints the result itself (CLI-8).
+		return printJSONResult(cmd.OutOrStdout(), revokedResult{
+			Revoked:       options.PrincipalType + "/" + options.PrincipalID,
+			Dataset:       options.Dataset,
+			PrincipalType: options.PrincipalType,
+			PrincipalID:   options.PrincipalID,
+		})
 	}
+	fmt.Fprintf(cmd.OutOrStdout(), "Revoked %s %q access to dataset %q.\n",
+		options.PrincipalType, options.PrincipalID, options.Dataset)
+	return nil
+}
+
+// pathUnescapeEditor fixes the escaping of the request path. principal_id is the only free-form
+// path parameter of the control plane, and the generated client escapes it before it becomes the
+// URL's Path, which Go then escapes again: "a b" travels as "a%2520b" and the server looks up the
+// principal "a%20b" (CLI-7). Unescaping the path makes Go escape it exactly once; a value that is
+// not a single valid escape sequence is left alone.
+func pathUnescapeEditor(_ context.Context, req *http.Request) error {
+	unescaped, err := url.PathUnescape(req.URL.Path)
+	if err != nil {
+		return nil
+	}
+	req.URL.Path = unescaped
+	req.URL.RawPath = ""
 	return nil
 }
 

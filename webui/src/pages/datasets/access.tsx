@@ -31,11 +31,48 @@ const PRINCIPAL_LABELS: Record<PrincipalType, string> = {
 const resolveUserName = (user: { id: string; friendly_name?: string }) => user.friendly_name || user.id;
 const resolveGroupName = (group: { id: string; name?: string }) => group.name || group.id;
 
+/** A principal whose grant failed, with the failure the server returned for it. */
+export interface GrantFailure {
+    principalId: string;
+    error: Error;
+}
+
+/**
+ * Grants read access to every selected principal, keeping the ones that worked (UI-4).
+ *
+ * `Promise.all` would reject on the first failure and hide the remaining principals' outcome,
+ * so the request is settled per principal and the failures are reported together. The caller
+ * re-reads the grant list either way: the grants that did succeed are already in force.
+ */
+export const grantAll = async (
+    datasetId: string,
+    type: PrincipalType,
+    entities: { id: string }[],
+): Promise<GrantFailure[]> => {
+    const results = await Promise.allSettled(
+        entities.map((entity) => datasets.grantAccess(datasetId, { principal_type: type, principal_id: entity.id })),
+    );
+    const failures: GrantFailure[] = [];
+    results.forEach((result, index) => {
+        if (result.status === 'rejected') {
+            failures.push({ principalId: entities[index].id, error: result.reason as Error });
+        }
+    });
+    return failures;
+};
+
+/** A message naming every principal the grant did not reach, plus the first reason given. */
+export const grantFailureMessage = (failures: GrantFailure[]): string => {
+    const names = failures.map((failure) => failure.principalId).join(', ');
+    const reason = failures[0]?.error?.message;
+    return reason ? `Could not grant read access to ${names}: ${reason}` : `Could not grant read access to ${names}`;
+};
+
 /**
  * Access of one dataset (DATASETS_DESIGN.md §11.2, §9.2): the users and groups that were granted
  * consumer read access, and the controls to grant and revoke it.
  *
- * The page is rendered only for a caller holding `datasets:ManageAccess`; a `403` from the list
+ * The page is rendered only for a caller holding `dataset:ManageAccess`; a `403` from the list
  * is treated exactly like the policy check saying no, so both paths show the same explanation
  * rather than an error.
  */
@@ -67,15 +104,11 @@ const DatasetAccessPage: FC = () => {
     const grant = async (type: PrincipalType, entities: { id: string }[]) => {
         setActionError(null);
         try {
-            await Promise.all(
-                entities.map((entity) =>
-                    datasets.grantAccess(datasetId, { principal_type: type, principal_id: entity.id }),
-                ),
-            );
-            refetch();
-        } catch (grantError) {
-            setActionError(grantError as Error);
+            const failures = await grantAll(datasetId, type, entities);
+            if (failures.length > 0) setActionError(new Error(grantFailureMessage(failures)));
         } finally {
+            // Always re-read: a partial success has already changed the grants on the server.
+            refetch();
             setAddType(null);
         }
     };
@@ -171,7 +204,7 @@ const DatasetAccessPage: FC = () => {
                     modalTitle={addType === 'user' ? 'Add users' : 'Add groups'}
                     addText={addType === 'user' ? 'Add users' : 'Add groups'}
                     headers={['', addType === 'user' ? 'User' : 'Group']}
-                    searchFn={(prefix, after) =>
+                    searchFn={(prefix: string, after: string) =>
                         addType === 'user'
                             ? auth.listUsers(prefix, after, PageSize)
                             : auth.listGroups(prefix, after, PageSize)

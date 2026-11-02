@@ -18,7 +18,8 @@
     "serve": "vite preview",
     "test": "vitest run",
     "test-watch": "vitest",
-    "lint": "eslint src",
+    "lint": "eslint src && npm run lint:types:datasets",
+    "lint:types:datasets": "node scripts/checkDatasetTypes.mjs",
     "format": "prettier --write \"src/**/*.{js,jsx,ts,tsx,json,css,scss,md}\"",
     "format:check": "prettier --check \"src/**/*.{js,jsx,ts,tsx,json,css,scss,md}\"",
     "typesync": "typesync"

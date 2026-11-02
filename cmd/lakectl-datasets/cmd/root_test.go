@@ -16,8 +16,8 @@ func TestRootCommandTree(t *testing.T) {
 
 	// commandPaths maps each command tree of §12.1 to the subcommands it must provide.
 	commandPaths := map[string][]string{
-		"datasets":               {"list", "show", "create", "publish", "validate", "versions", "diff", "delete", "proposals", "access", "metadata-keys"},
-		"datasets proposals":     {"list", "show", "create", "merge", "close"},
+		"datasets":               {"list", "show", "create", "publish", "validate", "versions", "diff", "delete", "pulls", "access", "metadata-keys"},
+		"datasets pulls":         {"list", "show", "create", "diff", "merge", "close"},
 		"datasets access":        {"list", "grant", "revoke"},
 		"datasets metadata-keys": {"list", "create", "delete"},
 	}
@@ -97,6 +97,41 @@ func TestOutputFlag(t *testing.T) {
 	})
 }
 
+// TestMetadataFilterWireQuery pins the repeated-metadata wire shape (CLI-6, review m1): a key
+// repeated on the command line is sent as one `metadata.<key>` query parameter per value, which
+// is what the server reads as OR within that key — metadata.tier=gold&metadata.tier=silver
+// matches a dataset whose tier is gold *or* silver. Collapsing the values, or joining them with
+// a comma, would silently change the server's answer, so the shape is pinned here.
+func TestMetadataFilterWireQuery(t *testing.T) {
+	root := NewRoot()
+	list, _, err := root.Find([]string{"list"})
+	require.NoError(t, err)
+	require.NoError(t, list.ParseFlags([]string{
+		"--metadata", "tier=gold",
+		"--metadata", "tier=silver",
+		"--metadata", "owner=data-platform",
+	}))
+
+	// The flag help must describe the same semantics the server implements.
+	require.Contains(t, list.Flags().Lookup(metadataFlagName).Usage, "a repeated key matches any of its values")
+
+	filters, err := parseMetadataFilters(list)
+	require.NoError(t, err)
+	require.Equal(t, map[string][]string{
+		"tier":  {"gold", "silver"},
+		"owner": {"data-platform"},
+	}, filters)
+
+	editor := metadataFilterEditor(filters)
+	require.NotNil(t, editor)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://example.com"+controlPlanePath+"/", nil)
+	require.NoError(t, err)
+	require.NoError(t, editor(t.Context(), req))
+	require.Equal(t, []string{"gold", "silver"}, req.URL.Query()["metadata.tier"])
+	require.Equal(t, []string{"data-platform"}, req.URL.Query()["metadata.owner"])
+	require.Equal(t, "metadata.owner=data-platform&metadata.tier=gold&metadata.tier=silver", req.URL.RawQuery)
+}
+
 // TestCheckResponse pins the error mapping of §10.4: one message plus one line per problem.
 func TestCheckResponse(t *testing.T) {
 	t.Run("expected status", func(t *testing.T) {
@@ -139,6 +174,42 @@ func TestCheckResponse(t *testing.T) {
 // endpoint is used as the server, so the generated operations resolve under /api/v1/datasets.
 func TestAPIClientPath(t *testing.T) {
 	require.Equal(t, "/api/v1/datasets", controlPlanePath)
+}
+
+// TestControlPlaneURL pins CLI-9: the base URL is derived from the parsed server URL, so a custom
+// endpoint path or a trailing slash survives instead of being pasted onto a trimmed string.
+func TestControlPlaneURL(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		want     string
+	}{
+		{endpoint: "http://localhost:8000", want: "http://localhost:8000/api/v1/datasets"},
+		{endpoint: "http://localhost:8000/", want: "http://localhost:8000/api/v1/datasets"},
+		{endpoint: "https://lakefs.example.com/lakefs", want: "https://lakefs.example.com/lakefs/api/v1/datasets"},
+		{endpoint: "https://lakefs.example.com/lakefs/", want: "https://lakefs.example.com/lakefs/api/v1/datasets"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got, err := controlPlaneURL(tt.endpoint)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+
+	t.Run("invalid endpoint", func(t *testing.T) {
+		_, err := controlPlaneURL("://not-a-url")
+		require.ErrorContains(t, err, "invalid server endpoint")
+	})
+}
+
+// TestRootHelpDocumentsFlagOrder pins the help text CLI-9 asks for: lakectl's global flags must
+// come before the command name, because the plugin only receives what follows it.
+func TestRootHelpDocumentsFlagOrder(t *testing.T) {
+	root := NewRoot()
+	require.Contains(t, root.Long, "must come before the command")
+	require.Contains(t, root.Long, "lakectl --config ~/.lakectl.yaml datasets list")
+	require.Contains(t, root.Long, "lakectl datasets list --prefix customer -o json")
+	require.Contains(t, root.Long, controlPlanePath)
 }
 
 // TestPluginArgumentsShape pins how the plugin is invoked: lakectl strips the plugin name, so

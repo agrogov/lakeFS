@@ -2,6 +2,9 @@ package datasets
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,15 +37,45 @@ type spikeFixture struct {
 	kvStore kv.Store
 }
 
+var (
+	spikeConfigOnce sync.Once
+	spikeConfigBase config.ConfigImpl
+	spikeConfigErr  error
+)
+
+// spikeConfig returns a private copy of the process configuration the fixtures build their catalog
+// from. config.NewConfig writes process globals - viper and the logrus outputs - so it runs once
+// (TestMain calls it before any test starts) rather than per fixture: building it per fixture
+// raced with every parallel test that logged, and failed the -race suite.
+func spikeConfig(t *testing.T) *config.ConfigImpl {
+	t.Helper()
+	testutil.MustDo(t, "build config", initSpikeConfig())
+	cfg := spikeConfigBase // the nested sections are values, so this copy is the fixture's own
+	return &cfg
+}
+
+func initSpikeConfig() error {
+	spikeConfigOnce.Do(func() {
+		// The catalog builds its block adapter from the process configuration; force the mem adapter.
+		viper.Set(config.BlockstoreTypeKey, block.BlockstoreTypeMem)
+		_, spikeConfigErr = config.NewConfig("", &spikeConfigBase)
+	})
+	return spikeConfigErr
+}
+
+func TestMain(m *testing.M) {
+	if err := initSpikeConfig(); err != nil {
+		fmt.Fprintln(os.Stderr, "datasets tests: build config:", err)
+		os.Exit(1)
+	}
+	os.Exit(m.Run())
+}
+
 func newSpikeFixture(t *testing.T) *spikeFixture {
 	t.Helper()
 	ctx := t.Context()
 
-	// The catalog builds its block adapter from the process configuration; force the mem adapter.
-	viper.Set(config.BlockstoreTypeKey, block.BlockstoreTypeMem)
-	cfg := &config.ConfigImpl{}
-	_, err := config.NewConfig("", cfg)
-	testutil.MustDo(t, "build config", err)
+	cfg := spikeConfig(t)
 	cfg.Committed.LocalCache.Dir = t.TempDir()
 	// Disable the repository and commit caches: they are wall-clock caches (default expiry is
 	// seconds), so a create-after-delete assertion would race with them. This is a test-only

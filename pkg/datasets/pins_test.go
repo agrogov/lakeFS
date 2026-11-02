@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -424,11 +425,10 @@ func TestDegradedDetection(t *testing.T) {
 	require.NoError(t, err)
 
 	now := time.Now().UTC()
-	_, err = f.store.CreateDataset(ctx, &DatasetRecord{
+	require.NoError(t, f.store.CreateDataset(ctx, &DatasetRecord{
 		Name: dataset, CreatedBy: "publisher", CreatedAt: now, UpdatedAt: now,
 		State: DatasetStateActive, LatestVersion: 1,
-	})
-	require.NoError(t, err)
+	}))
 	_, err = f.store.PutVersion(ctx, VersionRecord{
 		Dataset: dataset, Version: 1, Definition: def, Publisher: "publisher",
 		PublishedAt: now, CommitID: "dataset-commit", MetaRangeID: "metarange",
@@ -511,11 +511,10 @@ func TestDegradedDoesNotTouchTransientStates(t *testing.T) {
 	require.NoError(t, err)
 
 	now := time.Now().UTC()
-	_, err = f.store.CreateDataset(ctx, &DatasetRecord{
+	require.NoError(t, f.store.CreateDataset(ctx, &DatasetRecord{
 		Name: dataset, CreatedBy: "publisher", CreatedAt: now, UpdatedAt: now,
 		State: DatasetStatePublishing, LatestVersion: 1, PendingVersion: 2,
-	})
-	require.NoError(t, err)
+	}))
 	require.NoError(t, f.cat.DeleteRepository(ctx, "source-one", graveler.WithForce(true)))
 
 	missing, marked, err := f.pins.CheckDatasetDegraded(ctx, dataset)
@@ -608,4 +607,47 @@ func TestAcquireRollsBackOnlyWhatItAdded(t *testing.T) {
 	require.Equal(t, []string{ref}, f.pinRefs(t, goodSource.Repository, goodSource.CommitID),
 		"a reference that was already held must survive the rollback of a failed retry")
 	f.requirePinBranch(t, goodSource.Repository, goodSource.CommitID)
+}
+
+// TestAcquireReleaseConcurrentKeepsRecordAndBranchInStep is BUG-5: Acquire and Release of the same
+// reference race on the pin record and on the hidden branch. Afterwards the record must exist if
+// and only if the branch does: a record without a branch claims GC protection that is not there,
+// and a branch without a record protects a commit nothing references.
+func TestAcquireReleaseConcurrentKeepsRecordAndBranchInStep(t *testing.T) {
+	f := newPinFixture(t)
+	ctx := f.ctx
+	commit := f.sourceRepo(t, "source-race", "data/a/customers.parquet")
+	src := PinnedSource{Repository: "source-race", CommitID: commit.String()}
+	def := definitionOf(src)
+	ref := PinReference("customer-360", 1)
+
+	const iterations = 100
+	for i := 0; i < iterations; i++ {
+		var wg sync.WaitGroup
+		errs := make(chan error, 2)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, err := f.pins.Acquire(ctx, def, ref)
+			errs <- err
+		}()
+		go func() {
+			defer wg.Done()
+			errs <- f.pins.Release(ctx, def, ref)
+		}()
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			require.NoError(t, err, "iteration %d", i)
+		}
+
+		_, _, pinErr := f.store.GetPin(ctx, src.Repository, src.CommitID)
+		recordExists := pinErr == nil
+		if !recordExists {
+			require.ErrorIs(t, pinErr, kv.ErrNotFound, "iteration %d", i)
+		}
+		_, branchExists := f.pinBranchAt(t, src.Repository, src.CommitID)
+		require.Equal(t, recordExists, branchExists,
+			"iteration %d: the pin record and its branch must exist together", i)
+	}
 }

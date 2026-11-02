@@ -38,6 +38,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 	require.Equal(t, AccessModelOpen, cfg.AccessModel)
 	require.Empty(t, cfg.ImmutableGuardGroups)
 	require.False(t, cfg.Metadata.Strict)
+	require.Equal(t, DefaultMaxRequestBody, cfg.MaxRequestBody, "SEC-5: 4 MiB by default")
 }
 
 func TestLoadConfigValid(t *testing.T) {
@@ -58,6 +59,7 @@ datasets:
     - DatasetPublishers
   metadata:
     strict: true
+  max_request_body: 1048576
 `)
 
 	cfg, err := LoadConfig()
@@ -74,6 +76,7 @@ datasets:
 	require.Equal(t, AccessModelOpen, cfg.AccessModel)
 	require.Equal(t, []string{"DatasetAdmins", "DatasetPublishers"}, cfg.ImmutableGuardGroups)
 	require.True(t, cfg.Metadata.Strict)
+	require.Equal(t, int64(1<<20), cfg.MaxRequestBody)
 }
 
 // TestLoadConfigDisabledIsInert checks that the storage checks only apply when the service is
@@ -84,6 +87,25 @@ func TestLoadConfigDisabledIsInert(t *testing.T) {
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
 	require.False(t, cfg.Enabled)
+}
+
+// TestLoadConfigNamespacePrefixEnables is DOC-16: the documented configuration has no
+// datasets.enabled switch, only a storage namespace prefix, so a configured prefix enables
+// the feature when enabled is unset. An explicit enabled: false still wins.
+func TestLoadConfigNamespacePrefixEnables(t *testing.T) {
+	t.Run("prefix enables when enabled is unset", func(t *testing.T) {
+		useConfig(t, "datasets:\n  storage_namespace_prefix: \"mem://datasets\"\n")
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.True(t, cfg.Enabled)
+	})
+
+	t.Run("explicit false wins", func(t *testing.T) {
+		useConfig(t, "datasets:\n  enabled: false\n  storage_namespace_prefix: \"mem://datasets\"\n")
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.False(t, cfg.Enabled)
+	})
 }
 
 func TestLoadConfigEnvironmentOverrides(t *testing.T) {
@@ -167,6 +189,11 @@ func TestLoadConfigValidationErrors(t *testing.T) {
 			name:    "non-positive merge_fan_in",
 			yaml:    "datasets:\n  merge_fan_in: -64\n",
 			wantErr: "merge_fan_in must be positive",
+		},
+		{
+			name:    "negative max_request_body",
+			yaml:    "datasets:\n  max_request_body: -1\n",
+			wantErr: "max_request_body must not be negative",
 		},
 		{
 			name:    "unknown access_model",

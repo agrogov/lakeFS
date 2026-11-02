@@ -71,8 +71,10 @@ const (
 var (
 	// ErrDuplicateKey reports two sources producing the same dataset key, or a source
 	// whose entries are not strictly increasing. Targets are validated not to overlap
-	// (§5.2 rule 3), so this can only be a bug or a corrupted source, and it fails the
-	// publish instead of silently dropping an entry (§6.4).
+	// (§5.2 rule 3) and a source key that would land on the reserved definition entry is
+	// rejected earlier as a *ValidationError (checkReservedKey, §6.4), so this can only be
+	// a bug or a corrupted source, and it fails the publish instead of silently dropping an
+	// entry (§6.4).
 	ErrDuplicateKey = errors.New("duplicate or out-of-order key in materialised dataset")
 
 	// ErrNoChanges reports a publish that would reproduce the previous version
@@ -123,20 +125,11 @@ type Materializer struct {
 	// *ValidationError instead of becoming a version.
 	ValidateOptions ValidateOptions
 
-	// SourceGuard, when set, authorizes the caller's fs:ReadObject right on the exact
-	// object ARN of every source path the iterators below yield (SEC-3).
-	//
-	// It is the authoritative answer to "may this caller attach this data": the item
-	// level check of Authorizer.CheckSources authorizes one ARN per item, and for a
-	// prefix item that ARN carries a glob, which a Deny on a sub-path of the prefix
-	// does not match. A denial fails the publish with a *SourceError naming the item
-	// and the first denied path, before that entry is merged.
-	//
-	// A nil guard skips the check. Every publish that has a caller to check for sets
-	// one (Service.publish and Service.countSources build it); it stays nil only for a
-	// caller that has no principal to authorize, which is the service's own repair
-	// path (§12.3) and never a request.
-	SourceGuard *SourceReadGuard
+	// RequireSourceAuthz makes every source read fail unless the context carries the caller's
+	// per-object source-read check (SEC-3). The service sets it, so a code path that forgets to
+	// authorize fails closed instead of copying objects the caller may not read. Tests that
+	// drive the primitive directly leave it false.
+	RequireSourceAuthz bool
 }
 
 // PublishRequest is everything one publish needs. The definition must already be
@@ -174,11 +167,12 @@ type PublishRequest struct {
 	// §6.2 step 8. Leave it zero when publishing the first version.
 	Previous PreviousVersion
 
-	// Guard, when set, is called right before the commit and again right before the tag.
-	// It is how the service re-verifies that it still owns the dataset record before it
-	// writes anything other than the metarange (BUG-3): a long command that lost the record
-	// to a takeover must not commit a version it no longer owns. A preview leaves it nil.
-	Guard func(ctx context.Context) error
+	// BeforeCommit, when set, runs after the metarange is written and immediately before the
+	// commit (and therefore before the tag of Publish). The service uses it to re-verify, with
+	// a CAS, that the attempt still owns the dataset record right before the commit becomes
+	// durable (BUG-3): a publish that was taken over or rolled back must not commit. A nil
+	// hook is a caller with no record to guard (a proposal preview, a test of the primitive).
+	BeforeCommit func(ctx context.Context) error
 }
 
 // PreviousVersion is the version a publish supersedes. Callers that cannot supply
@@ -331,11 +325,6 @@ func (m *Materializer) Publish(ctx context.Context, req PublishRequest) (*Publis
 
 	// §6.2 step 10: the tag is what turns the commit into a version ref (§7.1). Only a
 	// version is tagged; MaterializePreview is the untagged form used by a proposal.
-	if req.Guard != nil {
-		if err := req.Guard(ctx); err != nil {
-			return nil, err
-		}
-	}
 	tag := VersionTag(req.Version)
 	if err := m.tag(ctx, req.Dataset, tag, result.CommitID); err != nil {
 		return nil, err
@@ -431,16 +420,27 @@ func (m *Materializer) materialize(ctx context.Context, req PublishRequest, bran
 	// that knows the previous metarange ID but not the previous definition (the
 	// reconciler resuming a publish, §12.3). A publish that merely repeats the previous
 	// definition was already rejected above.
+	//
+	// Known divergence (docs/datasets.md, "Known design divergences"): this branch cannot
+	// fire in practice. The metarange always contains the synthetic _dataset/definition.json
+	// entry of §6.4, and that document carries the version number, so the metarange of vN+1
+	// differs from vN's even when the data does not - and the definition comparison above
+	// already rejected that case. The check stays as a defensive net for a caller that
+	// supplies a previous metarange but no previous definition; removing it would silently
+	// drop the only guard such a caller has.
 	if req.Previous.MetaRangeID != "" && req.Previous.MetaRangeID == *metaRangeID {
 		return nil, fmt.Errorf("datasets: %s version %d: %w", req.Dataset, req.Version, ErrNoChanges)
 	}
 
-	// §6.2 step 9.
-	if req.Guard != nil {
-		if err := req.Guard(ctx); err != nil {
+	// BUG-3: the caller's last chance to prove it still owns the publish, taken after every
+	// read of the sources and before the commit and the tag become durable.
+	if req.BeforeCommit != nil {
+		if err := req.BeforeCommit(ctx); err != nil {
 			return nil, err
 		}
 	}
+
+	// §6.2 step 9.
 	commitID, err := m.commit(ctx, req, branch, *metaRangeID)
 	if err != nil {
 		return nil, err
@@ -566,14 +566,17 @@ func (m *Materializer) putDefinition(ctx context.Context, dsRepo *graveler.Repos
 	return &singleRecordIterator{key: graveler.Key(DefinitionPath), value: value}, nil
 }
 
-// openItems opens one source iterator per data item, in definition order (§6.3). On
-// error, the iterators that were already opened are closed again.
+// openItems opens one source iterator per data item, in definition order (§6.3), and refuses
+// an item whose source holds a key that maps onto the reserved definition entry (§6.4,
+// checkReservedKey). On error, the iterators that were already opened are closed again.
 //
 // §6.5 limits how many per-item iterators may be open at once (datasets.merge_fan_in,
 // default 64) and prescribes merging in two passes with WriteRange above that. This
 // implementation opens all of them for the duration of the merge: the iterators are
 // metadata-only, and datasets.max_items bounds the count at 1000 by default. The two-pass
-// variant is a later performance step, not a correctness one.
+// variant is a later performance step, not a correctness one. It is a documented divergence
+// (docs/datasets.md, "Known design divergences"): datasets.merge_fan_in is validated but not
+// applied, so do not rely on it to cap concurrent source iterators.
 func (m *Materializer) openItems(ctx context.Context, def Definition) ([]*itemIterator, error) {
 	items := make([]*itemIterator, 0, len(def.Data))
 	for i := range def.Data {
@@ -587,8 +590,7 @@ func (m *Materializer) openItems(ctx context.Context, def Definition) ([]*itemIt
 	return items, nil
 }
 
-// openItem builds the iterator of a single data item. Its entries are vetted by m.SourceGuard
-// when one is set (SEC-3).
+// openItem builds the iterator of a single data item.
 func (m *Materializer) openItem(ctx context.Context, index int, item *DataItem) (*itemIterator, error) {
 	stream := &itemStream{
 		index:  index,
@@ -627,25 +629,31 @@ func (m *Materializer) openItem(ctx context.Context, index int, item *DataItem) 
 	if err != nil {
 		return nil, err
 	}
-	// The per-object source read check of SEC-3: every entry this item yields is authorized
-	// for the caller before it is merged, so a Deny on a sub-path of a prefix item cannot be
-	// bypassed. The closure captures ctx, because a graveler.ValueIterator has no request
-	// context of its own.
-	var authorizeSourcePath func(path string) error
-	if m.SourceGuard != nil {
-		guard := m.SourceGuard
-		itemIndex, dataItem := index, item
-		authorizeSourcePath = func(path string) error {
-			return guard.CheckObject(ctx, itemIndex, dataItem, path)
-		}
+	// §6.4: an item that maps a source key onto DefinitionPath would collide with the
+	// synthetic definition entry the merge adds. Rejecting it here - after the authz gate of
+	// openSource, before putDefinition uploads the definition object and before the merge
+	// writes a single metarange entry - keeps the failure a definition problem that names
+	// the item, instead of the merge's internal ErrDuplicateKey.
+	if err := m.checkReservedKey(ctx, stream); err != nil {
+		src.Close()
+		return nil, err
 	}
-	return &itemIterator{stream: stream, src: src, adapter: m.Catalog.BlockAdapter, authorizeSourcePath: authorizeSourcePath}, nil
+	return &itemIterator{stream: stream, src: src, adapter: m.Catalog.BlockAdapter}, nil
 }
 
 // openSource opens the source-key-space iterator of one item: a single-key get for an
 // object item, a prefix-bounded Store.List for a prefix item (§6.3).
 func (m *Materializer) openSource(ctx context.Context, stream *itemStream) (graveler.ValueIterator, error) {
+	reader := sourceReaderFrom(ctx)
+	if reader == nil && m.RequireSourceAuthz {
+		return nil, ErrSourceAuthzMissing
+	}
 	if stream.object {
+		if reader != nil {
+			if err := checkSourceObject(ctx, reader, stream, stream.sourceKey); err != nil {
+				return nil, err
+			}
+		}
 		value, err := m.Catalog.Store.Get(ctx, stream.repository, graveler.Ref(stream.commitID), graveler.Key(stream.sourceKey))
 		if err != nil {
 			if errors.Is(err, graveler.ErrNotFound) {
@@ -671,7 +679,140 @@ func (m *Materializer) openSource(ctx context.Context, stream *itemStream) (grav
 		// An empty prefix is the whole repository (§5.2), which is where List starts.
 		it.SeekGE(graveler.Key(stream.sourceKey))
 	}
-	return &prefixIterator{it: it, prefix: stream.sourceKey}, nil
+	var src graveler.ValueIterator = &prefixIterator{it: it, prefix: stream.sourceKey}
+	if reader != nil {
+		src = &authorizedIterator{ValueIterator: src, ctx: ctx, reader: reader, stream: stream}
+	}
+	return src, nil
+}
+
+// ErrSourceAuthzMissing reports a source read attempted without the caller's authorization
+// check on the context. It is a programming error and fails the operation (SEC-3).
+var ErrSourceAuthzMissing = errors.New("datasets: source read without a per-object authorization check")
+
+// checkReservedKey fails an item that would map a source key onto DefinitionPath, the
+// dataset-repository key of the synthetic definition entry (§6.4).
+//
+// A prefix item with the root target (§5.2: the empty target) maps its source keys into the
+// dataset key space unchanged, so a source repository that happens to hold the reserved
+// _dataset/definition.json key produces the same dataset key as the synthetic entry. Left to
+// the merge, the strict key-increase assertion would fail the publish with ErrDuplicateKey,
+// which reads like an internal bug and says nothing about the source key that caused it; here
+// it is a definition problem that names the item and the reserved path, reported before the
+// definition object is uploaded and before any metarange entry is written.
+//
+// The check is exact, not a guess: reservedSourceKey names the only source key that can land
+// on the reserved path, so one catalog read decides it. That read is authorized like any other
+// source read (SEC-3), so a caller who may not read the key gets the denial rather than a hint
+// that it exists.
+func (m *Materializer) checkReservedKey(ctx context.Context, stream *itemStream) error {
+	sourceKey, possible := stream.reservedSourceKey()
+	if !possible {
+		return nil
+	}
+	if stream.object {
+		// An object item's output key is its target, so the entry would replace the synthetic
+		// one whether or not the source key has any siblings; openSource has already
+		// established that the source key exists.
+		return reservedKeyProblem(stream, sourceKey)
+	}
+	if reader := sourceReaderFrom(ctx); reader != nil {
+		if err := checkSourceObject(ctx, reader, stream, sourceKey); err != nil {
+			return err
+		}
+	}
+	_, err := m.Catalog.Store.Get(ctx, stream.repository, graveler.Ref(stream.commitID), graveler.Key(sourceKey))
+	switch {
+	case err == nil:
+		return reservedKeyProblem(stream, sourceKey)
+	case errors.Is(err, graveler.ErrNotFound):
+		// The source does not hold the reserved key, so this item cannot collide with the
+		// synthetic definition entry.
+		return nil
+	default:
+		return fmt.Errorf("datasets: %s: check reserved key %q in %s/%s: %w",
+			itemPath(stream.index, ""), sourceKey, stream.repository.RepositoryID, stream.commitID, err)
+	}
+}
+
+// reservedKeyProblem is the *ValidationError rejecting an item whose source holds a key the
+// dataset reserves for its own definition entry (§6.4). It names the item, the offending
+// source key and the reserved path, so the client can fix the definition - by narrowing the
+// source prefix or by moving the target off the repository root.
+func reservedKeyProblem(stream *itemStream, sourceKey string) error {
+	return &ValidationError{Problems: []Problem{{
+		Path: itemPath(stream.index, ""),
+		Message: fmt.Sprintf("source key %q maps onto %q, which the service reserves for the dataset definition",
+			sourceKey, DefinitionPath),
+	}}}
+}
+
+// checkSourceObject authorizes the read of one source key, mapping a denial to the SourceError
+// that names the item and the first denied path (SEC-3). It is the authoritative source-read
+// check: unlike the attach-time SourceReadNode of authz.go it authorizes the exact object, so a
+// Deny on any sub-path of a prefix item is seen here, and the first one fails the publish.
+func checkSourceObject(ctx context.Context, reader *SourceReader, stream *itemStream, key string) error {
+	err := reader.CheckObject(ctx, stream.repository.RepositoryID.String(), key)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrSourceReadDenied) {
+		return &SourceError{
+			Item:       stream.index,
+			Repository: stream.repository.RepositoryID.String(),
+			Path:       key,
+			Ref:        SourceRef{Type: RefTypeCommit, ID: stream.commitID.String()},
+			Err:        err,
+		}
+	}
+	return err
+}
+
+// authorizedIterator authorizes fs:ReadObject on every key the wrapped source iterator yields,
+// for the caller of the operation, and stops at the first denied path (SEC-3). The check runs
+// before the entry is decoded, counted or copied, so a denied object contributes nothing - not
+// even to a size estimate.
+type authorizedIterator struct {
+	graveler.ValueIterator
+	ctx    context.Context
+	reader *SourceReader
+	stream *itemStream
+	err    error
+}
+
+// Next implements graveler.ValueIterator.
+func (it *authorizedIterator) Next() bool {
+	if it.err != nil {
+		return false
+	}
+	if !it.ValueIterator.Next() {
+		return false
+	}
+	record := it.ValueIterator.Value()
+	if record == nil {
+		return true
+	}
+	if err := checkSourceObject(it.ctx, it.reader, it.stream, string(record.Key)); err != nil {
+		it.err = err
+		return false
+	}
+	return true
+}
+
+// Value implements graveler.ValueIterator.
+func (it *authorizedIterator) Value() *graveler.ValueRecord {
+	if it.err != nil {
+		return nil
+	}
+	return it.ValueIterator.Value()
+}
+
+// Err implements graveler.ValueIterator.
+func (it *authorizedIterator) Err() error {
+	if it.err != nil {
+		return it.err
+	}
+	return it.ValueIterator.Err()
 }
 
 // closeItemIterators closes the iterators of items that were opened before a failure.
@@ -719,6 +860,35 @@ func (s *itemStream) datasetKey(sourceKey string) string {
 	return s.target + "/" + rel
 }
 
+// reservedSourceKey returns the one source key this item would map onto DefinitionPath, the
+// dataset-repository key of the synthetic definition entry (§6.4), and reports whether the
+// item can reach that path at all. checkReservedKey uses it to decide a collision exactly,
+// without enumerating the source.
+//
+// datasetKey makes the answer exact:
+//
+//   - an object item produces its target and nothing else, so it reaches the reserved path
+//     only when its target is that path - which validation rejects as a reserved target
+//     (§5.2), so this branch is the primitive's own guard for a caller that skipped
+//     validation;
+//   - a prefix item always emits "<target>/<relative key>", so it can only reach the reserved
+//     path when its target is the repository root (§5.2: the empty target). Its keys then map
+//     unchanged, and "sourceKey + DefinitionPath" is the single source key that lands on the
+//     reserved path (for the whole-repository item - the empty source prefix - that key is
+//     DefinitionPath itself);
+//   - any other prefix target would have to make "<target>/" a prefix of the reserved path,
+//     that is be the reserved _dataset directory itself, which validation rejects as a target.
+func (s *itemStream) reservedSourceKey() (string, bool) {
+	switch {
+	case s.object:
+		return s.sourceKey, s.target == DefinitionPath
+	case s.target == RootTarget:
+		return s.sourceKey + DefinitionPath, true
+	default:
+		return "", false
+	}
+}
+
 // sourceSeekKey maps a dataset key back into the item's source key space, for
 // SeekGE. It is conservative: a key outside the item's own target span seeks to the
 // start of the span, so the merge — which owns the final ordering — never misses an
@@ -743,11 +913,6 @@ type itemIterator struct {
 	stream  *itemStream
 	src     graveler.ValueIterator
 	adapter block.Adapter
-
-	// authorizeSourcePath, when set, vets one source key with the caller's fs:ReadObject
-	// right before it is merged into the dataset (SEC-3). It is nil when the
-	// materialisation runs without a caller to check.
-	authorizeSourcePath func(path string) error
 
 	current *graveler.ValueRecord
 	err     error
@@ -774,15 +939,6 @@ func (it *itemIterator) Next() bool {
 			ErrInvalidSourceEntry, itemPath(it.stream.index, ""))
 		return false
 	}
-	// SEC-3: the caller's read right on this exact object, before anything is decoded,
-	// converted or merged, so a denied entry never reaches the dataset.
-	if it.authorizeSourcePath != nil {
-		if err := it.authorizeSourcePath(string(record.Key)); err != nil {
-			it.err = err
-			return false
-		}
-	}
-
 	entry, err := catalog.ValueToEntry(record.Value)
 	if err != nil {
 		it.err = fmt.Errorf("datasets: %s: decode source entry %q: %w", itemPath(it.stream.index, ""), record.Key, err)

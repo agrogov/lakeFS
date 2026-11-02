@@ -50,7 +50,7 @@ const classificationKey: MetadataKey = {
     allowed_values: ['public', 'internal', 'confidential'],
     allow_multiple: false,
     description: 'Sensitivity of the data',
-    created_at: Date.UTC(2026, 0, 1),
+    creation_date: Date.UTC(2026, 0, 1) / 1000,
     created_by: 'admin',
 };
 
@@ -65,7 +65,7 @@ describe('DatasetsSettingsPage', () => {
             </MemoryRouter>,
         );
 
-    const metadataCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/metadata-keys'));
+    const metadataCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/metadata'));
 
     const mockWith = (actions: string[]) => {
         fetchMock.mockImplementation(async (url: unknown, init: RequestInit = {}) => {
@@ -73,8 +73,8 @@ describe('DatasetsSettingsPage', () => {
             const method = (init.method ?? 'GET').toUpperCase();
             if (path.endsWith('/api/v1/user')) return jsonResponse({ user: { id: 'reviewer' } });
             if (path.includes('/auth/users/reviewer/policies')) return jsonResponse(policies(actions));
-            if (path.includes('/metadata-keys/') && method === 'PUT') return jsonResponse(classificationKey);
-            if (path.includes('/metadata-keys')) {
+            if (path.includes('/metadata/') && method === 'PUT') return jsonResponse(classificationKey);
+            if (path.includes('/metadata')) {
                 return jsonResponse({
                     results: keys,
                     pagination: { has_more: false, next_offset: '', results: keys.length, max_per_page: 1000 },
@@ -94,8 +94,8 @@ describe('DatasetsSettingsPage', () => {
         vi.unstubAllGlobals();
     });
 
-    it('renders the metadata keys when the caller holds datasets:ManageMetadataKeys', async () => {
-        mockWith(['datasets:ReadDataset', 'datasets:ManageMetadataKeys']);
+    it('renders the metadata keys when the caller holds dataset:CreateMetadataKey', async () => {
+        mockWith(['dataset:ReadDataset', 'dataset:CreateMetadataKey']);
         renderPage();
 
         expect(await screen.findByTestId('metadata-key-row-classification')).toBeInTheDocument();
@@ -103,12 +103,12 @@ describe('DatasetsSettingsPage', () => {
         expect(metadataCalls().length).toBeGreaterThan(0);
     });
 
-    it('does not render the metadata keys without datasets:ManageMetadataKeys', async () => {
-        mockWith(['datasets:ReadDataset']);
+    it('does not render the metadata keys without dataset:CreateMetadataKey', async () => {
+        mockWith(['dataset:ReadDataset']);
         renderPage();
 
         expect(await screen.findByText('Permission required')).toBeInTheDocument();
-        expect(screen.getAllByText(/datasets:ManageMetadataKeys/).length).toBeGreaterThan(0);
+        expect(screen.getAllByText(/dataset:CreateMetadataKey/).length).toBeGreaterThan(0);
         expect(screen.queryByTestId('metadata-key-row-classification')).not.toBeInTheDocument();
         expect(metadataCalls()).toHaveLength(0);
     });
@@ -118,9 +118,9 @@ describe('DatasetsSettingsPage', () => {
             const path = String(url);
             if (path.endsWith('/api/v1/user')) return jsonResponse({ user: { id: 'reviewer' } });
             if (path.includes('/auth/users/reviewer/policies')) {
-                return jsonResponse(policies(['datasets:ManageMetadataKeys']));
+                return jsonResponse(policies(['dataset:CreateMetadataKey']));
             }
-            if (path.includes('/metadata-keys')) return jsonResponse({ message: 'forbidden' }, 403);
+            if (path.includes('/metadata')) return jsonResponse({ message: 'forbidden' }, 403);
             return jsonResponse({ message: 'not found' }, 404);
         });
         renderPage();
@@ -129,7 +129,7 @@ describe('DatasetsSettingsPage', () => {
     });
 
     it('renders the type read-only with an explanation when editing a key', async () => {
-        mockWith(['datasets:ManageMetadataKeys']);
+        mockWith(['dataset:CreateMetadataKey']);
         renderPage();
 
         await screen.findByTestId('metadata-key-row-classification');
@@ -141,8 +141,8 @@ describe('DatasetsSettingsPage', () => {
         expect(screen.getByText(/cannot be changed after a metadata key is created/i)).toBeInTheDocument();
     });
 
-    it('never sends the type in an update, because §5.5 forbids changing it', async () => {
-        mockWith(['datasets:ManageMetadataKeys']);
+    it('sends the unchanged type in a full-replacement update (DOC-10)', async () => {
+        mockWith(['dataset:CreateMetadataKey']);
         renderPage();
 
         await screen.findByTestId('metadata-key-row-classification');
@@ -157,7 +157,7 @@ describe('DatasetsSettingsPage', () => {
             expect(
                 fetchMock.mock.calls.some(
                     ([url, init]) =>
-                        String(url).includes('/metadata-keys/classification') &&
+                        String(url).includes('/metadata/classification') &&
                         (init as RequestInit | undefined)?.method === 'PUT',
                 ),
             ).toBe(true),
@@ -165,12 +165,12 @@ describe('DatasetsSettingsPage', () => {
 
         const call = fetchMock.mock.calls.find(
             ([url, init]) =>
-                String(url).includes('/metadata-keys/classification') &&
-                (init as RequestInit | undefined)?.method === 'PUT',
+                String(url).includes('/metadata/classification') && (init as RequestInit | undefined)?.method === 'PUT',
         );
         const body = JSON.parse(String((call?.[1] as RequestInit).body));
-        expect(body).not.toHaveProperty('type');
+        // DOC-10: a PUT is a full replacement that requires the (unchanged) type.
         expect(body).toMatchObject({
+            type: 'enum',
             required: false,
             allow_multiple: false,
             allowed_values: ['public', 'internal', 'confidential'],

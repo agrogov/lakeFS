@@ -171,9 +171,14 @@ func TestEnvelopeDocumentShape(t *testing.T) {
 		require.NoError(t, err)
 		require.JSONEq(t, raw, string(out))
 
+		// DOC-13: an Enterprise namespace item names its namespace as a string, not as a
+		// {"name": ...} object, so it decodes here and validation answers 501 (not 400).
 		var ns DataItem
-		require.NoError(t, json.Unmarshal([]byte(`{"type":"namespace","namespace":{"name":"ns"}}`), &ns))
-		require.Equal(t, &NsSrc{Name: "ns"}, ns.Namespace)
+		require.NoError(t, json.Unmarshal([]byte(`{"type":"namespace","namespace":"ns"}`), &ns))
+		require.Equal(t, "ns", *ns.Namespace)
+		roundTrip, err := json.Marshal(ns)
+		require.NoError(t, err)
+		require.JSONEq(t, `{"target":"","repository":"","ref":{"type":"","id":""},"type":"namespace","namespace":"ns"}`, string(roundTrip))
 	})
 }
 

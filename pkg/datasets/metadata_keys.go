@@ -42,6 +42,13 @@ var (
 	}
 )
 
+// Bounds of the allowed_values list of an enum key, matching DatasetMetadataKeyUpdate
+// in ent-swagger v1.108: 1-256 values, each 1-256 characters and unique.
+const (
+	MaxMetadataAllowedValues     = 256
+	MaxMetadataAllowedValueChars = 256
+)
+
 // MetadataKey is the definition of one metadata key (design §5.5). Keys are
 // stored individually in KV (metadata_keys/<key>) and apply to the metadata of
 // every definition of every dataset.
@@ -59,6 +66,9 @@ type MetadataKey struct {
 // ErrInvalidMetadataKey reports a metadata key definition (or key update) that
 // failed validation; the wrapped message carries the problems.
 var ErrInvalidMetadataKey = errors.New("invalid metadata key")
+
+// ErrMetadataKeyNotFound reports an unknown metadata key. The handler maps it to 404.
+var ErrMetadataKeyNotFound = errors.New("metadata key not found")
 
 // ErrMetadataKeyRename reports an attempt to rename a metadata key. The name is
 // the KV key, so a rename is a delete plus a create.
@@ -106,8 +116,37 @@ func ValidateMetadataKey(key MetadataKey) []Problem {
 		problems = append(problems, metadataProblem(key.Name, ProblemAllowedValuesNotAllowed,
 			fmt.Sprintf("allowed_values is only valid for enum keys, got type %q", key.Type)))
 	}
+	if key.Type == MetadataTypeEnum {
+		problems = append(problems, validateAllowedValues(key.Name, key.AllowedValues)...)
+	}
 
 	SortProblems(problems)
+	return problems
+}
+
+// validateAllowedValues enforces the allowed_values bounds of ent-swagger v1.108:
+// at most MaxMetadataAllowedValues values, each 1-MaxMetadataAllowedValueChars
+// characters, all distinct. The non-empty requirement is part of the enum rule
+// above; an empty list therefore reports that problem only.
+func validateAllowedValues(key string, values []string) []Problem {
+	var problems []Problem
+	if len(values) > MaxMetadataAllowedValues {
+		problems = append(problems, metadataProblem(key, ProblemAllowedValuesTooMany,
+			fmt.Sprintf("allowed_values has %d values, the maximum is %d", len(values), MaxMetadataAllowedValues)))
+	}
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if len(value) == 0 || len(value) > MaxMetadataAllowedValueChars {
+			problems = append(problems, metadataProblem(key, ProblemAllowedValuesInvalid,
+				fmt.Sprintf("allowed value %q must be 1-%d characters", value, MaxMetadataAllowedValueChars)))
+		}
+		if _, duplicate := seen[value]; duplicate {
+			problems = append(problems, metadataProblem(key, ProblemAllowedValuesDuplicate,
+				fmt.Sprintf("allowed value %q is repeated", value)))
+			continue
+		}
+		seen[value] = struct{}{}
+	}
 	return problems
 }
 
@@ -129,7 +168,9 @@ func ValidateKeyUpdate(oldKey, newKey MetadataKey) error {
 			ErrMetadataKeyTypeChange, oldKey.Name, oldKey.Type, newKey.Type)
 	}
 	if problems := ValidateMetadataKey(newKey); len(problems) > 0 {
-		return fmt.Errorf("cannot update metadata key %q: %w", newKey.Name, problemsError(problems))
+		// DOC-10: an invalid replacement is a client problem (400 with one entry per
+		// problem), not an internal error. The type and rename rules above stay 409s.
+		return &ValidationError{Problems: problems}
 	}
 	return nil
 }

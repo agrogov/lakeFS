@@ -18,6 +18,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/datasets/apigen"
 	"github.com/treeverse/lakefs/pkg/httputil"
+	"github.com/treeverse/lakefs/pkg/logging"
 )
 
 //go:generate go run github.com/deepmap/oapi-codegen/cmd/oapi-codegen@v1.5.6 -package apigen -generate "types,client,chi-server,spec" -templates ../api/tmpl -o apigen/datasets.gen.go ../../api/datasets.yml
@@ -72,25 +73,30 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 	if err != nil {
 		return err
 	}
+	// BUG-12: ctx is the server's lifetime context (run.go cancels it on SIGINT/SIGTERM).
+	// Handing it to the service binds every asynchronous publish to the server, and the
+	// drain below waits for the ones already running when it is cancelled, so a shutdown
+	// does not abandon a publish mid-flight. A publish interrupted by the cancellation
+	// fails on its own and leaves the reconciler a state it resumes (§12.3 item 1).
+	svc.SetBackgroundContext(ctx)
+	drainOnShutdown(ctx, svc, deps.Logger)
 
-	// §9.5 and §8.2: the installation-wide policies and groups, the per-group immutability
-	// attachments and the datasets-pins-protect deny policy must exist on every start. Without
-	// this call nothing in production ever created them (SEC-1 of DATASETS_REVIEW.md): a plain
-	// member of Developers could delete pin branches, and GC would then collect data published
-	// dataset versions still serve. Bootstrap is idempotent, so running it on every start is
-	// what keeps a hand-edited installation honest; a failure is fatal, because a server that
-	// silently runs without the pin protection corrupts data later.
-	if err := Bootstrap(ctx, deps.AuthService, time.Now(),
-		WithBootstrapLogger(deps.Logger),
-		WithPinsProtectGroups(ImmutabilityGuardGroups(cfg.ImmutableGuardGroups)),
-	); err != nil {
-		return fmt.Errorf("datasets: bootstrap installation policies: %w", err)
+	// SEC-1: datasets is configured, so its installation-wide objects must exist before the
+	// first request. Bootstrap is idempotent and safe on every start; a failure is fatal
+	// because without datasets-pins-protect and the built-in groups the immutability and pin
+	// guarantees of §8.2 and §9.4 do not hold.
+	//
+	// The current dataset names go along, so the managed datasets-all-read policy keeps its
+	// statements across a restart instead of being emptied until the first reconcile pass.
+	datasetNames, err := svc.datasetNames(ctx)
+	if err != nil {
+		return fmt.Errorf("datasets: bootstrap: %w", err)
 	}
-
-	// §9.4: the authorizer decorator installed by the auth-service builder keeps the set of
-	// dataset repositories in immutable_guard.go; the service updates it as it creates and
-	// deletes datasets, so a dataset repository is protected from the moment it exists.
-	svc.setDatasetRepoIndex(installedOrNewDatasetRepoIndex(deps.KVStore, deps.Logger))
+	if err := Bootstrap(ctx, deps.AuthService, time.Now(),
+		WithBootstrapDatasets(datasetNames),
+		WithPinsProtectGroups(ImmutabilityGuardGroups(cfg.ImmutableGuardGroups))); err != nil {
+		return fmt.Errorf("datasets: bootstrap: %w", err)
+	}
 
 	// The core AuthMiddleware is bound to the swagger routes, so the datasets router wraps
 	// itself with the exported GenericAuthMiddleware. It honours the same schemes as the core
@@ -103,7 +109,13 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 		return fmt.Errorf("datasets: build auth middleware: %w", err)
 	}
 
-	datasetsRouter, err := NewRouter(authMiddleware, newServer(svc, newClientIPResolver(deps)))
+	// DOC-17: a permission denial answers the configured auth.authorization_failure_status,
+	// exactly like the core Controller. Zero (unset) means the core default, 401.
+	authzFailureStatus := http.StatusUnauthorized
+	if baseAuthCfg != nil && baseAuthCfg.AuthorizationFailureStatus != 0 {
+		authzFailureStatus = baseAuthCfg.AuthorizationFailureStatus
+	}
+	datasetsRouter, err := NewRouter(authMiddleware, newServer(svc, newClientIPResolver(deps), authzFailureStatus), cfg.MaxRequestBody)
 	if err != nil {
 		return err
 	}
@@ -116,6 +128,36 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 	reconciler.log = deps.Logger
 	go reconciler.Run(ctx)
 	return nil
+}
+
+// drainOnShutdown ties asynchronous publishes to the server's lifetime (BUG-12). The service
+// runs every accepted publish on the context installed by SetBackgroundContext, so cancelling
+// that context aborts the materialisation in flight; this goroutine then waits for those
+// goroutines to finish, so a graceful shutdown does not race the reconciler or a KV close,
+// and so a test can observe that the drain happened.
+//
+// It is a goroutine of its own because RoutesBuilder returns once the routes are mounted and
+// must not block startup. A context without a Done channel (context.Background, the zero-value
+// fallback for a nil ctx) never ends, so no goroutine is started for it, and the returned
+// channel is already closed.
+//
+// The returned channel closes when the drain is done, so a test can observe the wait without a
+// logger fake; RoutesBuilder ignores it.
+func drainOnShutdown(ctx context.Context, svc *Service, log logging.Logger) <-chan struct{} {
+	done := make(chan struct{})
+	if svc == nil || ctx == nil || ctx.Done() == nil {
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		<-ctx.Done()
+		svc.Wait()
+		if log != nil {
+			log.Info("datasets: drained the publishes that were in flight at shutdown")
+		}
+	}()
+	return done
 }
 
 // newClientIPResolver builds the client-IP resolver used by authorization conditions from the
@@ -135,16 +177,20 @@ func newClientIPResolver(deps cmdpkg.ServerDeps) *httputil.ClientIPResolver {
 // NewRouter builds the datasets sub-router. It is mounted at APIBasePath by RoutesBuilder, so
 // the routes registered by the generated server are relative to that mount point.
 //
-// The middleware stack mirrors the core API (pkg/api/serve.go): request validation first, then
-// authentication. The validator answers a malformed request with the datasets error shape
-// (§10.4) before any handler runs; the authenticated-user requirement after it answers 401,
-// so no control-plane route is reachable without a principal (DATASETS_DESIGN.md §4.5).
+// The middleware stack is ordered the way §4.5 and SEC-5 require, and the order is not
+// interchangeable: authentication first (api.GenericAuthMiddleware), then the
+// authenticated-user requirement (401 before anything else happens), then the request-body
+// limit (SEC-5: http.MaxBytesReader with datasets.max_request_body), and only then the
+// spec validator. A request with no principal is therefore answered 401 without its body
+// being read, and a malformed body is only parsed for an authenticated caller.
+//
+// maxRequestBody is the limit in bytes; a non-positive value means DefaultMaxRequestBody.
 //
 // authMiddleware is a parameter (rather than built here) so the router can be exercised without
 // a full auth service - without one nothing can authenticate, so every route answers 401.
 // server is a parameter so the service can be replaced in tests and so later phases can add
 // operations without touching the routing.
-func NewRouter(authMiddleware func(http.Handler) http.Handler, server apigen.ServerInterface) (http.Handler, error) {
+func NewRouter(authMiddleware func(http.Handler) http.Handler, server apigen.ServerInterface, maxRequestBody int64) (http.Handler, error) {
 	swagger, err := apigen.GetSwagger()
 	if err != nil {
 		return nil, fmt.Errorf("datasets: load control-plane spec: %w", err)
@@ -155,13 +201,34 @@ func NewRouter(authMiddleware func(http.Handler) http.Handler, server apigen.Ser
 	}
 
 	router := chi.NewRouter()
-	router.Use(validator)
 	if authMiddleware != nil {
 		router.Use(authMiddleware)
 	}
 	router.Use(requireUser)
+	router.Use(maxRequestBodyBytes(maxRequestBody))
+	router.Use(validator)
 	apigen.HandlerFromMux(server, router)
 	return router, nil
+}
+
+// maxRequestBodyBytes bounds the request body the rest of the stack may read (SEC-5).
+//
+// It wraps the body in http.MaxBytesReader, so the validator and the handlers see a read
+// error as soon as the limit is exceeded: nothing buffers more than limit bytes. The
+// validator turns that error into a 413 (writeValidationError). A non-positive limit means
+// DefaultMaxRequestBody, so a zero Config built in a test cannot silently disable the limit.
+func maxRequestBodyBytes(limit int64) func(http.Handler) http.Handler {
+	if limit <= 0 {
+		limit = DefaultMaxRequestBody
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Body != nil {
+				r.Body = http.MaxBytesReader(w, r.Body, limit)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // requireUser rejects requests that carry no authenticated principal. It runs after
@@ -275,11 +342,18 @@ func routeErrorStatus(err error) int {
 }
 
 // writeValidationError maps a validation failure to a status code and the datasets error body
-// (§10.4): 400 for a malformed request or body, 401 for a missing security requirement, 500
-// otherwise.
+// (§10.4): 400 for a malformed request or body, 401 for a missing security requirement, 413 for
+// a body over datasets.max_request_body (SEC-5), 500 otherwise.
 func writeValidationError(w http.ResponseWriter, r *http.Request, err error) {
 	var reqErr *openapi3filter.RequestError
 	var secErr *openapi3filter.SecurityRequirementsError
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		writeErrorResponse(w, r, http.StatusRequestEntityTooLarge, errorResponse{
+			Message: fmt.Sprintf("request body exceeds the server limit of %d bytes", maxBytesErr.Limit),
+		})
+		return
+	}
 	switch {
 	case errors.As(err, &reqErr):
 		writeErrorResponse(w, r, http.StatusBadRequest, errorResponse{

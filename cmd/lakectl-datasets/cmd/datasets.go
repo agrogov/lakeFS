@@ -1,11 +1,14 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
+	"github.com/manifoldco/promptui"
 	"github.com/spf13/cobra"
 	lakectlcmd "github.com/treeverse/lakefs/cmd/lakectl/cmd"
 	"github.com/treeverse/lakefs/pkg/api/apiutil"
@@ -19,8 +22,10 @@ import (
 // listOptions is the parsed command line of `datasets list` (DATASETS_DESIGN.md §12.1).
 type listOptions struct {
 	paginationOptions
-	Prefix   string
-	Metadata map[string]string
+	Prefix string
+	// Metadata holds one value list per metadata key: a repeated --metadata flag accumulates its
+	// values instead of replacing them (CLI-6).
+	Metadata map[string][]string
 	Output   outputFormat
 }
 
@@ -63,7 +68,7 @@ func listCmd() *cobra.Command {
 	withPaginationFlags(cmd)
 	cmd.Flags().String(prefixFlagName, "", "only list datasets whose name starts with this prefix")
 	cmd.Flags().StringArray(metadataFlagName, nil,
-		"only list datasets whose latest version metadata holds key=value (repeatable)")
+		"only list datasets whose latest version metadata holds key=value (repeatable; a repeated key matches any of its values)")
 	return cmd
 }
 
@@ -104,12 +109,12 @@ func runList(cmd *cobra.Command, options listOptions) error {
 			stats = formatStats(dataset.Stats)
 		}
 		rows[i] = []any{
-			dataset.Name,
+			dataset.Id,
 			derefString(dataset.Description),
-			formatVersion(dataset.LatestVersion),
-			dataset.State,
+			formatVersion(derefInt(dataset.Version)),
+			derefString(dataset.State),
 			stats,
-			formatMillis(dataset.CreatedAt),
+			formatSeconds(dataset.CreationDate),
 		}
 	}
 	printTable(cmd,
@@ -125,8 +130,8 @@ func runList(cmd *cobra.Command, options listOptions) error {
 // showOptions is the parsed command line of `datasets show`.
 type showOptions struct {
 	Dataset string
-	// Version is empty when the dataset record itself is shown, `latest`/`vN`/`N`/`proposal-<id>`
-	// when one version is shown.
+	// Version is empty when the dataset record itself is shown, `latest` or `v<N>` when one
+	// version is shown (api/datasets.yml VersionRef, DOC-19).
 	Version string
 	Output  outputFormat
 }
@@ -168,7 +173,7 @@ func showCmd() *cobra.Command {
 			return runShow(cmd, options)
 		},
 	}
-	cmd.Flags().String(versionFlagName, "", "show this version instead of the dataset (latest, vN or N)")
+	cmd.Flags().String(versionFlagName, "", "show this version instead of the dataset (latest or v<N>)")
 	return cmd
 }
 
@@ -219,8 +224,8 @@ func runShow(cmd *cobra.Command, options showOptions) error {
 type createOptions struct {
 	Dataset string
 	File    string
-	Publish bool
 	Message string
+	Async   bool
 	Output  outputFormat
 }
 
@@ -236,40 +241,35 @@ func parseCreateOptions(cmd *cobra.Command, args []string) (createOptions, error
 	if file == "" {
 		return createOptions{}, invalidArguments("create requires --%s with a definition file", fileFlagName)
 	}
-	publish, err := cmd.Flags().GetBool(publishFlagName)
-	if err != nil {
-		return createOptions{}, err
-	}
 	message, err := cmd.Flags().GetString(messageFlagName)
 	if err != nil {
 		return createOptions{}, err
 	}
-	switch {
-	case publish && message == "":
-		return createOptions{}, invalidArguments("--publish requires --%s", messageFlagName)
-	case !publish && message != "":
-		return createOptions{}, invalidArguments("--%s is only used with --publish", messageFlagName)
+	async, err := cmd.Flags().GetBool(asyncFlagName)
+	if err != nil {
+		return createOptions{}, err
 	}
 	output, err := outputOf(cmd)
 	if err != nil {
 		return createOptions{}, err
 	}
-	return createOptions{Dataset: args[0], File: file, Publish: publish, Message: message, Output: output}, nil
+	return createOptions{Dataset: args[0], File: file, Message: message, Async: async, Output: output}, nil
 }
 
 func createCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "create <dataset> --file definition.json [--publish --message msg]",
+		Use:   "create <dataset> --file definition.json [--message msg] [--async]",
 		Short: "Create a dataset",
-		Long: `Create a dataset and its read-only repository.
+		Long: `Create a dataset, its read-only repository and version v1.
 
-Without --publish the dataset is created empty: it has no version, and the latest ref holds only
-the initial commit. With --publish the definition is published as version v1.
+Every create publishes version v1, as the documented API does; --message names that version and
+defaults to "Create dataset <name>". --async publishes it in the background and prints the task to
+poll (an extension of this build).
 
 --file accepts either a bare dataset definition ({"format_version": 1, "data": [...]}) or the
 definition envelope ({"name": ..., "definition": {...}}); a name inside the envelope must match the
 dataset name on the command line.`,
-		Example: "lakectl datasets create customer-360 --file customer-360.json --publish --message \"initial dataset\"",
+		Example: "lakectl datasets create customer-360 --file customer-360.json --message \"initial dataset\"",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			options, err := parseCreateOptions(cmd, args)
@@ -280,8 +280,8 @@ dataset name on the command line.`,
 		},
 	}
 	definitionReadFlags(cmd)
-	cmd.Flags().Bool(publishFlagName, false, "publish the definition as version v1")
-	cmd.Flags().StringP(messageFlagName, "m", "", "publish message (required with --publish)")
+	cmd.Flags().StringP(messageFlagName, "m", "", "version message (default: Create dataset <name>)")
+	cmd.Flags().Bool(asyncFlagName, false, "publish v1 in the background and print the task")
 	return cmd
 }
 
@@ -294,14 +294,18 @@ func runCreate(cmd *cobra.Command, options createOptions) error {
 		return invalidArguments("definition file is for dataset %q, but the command line names %q", loaded.Name, options.Dataset)
 	}
 	request := apigen.DatasetCreateRequest{Name: options.Dataset, Definition: loaded.Definition}
-	if options.Publish {
+	if options.Message != "" {
 		request.Publish = &apigen.PublishOptions{Message: apiutil.Ptr(options.Message)}
+	}
+	params := &apigen.CreateDatasetParams{}
+	if options.Async {
+		params.Async = apiutil.Ptr(true)
 	}
 	client, err := getClient()
 	if err != nil {
 		return err
 	}
-	resp, err := client.CreateDatasetWithResponse(cmd.Context(), apigen.CreateDatasetJSONRequestBody(request))
+	resp, err := client.CreateDatasetWithResponse(cmd.Context(), params, apigen.CreateDatasetJSONRequestBody(request))
 	if err != nil {
 		return err
 	}
@@ -326,6 +330,10 @@ func runCreate(cmd *cobra.Command, options createOptions) error {
 // datasets publish
 // ---------------------------------------------------------------------------
 
+// defaultPublishTimeout bounds `datasets publish --wait`: the default publish timeout of the
+// service (30 minutes, §6.5), so the command cannot poll a wedged task forever (CLI-3).
+const defaultPublishTimeout = 30 * time.Minute
+
 // publishOptions is the parsed command line of `datasets publish`.
 type publishOptions struct {
 	Dataset         string
@@ -333,7 +341,9 @@ type publishOptions struct {
 	Message         string
 	ExpectedVersion *int
 	Wait            bool
-	Output          outputFormat
+	// Timeout bounds the --wait polling (CLI-3).
+	Timeout time.Duration
+	Output  outputFormat
 }
 
 // parsePublishOptions parses and validates the arguments of `datasets publish`.
@@ -367,6 +377,13 @@ func parsePublishOptions(cmd *cobra.Command, args []string) (publishOptions, err
 	if err != nil {
 		return publishOptions{}, err
 	}
+	timeout, err := cmd.Flags().GetDuration(timeoutFlagName)
+	if err != nil {
+		return publishOptions{}, err
+	}
+	if timeout <= 0 {
+		return publishOptions{}, invalidArguments("--%s must be positive, got %s", timeoutFlagName, timeout)
+	}
 	output, err := outputOf(cmd)
 	if err != nil {
 		return publishOptions{}, err
@@ -377,6 +394,7 @@ func parsePublishOptions(cmd *cobra.Command, args []string) (publishOptions, err
 		Message:         message,
 		ExpectedVersion: expectedVersion,
 		Wait:            wait,
+		Timeout:         timeout,
 		Output:          output,
 	}, nil
 }
@@ -387,9 +405,10 @@ func publishCmd() *cobra.Command {
 		Short: "Publish a new dataset version",
 		Long: `Publish a definition as the next dataset version (vN+1) and tag it in the dataset repository.
 
---expected-version behaves like an ETag: the publish fails with a conflict when the dataset's
-latest version is not the expected one. Large publishes are accepted asynchronously; --wait polls
-the task until it completes.`,
+The publish always sends the version it expects, so a duplicated or replayed request is answered
+with a conflict instead of publishing twice. --expected-version names that version explicitly;
+without it, the current version of the dataset is read first and asserted. Large publishes are
+accepted asynchronously: --wait polls the task until it completes, for at most --timeout.`,
 		Example: "lakectl datasets publish customer-360 --file customer-360.json --message \"add churn column\" --expected-version 2",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -402,8 +421,10 @@ the task until it completes.`,
 	}
 	definitionReadFlags(cmd)
 	cmd.Flags().StringP(messageFlagName, "m", "", "publish message (required)")
-	cmd.Flags().String(expectedVersionFlagName, "", "fail unless the latest version is this version (optimistic concurrency)")
+	cmd.Flags().String(expectedVersionFlagName, "",
+		"fail unless the latest version is this version (default: the version read from the dataset)")
 	cmd.Flags().Bool(waitFlagName, false, "wait for an asynchronous publish to finish")
+	cmd.Flags().Duration(timeoutFlagName, defaultPublishTimeout, "how long --wait polls the publish task before giving up")
 	return cmd
 }
 
@@ -415,14 +436,18 @@ func runPublish(cmd *cobra.Command, options publishOptions) error {
 	if loaded.Name != "" && loaded.Name != options.Dataset {
 		return invalidArguments("definition file is for dataset %q, but the command line names %q", loaded.Name, options.Dataset)
 	}
-	request := apigen.VersionPublishRequest{
-		Definition:      loaded.Definition,
-		Message:         options.Message,
-		ExpectedVersion: options.ExpectedVersion,
-	}
 	client, err := getClient()
 	if err != nil {
 		return err
+	}
+	expectedVersion, err := expectedVersionForPublish(cmd.Context(), client, options)
+	if err != nil {
+		return err
+	}
+	request := apigen.VersionPublishRequest{
+		Definition:      loaded.Definition,
+		Message:         options.Message,
+		ExpectedVersion: expectedVersion,
 	}
 	resp, err := client.PublishVersionWithResponse(cmd.Context(), apigen.DatasetName(options.Dataset), apigen.PublishVersionJSONRequestBody(request))
 	if err != nil {
@@ -448,7 +473,10 @@ func runPublish(cmd *cobra.Command, options publishOptions) error {
 		printTask(cmd, options.Dataset, *resp.JSON202)
 		return nil
 	}
-	task, taskBody, err := waitForTask(cmd, client, options.Dataset, resp.JSON202.Id)
+	// The publish itself is done; only the polling is bounded by --timeout.
+	waitCtx, cancel := context.WithTimeout(cmd.Context(), options.Timeout)
+	defer cancel()
+	task, taskBody, err := waitForTask(waitCtx, client, options.Dataset, resp.JSON202.Id, options.Timeout)
 	if err != nil {
 		return err
 	}
@@ -459,12 +487,38 @@ func runPublish(cmd *cobra.Command, options publishOptions) error {
 	return nil
 }
 
-// waitForTask polls an asynchronous publish task (§6.5) until it reaches a terminal state. It
-// returns the completed task and the body of the response that completed it.
-func waitForTask(cmd *cobra.Command, client *apigen.ClientWithResponses, dataset, taskID string) (*apigen.Task, []byte, error) {
+// expectedVersionForPublish returns the version the publish asserts: --expected-version when the
+// caller passed it, the dataset's current version otherwise. Sending it is what makes a replayed
+// POST answer 409 instead of publishing a duplicate version (CLI-2). The version is read with a
+// GET, the one method the retry policy may replay.
+func expectedVersionForPublish(ctx context.Context, client *apigen.ClientWithResponses, options publishOptions) (*int, error) {
+	if options.ExpectedVersion != nil {
+		return options.ExpectedVersion, nil
+	}
+	resp, err := client.GetDatasetWithResponse(ctx, apigen.DatasetName(options.Dataset))
+	if err != nil {
+		return nil, err
+	}
+	if err := checkResponse(resp.HTTPResponse, resp.Body, http.StatusOK); err != nil {
+		return nil, err
+	}
+	if resp.JSON200 == nil {
+		return nil, invalidResponse("bad response from server: missing dataset %q", options.Dataset)
+	}
+	latest := derefInt(resp.JSON200.Version)
+	return &latest, nil
+}
+
+// waitForTask polls an asynchronous publish task (§6.5) until it reaches a terminal state or ctx
+// is done, and returns the completed task with the body of the response that completed it. A
+// status outside the documented enum is an error, not something to keep polling (CLI-3).
+func waitForTask(ctx context.Context, client *apigen.ClientWithResponses, dataset, taskID string, timeout time.Duration) (*apigen.Task, []byte, error) {
 	for {
-		resp, err := client.GetTaskWithResponse(cmd.Context(), apigen.DatasetName(dataset), apigen.TaskID(taskID))
+		resp, err := client.GetTaskWithResponse(ctx, apigen.DatasetName(dataset), apigen.TaskID(taskID))
 		if err != nil {
+			if timeoutErr := taskTimeoutError(ctx, taskID, timeout); timeoutErr != nil {
+				return nil, nil, timeoutErr
+			}
 			return nil, nil, err
 		}
 		if err := checkResponse(resp.HTTPResponse, resp.Body, http.StatusOK); err != nil {
@@ -478,14 +532,31 @@ func waitForTask(cmd *cobra.Command, client *apigen.ClientWithResponses, dataset
 		case taskStatusCompleted:
 			return task, resp.Body, nil
 		case taskStatusFailed:
-			return nil, nil, taskFailed("publish task %s failed: %s", taskID, derefString(task.Error))
+			return nil, nil, taskFailed("publish task %s failed: %s", taskID, formatTaskError(task.Error))
+		case taskStatusPending, taskStatusRunning:
+			// Still working: poll again below.
+		default:
+			return nil, nil, invalidResponse("bad response from server: task %s has unknown status %q", taskID, task.Status)
 		}
 		select {
-		case <-cmd.Context().Done():
-			return nil, nil, cmd.Context().Err()
+		case <-ctx.Done():
+			if timeoutErr := taskTimeoutError(ctx, taskID, timeout); timeoutErr != nil {
+				return nil, nil, timeoutErr
+			}
+			return nil, nil, ctx.Err()
 		case <-time.After(taskPollInterval):
 		}
 	}
+}
+
+// taskTimeoutError turns the expiry of the --wait context into a user-facing timeout error. It
+// returns nil when the context ended for another reason (cancellation), so the caller reports the
+// real cause.
+func taskTimeoutError(ctx context.Context, taskID string, timeout time.Duration) error {
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return nil
+	}
+	return taskTimedOut("timed out after %s waiting for publish task %s", timeout, taskID)
 }
 
 // ---------------------------------------------------------------------------
@@ -647,16 +718,16 @@ func runVersions(cmd *cobra.Command, options versionsOptions) error {
 	rows := make([][]any, len(versions))
 	for i, version := range versions {
 		rows[i] = []any{
-			formatVersion(version.Version),
+			version.Id,
 			derefString(version.Message),
-			version.Publisher,
-			formatMillis(version.PublishedAt),
-			version.CommitId,
+			version.Author,
+			formatSeconds(version.CreationDate),
+			derefString(version.CommitId),
 			formatStats(version.Stats),
 		}
 	}
 	printTable(cmd,
-		[]any{"Version", "Message", "Publisher", "Published At", "Commit ID", "Data"},
+		[]any{"Version", "Message", "Author", "Creation Date", "Commit ID", "Data"},
 		rows, resp.JSON200.Pagination, options.Amount)
 	return nil
 }
@@ -686,11 +757,11 @@ func parseDiffOptions(cmd *cobra.Command, args []string) (diffOptions, error) {
 	if err != nil {
 		return diffOptions{}, err
 	}
-	left, err := parseVersionRef(args[1])
+	left, err := parseDiffRef(args[1])
 	if err != nil {
 		return diffOptions{}, err
 	}
-	right, err := parseVersionRef(args[2])
+	right, err := parseDiffRef(args[2])
 	if err != nil {
 		return diffOptions{}, err
 	}
@@ -721,7 +792,7 @@ func diffCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "diff <dataset> <left> <right>",
 		Short:   "Diff two dataset refs",
-		Long:    "Compare two refs of a dataset (latest, vN or proposal-<id>), by definition or, with --data, by data.",
+		Long:    "Compare two refs of a dataset (latest, v<N> or a pull request's pr/<id>), by definition or, with --data, by data.",
 		Example: "lakectl datasets diff customer-360 v2 v3 --data",
 		Args:    cobra.ExactArgs(datasetAndRefsArgsCount),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -783,7 +854,7 @@ func runDiff(cmd *cobra.Command, options diffOptions) error {
 		printDataDiff(cmd, diff, options.Amount)
 		return nil
 	}
-	var diff apigen.DefinitionDiff
+	var diff apigen.DatasetDiff
 	if err := json.Unmarshal(resp.Body, &diff); err != nil {
 		return fmt.Errorf("invalid definition diff response: %w", err)
 	}
@@ -833,16 +904,25 @@ versions and its control-plane records. The data of the source repositories is n
 	return cmd
 }
 
+// confirmFunc is the yes/no prompt the commands use: lakectl's own prompt, which answers "yes"
+// when --yes was given, prints its preamble to stdout and returns promptui.ErrAbort when the user
+// answers "no". It is a variable so tests can inject an answer (CLI-1).
+var confirmFunc = lakectlcmd.Confirm
+
+// ErrDeleteCancelled marks a delete the user declined. The command returns it so lakectl exits
+// non-zero, and no request is sent (CLI-1).
+var ErrDeleteCancelled = errors.New("delete cancelled")
+
+// deletePreamble explains what a delete does. It is printed to stderr, so a -o json run keeps
+// stdout parseable (CLI-1).
+var deletePreamble = []string{
+	"This deletes the dataset repository and releases the garbage-collection pins of its versions.",
+	"Object data in the source repositories is not touched.",
+}
+
 func runDelete(cmd *cobra.Command, options deleteOptions) error {
-	confirmed, err := lakectlcmd.Confirm(cmd.Flags(), fmt.Sprintf("Delete dataset %q?", options.Dataset),
-		"This deletes the dataset repository and releases the garbage-collection pins of its versions.",
-		"Object data in the source repositories is not touched.")
-	if err != nil {
+	if err := confirmDelete(cmd, options.Dataset); err != nil {
 		return err
-	}
-	if !confirmed {
-		fmt.Fprintln(cmd.OutOrStdout(), "Delete cancelled.")
-		return nil
 	}
 	client, err := getClient()
 	if err != nil {
@@ -855,8 +935,38 @@ func runDelete(cmd *cobra.Command, options deleteOptions) error {
 	if err := checkResponse(resp.HTTPResponse, resp.Body, http.StatusNoContent); err != nil {
 		return err
 	}
-	if options.Output != outputJSON {
-		fmt.Fprintf(cmd.OutOrStdout(), "Dataset %q deleted.\n", options.Dataset)
+	if options.Output == outputJSON {
+		// The response body is a 204, so the command prints the result itself (CLI-8).
+		return printJSONResult(cmd.OutOrStdout(), deletedResult{Deleted: options.Dataset})
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "Dataset %q deleted.\n", options.Dataset)
+	return nil
+}
+
+// confirmDelete asks the user to confirm deleting dataset. --yes answers without a prompt; every
+// other answer path prints the question to stderr and the answer "no" - which promptui reports as
+// promptui.ErrAbort - cancels the command (CLI-1).
+func confirmDelete(cmd *cobra.Command, dataset string) error {
+	confirmedByFlag, err := cmd.Flags().GetBool(lakectlcmd.AutoConfirmFlagName)
+	if err != nil {
+		return err
+	}
+	if confirmedByFlag {
+		return nil
+	}
+	for _, line := range deletePreamble {
+		fmt.Fprintln(cmd.ErrOrStderr(), line)
+	}
+	confirmed, err := confirmFunc(cmd.Flags(), fmt.Sprintf("Delete dataset %q?", dataset))
+	switch {
+	case errors.Is(err, promptui.ErrAbort):
+		fmt.Fprintln(cmd.ErrOrStderr(), "Delete cancelled.")
+		return ErrDeleteCancelled
+	case err != nil:
+		return err
+	case !confirmed:
+		fmt.Fprintln(cmd.ErrOrStderr(), "Delete cancelled.")
+		return ErrDeleteCancelled
 	}
 	return nil
 }

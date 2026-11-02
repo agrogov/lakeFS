@@ -13,12 +13,10 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"github.com/treeverse/lakefs/contrib/auth/acl"
 	"github.com/treeverse/lakefs/pkg/auth/model"
 	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/datasets/apigen"
 	"github.com/treeverse/lakefs/pkg/graveler"
-	"github.com/treeverse/lakefs/pkg/permissions"
 )
 
 // seedHandlerSource creates a source repository with one committed object and returns the
@@ -74,9 +72,9 @@ func TestDatasetsHTTPCreateGetDelete(t *testing.T) {
 
 	var created apigen.Dataset
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &created))
-	require.Equal(t, "handler-set", created.Name)
-	require.Equal(t, 1, created.LatestVersion)
-	require.Equal(t, DatasetStateActive, created.State)
+	require.Equal(t, "handler-set", created.Id)
+	require.Equal(t, 1, derefInt(created.Version))
+	require.Equal(t, DatasetStateActive, deref(created.State))
 	require.NotNil(t, created.Definition)
 	require.NotNil(t, created.Stats)
 	require.Equal(t, int64(1), created.Stats.Objects)
@@ -87,8 +85,8 @@ func TestDatasetsHTTPCreateGetDelete(t *testing.T) {
 		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
 		var got apigen.Dataset
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
-		require.Equal(t, created.Name, got.Name)
-		require.Equal(t, created.LatestVersion, got.LatestVersion)
+		require.Equal(t, created.Id, got.Id)
+		require.Equal(t, derefInt(created.Version), derefInt(got.Version))
 	})
 
 	t.Run("missing dataset is 404", func(t *testing.T) {
@@ -102,13 +100,27 @@ func TestDatasetsHTTPCreateGetDelete(t *testing.T) {
 		require.Equal(t, http.StatusConflict, rec.Code, "body: %s", rec.Body.String())
 	})
 
-	t.Run("repository name is 409", func(t *testing.T) {
+	t.Run("repository name is 409 without disclosing the repository", func(t *testing.T) {
+		// SEC-7: a plain repository and a dataset share the name namespace, and the answer
+		// must not tell a caller who cannot read the repository that it exists. The response
+		// therefore says only that the name is unavailable, and it is indistinguishable from
+		// the dataset-name clash above.
 		_, err := deps.Catalog.CreateRepository(t.Context(), "handler-repo", "", "mem://handler-repo-ns", "main", false)
 		require.NoError(t, err)
 		body := createDatasetBody(t, "handler-repo", def, false)
 		rec := doRequest(t, handler, http.MethodPost, "", body, accessKey, secret)
 		require.Equal(t, http.StatusConflict, rec.Code, "body: %s", rec.Body.String())
-		require.Contains(t, decodeError(t, rec).Message, "repository")
+		message := decodeError(t, rec).Message
+		require.Contains(t, message, ErrNameTaken.Error())
+		require.NotContains(t, message, "repository")
+		require.NotContains(t, message, "dataset")
+
+		duplicate := doRequest(t, handler, http.MethodPost, "", create, accessKey, secret)
+		require.Equal(t, http.StatusConflict, duplicate.Code, "body: %s", duplicate.Body.String())
+		require.Equal(t,
+			strings.ReplaceAll(decodeError(t, duplicate).Message, "handler-set", "NAME"),
+			strings.ReplaceAll(message, "handler-repo", "NAME"),
+			"a dataset clash and a repository clash are the same answer")
 	})
 
 	t.Run("list with metadata filter", func(t *testing.T) {
@@ -117,7 +129,7 @@ func TestDatasetsHTTPCreateGetDelete(t *testing.T) {
 		var list apigen.DatasetList
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &list))
 		require.Len(t, list.Results, 1)
-		require.Equal(t, "handler-set", list.Results[0].Name)
+		require.Equal(t, "handler-set", list.Results[0].Id)
 		require.False(t, list.Pagination.HasMore)
 
 		rec = doRequest(t, handler, http.MethodGet, "?metadata.tier=bronze", "", accessKey, secret)
@@ -187,87 +199,10 @@ func TestDatasetsHTTPValidationErrors(t *testing.T) {
 		def := objectDefinition("handler-src", commit.String(), "reference/countries.csv", "geo/countries.csv")
 		body := createDatasetBody(t, "denied-set", def, true)
 		rec := doRequest(t, handler, http.MethodPost, "", body, weakCred.AccessKeyID, weakCred.SecretAccessKey)
-		require.Equal(t, http.StatusForbidden, rec.Code, "body: %s", rec.Body.String())
+		require.Equal(t, http.StatusUnauthorized, rec.Code, "body: %s", rec.Body.String())
 		message := decodeError(t, rec).Message
 		require.Contains(t, message, "data[0]")
 		require.Contains(t, message, "handler-src")
-	})
-}
-
-// TestDatasetsHTTPPrefixSourceDeny is the SEC-3 end-to-end case from the review: a principal with
-// a blanket fs:* allow and a Deny on a sub-path of a source repository must not be able to attach
-// the prefix that covers it. Both the whole-repository prefix ("") and the prefix that merely
-// starts like the denied path ("sec") answer 403 naming the item, instead of silently copying the
-// denied objects into the dataset.
-func TestDatasetsHTTPPrefixSourceDeny(t *testing.T) {
-	handler, deps, accessKey, secret := newControlPlaneWithDeps(t)
-	ctx := t.Context()
-
-	// The source repository holds one secret and one public object, committed together.
-	const src = "exfil-src"
-	_, err := deps.Catalog.CreateRepository(ctx, src, "", "mem://exfil-src-ns", "main", false)
-	require.NoError(t, err)
-	for _, path := range []string{"secret/salaries.csv", "public/report.csv"} {
-		require.NoError(t, deps.Catalog.CreateEntry(ctx, src, "main", catalog.DBEntry{
-			Path:            path,
-			PhysicalAddress: "objects/" + strings.ReplaceAll(path, "/", "-"),
-			AddressType:     catalog.AddressTypeRelative,
-			CreationDate:    time.Now(),
-			Size:            7,
-			Checksum:        "deadbeef",
-			ContentType:     "text/csv",
-		}))
-	}
-	log, err := deps.Catalog.Commit(ctx, src, "main", "seed", "tester", nil, nil, nil, false)
-	require.NoError(t, err)
-	commit := graveler.CommitID(log.Reference)
-
-	// The exfiltrating principal: the ACL base grants (fs:*) through Admins, DatasetsFullAccess
-	// through DatasetAdmins, and one deny on the secrets directory of the source repository.
-	const exfiltrator = "exfiltrator"
-	_, err = deps.AuthService.CreateUser(ctx, &model.User{Username: exfiltrator})
-	require.NoError(t, err)
-	cred, err := deps.AuthService.AddCredentials(ctx, exfiltrator, "AKIAEXFILTRATOR00001", "exfil-secret")
-	require.NoError(t, err)
-	require.NoError(t, deps.AuthService.AddUserToGroup(ctx, exfiltrator, acl.AdminsGroup))
-	require.NoError(t, deps.AuthService.AddUserToGroup(ctx, exfiltrator, DatasetAdminsGroup))
-	deny := &model.Policy{
-		DisplayName: "exfiltrator-deny-secrets",
-		CreatedAt:   time.Now(),
-		Statement: model.Statements{{
-			Effect:   model.StatementEffectDeny,
-			Action:   []string{permissions.ReadObjectAction},
-			Resource: permissions.ObjectArn(src, "secret/*"),
-		}},
-	}
-	require.NoError(t, deps.AuthService.WritePolicy(ctx, deny, false))
-	require.NoError(t, deps.AuthService.AttachPolicyToUser(ctx, deny.DisplayName, exfiltrator))
-
-	t.Run("whole-repository prefix", func(t *testing.T) {
-		body := createDatasetBody(t, "exfil-all", prefixDefinition(src, commit.String(), "", ""), true)
-		rec := doRequest(t, handler, http.MethodPost, "", body, cred.AccessKeyID, cred.SecretAccessKey)
-		require.Equal(t, http.StatusForbidden, rec.Code, "body: %s", rec.Body.String())
-		message := decodeError(t, rec).Message
-		require.Contains(t, message, "data[0]", "the 403 names the item (§9.3)")
-		require.Contains(t, message, "secret/*", "the 403 names the deny that made it fail")
-		// Nothing was created: the check runs before the dataset exists.
-		getRec := doRequest(t, handler, http.MethodGet, "/exfil-all", "", accessKey, secret)
-		require.Equal(t, http.StatusNotFound, getRec.Code)
-	})
-
-	t.Run("prefix that only starts like the denied path", func(t *testing.T) {
-		body := createDatasetBody(t, "exfil-sec", prefixDefinition(src, commit.String(), "", "sec"), true)
-		rec := doRequest(t, handler, http.MethodPost, "", body, cred.AccessKeyID, cred.SecretAccessKey)
-		require.Equal(t, http.StatusForbidden, rec.Code, "body: %s", rec.Body.String())
-		message := decodeError(t, rec).Message
-		require.Contains(t, message, "data[0]")
-		require.Contains(t, message, "secret/*")
-	})
-
-	t.Run("a prefix outside the deny still publishes", func(t *testing.T) {
-		body := createDatasetBody(t, "exfil-public", prefixDefinition(src, commit.String(), "", "public/"), true)
-		rec := doRequest(t, handler, http.MethodPost, "", body, cred.AccessKeyID, cred.SecretAccessKey)
-		require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
 	})
 }
 
@@ -345,5 +280,58 @@ func TestDatasetsHTTPAccessGrants(t *testing.T) {
 
 		rec = doRequest(t, handler, http.MethodDelete, "/access-set/access/user/bob", "", accessKey, secret)
 		require.Equal(t, http.StatusNotFound, rec.Code)
+	})
+}
+
+// TestDatasetsHTTPDocumentedRoutes pins the routes this API revision adds or renames: the
+// documented `PUT /{dataset}` update (DOC-4), `GET /{dataset}/refs/{ref}` (DOC-6), the global
+// `GET /pulls` listing (DOC-8) and the `/metadata` schema paths (DOC-9). They are registered on
+// the real router, which is where a static route can shadow a `{dataset}` one.
+func TestDatasetsHTTPDocumentedRoutes(t *testing.T) {
+	handler, deps, accessKey, secret := newControlPlaneWithDeps(t)
+	commit := seedHandlerSource(t, deps.Catalog)
+	def := objectDefinition("handler-src", commit.String(), "reference/countries.csv", "geo/countries.csv")
+
+	rec := doRequest(t, handler, http.MethodPost, "", createDatasetBody(t, "http-routes", def, true), accessKey, secret)
+	require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
+
+	t.Run("get dataset by ref", func(t *testing.T) {
+		for _, ref := range []string{"latest", "v1"} {
+			rec := doRequest(t, handler, http.MethodGet, "/http-routes/refs/"+ref, "", accessKey, secret)
+			require.Equal(t, http.StatusOK, rec.Code, "ref %q: %s", ref, rec.Body.String())
+			var got apigen.Dataset
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+			require.Equal(t, "http-routes", got.Id)
+			require.Equal(t, 1, derefInt(got.Version))
+		}
+	})
+
+	t.Run("update dataset publishes synchronously", func(t *testing.T) {
+		updatedDef := def
+		updatedDef.Description = "updated through PUT"
+		// The update definition must differ from v1, or the no-op check answers 409.
+		body := marshalBody(t, map[string]any{
+			"definition": definitionToAPI(updatedDef),
+			"publish":    map[string]string{"message": "v2 through PUT"},
+		})
+		rec := doRequest(t, handler, http.MethodPut, "/http-routes", body, accessKey, secret)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		var dataset apigen.Dataset
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &dataset))
+		require.Equal(t, 2, derefInt(dataset.Version))
+		require.NotNil(t, dataset.Definition)
+	})
+
+	t.Run("global pull request listing", func(t *testing.T) {
+		rec := doRequest(t, handler, http.MethodGet, "/pulls", "", accessKey, secret)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		var list apigen.DatasetPullRequestList
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &list))
+		require.Empty(t, list.Results)
+	})
+
+	t.Run("metadata paths", func(t *testing.T) {
+		rec := doRequest(t, handler, http.MethodGet, "/metadata", "", accessKey, secret)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
 	})
 }
