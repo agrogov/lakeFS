@@ -48,6 +48,14 @@
 //     merged into main; the merged table must read back with both appends' rows. Then two branches
 //     change the same table from a common base, and the second merge must fail with 409: the
 //     pointer is a single entry, so concurrent changes to one table conflict at merge (§6.4).
+//   - TestIcebergTagRead: the table is read at a tag, where the rows are the ones the tag captured
+//     and not the branch's later appends, and a write addressed at the tag is refused with the
+//     documented "ref is read-only" message (§5, Q-I4).
+//   - TestIcebergDrop: the table is dropped through the catalog; the staged drop makes it stop
+//     loading and stop being listed, and the lakeFS commit publishes that by removing the pointer
+//     entry - the one entry that makes the table exist (§6.1). The file entries §6.3 staged are not
+//     removed by the drop, which is measured and recorded rather than asserted away
+//     (pkg/icebergcatalog/conformance/RESULTS.md §10 N-3).
 //
 // # What the GC step covers, and what it does not
 //
@@ -118,6 +126,10 @@ const (
 	// through: one append of a few files is far below it, and paging keeps the helpers correct for
 	// a table whose commit stages more entries than one page holds.
 	icebergCommitPageSize = 1000
+
+	// icebergTag is the tag TestIcebergTagRead cuts and reads: a named, immutable ref, which is the
+	// third kind of ref a reader may address (§5 "Reads work on any ref").
+	icebergTag = "iceberg-v1"
 )
 
 // TestIcebergReadPath registers a fixture table and reads it with PyIceberg and DuckDB: the
@@ -235,6 +247,100 @@ func TestIcebergBranchMerge(t *testing.T) {
 	require.Equal(t, beforeConflict, env.headCommit(t, cl, env.branch),
 		"a conflicted merge must not move the destination branch: %s stays where it was",
 		env.branch)
+}
+
+// TestIcebergTagRead is the "tag read" half of the ref rules of §5: a table is readable at a tag
+// and a write addressed at one is refused.
+//
+// A tag is what publishes a table version outside the branch that produced it, so the property that
+// matters is that the reader sees the table *as of the tag*, not the branch: the append that lands
+// on main after the tag is cut must not appear through the tag. Both published clients read it - the
+// identifier form for PyIceberg, the relative_to form for DuckDB - and both are read-only by
+// construction, so the append through the tag is expected to be refused with the documented
+// "ref is read-only" message (Q-I4) rather than to succeed quietly.
+func TestIcebergTagRead(t *testing.T) {
+	env := newIcebergEnv(t)
+	env.requireCatalogCommit(t)
+	cl := env.coreAPI(t)
+
+	// The table as of the tag: create it, append, commit, then cut the tag.
+	tagged := env.appendRows(t, env.branch, true, []icebergRow{{1, "alpha"}, {2, "beta"}})
+	taggedCommit := env.commitBranch(t, cl, env.branch, "iceberg: rows the tag captures")
+	env.createTag(t, cl, icebergTag, taggedCommit)
+
+	// A later append on the branch, committed after the tag exists: it must not be visible at the
+	// tag, because a tag is an immutable ref and not an alias of the branch.
+	later := env.appendRows(t, env.branch, false, []icebergRow{{3, "gamma"}})
+	env.commitBranch(t, cl, env.branch, "iceberg: rows after the tag")
+
+	read := env.readTable(t, icebergTag)
+	require.Equal(t, tagged.IDs, read.PyIcebergIDs,
+		"PyIceberg must read the rows the tag captured, not the branch's later append")
+	require.Equal(t, tagged.IDs, read.DuckDBIDs,
+		"DuckDB must read the tag through the relative_to form")
+	require.NotContains(t, read.PyIcebergIDs, later.IDs[0],
+		"the append that landed after the tag must not appear through the tag")
+
+	// The tag still points where it did, and the branch still reads the whole table.
+	branchRead := env.readTable(t, env.branch)
+	wantBranch := append(append([]int64{}, tagged.IDs...), later.IDs...)
+	require.Equal(t, wantBranch, branchRead.PyIcebergIDs,
+		"%s must read every append, including the one after the tag", env.branch)
+
+	// Writes need a branch: an append addressed at the tag is refused (§5, Q-I4).
+	env.requireRefReadOnly(t, icebergTag)
+}
+
+// TestIcebergDrop covers the drop operation (I2-5) and what the lakeFS commit does with it.
+//
+// A drop is staged like every other catalog write (§6.2): the catalog removes the pointer entry on
+// the branch, the table stops loading and stops being listed immediately, and the lakeFS commit
+// publishes the removal. The contract asserted here is that the commit's diff *removes* the pointer,
+// the single entry §6.1 says a table is.
+//
+// The other half is deliberately an observation, not an assertion: the `_lakefs_iceberg/files/...`
+// entries that §6.3 staged for the table are **not** removed by the drop (measured; see
+// pkg/icebergcatalog/conformance/RESULTS.md §10 N-3), so they keep the table's objects in the
+// committed GC's live set after the table is gone. Pinning that as an expectation would make a
+// future fix - tombstoning the entries, which is what would let the GC reclaim a dropped table's
+// files - look like a regression, so the test logs what survived instead.
+func TestIcebergDrop(t *testing.T) {
+	env := newIcebergEnv(t)
+	env.requireCatalogCommit(t)
+	cl := env.coreAPI(t)
+
+	appended := env.appendRows(t, env.branch, true, []icebergRow{{1, "alpha"}, {2, "beta"}})
+	base := env.commitBranch(t, cl, env.branch, "iceberg: create and append before the drop")
+	env.requireTableListed(t, env.branch, true)
+
+	// Drop through the catalog. Everything below happens on the staged state: the catalog writes
+	// into the branch's staging area, so the drop is visible to the catalog and not yet a commit.
+	env.dropTableThroughCatalog(t, env.branch)
+	env.requireTableAbsent(t, env.branch)
+	env.requireTableListed(t, env.branch, false)
+
+	// Publish the drop, then assert the same outcomes on the committed state, and that the commit
+	// removed the pointer - the one entry whose presence is the table.
+	dropped := env.commitBranch(t, cl, env.branch, "iceberg: drop the table")
+	require.NotEqualf(t, base, dropped, "the drop commit must be a new commit on %s", env.branch)
+	env.requireTableAbsent(t, env.branch)
+	env.requireTableListed(t, env.branch, false)
+
+	paths := env.diffPaths(t, cl, dropped)
+	require.Equalf(t, "removed", paths[icebergPointerPath([]string{env.namespace}, env.table)],
+		"the drop commit must remove the table pointer; diff paths: %v", sortedPathList(paths))
+
+	// Observed, not asserted: what the drop left behind under the table's file-entry directory.
+	filePrefix := icebergTableFileEntryPrefix(appended.TableUUID)
+	retained := 0
+	for path := range paths {
+		if strings.HasPrefix(path, filePrefix) {
+			retained++
+		}
+	}
+	t.Logf("the drop commit changed %d entries below %q; the catalog deletes the pointer only, so a "+
+		"dropped table's file entries stay in the branch and keep its objects GC-live "+
+		"(conformance/RESULTS.md §10 N-3)", retained, filePrefix)
 }
 
 // icebergRow is one row of the test table. The table is deliberately trivial - an id and a name -

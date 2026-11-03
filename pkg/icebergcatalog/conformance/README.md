@@ -39,15 +39,20 @@ entries are what the conformance subtests read back, and every subtest drops wha
 ### 1.2 Preparing a server
 
 Any lakefs-sso works. This is the local recipe the recorded run used (quickstart credentials,
-local blockstore, catalog on):
+local blockstore, catalog on).
+
+**It must run in a policy-capable auth mode.** With the default auth mode the server exits at startup
+(`icebergcatalog: read policy iceberg-reserved-prefix-protect: not implemented`, defect D-3 in
+[`RESULTS.md`](RESULTS.md) §10), so the recipe below writes a `lakefs.yaml` whose `sso:` section selects
+the ACL auth service. `RESULTS.md` §3 has the details and the stub OIDC issuer that section needs;
+without such a section nothing below runs.
 
 ```shell
+# from the repository root
+# lakefs.yaml: database/blockstore local, iceberg.enabled, and the sso: section of RESULTS.md §3.
 go build -o /tmp/lakefs-sso ./cmd/lakefs-sso
 
-LAKEFS_DATABASE_LOCAL_PATH=/tmp/lfsconf/kv \
-LAKEFS_BLOCKSTORE_LOCAL_PATH=/tmp/lfsconf/block \
-LAKEFS_ICEBERG_ENABLED=true \
-  /tmp/lakefs-sso run --quickstart &
+/tmp/lakefs-sso run --config /tmp/lfsconf/config.yaml --quickstart &
 
 # The repository's storage namespace must be inside blockstore.local.path, or the metadata
 # writes fail: the local adapter refuses a path outside the adapter's root.
@@ -190,48 +195,42 @@ Recorded here so a future run is not mistaken for a regression:
 
 ## 3. Recorded runs
 
-Recorded against `lakefs-sso` built from this tree at the time of writing.
+**The current record is [`RESULTS.md`](RESULTS.md).** It has the environment, the exact commands, the
+tool versions, the pass/fail result of each suite, the defects found and the gaps. Read it before
+believing anything below, and update it, not this section, when you run a suite.
 
-| Date | Suite | Result |
-|---|---|---|
-| 2026-11-03 | `go vet ./pkg/icebergcatalog/conformance/` | pass |
-| 2026-11-03 | iceberg-go catalogtest, `REST_CATALOG_URI`/`_CREDENTIAL`/`_WAREHOUSE` set | **fail - I-2 exit gate not met** |
-| 2026-11-03 | RCK | not executed here (needs a Gradle/JDK checkout of apache/iceberg); §2 documents the invocation and the allowlist |
+The latest recorded outcome, in one line each:
 
-The catalogtest failure is not in this suite: every subtest fails while the *client* is being built,
-with
+| Suite | Result |
+|---|---|
+| `go vet`, `go test ./pkg/icebergcatalog/...` | pass |
+| iceberg-go catalogtest (`REST_CATALOG_*` set) | **fail — 0 of 18 subtests**; the `relative_to` middleware is never mounted (`http.go`), so the client's namespace arrives un-prefixed |
+| Apache RCK | not run — no JDK/Gradle/apache-iceberg checkout on the recording host |
+| esti (`esti/iceberg_test.go`) | attempted, **all 5 tests skipped** — no docker daemon and no S3-compatible store; no assertion executed |
 
-```
-Get "http://127.0.0.1:8000/iceberg/relative_to/conformance.main/api/v1/config?warehouse=conformance.main":
-```
+### 3.1 Superseded notes from the first attempt
 
-and an empty `rest.oauthError{}` inside that `url.Error`: `POST /v1/oauth/tokens` answers
-`401 {"error":{"message":"authentication required","type":"NotAuthorizedException"}}`. The token
-endpoint is served by `catalogAuth.middleware` (auth.go), and `http.go`'s `newAuthMiddleware` still
-builds `api.GenericAuthMiddleware`, so the endpoint is never reached; the file's own wiring note
-records the one-line swap (I1-5, still `backlog`).
+Kept because the analysis is still worth reading, with what is now known to be out of date marked:
 
-Three further findings, measured with that swap plus two more local patches applied *outside this
-change* (they are not part of this commit):
-
-1. `http.go` mounts the catalog at `/iceberg/relative_to/{warehouse}/api` with `handler`, not
-   `RelativeTo(handler)`, so the `RelativeTo` middleware of I1-10 is never mounted and the warehouse
-   segment is ignored: `POST /v1/namespaces` with namespace `[ns]` is answered
-   `400 invalid iceberg identifier: namespace "ns" must name a repository, a ref and at least one
-   namespace level`.
-2. `RelativeTo` rewrites the `{namespace}` path parameter and the `parent` query parameter, but not
-   the namespace carried in the JSON body of `POST /v1/namespaces`, so under the `relative_to` form
-   a client cannot create a namespace at all (create table, which carries the namespace in the path,
-   is unaffected).
-3. With 1 and 2 fixed, 17 of the 18 catalogtest subtests pass; `ListNamespaces` fails because the
-   namespace comes back as `[repo, ref, ns]` where the client sent `[ns]`
-   (relative.go documents "nothing is un-prefixed on the way out"). §5 says the *client* namespace
-   under `relative_to` is `ns...`, and a REST client has no way to strip a server-imposed prefix, so
-   the relative form has to un-prefix what it injected for the client not to see its own identifiers
-   change.
-
-Until those are fixed, I2-7 - and therefore the I-2 exit gate - stays open, whatever this suite
-says.
+- **OAuth token endpoint (superseded).** The first attempt failed with `401` on
+  `POST /v1/oauth/tokens` because `http.go` still built `api.GenericAuthMiddleware`. That is fixed:
+  the endpoint answers `200` with a bearer token (`RESULTS.md` §1).
+- **Catalog startup (new, and it comes first now).** With the default auth mode, enabling the catalog
+  makes the server exit at startup with
+  `icebergcatalog: read policy iceberg-reserved-prefix-protect: not implemented`. Any run — including
+  §1.2 above and §2.2 below — has to start `lakefs-sso` in a policy-capable auth mode; see
+  `RESULTS.md` §3, which also gives the workaround the recorded run used. Defect D-3 in
+  `RESULTS.md` §10.
+- **`relative_to` is not mounted (still open).** `http.go` mounts the bare handler, not
+  `RelativeTo(handler)`, so the warehouse segment is ignored. Until that is fixed every subtest of the
+  Go suite and every DuckDB read fails on the first request; defect D-1.
+- **Namespace in the request body (still presumed open, not re-measured).** The rewrite covers the
+  `{namespace}` path parameter and the `parent` query parameter, not the namespace inside the JSON body
+  of `POST /v1/namespaces`; defect D-2.
+- **ListNamespaces under `relative_to` (predicted, not measured).** Responses are not un-prefixed, so
+  the client sees `[repo, ref, ns]` where it sent `[ns]`; defect D-4.
+- **An earlier run with local patches applied outside the change reported 17 of 18 subtests passing.**
+  That number was never committed and is **not** reproducible from this tree; do not cite it.
 
 ## 4. Clean-room and licensing
 

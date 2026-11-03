@@ -68,6 +68,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
@@ -275,8 +276,12 @@ func newIcebergEnv(t *testing.T) *icebergEnv {
 	env.s3 = icebergS3Settings(t)
 	env.bucket, env.runPrefix, env.storageNamespace = icebergStorageNamespace(t, env.repo)
 
+	// The catalog's installation-wide deny policy is created through the auth service, so the
+	// server has to run with an auth service that can store policies (see icebergServerConfig).
+	issuerURL := icebergOIDCIssuer(t)
+
 	configPath := filepath.Join(dir, "lakefs.yaml")
-	require.NoError(t, os.WriteFile(configPath, []byte(icebergServerConfig(listenAddress, dir, env.s3)), icebergConfigFileMode))
+	require.NoError(t, os.WriteFile(configPath, []byte(icebergServerConfig(listenAddress, dir, env.s3, issuerURL)), icebergConfigFileMode))
 
 	logFile, err := os.Create(env.logPath)
 	require.NoError(t, err, "create the server log file")
@@ -427,16 +432,69 @@ func icebergStorageNamespace(t *testing.T, repo string) (bucket, runPrefix, name
 	return bucket, runPrefix, namespace
 }
 
+// icebergOIDCIssuer serves an OpenID Connect discovery document from the test process and returns
+// its issuer URL, for the sso: section icebergServerConfig writes.
+//
+// It exists to select lakefs-sso's ACL auth service, the only auth service of this binary that
+// implements the policy writes pkg/icebergcatalog.Bootstrap needs (see icebergServerConfig); the
+// binary builds its OIDC-aware authentication service only when sso.enabled is true, and that
+// constructor discovers the issuer at startup. No login is ever performed and no token is ever
+// verified through it: every client of this suite authenticates with a lakeFS access key pair, so
+// the jwks_uri is advertised and never fetched.
+func icebergOIDCIssuer(t *testing.T) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/.well-known/openid-configuration") {
+			http.NotFound(w, r)
+			return
+		}
+		// gooidc requires the document's issuer to equal the URL it was discovered from, so it is
+		// derived from the request rather than from the listener address.
+		issuer := "http://" + r.Host
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"issuer":                                issuer,
+			"authorization_endpoint":                issuer + "/authorize",
+			"token_endpoint":                        issuer + "/token",
+			"jwks_uri":                              issuer + "/jwks",
+			"userinfo_endpoint":                     issuer + "/userinfo",
+			"response_types_supported":              []string{"code"},
+			"subject_types_supported":               []string{"public"},
+			"id_token_signing_alg_values_supported": []string{"RS256"},
+			"scopes_supported":                      []string{"openid", "profile", "email"},
+		}); err != nil {
+			t.Errorf("write the OIDC discovery document: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
+}
+
 // icebergServerConfig is the generated lakefs.yaml: the listen address of the free port, a
 // warning-level log, a local KV store in the temporary directory, the auth secret every lakeFS
-// installation needs, the S3 blockstore the clients also point at, and the iceberg section of
-// ICEBERG_CATALOG_PLAN.md §10.
+// installation needs, the S3 blockstore the clients also point at, the sso: section that selects
+// the ACL auth service, and the iceberg section of ICEBERG_CATALOG_PLAN.md §10.
 //
 // The blockstore section is written out in full instead of being inherited from the ambient
 // LAKEFS_* variables: a partial section would shadow viper's nested defaults, and the server, the
 // test process and the client containers must all address the same bucket with the same
 // credentials and path style for the fixture's files to be readable through the catalog.
-func icebergServerConfig(listenAddress, dir string, s3 icebergS3Config) string {
+//
+// The sso: section is a workaround for a defect of the catalog, not a property of this suite.
+// pkg/icebergcatalog.Bootstrap creates and attaches the installation-wide
+// iceberg-reserved-prefix-protect deny policy through the auth service, and fails startup when
+// that write fails. With the default auth mode lakefs-sso runs auth.BasicAuthService, whose
+// WritePolicy/GetPolicy/AttachPolicyToGroup answer auth.ErrNotImplemented, so with iceberg.enabled
+// and no sso: section the server refuses to start with
+//
+//	icebergcatalog: read policy iceberg-reserved-prefix-protect: not implemented
+//
+// and no catalog test of this suite can run at all (the run is recorded in
+// pkg/icebergcatalog/conformance/RESULTS.md). sso.enabled selects the ACL auth service, which
+// does implement those calls, so the suite can start a server whose catalog is enabled. Drop this
+// section once the catalog degrades gracefully (or correctly) when the auth service cannot store
+// policies.
+func icebergServerConfig(listenAddress, dir string, s3 icebergS3Config, issuerURL string) string {
 	var blockstore strings.Builder
 	blockstore.WriteString("blockstore:\n  type: s3\n  s3:\n")
 	fmt.Fprintf(&blockstore, "    region: %q\n", s3.Region)
@@ -461,10 +519,17 @@ database:
 auth:
   encrypt:
     secret_key: "esti-iceberg-read-path-secret-key"
+sso:
+  enabled: true
+  client_id: "esti-iceberg"
+  client_secret: "esti-iceberg-client-secret"
+  issuer_url: %q
+  callback_base_url: %q
 %siceberg:
   enabled: true
   prefix: %q
-`, listenAddress, filepath.Join(dir, "metadata"), blockstore.String(), icebergcatalog.CatalogPrefix)
+`, listenAddress, filepath.Join(dir, "metadata"), issuerURL, "http://"+listenAddress,
+		blockstore.String(), icebergcatalog.CatalogPrefix)
 }
 
 // icebergServerBinary returns the lakefs-sso binary to run, building it from source when the
@@ -706,7 +771,7 @@ func (e *icebergEnv) requireLoadTableAgrees(t *testing.T, wantMetadataLocation s
 	}
 
 	load("the identifier form", e.tableURL(e.catalogURL))
-	load("the relative_to form", e.tableURL(e.relativeToURL+"/"+e.repo+"."+e.branch+"/api"))
+	load("the relative_to form", e.relativeToTableURL(e.branch))
 }
 
 // readWithClients reads the registered table with PyIceberg through /iceberg/api and with DuckDB
@@ -845,8 +910,15 @@ func (e *icebergEnv) namespacesURL(mount string) string {
 // as the spec requires (ident.go NamespaceSeparator/EncodedNamespaceSeparator). Register (I2-6) is
 // an operation of the namespace, not of a table, so it hangs off this URL.
 func (e *icebergEnv) namespaceURL(mount string) string {
-	encoded := make([]string, 0, len([]string{e.repo, e.branch, e.namespace}))
-	for _, level := range []string{e.repo, e.branch, e.namespace} {
+	return e.refNamespaceURL(mount, e.branch)
+}
+
+// refNamespaceURL is namespaceURL for an arbitrary ref: the namespace levels of §5 with ref in the
+// second place. A tag and a commit id are refs like a branch is, and reads are served on all three
+// (§5 "Reads work on any ref"), so the same URL shape addresses a table at a tag.
+func (e *icebergEnv) refNamespaceURL(mount, ref string) string {
+	encoded := make([]string, 0, len([]string{e.repo, ref, e.namespace}))
+	for _, level := range []string{e.repo, ref, e.namespace} {
 		encoded = append(encoded, url.PathEscape(level))
 	}
 	return e.namespacesURL(mount) + "/" + strings.Join(encoded, icebergcatalog.EncodedNamespaceSeparator)
@@ -854,7 +926,21 @@ func (e *icebergEnv) namespaceURL(mount string) string {
 
 // tableURL is the LoadTable URL of the fixture table below a catalog mount.
 func (e *icebergEnv) tableURL(mount string) string {
-	return e.namespaceURL(mount) + "/tables/" + url.PathEscape(e.table)
+	return e.refTableURL(mount, e.branch)
+}
+
+// refTableURL is tableURL for an arbitrary ref.
+func (e *icebergEnv) refTableURL(mount, ref string) string {
+	return e.refNamespaceURL(mount, ref) + "/tables/" + url.PathEscape(e.table)
+}
+
+// relativeToTableURL is the LoadTable URL of the fixture table on the relative_to mount. The URL
+// fixes the repository and the ref (§5 rows 4-5), so the path parameter carries the client's own
+// namespace levels only: the catalog's RelativeTo middleware prepends the two fixed levels to
+// whatever the parameter holds, and sending them again would address [repo, ref, repo, ref, ns].
+func (e *icebergEnv) relativeToTableURL(ref string) string {
+	mount := e.relativeToURL + "/" + e.repo + "." + ref + "/api"
+	return e.namespacesURL(mount) + "/" + url.PathEscape(e.namespace) + "/tables/" + url.PathEscape(e.table)
 }
 
 // doJSON issues one catalog request with basic auth and returns the status and the body.
@@ -961,6 +1047,16 @@ func stringSliceField(t *testing.T, result map[string]any, key string) []string 
 	return values
 }
 
+// boolField reads one boolean out of a step's result.
+func boolField(t *testing.T, result map[string]any, key string) bool {
+	t.Helper()
+	raw, ok := result[key]
+	require.Truef(t, ok, "the step result has no %q field: %v", key, result)
+	value, ok := raw.(bool)
+	require.Truef(t, ok, "%q of the step result is not a boolean: %v", key, raw)
+	return value
+}
+
 // int64SliceField reads a list of JSON numbers out of a step's result.
 func int64SliceField(t *testing.T, result map[string]any, key string) []int64 {
 	t.Helper()
@@ -995,6 +1091,108 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// createTag cuts tag at ref. A tag is a ref a reader addresses by name afterwards, which is what
+// makes a released version of a table readable at <repo>.<tag>.<namespace>.<table> (§1.1 goal 1,
+// §5 "Reads work on any ref").
+func (e *icebergEnv) createTag(t *testing.T, cl *apigen.ClientWithResponses, tag, ref string) {
+	t.Helper()
+	res, err := cl.CreateTagWithResponse(t.Context(), e.repo, apigen.CreateTagJSONRequestBody{Id: tag, Ref: ref})
+	require.NoErrorf(t, err, "create tag %s at %s", tag, ref)
+	require.Equalf(t, http.StatusCreated, res.StatusCode(), "create tag %s at %s: %s", tag, ref, res.Body)
+}
+
+// dropTableThroughCatalog drops the fixture table through the catalog on ref: PyIceberg's
+// drop_table, i.e. the DELETE /v1/.../tables/{table} operation (I2-5), which stages the deletion of
+// the pointer entry exactly as create staged its addition (§6.2).
+func (e *icebergEnv) dropTableThroughCatalog(t *testing.T, ref string) {
+	t.Helper()
+	result := e.runClient(t, "drop:"+ref, icebergDropScript, map[string]string{
+		"ICEBERG_CATALOG_URI": e.dockerReachableURL(e.catalogURL),
+		"ICEBERG_CREDENTIAL":  e.key + ":" + e.secret,
+		"ICEBERG_IDENTIFIER":  icebergIdentifierJSON(t, e.repo, ref, e.namespace, e.table),
+		"ICEBERG_WAREHOUSE":   e.storageNamespace,
+	})
+	require.Truef(t, boolField(t, result, "dropped"), "drop %q through the catalog on %s must succeed", e.table, ref)
+}
+
+// requireTableAbsent asserts that the catalog answers 404 NoSuchTable for the fixture table at ref.
+// After a drop this is the observable outcome on that ref, before and after the lakeFS commit that
+// publishes it - a drop is staged like every other catalog write (§6.2).
+func (e *icebergEnv) requireTableAbsent(t *testing.T, ref string) {
+	t.Helper()
+	for _, mount := range []struct {
+		name string
+		url  string
+	}{
+		{"the identifier form", e.refTableURL(e.catalogURL, ref)},
+		{"the relative_to form", e.relativeToTableURL(ref)},
+	} {
+		status, body := e.doJSON(t, http.MethodGet, mount.url, nil)
+		require.Equalf(t, http.StatusNotFound, status,
+			"loading %q at %s through %s must be 404 after the drop: %s", e.table, ref, mount.name, body)
+		require.Containsf(t, string(body), icebergNoSuchTableType,
+			"the answer through %s must be typed %s: %s", mount.name, icebergNoSuchTableType, body)
+	}
+}
+
+// requireTableListed asserts whether the namespace listing at ref carries the fixture table: the
+// table is an entry of the namespace, so a staged drop removes it from the listing as well as from
+// the load path.
+func (e *icebergEnv) requireTableListed(t *testing.T, ref string, want bool) {
+	t.Helper()
+	status, body := e.doJSON(t, http.MethodGet, e.refNamespaceURL(e.catalogURL, ref)+"/tables", nil)
+	require.Equalf(t, http.StatusOK, status, "list the tables of %s at %s: %s", e.namespace, ref, body)
+
+	var listing struct {
+		Identifiers []struct {
+			Namespace []string `json:"namespace"`
+			Name      string   `json:"name"`
+		} `json:"identifiers"`
+	}
+	require.NoErrorf(t, json.Unmarshal(body, &listing), "decode the table listing: %s", body)
+
+	names := make([]string, 0, len(listing.Identifiers))
+	for _, identifier := range listing.Identifiers {
+		names = append(names, identifier.Name)
+	}
+	if want {
+		require.Containsf(t, names, e.table, "the listing of %s at %s must contain %q", e.namespace, ref, e.table)
+		return
+	}
+	require.NotContainsf(t, names, e.table, "the listing of %s at %s must not contain %q after the drop",
+		e.namespace, ref, e.table)
+}
+
+// requireRefReadOnly asserts that a client which tries to append through ref is refused with 403
+// and the documented "ref is read-only" message (Q-I4): writes need a branch, and a tag or a commit
+// id is not one.
+func (e *icebergEnv) requireRefReadOnly(t *testing.T, ref string) {
+	t.Helper()
+	result := e.runClient(t, "write-refused:"+ref, icebergWriteRefusedScript, map[string]string{
+		"ICEBERG_CATALOG_URI": e.dockerReachableURL(e.catalogURL),
+		"ICEBERG_CREDENTIAL":  e.key + ":" + e.secret,
+		"ICEBERG_IDENTIFIER":  icebergIdentifierJSON(t, e.repo, ref, e.namespace, e.table),
+		"ICEBERG_WAREHOUSE":   e.storageNamespace,
+	})
+	require.Truef(t, boolField(t, result, "refused"),
+		"an append addressed at %s must fail: writes to a tag are read-only (Q-I4)", ref)
+	errorText := stringField(t, result, "error")
+	require.Containsf(t, errorText, "ref is read-only",
+		"the refusal on %s must say the ref is read-only: %s", ref, errorText)
+}
+
+// icebergNoSuchTableType is the type of the 404 answer for a table that does not exist.
+const icebergNoSuchTableType = "NoSuchTableException"
+
+// icebergIdentifierJSON encodes a full catalog identifier for a client step: the namespace levels of
+// §5, i.e. [repository, ref, namespace, table].
+func icebergIdentifierJSON(t *testing.T, repo, ref, namespace, table string) string {
+	t.Helper()
+	encoded, err := json.Marshal([]string{repo, ref, namespace, table})
+	require.NoError(t, err, "marshal the PyIceberg identifier")
+	return string(encoded)
 }
 
 // icebergFixtureScript writes the fixture table outside the catalog.
@@ -1149,4 +1347,85 @@ print("RESULT:" + json.dumps({
     "duckdb_ids": duckdb_ids,
     "duckdb_relation": relation,
 }))
+`
+
+// icebergDropScript drops a table through the catalog.
+//
+// The drop is the DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table} operation: the catalog
+// stages the deletion of the pointer entry on the branch (§6.2), and the lakeFS commit that follows
+// is what publishes it. The drop is not a purge - lakeFS garbage collection, not a client, decides
+// when the files can go (§6.3) - so nothing here deletes an object.
+const icebergDropScript = `
+import json
+import os
+
+from pyiceberg.catalog.rest import RestCatalog
+
+
+def required(name):
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit("missing environment variable " + name)
+    return value
+
+
+catalog = RestCatalog(
+    name="lakefs",
+    uri=required("ICEBERG_CATALOG_URI"),
+    credential=required("ICEBERG_CREDENTIAL"),
+    warehouse=required("ICEBERG_WAREHOUSE"),
+)
+identifier = tuple(json.loads(required("ICEBERG_IDENTIFIER")))
+catalog.drop_table(identifier)
+print("RESULT:" + json.dumps({"dropped": True, "identifier": list(identifier)}))
+`
+
+// icebergWriteRefusedScript tries to append to a table addressed at a tag or a commit id and reports
+// the refusal. It is how the suite asserts the read-only rule of §5/Q-I4 from a client's side: the
+// status a client sees (403) is what selects its exception class, so the assertion is on the message
+// the catalog documents and on the fact that the write did not go through.
+const icebergWriteRefusedScript = `
+import json
+import os
+
+import pyarrow as pa
+from pyiceberg.catalog.rest import RestCatalog
+
+
+def required(name):
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit("missing environment variable " + name)
+    return value
+
+
+# The append rewrites data and manifests, so this step needs the same FileIO the append step uses.
+file_io_properties = {
+    "s3.access-key-id": required("ICEBERG_S3_KEY"),
+    "s3.secret-access-key": required("ICEBERG_S3_SECRET"),
+    "s3.region": os.environ.get("ICEBERG_S3_REGION", "us-east-1"),
+}
+if os.environ.get("ICEBERG_S3_ENDPOINT"):
+    file_io_properties["s3.endpoint"] = os.environ["ICEBERG_S3_ENDPOINT"]
+    file_io_properties["s3.path-style-access"] = os.environ.get("ICEBERG_S3_PATH_STYLE", "true")
+
+catalog = RestCatalog(
+    name="lakefs",
+    uri=required("ICEBERG_CATALOG_URI"),
+    credential=required("ICEBERG_CREDENTIAL"),
+    warehouse=required("ICEBERG_WAREHOUSE"),
+    **file_io_properties,
+)
+identifier = tuple(json.loads(required("ICEBERG_IDENTIFIER")))
+schema = pa.schema([
+    pa.field("id", pa.int64(), nullable=False),
+    pa.field("name", pa.string(), nullable=False),
+])
+table = catalog.load_table(identifier)
+try:
+    table.append(pa.Table.from_pylist([{"id": 99, "name": "refused"}], schema=schema))
+except Exception as exc:  # the client's own exception class, whatever it chose for the status
+    print("RESULT:" + json.dumps({"refused": True, "error": type(exc).__name__ + ": " + str(exc)}))
+else:
+    print("RESULT:" + json.dumps({"refused": False, "error": ""}))
 `
