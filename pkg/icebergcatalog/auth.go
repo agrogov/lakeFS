@@ -18,15 +18,33 @@ package icebergcatalog
 // session cookie (the cookie_auth scheme of api.GenericAuthMiddleware, read here as the same
 // internal_auth_session session carrying the same token). The web UI authenticates by cookie, and
 // the repository Tables tab explores the catalog's own read endpoints through it, so without the
-// cookie a signed-in user's browser could not read the tables it is allowed to read. The cookie is
-// accepted for GET and HEAD only:
+// cookie a signed-in user's browser could not read the tables it is allowed to read.
 //
-//   - a cookie is the one credential a browser attaches by itself, so accepting it for a write
-//     would let any page the user visits issue that write on their behalf. Reads cannot change
-//     catalog state, which is what keeps the UI path free of a CSRF-exposed write;
-//   - catalog clients never send one, so no client loses an option it had;
-//   - POST /v1/oauth/tokens is a POST and is served before this decision is made (middleware), so
-//     a cookie cannot be exchanged for a token either.
+// The cookie is accepted for GET and HEAD, and - since the Tables tab also manages tables - for
+// exactly four state-changing UI operations (cookieUIManagementOperations):
+//
+//   - a cookie is the one credential a browser attaches by itself, so a write authorised by a
+//     cookie is a write any page the user visits could try to issue on their behalf. That is why
+//     the management exception is closed rather than general: it names four operations and no
+//     others, and it additionally requires the request to identify itself as the web UI with an
+//     X-Lakefs-Client header starting with "lakefs-webui".
+//   - the header is what makes the exception usable at all. It is a non-simple header, so a
+//     browser sends it only after a CORS preflight, and this catalog answers no preflight and
+//     grants no cross-origin access: a cross-site page cannot reach a different-origin POST or
+//     DELETE with that header at all. The login cookie is SameSite=Lax as well, so it is not
+//     attached to a cross-site request in the first place. The header on its own is not a secret
+//     and is not the security boundary - the preflight refusal and SameSite are - but it keeps
+//     the exception scoped to the UI: a catalog client, a script, or any other same-origin
+//     caller that does not claim to be the web UI gets 401 for a cookie write, exactly as before.
+//   - every other write stays bearer/basic only, and deliberately so: POST tables/{table} (the
+//     commit), register, properties, rename, metrics, remote signing and
+//     POST /v1/oauth/tokens are not UI management operations and are never authenticated by a
+//     cookie. Those are the operations that change table contents or mint a credential, which is
+//     the larger surface a browser-supplied credential must not reach.
+//   - GET and HEAD stay open to the cookie without a header, because a read cannot change catalog
+//     state and the UI's own reads (the namespace tree, the table load) are the reason the cookie
+//     scheme exists.
+//   - catalog clients never send a cookie, so no client loses an option it had.
 //
 // Every other interactive scheme (OIDC, SAML) stays out (§7.1): those need a browser flow and a
 // cookie verification configuration that a catalog client cannot drive, and a catalog mount has
@@ -71,14 +89,66 @@ const (
 	bearerScheme = "Bearer"
 )
 
-// cookieAuthMethods are the methods the login session cookie authenticates. They are exactly the
-// methods a catalog read uses: GET for the operations themselves and HEAD for TableExists and
-// NamespaceExists. Everything else - POST, PUT, PATCH, DELETE, and the token endpoint's POST -
-// requires a bearer token or HTTP basic, so no state-changing request is ever authorised by a
-// credential the browser supplies on its own (see the file comment).
+// cookieAuthMethods are the methods the login session cookie authenticates without any further
+// condition. They are exactly the methods a catalog read uses: GET for the operations themselves
+// and HEAD for TableExists and NamespaceExists. Every other method requires a bearer token or HTTP
+// basic, except for the four UI management operations of cookieUIManagementOperations (see
+// cookieManagementAllowed).
 var cookieAuthMethods = map[string]bool{
 	http.MethodGet:  true,
 	http.MethodHead: true,
+}
+
+const (
+	// uiClientHeader is the header the web UI identifies itself with (webui/src/lib/api/index.js
+	// sends it on every core and catalog request as `lakefs-webui/<build version>`). It is the
+	// marker that scopes the cookie-write exception to the UI; see the file comment for why it is
+	// not itself the security boundary.
+	uiClientHeader = "X-Lakefs-Client" // #nosec G101 -- a header name, not a credential
+
+	// uiClientPrefix is the value uiClientHeader must start with for the cookie to authenticate a
+	// management write.
+	uiClientPrefix = "lakefs-webui"
+
+	// catalogAPIVersion is the first path segment of every catalog operation, the version prefix
+	// the routes of http.go are declared under (/v1/...).
+	catalogAPIVersion = "v1"
+
+	// namespacesPathSegment and tablesPathSegment are the two collection segments of the operation
+	// patterns in cookieUIManagementOperations.
+	namespacesPathSegment = "namespaces"
+	tablesPathSegment     = "tables"
+
+	// anyPathSegment is the wildcard of an operation pattern: it matches exactly one segment, the
+	// {prefix}, {namespace} or {table} of a route.
+	anyPathSegment = "*"
+)
+
+// cookieUIManagementOperations is the closed list of state-changing operations the login session
+// cookie authenticates, as method plus the path segments below the catalog mount the operation
+// matches. It is a list rather than a condition so that the exception is auditable at a glance and
+// so that adding an operation is a visible change here:
+//
+//	POST   /v1/{prefix}/namespaces                            create a namespace
+//	DELETE /v1/{prefix}/namespaces/{namespace}                drop an empty namespace
+//	POST   /v1/{prefix}/namespaces/{namespace}/tables          create a table
+//	DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}  drop a table
+//
+// Everything absent from this list is not a management operation the UI may make with a cookie:
+// the commit (POST .../tables/{table}), register (POST .../register), properties
+// (POST .../properties), metrics (POST .../metrics), remote signing (POST .../sign), the token
+// endpoint (POST /v1/oauth/tokens) and every read (GET/HEAD, which need no entry here). The list
+// matches on shape and not on names: the {namespace} segment is one segment however many levels it
+// joins with the separator, and its value is irrelevant to the decision - what the caller may do
+// with it is the Authorizer's question, not this one's.
+var cookieUIManagementOperations = []struct {
+	method  string
+	pattern []string
+}{
+	{method: http.MethodPost, pattern: []string{catalogAPIVersion, anyPathSegment, namespacesPathSegment}},
+	{method: http.MethodDelete, pattern: []string{catalogAPIVersion, anyPathSegment, namespacesPathSegment, anyPathSegment}},
+	{method: http.MethodPost, pattern: []string{catalogAPIVersion, anyPathSegment, namespacesPathSegment, anyPathSegment, tablesPathSegment}},
+	{method: http.MethodDelete, pattern: []string{catalogAPIVersion, anyPathSegment, namespacesPathSegment, anyPathSegment, tablesPathSegment, anyPathSegment}},
 }
 
 // catalogAuth is the catalog's authentication: it turns the credentials of a request into the
@@ -196,6 +266,10 @@ func (a *catalogAuth) middleware(next http.Handler) http.Handler {
 // authenticateRequest resolves the credentials of a request. It returns (nil, nil) for a request
 // that carries none, which requireUser answers, and an error for a request whose credentials are
 // present but wrong.
+//
+// The order is bearer, then basic, then cookie: a client that sends an Authorization header is
+// never authenticated by the cookie it happens to carry, and the cookie is consulted only when the
+// request carries no other credential.
 func (a *catalogAuth) authenticateRequest(r *http.Request) (*model.User, error) {
 	if token, ok := bearerToken(r); ok {
 		return a.userFromToken(r.Context(), token)
@@ -203,10 +277,66 @@ func (a *catalogAuth) authenticateRequest(r *http.Request) (*model.User, error) 
 	if accessKey, secretKey, ok := r.BasicAuth(); ok {
 		return a.userFromCredentials(r.Context(), accessKey, secretKey)
 	}
-	if cookieAuthMethods[r.Method] {
+	if cookieAuthMethods[r.Method] || cookieManagementAllowed(r) {
 		return a.userFromCookie(r)
 	}
 	return nil, nil //nolint:nilnil // "no credentials" is not an error: requireUser answers it.
+}
+
+// cookieManagementAllowed reports whether the login session cookie may authenticate this request
+// as one of the Tables tab's management operations.
+//
+// Two conditions, both required:
+//
+//   - the request identifies itself as the web UI, with an X-Lakefs-Client header that starts with
+//     "lakefs-webui". This is what keeps the exception scoped to the UI rather than to "a POST or a
+//     DELETE"; the CORS preflight a browser must send before it will attach this header to a
+//     cross-origin request is refused by the catalog (it grants no cross-origin access), and the
+//     login cookie is SameSite=Lax, so a cross-site page reaches neither.
+//   - the method and the path are exactly one of the four operations of
+//     cookieUIManagementOperations - create namespace, drop namespace, create table, drop table -
+//     and not merely a POST or a DELETE somewhere below the catalog.
+//
+// A request that fails either condition has no cookie credential, exactly as before this exception
+// existed: requireUser answers it with the constant 401, and a bearer token or an access key pair
+// still authenticate the same request (they are read first in authenticateRequest).
+func cookieManagementAllowed(r *http.Request) bool {
+	if !strings.HasPrefix(r.Header.Get(uiClientHeader), uiClientPrefix) {
+		return false
+	}
+	segments := requestPathSegments(r)
+	for _, operation := range cookieUIManagementOperations {
+		if operation.method == r.Method && matchPathSegments(operation.pattern, segments) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchPathSegments reports whether segments has exactly the length of pattern and agrees with it
+// on every segment that is not the anyPathSegment wildcard.
+func matchPathSegments(pattern, segments []string) bool {
+	if len(pattern) != len(segments) {
+		return false
+	}
+	for i, want := range pattern {
+		if want != anyPathSegment && want != segments[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// requestPathSegments is the path of the request relative to the catalog mount (requestPath),
+// split on "/" with the leading and trailing separators removed. Segment counts are what the shape
+// match of cookieManagementAllowed compares, so an empty path is no segments at all rather than one
+// empty one.
+func requestPathSegments(r *http.Request) []string {
+	path := strings.Trim(requestPath(r), "/")
+	if path == "" {
+		return nil
+	}
+	return strings.Split(path, "/")
 }
 
 // userFromCookie resolves the lakeFS login session cookie the web UI is signed in with. It is the
@@ -214,6 +344,10 @@ func (a *catalogAuth) authenticateRequest(r *http.Request) (*model.User, error) 
 // (api.GenericAuthMiddleware, pkg/api/auth_middleware.go), verified the same way - through
 // auth.UserByToken, so the signature, the expiry, the audience and the existence of the user are
 // all checked exactly as they are on a core route.
+//
+// The caller has already decided that this request is one the cookie may authenticate
+// (authenticateRequest): a GET or a HEAD, or one of the four UI management operations with the
+// X-Lakefs-Client header of the web UI.
 //
 // A request without the cookie, or with a session that carries no token, has no cookie
 // credential: (nil, nil), which requireUser answers with 401 - the same answer an anonymous

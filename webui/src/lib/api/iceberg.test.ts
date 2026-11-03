@@ -2,6 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AuthenticationError } from './index';
 import {
+    createTablePartitionSpec,
+    createTableRequestBody,
+    createTableSchema,
     currentPartitionSpec,
     currentSchema,
     currentSnapshot,
@@ -14,8 +17,11 @@ import {
     namespaceLevelsBelowRef,
     namespaceOf,
     namespaceParam,
+    namespacePathLevels,
     refNamespace,
     snapshotHistory,
+    validateCreateTableForm,
+    validateNamespacePath,
 } from './iceberg';
 
 const jsonResponse = (status: number, body: unknown) => ({
@@ -347,5 +353,219 @@ describe('iceberg metadata helpers', () => {
         ).toBe('struct<1: id: required long>');
         expect(formatIcebergType({ type: 'list', 'element-id': 2, element: 'string' })).toBe('list<2: string>');
         expect(formatIcebergType({ type: 'map', key: 'string', value: 'long' })).toBe('map<string, long>');
+    });
+});
+
+describe('iceberg client management requests', () => {
+    let fetchMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+        fetchMock = vi.fn();
+        vi.stubGlobal('fetch', fetchMock);
+        iceberg.clearCache();
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        iceberg.clearCache();
+    });
+
+    const initOf = (call: unknown[]): RequestInit => call[1] as RequestInit;
+    const bodyOf = (call: unknown[]): Record<string, unknown> => JSON.parse(String(initOf(call).body));
+
+    it('creates a namespace with a POST to the collection, carrying the UI client header', async () => {
+        fetchMock
+            .mockResolvedValueOnce(catalogConfig())
+            .mockResolvedValueOnce(jsonResponse(200, { namespace: ['repo', 'main', 'inventory'], properties: {} }));
+
+        const response = await iceberg.createNamespace(['repo', 'main', 'inventory']);
+
+        expect(response.namespace).toEqual(['repo', 'main', 'inventory']);
+        const call = fetchMock.mock.calls[1];
+        expect(urlOf(call)).toBe('/iceberg/api/v1/lakefs/namespaces');
+        expect(initOf(call).method).toBe('POST');
+        expect(bodyOf(call)).toEqual({ namespace: ['repo', 'main', 'inventory'], properties: {} });
+        // The catalog accepts the session cookie for this write only when the request says it is
+        // the web UI (pkg/icebergcatalog/auth.go).
+        expect((initOf(call).headers as Headers).get('X-Lakefs-Client')).toMatch(/^lakefs-webui/);
+        expect(initOf(call).credentials).toBe('same-origin');
+    });
+
+    it('keeps the namespace properties a caller sets', async () => {
+        fetchMock
+            .mockResolvedValueOnce(catalogConfig())
+            .mockResolvedValueOnce(
+                jsonResponse(200, { namespace: ['repo', 'main', 'inv'], properties: { owner: 'a' } }),
+            );
+
+        await iceberg.createNamespace(['repo', 'main', 'inv'], { owner: 'a' });
+
+        expect(bodyOf(fetchMock.mock.calls[1]).properties).toEqual({ owner: 'a' });
+    });
+
+    it('drops a namespace with a DELETE on its %1F address', async () => {
+        fetchMock.mockResolvedValueOnce(catalogConfig()).mockResolvedValueOnce({ status: 204, ok: true });
+
+        await iceberg.dropNamespace(['repo', 'main', 'inventory', 'books']);
+
+        const call = fetchMock.mock.calls[1];
+        expect(urlOf(call)).toBe('/iceberg/api/v1/lakefs/namespaces/repo%1Fmain%1Finventory%1Fbooks');
+        expect(initOf(call).method).toBe('DELETE');
+        expect((initOf(call).headers as Headers).get('X-Lakefs-Client')).toMatch(/^lakefs-webui/);
+    });
+
+    it('creates a table from the form: a schema with client-assigned ids and an identity partition', async () => {
+        fetchMock.mockResolvedValueOnce(catalogConfig()).mockResolvedValueOnce(loadTableResult());
+
+        await iceberg.createTable(['repo', 'main', 'inventory'], {
+            name: 'books',
+            columns: [
+                { name: 'id', type: 'long', required: true },
+                { name: 'title', type: 'string', required: false },
+            ],
+            partitionBy: 'title',
+        });
+
+        const call = fetchMock.mock.calls[1];
+        expect(urlOf(call)).toBe('/iceberg/api/v1/lakefs/namespaces/repo%1Fmain%1Finventory/tables');
+        expect(initOf(call).method).toBe('POST');
+        expect(bodyOf(call)).toEqual({
+            name: 'books',
+            schema: {
+                type: 'struct',
+                'schema-id': 0,
+                fields: [
+                    { id: 1, name: 'id', required: true, type: 'long' },
+                    { id: 2, name: 'title', required: false, type: 'string' },
+                ],
+            },
+            'partition-spec': {
+                'spec-id': 0,
+                fields: [{ name: 'title', transform: 'identity', 'source-id': 2, 'field-id': 1000 }],
+            },
+        });
+        expect((initOf(call).headers as Headers).get('X-Lakefs-Client')).toMatch(/^lakefs-webui/);
+    });
+
+    it('creates an unpartitioned table when the form names no partition column', async () => {
+        fetchMock.mockResolvedValueOnce(catalogConfig()).mockResolvedValueOnce(loadTableResult());
+
+        await iceberg.createTable(['repo', 'main', 'inv'], {
+            name: 'books',
+            columns: [{ name: 'id', type: 'long', required: true }],
+            partitionBy: '',
+        });
+
+        const body = bodyOf(fetchMock.mock.calls[1]);
+        expect(body).not.toHaveProperty('partition-spec');
+    });
+
+    it('drops a table with a DELETE on its address, encoding the name', async () => {
+        fetchMock.mockResolvedValueOnce(catalogConfig()).mockResolvedValueOnce({ status: 204, ok: true });
+
+        await iceberg.dropTable(['repo', 'main', 'inventory'], 'daily sales');
+
+        const call = fetchMock.mock.calls[1];
+        expect(urlOf(call)).toBe('/iceberg/api/v1/lakefs/namespaces/repo%1Fmain%1Finventory/tables/daily%20sales');
+        expect(initOf(call).method).toBe('DELETE');
+        expect((initOf(call).headers as Headers).get('X-Lakefs-Client')).toMatch(/^lakefs-webui/);
+    });
+
+    it('reports a refused management operation as an IcebergError, not an AuthenticationError', async () => {
+        fetchMock.mockResolvedValueOnce(catalogConfig()).mockResolvedValueOnce(
+            jsonResponse(403, {
+                error: { message: 'insufficient permissions', type: 'ForbiddenException', code: 403 },
+            }),
+        );
+
+        const error = await iceberg.dropTable(['repo', 'main', 'inventory'], 'books').catch((e) => e);
+
+        expect(error).toBeInstanceOf(IcebergError);
+        expect(error).not.toBeInstanceOf(AuthenticationError);
+        expect(isIcebergForbiddenError(error)).toBe(true);
+        expect(error.message).toBe('insufficient permissions');
+    });
+});
+
+describe('iceberg create-table form', () => {
+    it('numbers the schema fields from one in form order', () => {
+        expect(
+            createTableSchema([
+                { name: 'id', type: 'long', required: true },
+                { name: 'name', type: 'string', required: false },
+            ]),
+        ).toEqual({
+            type: 'struct',
+            'schema-id': 0,
+            fields: [
+                { id: 1, name: 'id', required: true, type: 'long' },
+                { id: 2, name: 'name', required: false, type: 'string' },
+            ],
+        });
+    });
+
+    it('builds the identity partition spec of the column the form chose', () => {
+        const columns = [
+            { name: 'id', type: 'long', required: true },
+            { name: 'title', type: 'string', required: false },
+        ];
+
+        expect(createTablePartitionSpec(columns, 'title')).toEqual({
+            'spec-id': 0,
+            fields: [{ name: 'title', transform: 'identity', 'source-id': 2, 'field-id': 1000 }],
+        });
+        expect(createTablePartitionSpec(columns, '')).toBeUndefined();
+        expect(createTablePartitionSpec(columns, undefined)).toBeUndefined();
+        // A partition column that is not a column of the table cannot become a spec.
+        expect(createTablePartitionSpec(columns, 'missing')).toBeUndefined();
+    });
+
+    it('omits the partition spec of an unpartitioned table and keeps the rest of the request', () => {
+        expect(
+            createTableRequestBody({
+                name: ' books ',
+                columns: [{ name: ' id ', type: ' long ', required: true }],
+            }),
+        ).toEqual({
+            name: 'books',
+            schema: { type: 'struct', 'schema-id': 0, fields: [{ id: 1, name: 'id', required: true, type: 'long' }] },
+        });
+    });
+
+    it('accepts a complete form and names what is missing otherwise', () => {
+        const valid = {
+            name: 'books',
+            columns: [{ name: 'id', type: 'long', required: true }],
+            partitionBy: 'id',
+        };
+
+        expect(validateCreateTableForm(valid)).toBeNull();
+        expect(validateCreateTableForm({ ...valid, name: '  ' })).toMatch(/needs a name/);
+        expect(validateCreateTableForm({ ...valid, columns: [] })).toMatch(/at least one column/);
+        expect(validateCreateTableForm({ ...valid, columns: [{ name: ' ', type: 'long', required: true }] })).toMatch(
+            /Every column needs a name/,
+        );
+        expect(
+            validateCreateTableForm({
+                ...valid,
+                columns: [
+                    { name: 'id', type: 'long', required: true },
+                    { name: 'id', type: 'string', required: false },
+                ],
+            }),
+        ).toMatch(/defined twice/);
+        expect(validateCreateTableForm({ ...valid, columns: [{ name: 'id', type: '  ', required: true }] })).toMatch(
+            /Every column needs a type/,
+        );
+        expect(validateCreateTableForm({ ...valid, partitionBy: 'other' })).toMatch(/partition column/);
+    });
+
+    it('splits a typed namespace path into its levels', () => {
+        expect(namespacePathLevels('inventory.books')).toEqual(['inventory', 'books']);
+        expect(namespacePathLevels(' inventory . books ')).toEqual(['inventory', 'books']);
+        expect(namespacePathLevels('inventory..books')).toEqual(['inventory', 'books']);
+        expect(namespacePathLevels('')).toEqual([]);
+        expect(validateNamespacePath('')).toMatch(/at least one level/);
+        expect(validateNamespacePath('inventory')).toBeNull();
     });
 });

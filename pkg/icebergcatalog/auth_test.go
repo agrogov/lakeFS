@@ -359,3 +359,234 @@ func TestAuthRejectsBadCookie(t *testing.T) {
 		requireUnauthorized(t, got)
 	})
 }
+
+// uiManagementPath is the path of one UI management operation as the web UI addresses it, with the
+// catalog's own {prefix} segment (CatalogPrefix).
+func uiManagementPath(segments ...string) string {
+	path := "/v1/" + CatalogPrefix
+	for _, segment := range segments {
+		path += "/" + segment
+	}
+	return catalogPath(path)
+}
+
+// uiManagementTestRouter is the production stack over a route table that carries the four UI
+// management operations and the writes the cookie must not reach. Every one of them is registered,
+// so a 401 in these tests is the authentication layer's answer and never a 404 or a 405 from a route
+// that is not there: the request shapes are exactly the ones auth.go matches on.
+func uiManagementTestRouter(t *testing.T) (http.Handler, cmdpkg.ServerDeps) {
+	t.Helper()
+	cfg := &Config{Prefix: CatalogPrefix, TokenTTL: time.Hour, MaxRequestBody: DefaultMaxRequestBody}
+	deps := newServerDeps(t)
+	middleware, err := NewAuthMiddleware(deps, cfg)
+	require.NoError(t, err)
+
+	whoami := func(w http.ResponseWriter, r *http.Request) {
+		user, err := auth.GetUser(r.Context())
+		if err != nil {
+			writeIcebergError(w, http.StatusUnauthorized, ErrTypeNotAuthorized, authFailureMessage(http.StatusUnauthorized))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"user": user.Username})
+	}
+	routeFor := func(method, pattern string) route {
+		return route{method: method, pattern: pattern, handler: whoami}
+	}
+	serve := testServer(cfg,
+		// The four operations the login session cookie may authenticate (with the UI's header):
+		// create namespace, drop namespace, create table, drop table.
+		routeFor(http.MethodPost, "/v1/{prefix}/namespaces"),
+		routeFor(http.MethodDelete, "/v1/{prefix}/namespaces/{namespace}"),
+		routeFor(http.MethodPost, "/v1/{prefix}/namespaces/{namespace}/tables"),
+		routeFor(http.MethodDelete, "/v1/{prefix}/namespaces/{namespace}/tables/{table}"),
+		// The writes it may not: the commit, register, properties, metrics, remote signing and
+		// the (v1 non-goal, but registered here anyway) rename.
+		routeFor(http.MethodPost, "/v1/{prefix}/namespaces/{namespace}/tables/{table}"),
+		routeFor(http.MethodPost, "/v1/{prefix}/namespaces/{namespace}/register"),
+		routeFor(http.MethodPost, "/v1/{prefix}/namespaces/{namespace}/properties"),
+		routeFor(http.MethodPost, "/v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics"),
+		routeFor(http.MethodPost, "/v1/{prefix}/namespaces/{namespace}/tables/{table}/sign"),
+		routeFor(http.MethodPost, "/v1/{prefix}/tables/rename"),
+	)
+	router, err := newRouter(middleware, cfg, serve)
+	require.NoError(t, err)
+	mux := coreRouter()
+	mux.Mount(APIBasePath, router)
+	return mux, deps
+}
+
+// clientCookieRequest sends a request authenticated only by the browser's cookie, identifying itself
+// with the given X-Lakefs-Client value (empty for none).
+func clientCookieRequest(t *testing.T, handler http.Handler, method, path string, cookie *http.Cookie, client string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, nil)
+	req.AddCookie(cookie)
+	if client != "" {
+		req.Header.Set(uiClientHeader, client)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestAuthAcceptsCookieOnUIManagementOperations is the UI-write half of the cookie rule: the Tables
+// tab manages tables, so the login session cookie authenticates exactly these four operations -
+// POST namespaces, DELETE namespace, POST tables, DELETE table - and only when the request carries
+// the web UI's X-Lakefs-Client header.
+func TestAuthAcceptsCookieOnUIManagementOperations(t *testing.T) {
+	router, deps := uiManagementTestRouter(t)
+	cookie := sessionCookie(t, deps, mintToken(t, router))
+
+	operations := []struct{ name, method, path string }{
+		{"create namespace", http.MethodPost, uiManagementPath("namespaces")},
+		{"drop namespace", http.MethodDelete, uiManagementPath("namespaces", "repo%1Fmain%1Finventory")},
+		{"create table", http.MethodPost, uiManagementPath("namespaces", "repo%1Fmain%1Finventory", "tables")},
+		{"drop table", http.MethodDelete, uiManagementPath("namespaces", "repo%1Fmain%1Finventory", "tables", "books")},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			rec := clientCookieRequest(t, router, operation.method, operation.path, cookie, uiClientPrefix+"/1.2.3")
+			require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+			require.JSONEq(t, `{"user":"`+testUsername+`"}`, rec.Body.String(),
+				"the handler sees the user the cookie authenticated")
+		})
+	}
+
+	t.Run("the bare UI marker is enough", func(t *testing.T) {
+		rec := clientCookieRequest(t, router, http.MethodPost, uiManagementPath("namespaces"), cookie, uiClientPrefix)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	})
+
+	t.Run("a multi-level namespace is one path segment", func(t *testing.T) {
+		// The {namespace} parameter joins its levels with %1F, so the drop of a nested namespace
+		// is still the four-segment shape and not a different operation.
+		rec := clientCookieRequest(t, router, http.MethodDelete,
+			uiManagementPath("namespaces", "repo%1Fmain%1Finventory%1Fbooks"), cookie, uiClientPrefix+"/9.9.9")
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	})
+}
+
+// TestAuthRejectsCookieOnUIManagementWithoutTheClientHeader pins the condition that scopes the
+// exception: the cookie authenticates those four writes only for a request that identifies itself as
+// the web UI. Without the header - or with any other client - the request carries no credential the
+// catalog accepts, exactly as before the exception existed.
+func TestAuthRejectsCookieOnUIManagementWithoutTheClientHeader(t *testing.T) {
+	router, deps := uiManagementTestRouter(t)
+	cookie := sessionCookie(t, deps, mintToken(t, router))
+
+	operations := []struct{ method, path string }{
+		{http.MethodPost, uiManagementPath("namespaces")},
+		{http.MethodDelete, uiManagementPath("namespaces", "repo%1Fmain%1Finventory")},
+		{http.MethodPost, uiManagementPath("namespaces", "repo%1Fmain%1Finventory", "tables")},
+		{http.MethodDelete, uiManagementPath("namespaces", "repo%1Fmain%1Finventory", "tables", "books")},
+	}
+	for _, client := range []string{"", "curl/8.5.0", "spark/3.5.0", "lakefs-cli/1.40.0", "not-lakefs-webui"} {
+		for _, operation := range operations {
+			t.Run(operation.method+" "+operation.path+" as "+client, func(t *testing.T) {
+				rec := clientCookieRequest(t, router, operation.method, operation.path, cookie, client)
+				requireUnauthorized(t, rec)
+			})
+		}
+	}
+}
+
+// TestAuthRejectsCookieOnWritesOutsideUIManagement pins the other boundary: even with the web UI's
+// header, a cookie authenticates none of the writes the UI does not make. The commit, register,
+// properties, metrics, remote signing and rename are the operations that change table contents or
+// mint a credential, and they stay bearer/basic only.
+func TestAuthRejectsCookieOnWritesOutsideUIManagement(t *testing.T) {
+	router, deps := uiManagementTestRouter(t)
+	cookie := sessionCookie(t, deps, mintToken(t, router))
+	namespace := "repo%1Fmain%1Finventory"
+
+	excluded := []struct{ name, method, path string }{
+		{"commit table", http.MethodPost, uiManagementPath("namespaces", namespace, "tables", "books")},
+		{"register table", http.MethodPost, uiManagementPath("namespaces", namespace, "register")},
+		{"update properties", http.MethodPost, uiManagementPath("namespaces", namespace, "properties")},
+		{"report metrics", http.MethodPost, uiManagementPath("namespaces", namespace, "tables", "books", "metrics")},
+		{"remote signing", http.MethodPost, uiManagementPath("namespaces", namespace, "tables", "books", "sign")},
+		{"table rename", http.MethodPost, uiManagementPath("tables", "rename")},
+	}
+	for _, operation := range excluded {
+		t.Run(operation.name, func(t *testing.T) {
+			rec := clientCookieRequest(t, router, operation.method, operation.path, cookie, uiClientPrefix+"/1.2.3")
+			requireUnauthorized(t, rec)
+		})
+	}
+
+	t.Run("POST "+OAuthTokenPath+" is not authenticated by a cookie, header or not", func(t *testing.T) {
+		body := strings.NewReader("grant_type=" + grantTypeClientCredentials + "&client_id=nobody&client_secret=wrong")
+		req := httptest.NewRequest(http.MethodPost, catalogPath(OAuthTokenPath), body)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set(uiClientHeader, uiClientPrefix+"/1.2.3")
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusUnauthorized, rec.Code, "body: %s", rec.Body.String())
+		require.NotContains(t, rec.Body.String(), "access_token")
+	})
+}
+
+// TestAuthBearerAndBasicAreUnchangedByTheUIManagementRule: the new condition is a cookie condition
+// and nothing else. A bearer token or an access key pair authenticates every route with or without
+// the UI header, on the management operations and away from them alike, and the header is not a
+// credential on its own.
+func TestAuthBearerAndBasicAreUnchangedByTheUIManagementRule(t *testing.T) {
+	router, _ := uiManagementTestRouter(t)
+
+	operations := []struct{ method, path string }{
+		{http.MethodPost, uiManagementPath("namespaces")},
+		{http.MethodDelete, uiManagementPath("namespaces", "repo%1Fmain%1Finventory")},
+		{http.MethodPost, uiManagementPath("namespaces", "repo%1Fmain%1Finventory", "tables")},
+		{http.MethodDelete, uiManagementPath("namespaces", "repo%1Fmain%1Finventory", "tables", "books")},
+		{http.MethodPost, uiManagementPath("namespaces", "repo%1Fmain%1Finventory", "tables", "books")}, // the commit
+	}
+
+	t.Run("bearer, with and without the UI header", func(t *testing.T) {
+		token := mintToken(t, router)
+		for _, operation := range operations {
+			for _, client := range []string{"", uiClientPrefix + "/1.2.3"} {
+				req := httptest.NewRequest(operation.method, operation.path, nil)
+				req.Header.Set("Authorization", bearerScheme+" "+token)
+				if client != "" {
+					req.Header.Set(uiClientHeader, client)
+				}
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, req)
+				require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+			}
+		}
+	})
+
+	t.Run("basic, with and without the UI header", func(t *testing.T) {
+		for _, operation := range operations {
+			for _, client := range []string{"", uiClientPrefix + "/1.2.3"} {
+				req := httptest.NewRequest(operation.method, operation.path, nil)
+				req.SetBasicAuth(testAccessKeyID, testSecretAccessKey)
+				if client != "" {
+					req.Header.Set(uiClientHeader, client)
+				}
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, req)
+				require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+			}
+		}
+	})
+
+	t.Run("a wrong bearer stays 401 even with the UI header", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, uiManagementPath("namespaces"), nil)
+		req.Header.Set("Authorization", bearerScheme+" not-a-jwt")
+		req.Header.Set(uiClientHeader, uiClientPrefix+"/1.2.3")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		requireUnauthorized(t, rec)
+	})
+
+	t.Run("the UI header alone is not a credential", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, uiManagementPath("namespaces"), nil)
+		req.Header.Set(uiClientHeader, uiClientPrefix+"/1.2.3")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		requireUnauthorized(t, rec)
+	})
+}

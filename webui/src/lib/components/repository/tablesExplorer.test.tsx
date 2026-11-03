@@ -164,7 +164,7 @@ describe('TablesTab', () => {
         });
 
         render(<TablesTab repository="repo" refId="main" />);
-        await user.click(await screen.findByRole('button', { name: /books/ }));
+        await user.click(await screen.findByRole('button', { name: 'books' }));
 
         expect(await screen.findByText('Sign in to read Iceberg tables')).toBeInTheDocument();
         expect(onUnauthenticated).not.toHaveBeenCalled();
@@ -206,7 +206,7 @@ describe('TablesTab', () => {
         expect(await within(tree).findByText('inventory')).toBeInTheDocument();
         // One namespace node: `inventory` is a leaf, so it must not list itself as a child.
         expect(within(tree).getAllByText('inventory')).toHaveLength(1);
-        const table = await screen.findByRole('button', { name: /books/ });
+        const table = await screen.findByRole('button', { name: 'books' });
 
         await user.click(table);
 

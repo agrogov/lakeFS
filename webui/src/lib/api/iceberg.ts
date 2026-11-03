@@ -1,8 +1,7 @@
 import { defaultAPIHeaders } from './index';
 
 /**
- * Typed, read-only client for the Apache Iceberg REST catalog (`pkg/icebergcatalog`, see
- * `docs/iceberg.md`).
+ * Typed client for the Apache Iceberg REST catalog (`pkg/icebergcatalog`, see `docs/iceberg.md`).
  *
  * The transport mirrors `lib/api/index.js` and `lib/api/datasets.ts`: `fetch` with the lakeFS
  * default headers, a status switch per call and errors surfaced as exceptions. It differs from
@@ -12,9 +11,18 @@ import { defaultAPIHeaders } from './index';
  * table as `repo␟ref␟namespace…␟table` - the repository and the ref are the first two namespace
  * levels (docs/iceberg.md, "Addressing"). The `␟` separator is `%1F` on the wire.
  *
- * Only the catalog's own read endpoints are used here: `GET /v1/config`, the namespace listing,
- * the table listing and the table load. The repository Tables tab is a viewer; creating, dropping
- * or committing a table stays a catalog-client job.
+ * Two kinds of operation are used here:
+ *
+ *   - the read endpoints: `GET /v1/config`, the namespace listing, the table listing and the
+ *     table load, which the Tables tab renders;
+ *   - the four management operations the Tables tab performs: create namespace, drop namespace,
+ *     create table and drop table. They are state-changing, and the catalog accepts the UI's
+ *     session cookie for them only because every request from this client carries the
+ *     `X-Lakefs-Client: lakefs-webui/...` header `defaultAPIHeaders` sets, and only for exactly
+ *     those four operations (`pkg/icebergcatalog/auth.go`). A cookie write anywhere else - the
+ *     commit, register, properties, metrics, remote signing, the token endpoint - is `401`, which
+ *     is why this client never makes one: committing and registering a table's data stays an
+ *     Iceberg client's job.
  */
 
 /** Base URL of the catalog. It sits next to the core API, not below it (`API_ENDPOINT`). */
@@ -112,9 +120,11 @@ const icebergRequest = async <T>(path: string, requestData: RequestInit = {}): P
         ...defaultAPIHeaders,
         ...((requestData.headers as Record<string, string> | undefined) ?? {}),
     });
-    // The UI authenticates with the lakeFS login session cookie. The catalog accepts it for reads
-    // only (pkg/icebergcatalog/auth.go), and `fetch` sends a same-origin cookie by default; the
-    // option is spelled out so the dependency on it is visible.
+    // The UI authenticates with the lakeFS login session cookie. The catalog accepts it for reads,
+    // and for the four management operations of this client - create/drop namespace and
+    // create/drop table - because every request carries the `X-Lakefs-Client: lakefs-webui/...`
+    // header of `defaultAPIHeaders` (pkg/icebergcatalog/auth.go). `fetch` sends a same-origin cookie
+    // by default; the option is spelled out so the dependency on it is visible.
     const response = await fetch(`${ICEBERG_ENDPOINT}${path}`, {
         credentials: 'same-origin',
         ...requestData,
@@ -279,6 +289,29 @@ export interface IcebergLoadTableResult {
     config?: Record<string, string>;
 }
 
+/**
+ * One row of the create-table form: a column name, an Iceberg type and whether the column is
+ * required. The type is one of `ICEBERG_PRIMITIVE_TYPES`, or any type string the catalog's own
+ * parser accepts (the form keeps it a string so a client's `struct<…>` can be typed too).
+ */
+export interface IcebergNewColumn {
+    name: string;
+    type: string;
+    required: boolean;
+}
+
+/**
+ * The create-table form: the table's name, its initial columns, and the optional column to
+ * partition by with the identity transform. Everything else a CreateTableRequest can carry
+ * (location, sort order, table properties, format version) is left to the catalog's defaults.
+ */
+export interface IcebergCreateTableForm {
+    name: string;
+    columns: IcebergNewColumn[];
+    /** The column the table is identity-partitioned by; absent or empty means unpartitioned. */
+    partitionBy?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Reading the metadata document
 // ---------------------------------------------------------------------------
@@ -370,6 +403,134 @@ export const formatIcebergType = (type: IcebergFieldType | undefined): string =>
             return typeof nested.type === 'string' ? nested.type : JSON.stringify(type);
     }
 };
+
+// ---------------------------------------------------------------------------
+// Writing: the create forms and the request they become
+// ---------------------------------------------------------------------------
+
+/**
+ * The primitive types the create-table form offers. They are the names of the Iceberg type spec, so
+ * the catalog's own parser (`iceberg-go`) accepts them unchanged; the form lets a caller type any
+ * other type string it accepts as well.
+ */
+export const ICEBERG_PRIMITIVE_TYPES = [
+    'boolean',
+    'int',
+    'long',
+    'float',
+    'double',
+    'date',
+    'time',
+    'timestamp',
+    'timestamptz',
+    'string',
+    'uuid',
+    'binary',
+] as const;
+
+// partitionFieldID is the field id of the create form's identity partition field. A create request
+// carries the client's own placeholders and the catalog resolves them (§6.2), so any id the client
+// picks is fine; 1000 is the first id the Iceberg spec reserves for partition fields.
+const partitionFieldID = 1000;
+
+/**
+ * The schema of a create request (spec: Schema), built from the form's columns.
+ *
+ * Field ids are the client's to assign on a create - the table does not exist yet - so they are
+ * numbered from 1 in form order. The catalog resolves the partition spec's `source-id` against
+ * them and assigns the table its own ids, which is what makes a `required` flag, a column order and
+ * an identity partition by name all survive the create.
+ */
+export const createTableSchema = (columns: IcebergNewColumn[]): IcebergSchema => ({
+    type: 'struct',
+    'schema-id': 0,
+    fields: columns.map((column, index) => ({
+        id: index + 1,
+        name: column.name.trim(),
+        required: column.required,
+        type: column.type.trim(),
+    })),
+});
+
+/**
+ * The identity partition spec of a create request for `partitionBy`, or `undefined` for an
+ * unpartitioned table. The source id is the column's id in `createTableSchema`, which is its
+ * position in the form plus one.
+ */
+export const createTablePartitionSpec = (
+    columns: IcebergNewColumn[],
+    partitionBy: string | undefined,
+): IcebergPartitionSpec | undefined => {
+    const column = partitionBy ? columns.find((candidate) => candidate.name.trim() === partitionBy.trim()) : undefined;
+    if (!column) return undefined;
+    return {
+        'spec-id': 0,
+        fields: [
+            {
+                name: column.name.trim(),
+                transform: 'identity',
+                'source-id': columns.indexOf(column) + 1,
+                'field-id': partitionFieldID,
+            },
+        ],
+    };
+};
+
+/**
+ * The CreateTableRequest body of a form (spec: components.schemas.CreateTableRequest): the name, the
+ * schema, and the identity partition spec when the form named a partition column. Members the form
+ * does not model are absent rather than empty, so the catalog applies its own defaults (the managed
+ * table location, an unsorted order, format version 2).
+ */
+export const createTableRequestBody = (form: IcebergCreateTableForm): Record<string, unknown> => {
+    const body: Record<string, unknown> = {
+        name: form.name.trim(),
+        schema: createTableSchema(form.columns),
+    };
+    const partitionSpec = createTablePartitionSpec(form.columns, form.partitionBy);
+    if (partitionSpec) body['partition-spec'] = partitionSpec;
+    return body;
+};
+
+/**
+ * The problem with a create-table form, or `null` when it can be submitted. It checks only what the
+ * form can get wrong on its own - the catalog remains the authority on identifiers, types and
+ * locations, and its answer is shown in place. `partitionBy` is matched against the columns by name,
+ * because that is how the form offers it.
+ */
+export const validateCreateTableForm = (form: IcebergCreateTableForm): string | null => {
+    if (form.name.trim() === '') return 'The table needs a name.';
+    if (form.columns.length === 0) return 'The table needs at least one column.';
+    const names = form.columns.map((column) => column.name.trim());
+    if (names.some((name) => name === '')) return 'Every column needs a name.';
+    const duplicate = names.find((name, index) => names.indexOf(name) !== index);
+    if (duplicate !== undefined) return `The column ${duplicate} is defined twice.`;
+    if (form.columns.some((column) => column.type.trim() === '')) return 'Every column needs a type.';
+    if (form.partitionBy && form.partitionBy.trim() !== '' && !names.includes(form.partitionBy.trim())) {
+        return 'The partition column must be one of the table columns.';
+    }
+    return null;
+};
+
+/**
+ * The namespace levels of a path as the create forms type it: `inventory.books` becomes
+ * `['inventory', 'books']`. Dots are the separator the UI already displays namespace levels with
+ * (`namespaceLabel`), so a level whose own name contains a dot cannot be typed this way; the tab's
+ * tree is the unambiguous view of it.
+ */
+export const namespacePathLevels = (path: string): string[] =>
+    path
+        .split('.')
+        .map((level) => level.trim())
+        .filter((level) => level !== '');
+
+/**
+ * The problem with the namespace path of a create-namespace or create-table form, or `null` when it
+ * can be submitted. The catalog validates the identifiers themselves; what it cannot answer for the
+ * UI is that there is nothing to send at all.
+ */
+export const validateNamespacePath = (path: string): string | null =>
+    namespacePathLevels(path).length === 0 ? 'The namespace needs at least one level below the ref.' : null;
 
 // ---------------------------------------------------------------------------
 // Requests
@@ -468,6 +629,70 @@ class Iceberg {
         return icebergRequest<IcebergLoadTableResult>(
             `/v1/${encodeURIComponent(prefix)}/namespaces/${namespaceParam(namespace)}/tables/${encodeURIComponent(table)}`,
             { method: 'GET' },
+        );
+    }
+
+    /**
+     * `POST /v1/{prefix}/namespaces`: create a namespace, with `namespace` the full levels
+     * `[repository, ref, …levels]` (docs/iceberg.md, "Addressing").
+     *
+     * The catalog stages a marker entry for it on the ref, so the create is not visible in the
+     * branch's data until the branch is committed - the same as every other catalog write. A name
+     * that is taken is `409 NamespaceAlreadyExistsException`.
+     */
+    async createNamespace(
+        namespace: string[],
+        properties?: Record<string, string>,
+    ): Promise<{ namespace: string[]; properties: Record<string, string> }> {
+        const prefix = await this.prefix();
+        return icebergRequest<{ namespace: string[]; properties: Record<string, string> }>(
+            `/v1/${encodeURIComponent(prefix)}/namespaces`,
+            { method: 'POST', body: JSON.stringify({ namespace, properties: properties ?? {} }) },
+        );
+    }
+
+    /**
+     * `DELETE /v1/{prefix}/namespaces/{namespace}`: drop a namespace.
+     *
+     * The catalog refuses a namespace that still holds a table or a child namespace with
+     * `409 NamespaceNotEmptyException`, which is the answer the tab shows in place; the reader drops
+     * what is inside it first.
+     */
+    async dropNamespace(namespace: string[]): Promise<void> {
+        const prefix = await this.prefix();
+        await icebergRequest<void>(`/v1/${encodeURIComponent(prefix)}/namespaces/${namespaceParam(namespace)}`, {
+            method: 'DELETE',
+        });
+    }
+
+    /**
+     * `POST /v1/{prefix}/namespaces/{namespace}/tables`: create a table from the form, and return the
+     * load result of the table the catalog created.
+     *
+     * The schema and the optional identity partition spec are built by `createTableRequestBody`; the
+     * namespace must already exist (`404 NoSuchNamespaceException`), and a taken name is
+     * `409 AlreadyExistsException`.
+     */
+    async createTable(namespace: string[], form: IcebergCreateTableForm): Promise<IcebergLoadTableResult> {
+        const prefix = await this.prefix();
+        return icebergRequest<IcebergLoadTableResult>(
+            `/v1/${encodeURIComponent(prefix)}/namespaces/${namespaceParam(namespace)}/tables`,
+            { method: 'POST', body: JSON.stringify(createTableRequestBody(form)) },
+        );
+    }
+
+    /**
+     * `DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}`: drop a table.
+     *
+     * The drop removes the table's pointer and the file entries staged for it on the ref; the objects
+     * themselves stay in the object store and are reclaimed by GC, so the drop is staged and
+     * reversible like every other catalog write (docs/iceberg.md, "Staged commits").
+     */
+    async dropTable(namespace: string[], table: string): Promise<void> {
+        const prefix = await this.prefix();
+        await icebergRequest<void>(
+            `/v1/${encodeURIComponent(prefix)}/namespaces/${namespaceParam(namespace)}/tables/${encodeURIComponent(table)}`,
+            { method: 'DELETE' },
         );
     }
 }

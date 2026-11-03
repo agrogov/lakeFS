@@ -44,7 +44,7 @@ export const TablesSessionRequired: FC = () => (
 );
 
 /**
- * A catalog read the caller is not allowed to make (`403`).
+ * A catalog operation the caller is not allowed to make (`403`).
  *
  * The catalog's own authorization (`catalog:*` policies, `pkg/icebergcatalog/authz.go`) answers
  * `403 ForbiddenException`; the UI only explains it, and names the permissions so the reader knows
@@ -60,8 +60,10 @@ export const TablesPermissionRequired: FC<{ what?: string }> = ({ what = 'Readin
             <h4>Permission required</h4>
             <p className="text-muted mb-2">
                 {what} requires the <code>catalog:ListNamespaces</code>, <code>catalog:ListTables</code> and{' '}
-                <code>catalog:LoadTable</code> permissions on this repository, together with{' '}
-                <code>fs:ReadRepository</code>.
+                <code>catalog:ReadTable</code> permissions on this repository, together with{' '}
+                <code>fs:ReadRepository</code>. Managing it also needs <code>catalog:CreateTable</code>,{' '}
+                <code>catalog:DeleteTable</code>, <code>catalog:CreateNamespace</code> and{' '}
+                <code>catalog:DeleteNamespace</code>.
             </p>
             <p className="text-muted mb-0">Ask an administrator to grant them on this server.</p>
         </Card.Body>
@@ -71,9 +73,9 @@ export const TablesPermissionRequired: FC<{ what?: string }> = ({ what = 'Readin
 /**
  * The ref has no Iceberg tables.
  *
- * Tables are created by an Iceberg client (Spark, Trino, PyIceberg, DuckDB) pointed at the
- * catalog, so the empty state says that instead of offering a create button this tab does not
- * have.
+ * The tab can create a namespace but not a table in a namespace that does not exist yet, and it
+ * cannot commit a table's data at all: the empty state says both, so the reader knows which half of
+ * the work belongs here and which belongs to an Iceberg client.
  */
 export const NoTables: FC<{ refLabel: string }> = ({ refLabel }) => (
     <Card className="text-center">
@@ -83,8 +85,9 @@ export const NoTables: FC<{ refLabel: string }> = ({ refLabel }) => (
             </div>
             <h4>No Iceberg tables</h4>
             <p className="text-muted mb-0">
-                <code>{refLabel}</code> has no Iceberg tables yet. Write to it with an Iceberg client pointed at this
-                server&apos;s catalog, and the tables appear here.
+                <code>{refLabel}</code> has no Iceberg tables yet. Create a namespace above and then a table in it, or
+                write to it with an Iceberg client pointed at this server&apos;s catalog; committing a table&apos;s data
+                stays the client&apos;s job.
             </p>
         </Card.Body>
     </Card>

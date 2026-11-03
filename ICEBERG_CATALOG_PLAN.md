@@ -3,9 +3,10 @@
 Status: implemented and closed on `feature/iceberg-catalog`; spike findings folded into §15, and §15.4
 records the close-out — every v1 capability is landed, and the remaining gaps are environmental (no RCK
 run, no S3 blockstore, esti unexecuted) or v1 non-goals. A later review round added two things on top of
-that close-out, both recorded in §15.4: the web UI **Tables tab**, a read-only explorer of a ref's Iceberg
-tables, and the login **session cookie** as a read-only authentication scheme for it (§7.1). The
-user-facing documentation is [`docs/iceberg.md`](docs/iceberg.md).
+that close-out, both recorded in §15.4: the web UI **Tables tab**, an explorer of a ref's Iceberg tables
+that also manages them (create/drop namespace, create/drop table), and the login **session cookie** as an
+authentication scheme for that tab — reads anywhere, plus those four management operations and nothing
+else (§7.1). The user-facing documentation is [`docs/iceberg.md`](docs/iceberg.md).
 Unblocks: DATASETS_DESIGN.md §1.2 (non-goal), §3 parity row "Items: `table`, `namespace`", §7.4, §17 Phase 5, §18 Q4.
 
 All external facts carry a source link. Statements about lakeFS Enterprise come from its **public docs only**
@@ -315,15 +316,21 @@ the docs: "metadata files are treated as ordinary files"
   not reuse it: `NewAuthMiddleware` (`pkg/icebergcatalog/auth.go`) is a drop-in replacement that keeps the bearer/basic
   schemes, serves the token endpoint itself and adds the cookie scheme below.
 - SSO users: they use access keys. There is no browser *login* flow on the catalog mount — no login or callback route.
-- **The web UI's login session cookie, for `GET` and `HEAD` only.** A signed-in browser must be able to read the
-  catalog it is already authenticated against (the repository Tables tab, §15.4), so the `internal_auth_session`
-  cookie is accepted on reads and on nothing else. It is the same session, the same token key and the same
-  `auth.UserByToken` verification the core API's `cookie_auth` scheme uses. A state-changing request carrying only
-  a cookie is `401`: a cookie is the one credential a browser attaches by itself, so accepting it for a write would
-  expose every catalog write to CSRF. `POST /v1/oauth/tokens` is served ahead of that decision (it is the
-  middleware's own handler), so a cookie cannot be exchanged for a token, and the `Authorization` header is read
-  first, so a client that sends a bearer token is never authenticated by the cookie. Authorisation is unchanged —
-  the cookie passes the same `catalog:*` checks.
+- **The web UI's login session cookie, for `GET`/`HEAD` and for four named management operations.** A signed-in
+  browser must be able to read and manage the catalog it is already authenticated against (the repository Tables
+  tab, §15.4), so the `internal_auth_session` cookie is accepted for reads unconditionally and for exactly four
+  state-changing operations — `POST …/namespaces`, `DELETE …/namespaces/{namespace}`, `POST
+  …/namespaces/{namespace}/tables`, `DELETE …/namespaces/{namespace}/tables/{table}` — and only when the request
+  carries an `X-Lakefs-Client` header starting with `lakefs-webui`. It is the same session, the same token key and
+  the same `auth.UserByToken` verification the core API's `cookie_auth` scheme uses. The exception is closed on
+  purpose: every other write carrying only a cookie — the commit (`POST …/tables/{table}`), `register`, properties,
+  `metrics`, remote signing, `POST /v1/oauth/tokens` and the rest — is `401`, so committing data, renaming and
+  minting a credential stay bearer/basic-only. The header is what a browser will not attach to a cross-origin
+  request without a CORS preflight, which this catalog does not answer, and the cookie is `SameSite=Lax`; together
+  they are what keeps the exception from being a CSRF-exposed write. `POST /v1/oauth/tokens` is served ahead of the
+  decision (it is the middleware's own handler), so a cookie cannot be exchanged for a token, and the
+  `Authorization` header is read first, so a client that sends a bearer token is never authenticated by the cookie.
+  Authorisation is unchanged — the cookie passes the same `catalog:*` checks.
 
 ### 7.2 Authorization (branch-agnostic ARNs, `pkg/permissions/permission.go:66-76`)
 
@@ -443,13 +450,23 @@ Total ≈ 6–7 weeks. I-1 to I-3 is the usable minimum (≈ 4 weeks).
 - **Web UI (`webui/src`, vitest):** `lib/api/iceberg.test.ts` — the error mapping (`501` is disabled, `404` is
   disabled, `500` is not, `403` is forbidden, a `401` with the catalog's constant message is "no session" and not a
   permission denial, the core `{"message": …}` placeholder body), the request shapes (the catalog's own mount, not
-  `/api/v1`; `%1F`; a nested parent; `pageToken`/`pageSize`; an encoded table name; the prefix cached once) and the
-  metadata helpers. `lib/components/repository/tablesExplorer.test.tsx` — the Enterprise upsell on `501`, the `401`
-  answer not being an upsell, the permission state on `403` from the config and from a listing, the empty state, and
-  the namespace → table → details flow.
+  `/api/v1`; `%1F`; a nested parent; `pageToken`/`pageSize`; an encoded table name; the prefix cached once), the
+  metadata helpers, and the four management requests (URL, method, `X-Lakefs-Client: lakefs-webui/…`, the
+  create-table body with client-assigned field ids and the identity partition spec, the create-form validation).
+  `lib/components/repository/tablesExplorer.test.tsx` — the Enterprise upsell on `501`, the `401` answer not being
+  an upsell, the permission state on `403` from the config and from a listing, the empty state, and the namespace →
+  table → details flow. `tablesManagement.test.tsx` — the create-namespace and create-table dialogs (including the
+  schema editor and the chosen identity partition), both confirmations, a refused create reported in its dialog, a
+  failed drop reported in the tab, `401`/`403` never reaching `onUnauthenticated()` (no login redirect), and the
+  management controls disabled after a `403`.
 - **Auth:** `pkg/icebergcatalog/auth_test.go` — a cookie `GET` succeeds on `/v1/config` and on the four read routes
   (with the user on the request context), a cookie `POST`/`PUT`/`PATCH`/`DELETE` is `401`, the token endpoint mints
-  nothing for a cookie, and a cookie whose token does not verify is rejected.
+  nothing for a cookie, and a cookie whose token does not verify is rejected. For the management exception (added
+  after the close-out): a cookie **with** `X-Lakefs-Client: lakefs-webui/…` succeeds on the four management
+  operations; the same cookie **without** that header (or with any other client value) is `401` on all four; a
+  cookie **with** the header is still `401` on the excluded writes (commit, register, properties, metrics, remote
+  signing, rename, the token endpoint); and bearer/basic keep working on every route with and without the header,
+  while the header alone is not a credential.
 - **Security tests:**
   - a user without `catalog:ReadTable` gets 403 on load;
   - writes to a tag ref get 403;
@@ -691,8 +708,8 @@ of gaps at the end of this section, not unwired work:
 | §6.3 uncommitted-GC grace and the `_lakefs_iceberg/` deny | **landed and wired**: `Bootstrap` installs the grace via `catalog.SetUncommittedGCProtector` and attaches `iceberg-reserved-prefix-protect`. An auth backend that cannot store policies (the **default** auth mode) degrades to a warning and the deny is **not attached** — a real security gap for those deployments |
 | §8 remote signing and vended credentials | **services mounted and advertised** when the blockstore supports them; the table load still returns an empty `config` |
 | §7.1 OAuth token endpoint | **landed**: the catalog's own auth middleware serves `POST /v1/oauth/tokens` (form `client_id`/`client_secret` or HTTP Basic) |
-| §7.1 cookie reads (added after the close-out) | **landed**: `NewAuthMiddleware` also accepts the web UI's `internal_auth_session` cookie, for `GET` and `HEAD` only. A request carrying only a cookie on `POST`/`PUT`/`PATCH`/`DELETE` — including `POST /v1/oauth/tokens` — is `401`, so no catalog write is reachable from a cookie. Bearer and basic are read first; authorisation stays the `catalog:*` checks |
-| Web UI Tables tab (added after the close-out) | **landed**: the repository Tables tab is a read-only explorer of the current ref through `/iceberg/api` (`webui/src/lib/api/iceberg.ts`, `repository/tablesExplorer.tsx`, `tablesDetails.tsx`, `tablesStates.tsx`). `GET /v1/config` picks the explorer, the Enterprise upsell (`501`; also `404` when the path is not routed at all), the permission state (`403`) or the login redirect (`401`); it uses `GET /v1/config`, the namespace listing, the table listing and the table load, and writes nothing |
+| §7.1 cookie reads and UI management (added after the close-out) | **landed**: `NewAuthMiddleware` accepts the web UI's `internal_auth_session` cookie for `GET`/`HEAD` unconditionally, and for exactly four management operations — `POST …/namespaces`, `DELETE …/namespaces/{namespace}`, `POST …/namespaces/{namespace}/tables`, `DELETE …/namespaces/{namespace}/tables/{table}` — only when the request carries `X-Lakefs-Client: lakefs-webui…` (a custom header forces a CORS preflight the catalog does not grant, and the cookie is `SameSite=Lax`). A cookie on any other write — commit (`POST …/tables/{table}`), register, properties, metrics, remote signing, `POST /v1/oauth/tokens` — is `401`, header or not, so committing data and minting a credential are never reachable from a cookie. Bearer and basic are read first and are unchanged; authorisation stays the `catalog:*` checks |
+| Web UI Tables tab (added after the close-out) | **landed**: the repository Tables tab is an explorer and manager of the current ref through `/iceberg/api` (`webui/src/lib/api/iceberg.ts`, `repository/tablesExplorer.tsx`, `tablesDetails.tsx`, `tablesStates.tsx`, `tablesManagement.tsx`). `GET /v1/config` picks the explorer, the Enterprise upsell (`501`; also `404` when the path is not routed at all), the permission state (`403`) or the tab's own sign-in state (`401`, a plain link, never a login redirect). It reads with `GET /v1/config`, the namespace listing, the table listing and the table load, and it manages with the four cookie operations: create namespace, drop empty namespace, create table (name, columns with name/type/required, optional identity partition) and drop table. Drops are confirmed, catalog errors are shown in place, and a `403` disables the management controls |
 | §7.2 `catalog:ReadTableData` / `catalog:WriteTableData` and the `CatalogRead` grant | **landed** |
 | §6.4 compaction auto-resolve | **landed and wired**: keyed on the `lakefs.compaction.operation-id` snapshot property (not the commit message), installed as the `pkg/catalog` merge hook by `Bootstrap` when `iceberg.enabled` and `iceberg.ignore_compaction_commits` are both true (`commit.go`, `pkg/catalog/merge_conflict.go`) |
 | I-5 ETag / `If-None-Match` | **landed** on table load, varying with `snapshots`; no tag on `HEAD` |
@@ -708,10 +725,10 @@ of gaps at the end of this section, not unwired work:
 - Only `gc/prepare_commits` was run, never the real Spark GC sweep it feeds.
 - Views, `/plan`, `/tasks`, rename and multi-table transactions remain v1 non-goals (§1.2) and are never
   advertised.
-- The Tables tab's permission state prints `catalog:LoadTable` for the table load; no such action exists —
-  the action the catalog checks is `catalog:ReadTable`. The state is otherwise correct, and the tab itself is
-  a viewer by design, not a gap.
+- ~~The Tables tab's permission state prints `catalog:LoadTable` for the table load; no such action exists.~~ Fixed
+  with the management work: the state names `catalog:ReadTable`, the action the catalog actually checks, plus the
+  four management actions the tab now uses.
 
 The user-facing summary of this table lives in [`docs/iceberg.md`](docs/iceberg.md), including the
 uncommitted-GC window, the RBAC note for policies written before the data-plane actions existed, the
-cookie-on-reads rule and the [Tables tab](docs/iceberg.md#web-ui-the-tables-tab).
+cookie rule (reads plus the four management operations) and the [Tables tab](docs/iceberg.md#web-ui-the-tables-tab).

@@ -284,23 +284,46 @@ credential was rejected, and authentication runs before any request or body vali
 unauthenticated caller cannot learn whether its request was well-formed. Bodies larger than
 `iceberg.max_request_body` are `413`.
 
-**The web UI reads with its session cookie, on `GET` and `HEAD` only.** A third scheme is accepted
-for the browser rather than for a catalog client: the lakeFS login session cookie
+**The web UI uses its session cookie for reads, and for four management operations.** A third scheme is
+accepted for the browser rather than for a catalog client: the lakeFS login session cookie
 (`internal_auth_session` — the same session, the same token key and the same `auth.UserByToken`
 verification the core API's `cookie_auth` scheme uses), which is what lets a signed-in user's
-browser read the catalog through the [Tables tab](#web-ui-the-tables-tab). It is accepted for
-`GET` and `HEAD` and for nothing else:
+browser explore and manage the catalog through the [Tables tab](#web-ui-the-tables-tab). It is
+accepted for:
 
-- a cookie is the one credential a browser attaches by itself, so a write authorised by a cookie
-  would be a write any page the user visits could issue on their behalf. `POST`, `PUT`, `PATCH`
-  and `DELETE` that carry only a cookie are `401` with the constant message `authentication
-  required`, which is what keeps the browser path free of a CSRF-exposed write: a catalog write
-  always needs a bearer token or access keys;
+- `GET` and `HEAD`, unconditionally — the reads the tab makes (the namespace listing, the table
+  listing, the table load) cannot change catalog state, and they are the reason the cookie scheme
+  exists;
+- exactly four state-changing operations, and only when the request carries an
+  `X-Lakefs-Client` header whose value starts with `lakefs-webui` (the marker every web UI request
+  already sends): `POST /v1/{prefix}/namespaces` (create namespace), `DELETE
+  /v1/{prefix}/namespaces/{namespace}` (drop an empty namespace), `POST
+  /v1/{prefix}/namespaces/{namespace}/tables` (create table) and `DELETE
+  /v1/{prefix}/namespaces/{namespace}/tables/{table}` (drop table);
+- nothing else. `POST`, `PUT`, `PATCH` and `DELETE` outside those four — the commit
+  (`POST …/tables/{table}`), `register`, the properties update, `metrics`, remote signing,
+  `POST /v1/oauth/tokens`, and every other write — are `401` with the constant message
+  `authentication required` when they carry only a cookie, whatever header they send.
+
+The management exception is closed on purpose. A cookie is the one credential a browser attaches
+by itself, so a general cookie write would be a write any page the user visits could issue on their
+behalf. Four things bound it:
+
+- `X-Lakefs-Client` is a non-simple header, so a browser attaches it to a cross-origin request only
+  after a CORS preflight, and this catalog answers no preflight and grants no cross-origin access;
+  the login cookie is `SameSite=Lax` as well, so a cross-site page reaches neither. The header is
+  not a secret and is not the security boundary — the preflight refusal and `SameSite` are — but it
+  keeps the exception scoped to the UI: a catalog client, a script, or any other same-origin caller
+  that does not claim to be the web UI gets `401` for a cookie write, as before;
+- the four operations are named explicitly rather than "anything the tab happens to call", so
+  committing a table's data, registering a table, renaming one and minting a credential stay
+  bearer/basic-only. Those are the operations that change table contents or hand out access, and
+  they are the larger surface a browser-supplied credential must not reach;
 - `POST /v1/oauth/tokens` is served before that decision is taken (it is the authentication
   middleware's own handler, not a route), so a cookie cannot be exchanged for a token either —
   the token endpoint only ever reads `client_id`/`client_secret` or HTTP Basic;
-- a bearer token or access keys take precedence on a `GET`/`HEAD` too: the `Authorization`
-  header is read first and the cookie is consulted only when the request carries neither;
+- a bearer token or access keys take precedence on every method: the `Authorization` header is read
+  first and the cookie is consulted only when the request carries neither;
 - authorisation is unchanged — a cookie-authenticated request passes the same `catalog:*` checks
   (`pkg/icebergcatalog/authz.go`), so the cookie grants nothing a bearer token of the same user
   would not.
@@ -314,13 +337,22 @@ replayed for the same key while the advertised `idempotency-key-lifetime` (30 mi
 
 ## Web UI: the Tables tab
 
-A repository's **Tables** tab is a read-only explorer of the Iceberg tables on the ref the page is
-showing — a branch, a tag or a commit id, because [reads work on any ref](#addressing). It is part
-of the web UI (`webui/src/lib/api/iceberg.ts`,
-`webui/src/lib/components/repository/tablesExplorer.tsx`), it addresses the catalog through
-`/iceberg/api` only (never `relative_to`), and it calls nothing but four read operations:
-`GET /v1/config`, the namespace listing, the table listing and the table load. It never sends
-`HEAD`, and it writes nothing.
+A repository's **Tables** tab is an explorer and, for the four operations below, a manager of the
+Iceberg tables on the ref the page is showing — a branch, a tag or a commit id, because
+[reads work on any ref](#addressing). It is part of the web UI
+(`webui/src/lib/api/iceberg.ts`, `webui/src/lib/components/repository/tablesExplorer.tsx`,
+`tablesManagement.tsx`), it addresses the catalog through `/iceberg/api` only (never
+`relative_to`), and it calls:
+
+- the four read operations — `GET /v1/config`, the namespace listing, the table listing and the
+  table load;
+- four management operations, which are exactly the ones the catalog accepts the session cookie for
+  ([above](#access)): `POST …/namespaces` (create a namespace), `DELETE …/namespaces/{namespace}`
+  (drop an empty namespace), `POST …/namespaces/{namespace}/tables` (create a table) and `DELETE
+  …/namespaces/{namespace}/tables/{table}` (drop a table).
+
+It never sends `HEAD`, and it never commits, registers or renames a table: committing a table's data
+stays an Iceberg client's job, and the catalog does not accept the cookie for it.
 
 `GET /iceberg/api/v1/config` decides what the tab is, because that one answer separates the
 deployments from each other:
@@ -331,23 +363,24 @@ deployments from each other:
 | `501` | the Enterprise upsell it has always shown: `iceberg.enabled` is false. |
 | `404` | the same upsell: `/iceberg/api` is not routed at all. |
 | `403 ForbiddenException` | the permission state, naming the catalog permissions the read needs. |
-| `401` | the web UI's ordinary login redirect — a session that expired mid-visit. |
+| `401` | the tab's own sign-in state: a sentence saying the catalog session is not valid, and a plain link the reader chooses to follow. |
 
 The `501` is the same answer whether the catalog itself gave it (`NotImplementedException`) or the
 core placeholder `pkg/api/services.go` mounts at the same prefixes did (a plain `lakefs` build): the
 tab keys on the status, not the body. A disabled catalog mounts its answer *without* the
 authentication middleware, so the `501` arrives before anyone is authenticated. `404` is the same
 situation one step further out — a proxy in front, or a deployment that serves the UI from another
-host — and a `401` is not a permission problem at all, so it takes the shared login redirect. A
-`403` is never softened into an empty listing: "you may not read this" and "there is nothing here"
-are different facts, and the tab shows the empty state only when the catalog answered a listing.
+host. Neither a `401` nor a `403` navigates: the catalog's answer is about this mount's credential or
+this user's permissions, not about the reader's core lakeFS session, so both are shown in place and
+the tab never turns one into a login redirect. A `403` is never softened into an empty listing: "you
+may not read this" and "there is nothing here" are different facts, and the tab shows the empty
+state only when the catalog answered a listing.
 
 The explorer lists the namespaces of `<repo>␟<ref>` with `parent=<repo>␟<ref>`, and every node is
 loaded lazily: expanding one fetches that node's child namespaces and its tables in one go, so a
 page load costs one listing plus two per top-level namespace rather than a walk of the whole
 warehouse. The top level is open by default, and a ref with no namespaces below it shows the empty
-state instead ("write to it with an Iceberg client pointed at this server's catalog") — the tab has
-no create button, because creating a table is a client's job.
+state instead ("create a namespace and then a table in it, or write to it with an Iceberg client").
 
 For the selected table the tab renders what the load result carries: the format version and the
 current snapshot's operation, the `metadata-location`, the table location, the table UUID and the
@@ -361,6 +394,38 @@ properties.
 
 The tab does not page: it sends no `pageSize`, and a catalog answers an absent `pageSize` with one
 page holding the whole listing, so nothing is hidden behind a next-page token.
+
+### Managing tables from the tab
+
+Four controls, each of which is one of the four management operations the cookie is accepted for:
+
+- **Create namespace** (the tab's header) opens a dialog for the levels below the ref
+  (`inventory` or `inventory.books`; every parent level must exist already).
+- **Create table** (on a namespace node) opens a dialog with a schema editor: a table name, columns
+  with name, [type](https://iceberg.apache.org/spec/#primitive-types) (a primitive, or any type
+  string the catalog's parser accepts) and required-or-optional, and an optional **identity
+  partition** by one of those columns. The dialog creates the table in the namespace whose node it
+  was opened from, so the address cannot drift from the tree on screen.
+- **Drop table** (on a table row) and **Drop namespace** (on a namespace node) ask for confirmation
+  first, the way the repositories and datasets pages confirm their destructive actions. The
+  confirmations say what a drop does: the metadata pointer and the staged file entries go, the
+  objects stay in the object store and are reclaimed by garbage collection, and the whole thing is a
+  staged change that becomes visible to readers when the branch is committed.
+
+Every management operation is an ordinary staged catalog write, so `409` (a taken name, a namespace
+that is not empty), `404` (a missing namespace or table) and the branch-protection and read-only
+refusals arrive as the catalog sends them, and the tab shows the catalog's own message:
+
+- a **create** keeps its dialog open and renders the message in it, so the reader can correct the
+  form and retry;
+- a **drop** closes its confirmation and renders the message in the tab, above the tree.
+
+A `401` becomes a sentence about the catalog session ("sign in again and retry"), in the create
+dialog or in the tab; it is never a login redirect. A `403` also **disables** the management controls and says which
+permissions the operations need (`catalog:CreateNamespace`, `catalog:DeleteNamespace`,
+`catalog:CreateTable`, `catalog:DeleteTable`, on top of the reads' `catalog:ListNamespaces`,
+`catalog:ListTables`, `catalog:ReadTable` and `fs:ReadRepository`): a user the catalog denied once
+will be denied again, so the tab stops offering what cannot work.
 
 ## Data-plane access
 
@@ -521,13 +586,13 @@ receives the full response; `HEAD` sets no tag.
   and advertised in `GET /v1/config`, but the `LoadTableResult` still carries an empty `config`, with
   no `storage-credentials` and no `s3.remote-signing-enabled`. A standard client therefore keeps its own
   `FileIO` unless it calls an endpoint directly (see [Data-plane access](#data-plane-access)).
-- **The Tables tab is a viewer.** It creates, drops and commits nothing: a table is written by an
-  Iceberg client, and the tab says so rather than offering a create button. It also explores one
-  ref at a time — the one the page shows — with no repository or ref picker, and it uses the
-  `/iceberg/api` form only. The permissions a read needs — and the ones its permission state is
-  meant to name — are `catalog:ListNamespaces`, `catalog:ListTables`, `catalog:ReadTable` and
-  `fs:ReadRepository`; the copy currently prints `catalog:LoadTable` for the table load, which is
-  not an action this catalog defines.
+- **The Tables tab does not commit.** It creates and drops namespaces and tables (the four operations the
+  cookie is accepted for), and everything else is still an Iceberg client's job: no commit, no register,
+  no rename, no data write. It also explores one ref at a time — the one the page shows — with no
+  repository or ref picker, and it uses the `/iceberg/api` form only. The permissions it needs are
+  `catalog:ListNamespaces`, `catalog:ListTables`, `catalog:ReadTable` and `fs:ReadRepository` to look,
+  plus `catalog:CreateNamespace`, `catalog:DeleteNamespace`, `catalog:CreateTable` and
+  `catalog:DeleteTable` to manage.
 - **The esti system tests are written but have no executed assertion here.** `esti/iceberg_test.go`
   covers the PyIceberg/DuckDB read path, append → lakeFS commit → GC prepare → still readable, and
   branch/merge including the conflict. It compiles and *skips*: this evidence host has no docker daemon
