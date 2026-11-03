@@ -763,28 +763,42 @@ func validatePropertyRemovals(removals []string) error {
 	return nil
 }
 
-// namespaceIsEmpty reports whether the namespace holds no tables and no child namespace, i.e.
-// whether dropping it loses nothing. The checks look under the marker in the layout of §6.1:
+// namespaceIsEmpty reports whether the namespace holds no tables, no views and no child
+// namespace, i.e. whether dropping it loses nothing. The checks look under the marker in the layout
+// of §6.1:
 //
 //   - any entry under `_lakefs_iceberg/tables/<ns>/` is a table of this namespace or of a
 //     descendant namespace (a table pointer of a child namespace is below the same prefix), so
 //     the namespace is not empty;
+//   - any entry under `_lakefs_iceberg/views/<ns>/` is a view of this namespace or of a descendant
+//     namespace, for exactly the same reason: a view is named state that a drop namespace would
+//     otherwise orphan, and the spec's DropNamespace answers 409 NamespaceNotEmptyException when
+//     anything is still in the namespace;
 //   - any common-prefix entry under `_lakefs_iceberg/ns/<ns>/` is a child namespace marker.
 //     The namespace's own `_lakefs_iceberg/ns/<ns>/.namespace` marker is not a common prefix and
 //     is therefore not mistaken for a child.
 func (n *namespaceService) namespaceIsEmpty(ctx context.Context, addr Address) (bool, error) {
-	hasTables, err := n.anyEntry(ctx, addr, tableEntriesPrefix(addr.Namespace))
-	if err != nil {
-		return false, err
-	}
-	if hasTables {
-		return false, nil
+	for _, prefix := range []string{tableEntriesPrefix(addr.Namespace), viewEntriesPrefix(addr.Namespace)} {
+		hasNamed, err := n.anyEntry(ctx, addr, prefix)
+		if err != nil {
+			return false, err
+		}
+		if hasNamed {
+			return false, nil
+		}
 	}
 	hasChild, err := n.hasChildNamespace(ctx, addr)
 	if err != nil {
 		return false, err
 	}
 	return !hasChild, nil
+}
+
+// viewEntriesPrefix is viewEntryPrefix for the namespace-emptiness check: the reserved key prefix
+// under which a view of this namespace or of a descendant namespace appears. It is declared here
+// next to tableEntriesPrefix so the two checks read as one rule.
+func viewEntriesPrefix(namespace Namespace) string {
+	return viewEntryPrefix(namespace)
 }
 
 // anyEntry reports whether any entry at all exists below prefix on addr.Ref.

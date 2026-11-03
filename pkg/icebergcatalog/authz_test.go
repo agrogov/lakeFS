@@ -37,6 +37,7 @@ const (
 	// contract a policy author writes by hand.
 	authzNamespaceArn = "arn:lakefs:catalog:::namespace/lakehouse/inventory.books"
 	authzTableArn     = "arn:lakefs:catalog:::table/lakehouse/inventory.books/titles"
+	authzViewArn      = "arn:lakefs:catalog:::view/lakehouse/inventory.books/orders_view"
 	authzRepoArn      = "arn:lakefs:fs:::repository/lakehouse"
 	// §7.2: writes additionally need fs:WriteObject on the reserved _lakefs_iceberg/ area.
 	authzWriteObjectArn = "arn:lakefs:fs:::repository/lakehouse/object/_lakefs_iceberg/*"
@@ -56,25 +57,38 @@ var authzAllOps = []Operation{
 	OpDeleteTable,
 	OpReadTableData,
 	OpWriteTableData,
+	OpListViews,
+	OpReadView,
+	OpCreateView,
+	OpUpdateView,
+	OpDeleteView,
 }
 
-// authzTableAddress is the address of a table; authzNamespaceAddress the address of the namespace
-// that contains it.
+// authzTableAddress is the address of a table; authzViewAddress the address of a view in the same
+// namespace; authzNamespaceAddress the address of the namespace that contains both.
 func authzTableAddress() Address {
 	return Address{Repo: authzRepo, Ref: authzRef, Namespace: Namespace{"inventory", "books"}, Table: "titles"}
+}
+
+func authzViewAddress() Address {
+	return Address{Repo: authzRepo, Ref: authzRef, Namespace: Namespace{"inventory", "books"}, View: "orders_view"}
 }
 
 func authzNamespaceAddress() Address {
 	return Address{Repo: authzRepo, Ref: authzRef, Namespace: Namespace{"inventory", "books"}}
 }
 
-// authzAddressFor returns an address op is defined on: a table address for the table operations,
-// a namespace address for everything else.
+// authzAddressFor returns an address op is defined on: a table address for the table operations, a
+// view address for the view operations, and a namespace address for everything else.
 func authzAddressFor(op Operation) Address {
-	if op.IsTableOperation() {
+	switch {
+	case op.IsTableOperation():
 		return authzTableAddress()
+	case op.IsViewOperation():
+		return authzViewAddress()
+	default:
+		return authzNamespaceAddress()
 	}
-	return authzNamespaceAddress()
 }
 
 // authzReadStatements grants every catalog read action on every catalog ARN, plus the
@@ -89,6 +103,8 @@ func authzReadStatements() model.Statements {
 				permissions.CatalogListTablesAction,
 				permissions.CatalogReadTableAction,
 				permissions.CatalogReadTableDataAction,
+				permissions.CatalogListViewsAction,
+				permissions.CatalogReadViewAction,
 			},
 			Resource: "arn:lakefs:catalog:::*",
 		},
@@ -114,6 +130,9 @@ func authzWriteStatements() model.Statements {
 				permissions.CatalogUpdateTableAction,
 				permissions.CatalogDeleteTableAction,
 				permissions.CatalogWriteTableDataAction,
+				permissions.CatalogCreateViewAction,
+				permissions.CatalogUpdateViewAction,
+				permissions.CatalogDeleteViewAction,
 			},
 			Resource: "arn:lakefs:catalog:::*",
 		},
@@ -350,6 +369,49 @@ func TestAuthzRequiredNode(t *testing.T) {
 			req:  Request{Op: OpWriteTableData, Address: authzTableAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:WriteTableData", Resource: authzTableArn},
+				{Action: "fs:ReadRepository", Resource: authzRepoArn},
+				{Action: "fs:WriteObject", Resource: authzWriteObjectArn},
+			},
+		},
+		{
+			name: "list views is authorized on the namespace ARN",
+			req:  Request{Op: OpListViews, Address: authzNamespaceAddress()},
+			want: []permissions.Permission{
+				{Action: "catalog:ListViews", Resource: authzNamespaceArn},
+				{Action: "fs:ReadRepository", Resource: authzRepoArn},
+			},
+		},
+		{
+			name: "read view is authorized on the view ARN",
+			req:  Request{Op: OpReadView, Address: authzViewAddress()},
+			want: []permissions.Permission{
+				{Action: "catalog:ReadView", Resource: authzViewArn},
+				{Action: "fs:ReadRepository", Resource: authzRepoArn},
+			},
+		},
+		{
+			name: "create view needs the write area",
+			req:  Request{Op: OpCreateView, Address: authzViewAddress()},
+			want: []permissions.Permission{
+				{Action: "catalog:CreateView", Resource: authzViewArn},
+				{Action: "fs:ReadRepository", Resource: authzRepoArn},
+				{Action: "fs:WriteObject", Resource: authzWriteObjectArn},
+			},
+		},
+		{
+			name: "update view needs the write area",
+			req:  Request{Op: OpUpdateView, Address: authzViewAddress()},
+			want: []permissions.Permission{
+				{Action: "catalog:UpdateView", Resource: authzViewArn},
+				{Action: "fs:ReadRepository", Resource: authzRepoArn},
+				{Action: "fs:WriteObject", Resource: authzWriteObjectArn},
+			},
+		},
+		{
+			name: "delete view needs the write area",
+			req:  Request{Op: OpDeleteView, Address: authzViewAddress()},
+			want: []permissions.Permission{
+				{Action: "catalog:DeleteView", Resource: authzViewArn},
 				{Action: "fs:ReadRepository", Resource: authzRepoArn},
 				{Action: "fs:WriteObject", Resource: authzWriteObjectArn},
 			},
@@ -730,6 +792,130 @@ func TestAuthzFilterTablesAddress(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidAuthzRequest)
 }
 
+// TestAuthzFilterViews is TestAuthzFilterTables for the view listing: catalog:ListViews on the
+// namespace ARN with a catalog:ViewName condition decides which views of a listing are visible,
+// and a caller who may not list the namespace gets the denial rather than an empty page.
+func TestAuthzFilterViews(t *testing.T) {
+	t.Parallel()
+
+	// A policy that may only list views whose name starts with "analytics-".
+	analyticsOnly := model.Statements{
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{permissions.CatalogListViewsAction},
+			Resource: authzNamespaceArn,
+			Condition: map[string]map[string][]string{
+				"StringLike": {ConditionFieldViewName: {"analytics-*"}},
+			},
+		},
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{permissions.ReadRepositoryAction},
+			Resource: authzRepoArn,
+		},
+	}
+	// The same, and an explicit deny of the temporary views.
+	withTempDeny := append(append(model.Statements(nil), analyticsOnly...), model.Statement{
+		Effect:   model.StatementEffectDeny,
+		Action:   []string{permissions.CatalogListViewsAction},
+		Resource: authzNamespaceArn,
+		Condition: map[string]map[string][]string{
+			"StringLike": {ConditionFieldViewName: {"analytics-tmp-*"}},
+		},
+	})
+	// A condition on the *table* name must not scope views: the two are separate fields.
+	tableNameOnly := model.Statements{
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{permissions.CatalogListViewsAction},
+			Resource: authzNamespaceArn,
+			Condition: map[string]map[string][]string{
+				"StringLike": {ConditionFieldTableName: {"analytics-*"}},
+			},
+		},
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{permissions.ReadRepositoryAction},
+			Resource: authzRepoArn,
+		},
+	}
+
+	tests := []struct {
+		name       string
+		statements model.Statements
+		names      []string
+		want       []string
+		wantDenied bool
+	}{
+		{
+			name:       "an unconditional grant lists every view",
+			statements: authzReadStatements(),
+			names:      []string{"orders_view", "sales-data", "analytics-report"},
+			want:       []string{"orders_view", "sales-data", "analytics-report"},
+		},
+		{
+			name:       "an empty namespace with an unconditional grant lists nothing",
+			statements: authzReadStatements(),
+			names:      nil,
+			want:       []string{},
+		},
+		{
+			name:       "catalog:ViewName StringLike narrows the listing",
+			statements: analyticsOnly,
+			names:      []string{"analytics-report", "sales-data", "analytics-events"},
+			want:       []string{"analytics-report", "analytics-events"},
+		},
+		{
+			name:       "a deny on catalog:ViewName hides the matching views",
+			statements: withTempDeny,
+			names:      []string{"analytics-report", "analytics-tmp-1"},
+			want:       []string{"analytics-report"},
+		},
+		{
+			name:       "a condition on catalog:TableName does not scope views",
+			statements: tableNameOnly,
+			names:      []string{"analytics-report", "orders_view"},
+			want:       []string{},
+			wantDenied: true,
+		},
+		{
+			name: "no grant at all is a denial, not an empty page",
+			statements: model.Statements{{
+				Effect:   model.StatementEffectAllow,
+				Action:   []string{permissions.ReadRepositoryAction},
+				Resource: authzRepoArn,
+			}},
+			names:      []string{"orders_view"},
+			want:       nil,
+			wantDenied: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			f := newAuthzUser(t, tt.statements)
+			got, err := f.authz.FilterViews(t.Context(), Caller{Username: "alice"},
+				authzNamespaceAddress(), tt.names)
+			if tt.wantDenied {
+				require.ErrorIs(t, err, ErrPermissionDenied)
+				require.Nil(t, got)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestAuthzFilterViewsAddress rejects a view address: a listing is a namespace operation.
+func TestAuthzFilterViewsAddress(t *testing.T) {
+	t.Parallel()
+	f := newAuthzUser(t, authzReadStatements())
+	_, err := f.authz.FilterViews(t.Context(), Caller{Username: "alice"},
+		authzViewAddress(), []string{"orders_view"})
+	require.ErrorIs(t, err, ErrInvalidAuthzRequest)
+}
+
 // TestAuthzDatasetRepositoryIsReadOnly verifies the §7.2 note that the datasets guard already
 // makes a dataset repository read-only through the catalog, without a catalog-shaped deny:
 // the dataset-<name>-immutable policy denies fs:WriteObject, and fs:WriteObject is part of every
@@ -747,6 +933,8 @@ func TestAuthzDatasetRepositoryIsReadOnly(t *testing.T) {
 			Resource: "arn:lakefs:catalog:::namespace/" + dataset + "/*"},
 		{Effect: model.StatementEffectAllow, Action: []string{"catalog:*"},
 			Resource: "arn:lakefs:catalog:::table/" + dataset + "/*"},
+		{Effect: model.StatementEffectAllow, Action: []string{"catalog:*"},
+			Resource: "arn:lakefs:catalog:::view/" + dataset + "/*"},
 		{Effect: model.StatementEffectAllow, Action: []string{"fs:*"},
 			Resource: permissions.RepoArn(dataset)},
 		{Effect: model.StatementEffectAllow, Action: []string{"fs:*"},
@@ -756,10 +944,14 @@ func TestAuthzDatasetRepositoryIsReadOnly(t *testing.T) {
 	f.attach(t, "writer", datasets.ImmutabilityPolicy(dataset, time.Now()))
 
 	address := func(op Operation) Address {
-		if op.IsTableOperation() {
+		switch {
+		case op.IsTableOperation():
 			return Address{Repo: dataset, Ref: authzRef, Namespace: Namespace{"inventory"}, Table: "titles"}
+		case op.IsViewOperation():
+			return Address{Repo: dataset, Ref: authzRef, Namespace: Namespace{"inventory"}, View: "titles_view"}
+		default:
+			return Address{Repo: dataset, Ref: authzRef, Namespace: Namespace{"inventory"}}
 		}
-		return Address{Repo: dataset, Ref: authzRef, Namespace: Namespace{"inventory"}}
 	}
 	for _, op := range authzAllOps {
 		op := op

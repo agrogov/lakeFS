@@ -493,7 +493,9 @@ func TestAuthRejectsCookieOnUIManagementWithoutTheClientHeader(t *testing.T) {
 // TestAuthRejectsCookieOnWritesOutsideUIManagement pins the other boundary: even with the web UI's
 // header, a cookie authenticates none of the writes the UI does not make. The commit, register,
 // properties, metrics, remote signing and rename are the operations that change table contents or
-// mint a credential, and they stay bearer/basic only.
+// mint a credential, and they stay bearer/basic only. The view writes are in that group too: the
+// Tables tab manages tables, and a view created or replaced from a browser session would be
+// exactly the cookie-issued catalog write the four-operation exception exists to keep narrow.
 func TestAuthRejectsCookieOnWritesOutsideUIManagement(t *testing.T) {
 	router, deps := uiManagementTestRouter(t)
 	cookie := sessionCookie(t, deps, mintToken(t, router))
@@ -506,6 +508,9 @@ func TestAuthRejectsCookieOnWritesOutsideUIManagement(t *testing.T) {
 		{"report metrics", http.MethodPost, uiManagementPath("namespaces", namespace, "tables", "books", "metrics")},
 		{"remote signing", http.MethodPost, uiManagementPath("namespaces", namespace, "tables", "books", "sign")},
 		{"table rename", http.MethodPost, uiManagementPath("tables", "rename")},
+		{"create view", http.MethodPost, uiManagementPath("namespaces", namespace, "views")},
+		{"replace view", http.MethodPost, uiManagementPath("namespaces", namespace, "views", "orders_view")},
+		{"drop view", http.MethodDelete, uiManagementPath("namespaces", namespace, "views", "orders_view")},
 	}
 	for _, operation := range excluded {
 		t.Run(operation.name, func(t *testing.T) {

@@ -1019,6 +1019,14 @@ func tableEntryPrefix(namespace Namespace) string {
 // `<prefix><table>/.pointer` is not a table of this namespace and is skipped: it is either a
 // deeper pointer (a nested namespace's table) or something this catalog did not write.
 func tableNameOfPointer(prefix, entryPath string) (string, bool, error) {
+	return pointerHolderName(prefix, entryPath)
+}
+
+// pointerHolderName is the walk a namespace listing does over the pointers below its own key
+// prefix: the remainder of a pointer key must be exactly `<name>/.pointer`, and that name is what
+// the listing reports. Tables (tableNames) and views (viewNames, views_http.go) list their
+// pointers with it, because a pointer is the one entry that makes either object exist.
+func pointerHolderName(prefix, entryPath string) (string, bool, error) {
 	if !strings.HasPrefix(entryPath, prefix) {
 		return "", false, fmt.Errorf("%w: entry %q is not below %q", ErrInvalidPointer, entryPath, prefix)
 	}
@@ -1028,7 +1036,7 @@ func tableNameOfPointer(prefix, entryPath string) (string, bool, error) {
 		return "", false, nil
 	}
 	if err := validateLayoutSegment(name); err != nil {
-		return "", false, fmt.Errorf("table pointer %q: %w", entryPath, err)
+		return "", false, fmt.Errorf("pointer %q: %w", entryPath, err)
 	}
 	return name, true, nil
 }

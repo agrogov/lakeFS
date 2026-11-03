@@ -205,6 +205,12 @@ change in lakeFS.
   before anything is staged — that refusal is the client's, not an unknown outcome.
 - `set-location` is refused with `400`. A table's location is fixed at creation, which is what allows
   the catalog to keep its files in one place across branches.
+- **Views follow the same rules.** A view replace is a compare-and-swap on the view pointer's
+  `metadata-location` with the same `409` / `400` / `500 CommitStateUnknownException` classification,
+  and the metadata document a replace writes is staged as a lakeFS entry before the pointer moves. A
+  view has no data files, so there is no file-registration step beyond that one document. `set-location`
+  *is* served for views (a view roots no data files and no GC window), but only inside the catalog's
+  table area. See [Views](#views).
 
 ### What is stored, and where
 
@@ -217,12 +223,17 @@ _lakefs_iceberg/                              on the branch: ordinary lakeFS ent
                                                   iceberg.metadata-location = physical URI
                                                   iceberg.table-uuid
                                                   iceberg.format-version
-  files/<table-uuid>/<relative path>           one entry per table file the commit or create staged
-                                                  (metadata, manifest-list, manifest, data)
+  views/<ns1>/<ns2>/<view>/.pointer             view pointer; user metadata:
+                                                  iceberg.metadata-location = physical URI
+                                                  iceberg.view-uuid
+                                                  iceberg.format-version
+  files/<uuid>/<relative path>                 one entry per file the commit, create or replace staged:
+                                                  table files (metadata, manifest-list, manifest, data)
+                                                  and view metadata documents
 
-<storage_namespace>/_iceberg/<table-uuid>/     in object storage: the files themselves
-  metadata/…
-  data/…
+<storage_namespace>/_iceberg/<uuid>/           in object storage: the files themselves
+  metadata/…                                    metadata.json for a table or a view
+  data/…                                        table data (views have none)
 ```
 
 The entry area is versioned (diff, merge, revert, commit); the object area is shared by every branch and
@@ -236,6 +247,72 @@ A table created without an explicit location gets
 is inside `<storage_namespace>/_iceberg/` or below it; a location outside that area is `400`, both
 because the server writes the initial metadata there with its own credentials and because a table must
 not point into another repository or bucket.
+
+## Views
+
+An Iceberg **view** is a named, versioned SQL query: it has a schema, a set of view versions (each a
+list of SQL representations plus a default namespace), and a current version — and no snapshots,
+manifests or data files. The catalog serves the six view operations of the REST spec:
+
+| Operation | Endpoint |
+|---|---|
+| list views | `GET /v1/{prefix}/namespaces/{namespace}/views` |
+| load view | `GET /v1/{prefix}/namespaces/{namespace}/views/{view}` |
+| view exists | `HEAD /v1/{prefix}/namespaces/{namespace}/views/{view}` |
+| create view | `POST /v1/{prefix}/namespaces/{namespace}/views` |
+| replace view | `POST /v1/{prefix}/namespaces/{namespace}/views/{view}` |
+| drop view | `DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}` |
+
+They are advertised in `GET /v1/config`, they work through both addressing forms (`/iceberg/api` and
+`/iceberg/relative_to/{repo}[.{branch}]/api`), and they carry the same Git semantics as tables:
+a create, a replace and a drop are staged on the branch and published by an explicit lakeFS commit, so
+diff, merge, revert, branch protection and GC apply to views unchanged.
+
+**What a view is made of.** A pointer entry and a metadata document, exactly like a table:
+
+```
+_lakefs_iceberg/views/<ns>/<view>/.pointer     the one entry that makes the view exist
+  iceberg.metadata-location                    the physical URI of the current view metadata document
+  iceberg.view-uuid                            the view uuid the document carries
+  iceberg.format-version                       1
+<storage_namespace>/_iceberg/<view-uuid>/metadata/<seq>-<uuid>.metadata.json
+_lakefs_iceberg/files/<view-uuid>/metadata/…   the lakeFS entry of that document (GC safety, §6.3)
+```
+
+A create mints the view uuid, places the view under `<storage_namespace>/_iceberg/<view-uuid>/` unless
+the client asked for a location inside that area, writes the initial document, stages its entry, and
+stages the pointer with assert-create semantics — a duplicate create is `409 AlreadyExistsException`. A
+replace validates the request's requirements (`assert-view-uuid`), applies its updates, writes a fresh
+document, stages it, and swaps the pointer with a compare-and-swap on the previous `metadata-location`.
+A drop removes the pointer and releases the staged metadata entries in the same commit; the objects
+themselves are left to the committed GC, and reverting the drop commit brings the view back.
+
+**What a replace accepts.** The view update language, not the table one: `assign-uuid`,
+`upgrade-format-version`, `add-schema`, `set-location`, `set-properties`, `remove-properties`,
+`add-view-version` and `set-current-view-version`. A requirement that does not hold is
+`409 CommitFailedException`, a lost compare-and-swap is `409` as well, an update the current document
+cannot accept (including an unsupported format version) is `400`, and anything that fails after the new
+document is written is `500 CommitStateUnknownException`. View format version 2 does not exist yet;
+version 1 is the only one served.
+
+**What is not served.** `POST /v1/{prefix}/views/rename` (`RenameView`) and
+`POST …/namespaces/{namespace}/register-view` stay out of scope: neither is advertised, and a client
+that calls one gets the catalog's `404`. A view *can* be created under the same name as a table in the
+same namespace — they live in different directories of the reserved area and are addressed by different
+endpoints — and a dropped table or view never removes the other.
+
+**Namespaces and views.** A namespace that still holds a view is not empty: `DELETE
+/v1/{prefix}/namespaces/{namespace}` answers `409 NamespaceNotEmptyException`, so a namespace drop can
+never orphan a view pointer. Views of descendant namespaces count too, exactly as tables do.
+
+**Clients.** PyIceberg 0.12 speaks the whole surface it implements — `create_view`, `load_view`,
+`list_views`, `view_exists`, `drop_view` — and the system test
+([`esti/iceberg_views_test.go`](../esti/iceberg_views_test.go)) runs that round trip against a real
+`lakefs-sso` on S3, then replaces the view over HTTP (`assert-view-uuid` + `add-view-version` +
+`set-current-view-version` + `set-properties`). Trino's `CREATE VIEW`/`DROP VIEW` use the same requests.
+The **web UI is not required**: the repository Tables tab lists namespaces and tables, and views are
+managed by an Iceberg client through the REST API. Reading them from the UI is not a prerequisite for
+creating or replacing them, and no UI surface has to be present for a catalog client to use views.
 
 ## Access
 
@@ -254,6 +331,10 @@ two lakeFS actions on the repository and its reserved key area:
 | drop table | `catalog:DeleteTable` | `CatalogTableArn(repo, ns, table)` |
 | data-plane read: remote signing, vended read credentials | `catalog:ReadTableData` | `CatalogTableArn(repo, ns, table)` |
 | data-plane write: remote signing, vended write credentials | `catalog:WriteTableData` | `CatalogTableArn(repo, ns, table)` |
+| list views (filtered per view with a `catalog:ViewName` `StringLike` condition) | `catalog:ListViews` | `CatalogNamespaceArn(repo, ns)` |
+| load / HEAD view | `catalog:ReadView` | `CatalogViewArn(repo, ns, view)` |
+| create / replace view | `catalog:CreateView`, `catalog:UpdateView` | `CatalogViewArn(repo, ns, view)` |
+| drop view | `catalog:DeleteView` | `CatalogViewArn(repo, ns, view)` |
 
 Additionally, every request scoped to a repository needs `fs:ReadRepository` on that repository, every
 write needs `fs:WriteObject` on `ObjectArn(repo, "_lakefs_iceberg/*")` — the reserved entry area — and the
@@ -303,7 +384,10 @@ accepted for:
 - nothing else. `POST`, `PUT`, `PATCH` and `DELETE` outside those four — the commit
   (`POST …/tables/{table}`), `register`, the properties update, `metrics`, remote signing,
   `POST /v1/oauth/tokens`, and every other write — are `401` with the constant message
-  `authentication required` when they carry only a cookie, whatever header they send.
+  `authentication required` when they carry only a cookie, whatever header they send. That includes
+  the view writes: `POST …/namespaces/{ns}/views` and `DELETE …/namespaces/{ns}/views/{view}` are
+  not in the four, so creating, replacing or dropping a view from a browser session needs an access
+  key pair or a bearer token, never the UI cookie.
 
 The management exception is closed on purpose. A cookie is the one credential a browser attaches
 by itself, so a general cookie write would be a write any page the user visits could issue on their
@@ -336,6 +420,11 @@ Every mutating operation honours `Idempotency-Key`: the final response (includin
 replayed for the same key while the advertised `idempotency-key-lifetime` (30 minutes) has not elapsed.
 
 ## Web UI: the Tables tab
+
+Views are **not** managed from the UI: the tab below lists namespaces and tables, and a view is created,
+replaced and dropped by an Iceberg client through the REST API (see [Views](#views)). Nothing about views
+depends on the tab — no UI surface has to exist for a client to use them, and a deployment without the tab
+serves them identically.
 
 A repository's **Tables** tab is an explorer and, for the four operations below, a manager of the
 Iceberg tables on the ref the page is showing — a branch, a tag or a commit id, because
@@ -557,13 +646,15 @@ only when it is mounted and tested.
 | `POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics` | served (accepted and discarded) |
 | `POST /v1/{prefix}/namespaces/{namespace}/register` | served (adopts a client-written `metadata.json`) |
 | `GET …/tables/{table}/credentials`, `POST …/tables/{table}/sign` | served and advertised only when supported: S3 blockstore for signing, S3 plus `credentials_vending.role_arn` for vending |
-| `tables/rename`, `transactions/commit`, `views/*`, `plan`, `tasks` | out of scope for v1, never advertised |
+| `GET`, `POST /v1/{prefix}/namespaces/{namespace}/views` | served (list and create) |
+| `GET`, `HEAD`, `POST`, `DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}` | served (load, exists, replace, drop) |
+| `tables/rename`, `views/rename`, `register-view`, `transactions/commit`, `plan`, `tasks` | out of scope for v1, never advertised |
 
 `POST /v1/oauth/tokens` is served as well. It is the catalog's authentication endpoint rather than a
 `/v1/{prefix}` operation, so it is not part of the advertised list.
 
 Errors use the protocol's envelope, `{"error": {"message": …, "type": …, "code": …}}`, with the
-`NoSuchNamespaceException`, `NoSuchTableException`, `AlreadyExistsException`,
+`NoSuchNamespaceException`, `NoSuchTableException`, `NoSuchViewException`, `AlreadyExistsException`,
 `NamespaceAlreadyExistsException`, `NamespaceNotEmptyException`, `CommitFailedException`,
 `CommitStateUnknownException`, `ForbiddenException`, `NotAuthorizedException`,
 `RequestTooLargeException`, `NotImplementedException` and `NoSuchWarehouseException` types. Status codes
@@ -593,18 +684,21 @@ receives the full response; `HEAD` sets no tag.
   `catalog:ListNamespaces`, `catalog:ListTables`, `catalog:ReadTable` and `fs:ReadRepository` to look,
   plus `catalog:CreateNamespace`, `catalog:DeleteNamespace`, `catalog:CreateTable` and
   `catalog:DeleteTable` to manage.
-- **The esti system tests are written but have no executed assertion here.** `esti/iceberg_test.go`
+- **The esti system tests run on S3, and the view suite runs with them.** `esti/iceberg_test.go`
   covers the PyIceberg/DuckDB read path, append → lakeFS commit → GC prepare → still readable, and
-  branch/merge including the conflict. It compiles and *skips*: this evidence host has no docker daemon
-  and no S3-compatible blockstore, so no esti assertion has run. The **iceberg-go external conformance
-  suite is green** — 18 of 18 subtests, 0 skipped — through the `relative_to` URI against a `lakefs-sso`
-  server built from this tree in the default auth mode; that run is recorded in
-  `pkg/icebergcatalog/conformance/RESULTS.md`. Apache RCK was not run (no JDK/Gradle on the host), and
-  every measurement used a local blockstore, so S3 presigning, credential vending and remote signing
-  remain unvalidated.
-- **Iceberg format v3, views, functions, server-side scan planning and multi-table transactions** are
-  out of scope for v1 and are never advertised. `add-encryption-key` (format v3 only) decodes and is
-  refused with a `400` naming the reason rather than failing as a server error.
+  branch/merge including the conflict; `esti/iceberg_views_test.go` covers the PyIceberg view round
+  trip, the staged metadata entries, a replace over HTTP, the any-ref read of a tag, the
+  namespace-emptiness rule and the drop. Both were run against SeaweedFS (`blockstore.type: s3`, path
+  style) with the `esti-iceberg-client` image, and all six tests pass; the exact command and output are
+  in the commit that added the view suite. The **iceberg-go external conformance suite is green** — 18
+  of 18 subtests, 0 skipped — through the `relative_to` URI against a `lakefs-sso` server built from
+  this tree; that run is recorded in `pkg/icebergcatalog/conformance/RESULTS.md`. Apache RCK was not
+  run (no JDK/Gradle on the host), and S3 presigning, credential vending and remote signing remain
+  unvalidated.
+- **Iceberg format v3, functions, server-side scan planning, view rename and multi-table transactions**
+  are out of scope for v1 and are never advertised. `add-encryption-key` (format v3 only) decodes and is
+  refused with a `400` naming the reason rather than failing as a server error. Views themselves are
+  served (see [Views](#views)).
 
 ### Known design divergences
 

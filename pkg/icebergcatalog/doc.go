@@ -25,11 +25,15 @@
 //     error model;
 //   - ident.go — namespace and identifier parsing (repo.ref.ns….table, %1F,
 //     relative_to);
-//   - authz.go — catalog:* checks on CatalogNamespaceArn and CatalogTableArn;
+//   - authz.go — catalog:* checks on CatalogNamespaceArn, CatalogTableArn and
+//     CatalogViewArn;
 //   - store.go — namespace markers and table pointers as graveler entries, with
 //     conditional writes;
 //   - commit.go — requirement validation, update application via iceberg-go,
 //     metadata.json write and the compare-and-swap of the table pointer;
+//   - views.go, views_http.go — views: view pointers under _lakefs_iceberg/views, the
+//     view metadata document, the create/replace/drop commit and the six view
+//     endpoints, with the view model of iceberg-go's `view` package;
 //   - register.go — staging of table files as lakeFS entries (GC safety);
 //   - creds.go — vended credentials and remote signing.
 //

@@ -12,8 +12,13 @@ package icebergcatalog
 //	                                           iceberg.metadata-location = physical URI of metadata.json
 //	                                           iceberg.table-uuid       = table UUID
 //	                                           iceberg.format-version   = 1 | 2
-//	  files/<table-uuid>/<relative path>     one entry per table file (§6.3, files.go): the files a
-//	                                           commit added, and the initial metadata.json a create wrote
+//	  views/<ns1>/<ns2>/<view>/.pointer      view pointer, entry user metadata (views.go):
+//	                                           iceberg.metadata-location = physical URI of metadata.json
+//	                                           iceberg.view-uuid        = view UUID
+//	                                           iceberg.format-version   = 1
+//	  files/<uuid>/<relative path>           one entry per staged file (§6.3, files.go): the table files
+//	                                           a commit added, the initial metadata.json a create wrote,
+//	                                           and the view metadata documents a create or replace wrote
 //
 // The read half resolves the marker and the pointer on a branch, tag or commit, decodes the
 // pointer's user metadata and loads the referenced metadata.json through the block adapter.
@@ -106,10 +111,10 @@ const (
 	FormatVersionKey = iceberglayout.FormatVersionKey
 )
 
-// ErrInvalidPointer is wrapped when the table pointer or the namespace marker exists but its
-// content is unusable: a missing or empty field, a format version this catalog does not serve,
-// or a metadata.json that does not parse. It is a server-side data error, not a missing table:
-// the caller of GetTable already established that the pointer entry exists.
+// ErrInvalidPointer is wrapped when a table pointer, a view pointer or the namespace marker exists
+// but its content is unusable: a missing or empty field, a format version this catalog does not
+// serve, or a metadata.json that does not parse. It is a server-side data error, not a missing
+// object: the caller of GetTable or GetView already established that the pointer entry exists.
 var ErrInvalidPointer = errors.New("invalid iceberg catalog entry")
 
 // ErrAlreadyExists is wrapped when a create-only write finds a value where it required an absent

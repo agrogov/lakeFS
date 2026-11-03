@@ -203,9 +203,10 @@ const (
 	//   - two segments is enough on the deny side, with one to spare: every key the catalog writes
 	//     has at least three segments after the prefix - _lakefs_iceberg/ns/<ns>/.namespace and
 	//     _lakefs_iceberg/tables/<ns>/<table>/.pointer (store.go namespaceMarkerPath /
-	//     tablePointerPath) and _lakefs_iceberg/files/<uuid>/<relative path> (files.go
-	//     TableFilePath, whose relative path is validated to be non-empty and clean) - and every
-	//     such key is matched. gc_test.go pins that invariant shape by shape, against
+	//     tablePointerPath), _lakefs_iceberg/views/<ns>/<view>/.pointer (views.go viewPointerPath)
+	//     and _lakefs_iceberg/files/<uuid>/<relative path> (files.go TableFilePath, whose relative
+	//     path is validated to be non-empty and clean; a view's metadata document is staged there
+	//     too) - and every such key is matched. gc_test.go pins that invariant shape by shape, against
 	//     auth.ArnMatch and against the real ACL engine, so a future builder that emitted a
 	//     shallower key fails there instead of shipping a hole.
 	//

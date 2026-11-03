@@ -34,6 +34,8 @@ bigger surface than datasets.
 ### 1.1 Goals (v1)
 1. An Iceberg REST catalog served by `lakefs-sso` at `/iceberg/api`. Spark, Trino, PyIceberg and DuckDB must be able
    to create, read, append to, update and drop tables on any lakeFS branch, and read them on any ref (tag or commit).
+   The same clients must be able to create, load, replace and drop **views** on a branch and read them on any ref -
+   a view is staged, committed and garbage-collected by the table rules (§6.1, §6.2, §6.3, §7.2).
 2. Addressing that is wire-compatible with the public lakeFS docs: `<repo>.<branch>.<namespace>[.<ns>…].<table>`, plus
    `/iceberg/relative_to/<repo>.<branch>/api` and `/iceberg/relative_to/<repo>/api`
    ([docs.lakefs.io/iceberg](https://docs.lakefs.io/iceberg/), [DuckDB](https://docs.lakefs.io/integrations/duckdb/),
@@ -47,9 +49,13 @@ bigger surface than datasets.
 6. Unblock datasets `table` and `namespace` items (§9 of this plan).
 
 ### 1.2 Non-goals (v1) — and not advertised in `/v1/config.endpoints`
-- Views, functions, server-side scan planning (`/plan`, `/tasks`), `tables/rename`, location change through commit,
-  Iceberg format v3. Enterprise does not support these either
+- Functions, server-side scan planning (`/plan`, `/tasks`), `tables/rename`, `views/rename`, `register-view`,
+  location change through a *table* commit, Iceberg format v3. Enterprise does not support these either
   ([docs.lakefs.io/iceberg](https://docs.lakefs.io/iceberg/)).
+- Views themselves are **served** (list, load, exists, create, replace, drop; see §6.1 and §7.2). They were a
+  non-goal of the original v1 scope and are no longer: the state a view needs is the state a table already needs
+  (a pointer entry, a metadata document written under the table area, and a staged file entry for that document),
+  so the storage, commit, GC and RBAC rules were reused rather than re-derived.
 - Multi-table `POST /v1/transactions/commit`. The spec says this is "primarily a Java API feature" that servers don't
   have to support ([rest-protocol.md](https://github.com/apache/iceberg/blob/main/docs/docs/rest-protocol.md)).
   DuckDB has `DISABLE_MULTI_TABLE_COMMIT`
@@ -224,7 +230,19 @@ _lakefs_iceberg/
                                                iceberg.metadata-location = <physical URI of current metadata.json>
                                                iceberg.table-uuid       = <uuid>
                                                iceberg.format-version   = 1|2
+  views/<ns1>/<ns2>/<view>/.pointer          view pointer; entry user-metadata:
+                                               iceberg.metadata-location = <physical URI of current view metadata.json>
+                                               iceberg.view-uuid        = <uuid>
+                                               iceberg.format-version   = 1
+  files/<uuid>/<relative path>               one entry per staged file: table files (metadata, manifest-list,
+                                               manifest, data) and view metadata documents
 ```
+
+A view is the table layout with the table-only parts removed: it has a pointer, a metadata document under
+`<storage_namespace>/_iceberg/<view-uuid>/metadata/`, and a staged entry for that document, but no snapshots,
+manifests or data files. It reuses the compare-and-swap of §6.2 (conditioned on the pointer's
+`iceberg.metadata-location`), the §6.3 file entry (a document that is not an entry is collectable by the
+committed GC) and the any-ref read path. `views/rename` and `register-view` stay unserved and unadvertised.
 The reserved prefix `_lakefs_iceberg/` is hidden from `fs:` writes by a deny statement, the same way datasets protects
 `_lakefs_ds_pin_*`. Table files live under
 `<storage_namespace>/_iceberg/<table-uuid>/{metadata,data}/…`, a physical location that is stable across branches.
@@ -343,6 +361,10 @@ the docs: "metadata files are treated as ordinary files"
 | load table | `catalog:ReadTable` | `CatalogTableArn(repo, ns, t)` |
 | create / register / commit / drop | `catalog:CreateTable` / `UpdateTable` / `DeleteTable` | `CatalogTableArn` |
 | vended read / write creds | **`catalog:ReadTableData` / `catalog:WriteTableData`** (new) | `CatalogTableArn` |
+| list views | `catalog:ListViews` (+ filter with `catalog:ViewName` StringLike condition) | `CatalogNamespaceArn` |
+| load view | `catalog:ReadView` | `CatalogViewArn(repo, ns, view)` |
+| create / replace view | `catalog:CreateView` / `UpdateView` | `CatalogViewArn` |
+| drop view | `catalog:DeleteView` | `CatalogViewArn` |
 
 Additionally, require `fs:ReadRepository` on the repo and, for writes, `fs:WriteObject` on
 `ObjectArn(repo, "_lakefs_iceberg/*")`. Then the existing branch, repo and immutability denies (datasets
@@ -710,6 +732,7 @@ of gaps at the end of this section, not unwired work:
 | §7.1 OAuth token endpoint | **landed**: the catalog's own auth middleware serves `POST /v1/oauth/tokens` (form `client_id`/`client_secret` or HTTP Basic) |
 | §7.1 cookie reads and UI management (added after the close-out) | **landed**: `NewAuthMiddleware` accepts the web UI's `internal_auth_session` cookie for `GET`/`HEAD` unconditionally, and for exactly four management operations — `POST …/namespaces`, `DELETE …/namespaces/{namespace}`, `POST …/namespaces/{namespace}/tables`, `DELETE …/namespaces/{namespace}/tables/{table}` — only when the request carries `X-Lakefs-Client: lakefs-webui…` (a custom header forces a CORS preflight the catalog does not grant, and the cookie is `SameSite=Lax`). A cookie on any other write — commit (`POST …/tables/{table}`), register, properties, metrics, remote signing, `POST /v1/oauth/tokens` — is `401`, header or not, so committing data and minting a credential are never reachable from a cookie. Bearer and basic are read first and are unchanged; authorisation stays the `catalog:*` checks |
 | Web UI Tables tab (added after the close-out) | **landed**: the repository Tables tab is an explorer and manager of the current ref through `/iceberg/api` (`webui/src/lib/api/iceberg.ts`, `repository/tablesExplorer.tsx`, `tablesDetails.tsx`, `tablesStates.tsx`, `tablesManagement.tsx`). `GET /v1/config` picks the explorer, the Enterprise upsell (`501`; also `404` when the path is not routed at all), the permission state (`403`) or the tab's own sign-in state (`401`, a plain link, never a login redirect). It reads with `GET /v1/config`, the namespace listing, the table listing and the table load, and it manages with the four cookie operations: create namespace, drop empty namespace, create table (name, columns with name/type/required, optional identity partition) and drop table. Drops are confirmed, catalog errors are shown in place, and a `403` disables the management controls |
+| Views: list, load, exists, create, replace, drop (`views.go`, `views_http.go`) | **landed and advertised**: pointer under `_lakefs_iceberg/views/`, metadata document under `<storage_namespace>/_iceberg/<view-uuid>/` and staged as a §6.3 entry, replace with `assert-view-uuid` + the eight view update actions and a CAS on the pointer, drop that releases the entries, `catalog:List/Read/Create/Update/DeleteView` on `CatalogViewArn`, namespace emptiness counts views, and the UI Tables tab is not required. `views/rename` and `register-view` stay non-goals. Esti: PyIceberg create/load/list/exists/drop plus an HTTP replace, green on SeaweedFS |
 | §7.2 `catalog:ReadTableData` / `catalog:WriteTableData` and the `CatalogRead` grant | **landed** |
 | §6.4 compaction auto-resolve | **landed and wired**: keyed on the `lakefs.compaction.operation-id` snapshot property (not the commit message), installed as the `pkg/catalog` merge hook by `Bootstrap` when `iceberg.enabled` and `iceberg.ignore_compaction_commits` are both true (`commit.go`, `pkg/catalog/merge_conflict.go`) |
 | I-5 ETag / `If-None-Match` | **landed** on table load, varying with `snapshots`; no tag on `HEAD` |
@@ -723,8 +746,8 @@ of gaps at the end of this section, not unwired work:
   `local://` FileIO shim; S3 presigning, credential vending and remote signing are unvalidated.
 - The esti suite compiles and skips — no esti assertion has executed (no docker daemon, no S3 bucket).
 - Only `gc/prepare_commits` was run, never the real Spark GC sweep it feeds.
-- Views, `/plan`, `/tasks`, rename and multi-table transactions remain v1 non-goals (§1.2) and are never
-  advertised.
+- `/plan`, `/tasks`, `tables/rename`, `views/rename`, `register-view` and multi-table transactions remain v1
+  non-goals (§1.2) and are never advertised. Views themselves are served.
 - ~~The Tables tab's permission state prints `catalog:LoadTable` for the table load; no such action exists.~~ Fixed
   with the management work: the state names `catalog:ReadTable`, the action the catalog actually checks, plus the
   four management actions the tab now uses.

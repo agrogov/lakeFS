@@ -60,14 +60,21 @@ var (
 	errNonGoalEndpoint = errors.New("icebergcatalog: endpoint is out of scope for v1 and must not be advertised")
 )
 
-// nonGoalEndpointFragments are the operations §1.2 excludes from v1: views, table rename,
+// nonGoalEndpointFragments are the operations §1.2 excludes from v1: view rename, table rename,
 // multi-table transaction commit and server-side scan planning. An advertised endpoint is a
 // promise: §2.1 says a client calls only the endpoints the server lists, so advertising one of
 // these would either be a lie or force clients into a path this catalog does not implement.
 // A route that carries one of these fragments is rejected while the router is built, not when a
 // client first calls it.
+//
+// Views are no longer on this list: the six view operations the REST spec defines and this catalog
+// serves (list, load, exists, create, replace, drop) are mounted by views_http.go and advertised
+// like every other operation. What stays out are the view operations v1 does not implement -
+// `POST /v1/{prefix}/views/rename` and `POST /v1/{prefix}/namespaces/{namespace}/register-view` -
+// together with the remaining §1.2 non-goals.
 var nonGoalEndpointFragments = []string{
-	"/views",
+	"/views/rename",
+	"/register-view",
 	"/tables/rename",
 	"/transactions/",
 	"/plan",
@@ -129,6 +136,10 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 			// The table reads of I1-9, the staged create of I2-4, and the drop and metrics sink
 			// of I2-5.
 			NewTableService(store, authorizer, deps.Catalog, cfg),
+			// The view surface: list, load, exists, create, replace and drop (views.go,
+			// views_http.go). It is a service of its own so its six endpoints are advertised
+			// exactly when the routes are mounted, like every other operation.
+			NewViewService(store, authorizer, deps.Catalog, cfg),
 			// Register (register.go): adopting a metadata.json written outside the catalog. It is its
 			// own service, so its endpoint is advertised exactly when it is mounted.
 			NewRegisterService(store, authorizer, deps.Catalog, cfg),

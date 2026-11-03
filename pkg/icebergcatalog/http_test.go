@@ -214,15 +214,18 @@ func TestRouterEnvelopesUnknownPathAndMethod(t *testing.T) {
 }
 
 // TestRouterRefusesToAdvertiseNonGoals is the §1.2 compatibility rule: an advertised endpoint is
-// a promise (§2.1), so a route that would advertise views, table rename, the multi-table
-// transaction commit or server-side scan planning fails the build of the router instead of
-// quietly appearing in GET /v1/config.
+// a promise (§2.1), so a route that would advertise view rename, table rename, the multi-table
+// transaction commit, server-side scan planning or a view register this catalog does not serve
+// fails the build of the router instead of quietly appearing in GET /v1/config.
+//
+// The view operations this catalog *does* serve are mounted (views_http.go) and advertised, so a
+// route carrying one of them must be accepted - the last subtest is that other half of the rule.
 func TestRouterRefusesToAdvertiseNonGoals(t *testing.T) {
 	cfg := &Config{MaxRequestBody: 1024}
 	for name, endpoint := range map[string]string{
 		"table rename":       "POST /v1/{prefix}/tables/rename",
-		"view load":          "GET /v1/{prefix}/namespaces/{namespace}/views/{view}",
 		"view rename":        "POST /v1/{prefix}/views/rename",
+		"view register":      "POST /v1/{prefix}/namespaces/{namespace}/register-view",
 		"transaction commit": "POST /v1/{prefix}/transactions/commit",
 		"scan planning":      "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/plan",
 		"scan task fetch":    "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/tasks",
@@ -249,6 +252,28 @@ func TestRouterRefusesToAdvertiseNonGoals(t *testing.T) {
 		})
 		_, err := newRouter(authenticated, cfg, c)
 		require.NoError(t, err)
+	})
+
+	t.Run("the view operations this catalog serves are accepted", func(t *testing.T) {
+		// Views are served now, so the fragment that used to reject every "/views" endpoint must
+		// not reject them: only view *rename* stays a non-goal.
+		for _, endpoint := range []string{
+			listViewsEndpoint,
+			loadViewEndpoint,
+			viewExistsEndpoint,
+			createViewEndpoint,
+			replaceViewEndpoint,
+			dropViewEndpoint,
+		} {
+			c := testServer(cfg, route{
+				method:   http.MethodPost,
+				pattern:  "/v1/views",
+				handler:  echoHandler,
+				endpoint: endpoint,
+			})
+			_, err := newRouter(authenticated, cfg, c)
+			require.NoErrorf(t, err, "%q is an operation the catalog serves and must be mountable", endpoint)
+		}
 	})
 }
 

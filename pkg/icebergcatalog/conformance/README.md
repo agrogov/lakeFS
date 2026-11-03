@@ -89,6 +89,20 @@ partially configured invocation is a mistake in the command line, not an absent 
 with the names of the missing variables - a suite that skips over a typo reads like a suite that
 passed.
 
+### 1.4 Views
+
+iceberg-go v0.7.0's `catalogtest` has no view subtests: it specifies namespaces, tables and table
+commits only, so this suite's green run says nothing about views. The view surface is covered by
+
+- `pkg/icebergcatalog/views_test.go` - the six operations, the commit (requirements, the eight view
+  update actions, the compare-and-swap), the namespace-emptiness rule, the `catalog:ViewName` filter
+  and the `relative_to` round trip, against the production middleware stack; and
+- `esti/iceberg_views_test.go` - the client-side round trip: PyIceberg 0.12's `create_view`,
+  `load_view`, `list_views`, `view_exists` and `drop_view` against a real `lakefs-sso` on S3, plus a
+  replace over HTTP (`assert-view-uuid` + `add-view-version` + `set-current-view-version` +
+  `set-properties`), the staged metadata entries, a tag read and the drop. That suite is the closest
+  thing to a conformance run for views until the RCK (or a client with view tests) is available.
+
 ## 2. Apache RCK
 
 The RCK is the Java reference suite; it lives in the iceberg checkout under `open-api`, and drives

@@ -140,9 +140,20 @@ func (s *Store) WriteMetadata(ctx context.Context, repositoryID, location string
 	if err != nil {
 		return nil, fmt.Errorf("marshal iceberg metadata for %q: %w", location, err)
 	}
+	if err := s.writeDocument(ctx, repositoryID, location, data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// writeDocument puts one already-serialized metadata document at location through the block
+// adapter. It is the write half WriteMetadata and WriteViewMetadata (views.go) share: both write
+// <location>/metadata/<seq>-<uuid>.metadata.json into the repository's storage namespace with the
+// server's credentials, and neither may exist twice under one name.
+func (s *Store) writeDocument(ctx context.Context, repositoryID, location string, data []byte) error {
 	repo, err := s.catalog.GetRepository(ctx, repositoryID)
 	if err != nil {
-		return nil, fmt.Errorf("resolve repository %q: %w", repositoryID, err)
+		return fmt.Errorf("resolve repository %q: %w", repositoryID, err)
 	}
 	_, err = s.block.Put(ctx, block.ObjectPointer{
 		StorageID:        repo.StorageID,
@@ -151,7 +162,7 @@ func (s *Store) WriteMetadata(ctx context.Context, repositoryID, location string
 		IdentifierType:   block.IdentifierTypeFull,
 	}, int64(len(data)), bytes.NewReader(data), block.PutOpts{})
 	if err != nil {
-		return nil, fmt.Errorf("write iceberg metadata %q: %w", location, err)
+		return fmt.Errorf("write iceberg metadata %q: %w", location, err)
 	}
-	return data, nil
+	return nil
 }

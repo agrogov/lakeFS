@@ -41,6 +41,14 @@ package icebergcatalog
 //     POST /v1/oauth/tokens are not UI management operations and are never authenticated by a
 //     cookie. Those are the operations that change table contents or mint a credential, which is
 //     the larger surface a browser-supplied credential must not reach.
+//     The six view operations (views_http.go) are in that group as well. Two of them happen to
+//     share the shape of a management operation - create a view is POST …/namespaces/{ns}/views
+//     and drop a view is DELETE …/namespaces/{ns}/views/{view} - but neither pattern below names
+//     "views", so both are refused for a cookie and no view write is reachable from a browser
+//     session. That is deliberate: the Tables tab manages tables, a view is not a table, and a
+//     cookie-authenticated create or replace would be exactly the browser-issued catalog write
+//     this exception exists to keep narrow. A UI that manages views would have to add them here,
+//     in a visible change, with the same header requirement.
 //   - GET and HEAD stay open to the cookie without a header, because a read cannot change catalog
 //     state and the UI's own reads (the namespace tree, the table load) are the reason the cookie
 //     scheme exists.

@@ -106,17 +106,29 @@ func (n Namespace) Dotted() string {
 // Address is a parsed catalog address (ICEBERG_CATALOG_PLAN.md §5). Repo is always set. Ref
 // is empty only for the repository-only level of the namespace listing. Namespace is the client
 // namespace (nil when empty); it is empty only for the repository and repository.ref levels that
-// the namespace listing addresses. Table is empty for a namespace address.
+// the namespace listing addresses. Table is empty for a namespace address and for every view
+// address; View is set only by a view address.
 type Address struct {
 	Repo      string
 	Ref       string
 	Namespace Namespace
 	Table     string
+	View      string
 }
 
-// HasTable reports whether the address names a table rather than a namespace.
+// HasTable reports whether the address names a table rather than a namespace or a view.
 func (a Address) HasTable() bool {
 	return a.Table != ""
+}
+
+// HasView reports whether the address names a view rather than a namespace or a table.
+//
+// A view and a table can carry the same name in the same namespace - they live in different
+// directories of the reserved area (store.go ViewPointerPath, tablePointerPath) and the Iceberg
+// spec addresses them by different endpoints - so the two fields are not exclusive by name, only
+// by which endpoint parsed the address.
+func (a Address) HasView() bool {
+	return a.View != ""
 }
 
 // Scope is the part of an address that a relative_to URL fixes (ICEBERG_CATALOG_PLAN.md §5).
@@ -172,7 +184,7 @@ func ParseWarehouse(segment string) (Scope, error) {
 // The first two levels are always the repository and the ref (§5: "Levels 1 and 2 are always
 // repo and ref"); every level after them is a namespace level.
 func ParseNamespace(namespaceParam string) (Address, error) {
-	return parseAddress(Scope{}, namespaceParam, "", false)
+	return parseAddressWith(Scope{}, namespaceParam, "", noName)
 }
 
 // ParseTable parses a table address of the /iceberg/api form
@@ -180,7 +192,15 @@ func ParseNamespace(namespaceParam string) (Address, error) {
 // the namespace parameter to carry repo, ref and at least one namespace level: a table always
 // lives in a namespace, so "repo<sep>ref" is not a table address.
 func ParseTable(namespaceParam, table string) (Address, error) {
-	return parseAddress(Scope{}, namespaceParam, table, true)
+	return parseAddressWith(Scope{}, namespaceParam, table, tableName)
+}
+
+// ParseView parses a view address of the /iceberg/api form
+// (/v1/{prefix}/namespaces/{namespace}/views/{view}). It requires the same shape ParseTable
+// requires - a repository, a ref and at least one namespace level - because a view lives in a
+// namespace exactly as a table does.
+func ParseView(namespaceParam, view string) (Address, error) {
+	return parseAddressWith(Scope{}, namespaceParam, view, viewName)
 }
 
 // ParseRelativeNamespace parses a namespace address of the relative_to forms
@@ -193,14 +213,20 @@ func ParseTable(namespaceParam, table string) (Address, error) {
 //
 // An empty Scope parses the parameter exactly like ParseNamespace.
 func ParseRelativeNamespace(scope Scope, namespaceParam string) (Address, error) {
-	return parseAddress(scope, namespaceParam, "", false)
+	return parseAddressWith(scope, namespaceParam, "", noName)
 }
 
 // ParseRelativeTable is ParseRelativeNamespace for a table address: it additionally requires at
 // least one namespace level below the fixed repo and ref (or below the ref carried by the
 // parameter).
 func ParseRelativeTable(scope Scope, namespaceParam, table string) (Address, error) {
-	return parseAddress(scope, namespaceParam, table, true)
+	return parseAddressWith(scope, namespaceParam, table, tableName)
+}
+
+// ParseRelativeView is ParseRelativeTable for a view address: the same relative_to forms, with the
+// view name where the table name would be.
+func ParseRelativeView(scope Scope, namespaceParam, view string) (Address, error) {
+	return parseAddressWith(scope, namespaceParam, view, viewName)
 }
 
 // DecodeNamespacePath decodes and validates a namespace path parameter that is entirely a
@@ -236,9 +262,23 @@ func DecodeNamespacePathWithSeparator(raw, separator string) (Namespace, error) 
 	return namespace, nil
 }
 
-// parseAddress implements all four Parse* forms. wantTable distinguishes a table address from a
-// namespace address.
-func parseAddress(scope Scope, namespaceParam, table string, wantTable bool) (Address, error) {
+// nameKind is what a parsed address names below its namespace: nothing (a namespace address),
+// a table or a view. It is a type rather than a bool because there are now three cases, and the
+// three differ only in which field of Address is filled and which decoder validates the name.
+type nameKind int
+
+const (
+	// noName is a namespace address: nothing is named below the namespace.
+	noName nameKind = iota
+	// tableName is a table address (/…/tables/{table}).
+	tableName
+	// viewName is a view address (/…/views/{view}).
+	viewName
+)
+
+// parseAddressWith implements all six Parse* forms. kind says what the address names below its
+// namespace, and so whether a name is required and how it is validated.
+func parseAddressWith(scope Scope, namespaceParam, name string, kind nameKind) (Address, error) {
 	if scope.Ref != "" && scope.Repo == "" {
 		return Address{}, fmt.Errorf("%w: a fixed ref requires a fixed repository", ErrInvalidIdentifier)
 	}
@@ -254,7 +294,7 @@ func parseAddress(scope Scope, namespaceParam, table string, wantTable bool) (Ad
 	switch {
 	case scope.Repo == "":
 		// /iceberg/api form: the first two levels are the repository and the ref.
-		if len(levels) == 1 && !wantTable {
+		if len(levels) == 1 && kind == noName {
 			// A repository-only address: the root of the namespace listing.
 			addr.Repo = levels[0]
 			break
@@ -293,19 +333,35 @@ func parseAddress(scope Scope, namespaceParam, table string, wantTable bool) (Ad
 		return Address{}, err
 	}
 
-	if !wantTable {
+	if kind == noName {
 		return addr, nil
 	}
 	if len(addr.Namespace) == 0 {
-		return Address{}, fmt.Errorf("%w: a table address needs a namespace between the ref and the table",
-			ErrInvalidIdentifier)
+		return Address{}, fmt.Errorf("%w: a %s address needs a namespace between the ref and the %s",
+			ErrInvalidIdentifier, kind, kind)
 	}
-	name, err := decodeTableName(table)
+	decoded, err := decodeName(name, kind.String())
 	if err != nil {
 		return Address{}, err
 	}
-	addr.Table = name
+	if kind == viewName {
+		addr.View = decoded
+	} else {
+		addr.Table = decoded
+	}
 	return addr, nil
+}
+
+// String is the noun of a name kind, for messages and for the decoders below.
+func (k nameKind) String() string {
+	switch k {
+	case tableName:
+		return "table"
+	case viewName:
+		return "view"
+	default:
+		return "name"
+	}
 }
 
 // splitPathParam percent-decodes one path parameter and splits it into levels. It accepts the
@@ -436,36 +492,50 @@ func validateRef(ref string) error {
 	return nil
 }
 
-// decodeTableName decodes and validates the table path parameter. Table names are not covered
+// decodeTableName decodes and validates the table path parameter.
+func decodeTableName(raw string) (string, error) {
+	return decodeName(raw, "table")
+}
+
+// decodeViewName decodes and validates the view path parameter. A view name is validated exactly
+// like a table name: both are turned into a key component of the reserved area, so the same rules
+// (no separator, no path separator, no dot-only name, no control character, the same length cap)
+// are what keeps the key unambiguous.
+func decodeViewName(raw string) (string, error) {
+	return decodeName(raw, "view")
+}
+
+// decodeName decodes and validates a table or view path parameter. These names are not covered
 // by the lakeFS namespace rules, so only what this package's addressing needs is rejected: an
 // empty name, a separator, a path separator or a dot-only name, all of which would either split
-// the address or make the _lakefs_iceberg/tables/<ns>/<table> key ambiguous. Control characters
-// are rejected because they cannot appear in a lakeFS key that is also a URI.
-func decodeTableName(raw string) (string, error) {
-	table, err := unescapeSegment(raw)
+// the address or make the _lakefs_iceberg/tables/<ns>/<table> (and views/<ns>/<view>) key
+// ambiguous. Control characters are rejected because they cannot appear in a lakeFS key that is
+// also a URI. noun is "table" or "view" and appears in every message.
+func decodeName(raw, noun string) (string, error) {
+	name, err := unescapeSegment(raw)
 	if err != nil {
 		return "", err
 	}
-	if table == "" {
-		return "", fmt.Errorf("%w: the table name is empty", ErrInvalidIdentifier)
+	if name == "" {
+		return "", fmt.Errorf("%w: the %s name is empty", ErrInvalidIdentifier, noun)
 	}
-	if strings.Contains(table, NamespaceSeparator) {
-		return "", fmt.Errorf("%w: table %q contains a namespace separator", ErrInvalidIdentifier, table)
+	if strings.Contains(name, NamespaceSeparator) {
+		return "", fmt.Errorf("%w: %s %q contains a namespace separator", ErrInvalidIdentifier, noun, name)
 	}
-	if strings.ContainsAny(table, "/\\") {
-		return "", fmt.Errorf("%w: table %q contains a path separator", ErrInvalidIdentifier, table)
+	if strings.ContainsAny(name, "/\\") {
+		return "", fmt.Errorf("%w: %s %q contains a path separator", ErrInvalidIdentifier, noun, name)
 	}
-	if strings.Trim(table, ".") == "" {
-		return "", fmt.Errorf("%w: table %q is reserved", ErrInvalidIdentifier, table)
+	if strings.Trim(name, ".") == "" {
+		return "", fmt.Errorf("%w: %s %q is reserved", ErrInvalidIdentifier, noun, name)
 	}
-	for _, r := range table {
+	for _, r := range name {
 		if r == utf8.RuneError || unicode.IsControl(r) {
-			return "", fmt.Errorf("%w: table %q contains an unsupported character", ErrInvalidIdentifier, table)
+			return "", fmt.Errorf("%w: %s %q contains an unsupported character", ErrInvalidIdentifier, noun, name)
 		}
 	}
-	if n := utf8.RuneCountInString(table); n >= MaxNamespacePathLength {
-		return "", fmt.Errorf("%w: table name is %d characters, the limit is %d",
-			ErrInvalidIdentifier, n, MaxNamespacePathLength-1)
+	if n := utf8.RuneCountInString(name); n >= MaxNamespacePathLength {
+		return "", fmt.Errorf("%w: %s name is %d characters, the limit is %d",
+			ErrInvalidIdentifier, noun, n, MaxNamespacePathLength-1)
 	}
-	return table, nil
+	return name, nil
 }

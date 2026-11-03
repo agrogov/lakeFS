@@ -552,9 +552,11 @@ func TestReservedPrefixDenied(t *testing.T) {
 func TestReservedPrefixDeniedCatalogKeyShapes(t *testing.T) {
 	t.Parallel()
 
-	// The shapes, from the three builders that write the reserved area: the namespace marker, the
-	// table pointer (both at every namespace depth the layout allows) and the staged table file
-	// (whose relative path the builder validates, so <one segment> is the shallowest file entry).
+	// The shapes, from the four builders that write the reserved area: the namespace marker, the
+	// table pointer and the view pointer (all three at every namespace depth the layout allows),
+	// and the staged file (whose relative path the builder validates, so <one segment> is the
+	// shallowest file entry). A view's metadata file is staged under the same files/<uuid>/ area as
+	// a table's, so one builder covers both.
 	type keyShape struct {
 		shape string
 		key   string
@@ -570,6 +572,8 @@ func TestReservedPrefixDeniedCatalogKeyShapes(t *testing.T) {
 		add("namespace marker "+namespace.Dotted(), marker, err)
 		pointer, err := tablePointerPath(Address{Namespace: namespace, Table: "titles"})
 		add("table pointer "+namespace.Dotted(), pointer, err)
+		viewPointer, err := viewPointerPath(Address{Namespace: namespace, View: "orders_view"})
+		add("view pointer "+namespace.Dotted(), viewPointer, err)
 	}
 	tableUUID := uuid.MustParse(storeTestUUID)
 	for _, relative := range []string{
@@ -581,7 +585,7 @@ func TestReservedPrefixDeniedCatalogKeyShapes(t *testing.T) {
 		key, err := TableFilePath(tableUUID, relative)
 		add("staged file "+relative, key, err)
 	}
-	require.Len(t, shapes, 10, "every builder and every depth is listed above")
+	require.Len(t, shapes, 13, "every builder and every depth is listed above")
 
 	// A principal with the widest possible grant: only the deny can refuse these writes.
 	f := newAuthzUser(t, model.Statements{{
@@ -591,7 +595,7 @@ func TestReservedPrefixDeniedCatalogKeyShapes(t *testing.T) {
 	}})
 	f.attach(t, "alice", ReservedPrefixProtectPolicy(gcNow))
 
-	directories := []string{NamespaceDirectory, TablesDirectory, FilesDirectory}
+	directories := []string{NamespaceDirectory, TablesDirectory, ViewsDirectory, FilesDirectory}
 	for _, shape := range shapes {
 		t.Run(shape.shape, func(t *testing.T) {
 			require.True(t, strings.HasPrefix(shape.key, ReservedPrefix+"/"),
@@ -603,7 +607,7 @@ func TestReservedPrefixDeniedCatalogKeyShapes(t *testing.T) {
 			require.GreaterOrEqual(t, len(segments), 3,
 				"%q must have a segment to spare over the two-segment deny", shape.key)
 			require.Contains(t, directories, segments[0],
-				"%q must sit in ns/, tables/ or files/", shape.key)
+				"%q must sit in ns/, tables/, views/ or files/", shape.key)
 			for _, segment := range segments {
 				require.NotEmpty(t, segment, "%q must not have an empty path segment", shape.key)
 			}
@@ -629,6 +633,7 @@ func TestReservedPrefixDeniedCatalogKeyShapes(t *testing.T) {
 		ReservedPrefix + "/foo",
 		ReservedPrefix + "/ns",
 		ReservedPrefix + "/tables",
+		ReservedPrefix + "/views",
 		ReservedPrefix + "/files",
 		ReservedPrefix + "/foo.bin",
 	}
