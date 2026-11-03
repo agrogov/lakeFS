@@ -4,12 +4,58 @@ import (
 	"context"
 	"errors"
 	"strings"
+	stdatomic "sync/atomic"
 	"time"
 
 	"github.com/treeverse/lakefs/pkg/graveler"
 	"github.com/xitongsys/parquet-go/parquet"
 	"github.com/xitongsys/parquet-go/writer"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+// UncommittedGCProtector decides whether a staged object the uncommitted-GC prepare step has just
+// listed must be left out of the report, i.e. must not be offered to the GC job for deletion.
+//
+// key is the object key relative to the repository's storage namespace - the form the report
+// stores as physical_address - lastModified is the staged entry's recorded modification time and
+// now is the clock the decision is taken at.
+//
+// The uncommitted GC has no other extension point: it walks branches, takes each branch's
+// uncommitted diff and writes one row per staged entry. Installations that need to protect part of
+// the namespace from that report (the Iceberg catalog does, see ICEBERG_CATALOG_PLAN.md §6.3 and
+// pkg/icebergcatalog/gc.go) install a protector at startup with SetUncommittedGCProtector; with no
+// protector installed every staged entry is reported, which is the upstream behaviour.
+type UncommittedGCProtector func(key string, lastModified, now time.Time) bool
+
+// uncommittedGCProtector holds the protector installed by SetUncommittedGCProtector. It is read
+// on every staged entry of every prepare run and written once at startup, so it is an atomic
+// pointer rather than a plain variable.
+var uncommittedGCProtector stdatomic.Pointer[UncommittedGCProtector]
+
+// SetUncommittedGCProtector installs protector, or clears it when protector is nil. It is called
+// once at startup by the wrapper binary that owns the protected area; a nil protector keeps the
+// default behaviour of reporting every staged object.
+func SetUncommittedGCProtector(protector UncommittedGCProtector) {
+	if protector == nil {
+		uncommittedGCProtector.Store(nil)
+		return
+	}
+	uncommittedGCProtector.Store(&protector)
+}
+
+// uncommittedGCSkip applies the installed protector to one staged entry. An entry with no
+// modification time is handed over as the zero time, which a protector reads as "age unknown".
+func uncommittedGCSkip(key string, lastModified *timestamppb.Timestamp) bool {
+	protector := uncommittedGCProtector.Load()
+	if protector == nil {
+		return false
+	}
+	var modified time.Time
+	if lastModified != nil {
+		modified = lastModified.AsTime()
+	}
+	return (*protector)(key, modified, time.Now())
+}
 
 func gcWriteUncommitted(ctx context.Context, store Store, repository *graveler.RepositoryRecord, w *UncommittedWriter, mark *GCUncommittedMark, runID string, maxFileSize int64, prepareDuration time.Duration) (*GCUncommittedMark, bool, error) {
 	pw, err := writer.NewParquetWriterFromWriter(w, new(UncommittedParquetObject), gcParquetParallelNum)
@@ -114,6 +160,13 @@ func processBranch(ctx context.Context, store Store, repository *graveler.Reposi
 				continue
 			}
 			entryAddress = entryAddress[len(normalizedStorageNamespace):]
+		}
+
+		// The key is now relative to the storage namespace, which is what an installed protector
+		// expects; a protected entry is left out of the report entirely, so it is neither counted
+		// towards this page nor written to the parquet file the GC job reads.
+		if uncommittedGCSkip(entryAddress, entry.LastModified) {
+			continue
 		}
 
 		count++

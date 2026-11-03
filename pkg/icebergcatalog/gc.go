@@ -103,11 +103,12 @@ const DataPrefix = "_iceberg"
 //     server) is protected rather than collected, so skew never deletes, only delays.
 //
 // The predicate is exported because pkg/catalog cannot import this package (this package imports
-// pkg/catalog, so the dependency back would be a cycle) and PrepareGCUncommitted currently has no
-// extension point to inject a filter. Wiring it is one guarded `continue` in processBranch,
-// immediately after the address has been normalized and before the row is written; per the
-// "narrow, tested predicate, do not change GC's defaults" rule of I3-2 this package ships the
-// predicate and its tests, and the hook in pkg/catalog follows with the GC follow-up task.
+// pkg/catalog, so the dependency back would be a cycle). PrepareGCUncommitted reaches it through
+// catalog.SetUncommittedGCProtector, a narrow extension point of pkg/catalog's prepare step
+// (pkg/catalog/gc_write_uncommitted.go), which Bootstrap (bootstrap.go) installs at startup with
+// UncommittedGCGraceProtector. The prepare step applies it as one guarded `continue` in
+// processBranch, immediately after the address has been normalized and before the row is written,
+// so a protected object never reaches the parquet report the GC job deletes from.
 func UncommittedGCProtected(key string, lastModified, now time.Time, grace time.Duration) bool {
 	if !IsIcebergDataKey(key) {
 		return false
@@ -143,6 +144,20 @@ func IsIcebergDataKey(key string) bool {
 		return true
 	}
 	return strings.HasPrefix(key, DataPrefix+"/")
+}
+
+// UncommittedGCGraceProtector binds UncommittedGCProtected to one grace window, in the shape
+// pkg/catalog's prepare step takes (catalog.UncommittedGCProtector).
+//
+// The function value it returns has no dependency on this package's configuration: Bootstrap reads
+// iceberg.uncommitted_gc_grace once at startup and installs the result, so a prepare run never
+// reads configuration. Passing the value returned here to catalog.SetUncommittedGCProtector is the
+// whole hook of §6.3's grace; with no protector installed (the plain lakefs binary, or a disabled
+// catalog) every staged object keeps being reported, exactly as before.
+func UncommittedGCGraceProtector(grace time.Duration) func(key string, lastModified, now time.Time) bool {
+	return func(key string, lastModified, now time.Time) bool {
+		return UncommittedGCProtected(key, lastModified, now, grace)
+	}
 }
 
 // ReservedPrefixProtectPolicyName is the display name of the installation-wide deny policy that
@@ -225,7 +240,9 @@ var ReservedPrefixProtectDeniedActions = []string{
 // Bootstrap attaches it to the same base groups datasets-pins-protect uses (Admins, Developers,
 // SuperUsers plus datasets.immutable_guard_groups; see pkg/datasets PinsProtectGroups), so it is
 // not attached here: this file only builds the policy, like pkg/datasets/authz.go builds
-// PinsProtectPolicy and leaves the attachment to bootstrap.
+// PinsProtectPolicy and leaves the attachment to bootstrap. bootstrap.go owns that attachment
+// (EnsureReservedPrefixProtectPolicy), and lakefs-sso registers it with
+// cmd.AddExtraRoutesBuilder next to the catalog's own builder.
 func ReservedPrefixProtectPolicy(ts time.Time) *model.Policy {
 	return &model.Policy{
 		CreatedAt:   ts,

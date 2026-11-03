@@ -15,8 +15,16 @@ package icebergcatalog
 // a mock, because the question is not what this package builds but what the Deny-precedence and
 // wildcard machinery of lakeFS does with it. The ARNs are asserted as literals for the same reason:
 // they are the strings a policy author writes by hand.
+//
+// The hook half (Bootstrap, EnsureReservedPrefixProtectPolicy, catalog.SetUncommittedGCProtector)
+// runs against a real *catalog.Catalog from store_test.go's fixture, so "the grace removes the row
+// from the parquet report the GC job reads" is a fact of the code the server runs, not a claim about
+// a mock.
 
 import (
+	"io"
+	"net/url"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -24,7 +32,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/model"
+	"github.com/treeverse/lakefs/pkg/block"
+	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/permissions"
+	"github.com/xitongsys/parquet-go-source/buffer"
+	"github.com/xitongsys/parquet-go/reader"
 )
 
 const (
@@ -260,6 +272,136 @@ func TestUncommittedGcGraceConfig(t *testing.T) {
 	})
 }
 
+// TestUncommittedGcGracePrepareStep covers the hook itself, not the predicate: it runs the real
+// PrepareGCUncommitted of a real catalog over a branch staged the way §6.3 stages table files, and
+// reads the parquet report the GC job deletes from. The three expectations are the contract of the
+// wiring:
+//
+//   - with no protector installed every staged object is reported, so the upstream GC behaviour of
+//     the plain lakefs binary is unchanged;
+//   - with the 24h grace installed a fresh table file is absent from the report while an old one
+//     and an ordinary staged object are still there;
+//   - with the protect-all grace (0) no table file is reported at all.
+//
+// The row's physical_address is the object key relative to the storage namespace - the form the
+// predicate documents and the form processBranch produces - so this test is also the call-site check
+// that the grace is applied to the key it is written for.
+func TestUncommittedGcGracePrepareStep(t *testing.T) {
+	// Not parallel: it installs a process-wide protector in pkg/catalog.
+	f := newStoreFixture(t)
+	namespace := "mem://" + storeTestRepo + "-ns"
+
+	const tableUUID = "6f1c9f2e-0000-4000-8000-000000000001"
+	now := time.Now()
+	staged := []struct {
+		name      string
+		entryPath string
+		objectKey string
+		created   time.Time
+	}{
+		{
+			name:      "fresh table file",
+			entryPath: ReservedPrefix + "/files/" + tableUUID + "/data/part-00000.parquet",
+			objectKey: DataPrefix + "/" + tableUUID + "/data/part-00000.parquet",
+			created:   now.Add(-time.Hour),
+		},
+		{
+			name:      "table file older than the grace",
+			entryPath: ReservedPrefix + "/files/" + tableUUID + "/data/part-00001.parquet",
+			objectKey: DataPrefix + "/" + tableUUID + "/data/part-00001.parquet",
+			created:   now.Add(-gcGrace - time.Hour),
+		},
+		{
+			name:      "ordinary staged object",
+			entryPath: "exports/2025/report.csv",
+			objectKey: "exports/2025/report.csv",
+			created:   now.Add(-time.Hour),
+		},
+	}
+	for _, e := range staged {
+		require.NoErrorf(t, f.catalog.CreateEntry(f.ctx, storeTestRepo, "main", catalog.DBEntry{
+			Path:            e.entryPath,
+			PhysicalAddress: namespace + "/" + e.objectKey,
+			AddressType:     catalog.AddressTypeFull,
+			CreationDate:    e.created,
+		}), "stage %s", e.name)
+	}
+
+	// No protector: the default behaviour of every lakeFS build without the catalog.
+	catalog.SetUncommittedGCProtector(nil)
+	require.ElementsMatch(t, []string{
+		staged[0].objectKey, staged[1].objectKey, staged[2].objectKey,
+	}, prepareUncommittedReport(t, f), "without a protector every staged object is reported")
+
+	// The configured grace, installed exactly as Bootstrap installs it.
+	catalog.SetUncommittedGCProtector(catalog.UncommittedGCProtector(UncommittedGCGraceProtector(gcGrace)))
+	t.Cleanup(func() { catalog.SetUncommittedGCProtector(nil) })
+	require.ElementsMatch(t, []string{
+		staged[1].objectKey, staged[2].objectKey,
+	}, prepareUncommittedReport(t, f),
+		"the fresh table file is skipped, the old one and ordinary data are still reportable")
+
+	// iceberg.uncommitted_gc_grace: 0 - protect every table file, however old.
+	catalog.SetUncommittedGCProtector(catalog.UncommittedGCProtector(
+		UncommittedGCGraceProtector(UncommittedGCGraceProtectAll)))
+	require.ElementsMatch(t, []string{staged[2].objectKey}, prepareUncommittedReport(t, f),
+		"protect-all keeps the whole _iceberg/ area out of the report")
+}
+
+// TestUncommittedGcGraceProtectorAdapter pins the shape of the binder Bootstrap installs: the
+// closure answers exactly what the predicate answers, for the four decisions that matter.
+func TestUncommittedGcGraceProtectorAdapter(t *testing.T) {
+	t.Parallel()
+	protect := UncommittedGCGraceProtector(gcGrace)
+
+	fresh := gcNow.Add(-time.Hour)
+	old := gcNow.Add(-gcGrace - time.Hour)
+	require.True(t, protect("_iceberg/u/data/p.parquet", fresh, gcNow))
+	require.False(t, protect("_iceberg/u/data/p.parquet", old, gcNow))
+	require.False(t, protect("data/p.parquet", fresh, gcNow))
+	require.Equal(t, UncommittedGCProtected("_iceberg/u/data/p.parquet", fresh, gcNow, gcGrace),
+		protect("_iceberg/u/data/p.parquet", fresh, gcNow),
+		"the installed protector and the tested predicate cannot disagree")
+}
+
+// prepareUncommittedReport runs one PrepareGCUncommitted pass over the fixture's repository and
+// returns the physical_address column of the parquet report it produced, sorted.
+func prepareUncommittedReport(t *testing.T, f *storeFixture) []string {
+	t.Helper()
+	info, err := f.catalog.PrepareGCUncommitted(f.ctx, storeTestRepo, nil)
+	require.NoError(t, err, "prepare uncommitted GC")
+	if info.Filename == "" {
+		return nil
+	}
+	location, err := url.JoinPath(info.Location, info.Filename)
+	require.NoError(t, err)
+
+	readerAt, err := f.catalog.BlockAdapter.Get(f.ctx, block.ObjectPointer{
+		Identifier:       location,
+		IdentifierType:   block.IdentifierTypeFull,
+		StorageNamespace: "mem://" + storeTestRepo + "-ns",
+	})
+	require.NoError(t, err, "read the uncommitted GC report")
+	defer func() { _ = readerAt.Close() }()
+	data, err := io.ReadAll(readerAt)
+	require.NoError(t, err)
+
+	bufferFile := buffer.NewBufferFileFromBytes(data)
+	defer func() { _ = bufferFile.Close() }()
+	parquetReader, err := reader.NewParquetReader(bufferFile, new(catalog.UncommittedParquetObject), 1)
+	require.NoError(t, err)
+	defer parquetReader.ReadStop()
+
+	rows := make([]*catalog.UncommittedParquetObject, parquetReader.GetNumRows())
+	require.NoError(t, parquetReader.Read(&rows))
+	addresses := make([]string, 0, len(rows))
+	for _, row := range rows {
+		addresses = append(addresses, row.PhysicalAddress)
+	}
+	sort.Strings(addresses)
+	return addresses
+}
+
 // TestReservedPrefixDenied covers §6.1 and the §12 security test: _lakefs_iceberg/ cannot be
 // written through the fs: object API, the deny does not overreach into ordinary keys, and it does
 // not break the catalog's own §7.2 permission request.
@@ -395,6 +537,103 @@ func TestReservedPrefixDenied(t *testing.T) {
 			Action:   permissions.WriteObjectAction,
 			Resource: permissions.ObjectArn(authzRepo, pointer),
 		}), "a direct write to %q through fs: must be denied", pointer)
+	})
+}
+
+// TestReservedPrefixDeniedBootstrap covers the attachment half of §6.1: the policy built by
+// ReservedPrefixProtectPolicy is created and attached to the installation's non-service groups by
+// EnsureReservedPrefixProtectPolicy, idempotently, and the deny it produces is what refuses a wide
+// fs:* principal. It also pins the group list to pkg/datasets' list, so the two installation-wide
+// denies cannot cover different principals.
+func TestReservedPrefixDeniedBootstrap(t *testing.T) {
+	t.Parallel()
+
+	t.Run("the group list covers both group templates", func(t *testing.T) {
+		t.Parallel()
+		// The expected list is pinned as a literal: it is the non-service group set of
+		// pkg/datasets.PinsProtectGroups, which this package cannot import (pkg/datasets imports it,
+		// see bootstrap.go), and lakefs-sso's main passes that list in. A change on either side that
+		// made the two denies cover different principals is meant to be visible here.
+		groups := ReservedPrefixProtectGroups([]string{"custom-operators", "Admins", ""})
+		require.Equal(t, []string{
+			"Admins", "Supers", "Writers", "Readers", "SuperUsers", "Developers", "Viewers",
+			"custom-operators",
+		}, groups, "base groups of both templates, then the extras, deduplicated, no empty names")
+	})
+
+	t.Run("attaches, is idempotent, repairs a tampered policy, and denies", func(t *testing.T) {
+		t.Parallel()
+		f := newAuthzFixture(t)
+		ctx := t.Context()
+		f.user(t, "alice")
+
+		// The installation runs one of the two group templates; the fixture has one of each kind,
+		// plus a custom guard group, and the missing name must not be fatal.
+		for _, group := range []string{"Admins", "custom-operators"} {
+			_, err := f.svc.CreateGroup(ctx, &model.Group{DisplayName: group, CreatedAt: gcNow})
+			require.NoErrorf(t, err, "create group %s", group)
+		}
+		require.NoError(t, f.svc.AddUserToGroup(ctx, "alice", "Admins"))
+
+		// The wide grant comes from a group policy, so the deny has to be attached to the group too,
+		// and the fixture's user policies must not be what decides this.
+		wide := &model.Policy{DisplayName: "grants", CreatedAt: gcNow, Statement: model.Statements{{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{"fs:*", "catalog:*"},
+			Resource: permissions.All,
+		}}}
+		require.NoError(t, f.svc.WritePolicy(ctx, wide, false))
+		require.NoError(t, f.svc.AttachPolicyToGroup(ctx, wide.DisplayName, "Admins"))
+
+		// A tampered policy must be repaired rather than trusted: the name is predictable, so it can
+		// be pre-created with no statements.
+		require.NoError(t, f.svc.WritePolicy(ctx, &model.Policy{
+			DisplayName: ReservedPrefixProtectPolicyName,
+			CreatedAt:   gcNow,
+			Statement:   model.Statements{},
+		}, false))
+
+		require.NoError(t, EnsureReservedPrefixProtectPolicy(ctx, f.svc, gcNow,
+			[]string{"custom-operators", "missing-group"}))
+
+		stored, err := f.svc.GetPolicy(ctx, ReservedPrefixProtectPolicyName)
+		require.NoError(t, err, "bootstrap creates the deny policy")
+		require.True(t, reservedPrefixProtectStatementsEqual(ReservedPrefixProtectPolicy(gcNow).Statement, stored.Statement),
+			"a pre-created policy with no statements is rewritten to the built-in deny: %+v", stored.Statement)
+
+		for _, group := range []string{"Admins", "custom-operators"} {
+			policies, _, err := f.svc.ListGroupPolicies(ctx, group, &model.PaginationParams{Amount: -1})
+			require.NoError(t, err)
+			names := make([]string, 0, len(policies))
+			for _, policy := range policies {
+				names = append(names, policy.DisplayName)
+			}
+			require.Containsf(t, names, ReservedPrefixProtectPolicyName, "group %s must carry the deny", group)
+		}
+
+		// Idempotent: a second start changes nothing and fails nothing.
+		require.NoError(t, EnsureReservedPrefixProtectPolicy(ctx, f.svc, gcNow.Add(time.Hour), []string{"custom-operators"}))
+		storedAgain, err := f.svc.GetPolicy(ctx, ReservedPrefixProtectPolicyName)
+		require.NoError(t, err)
+		require.True(t, reservedPrefixProtectStatementsEqual(stored.Statement, storedAgain.Statement),
+			"a second bootstrap leaves the policy alone")
+
+		// The point of the attachment: an administrator's fs:* is defeated on the reserved prefix.
+		pointer := ReservedPrefix + "/tables/inventory/books/titles/.pointer"
+		require.True(t, gcDenied(t, f, "alice", permissions.Permission{
+			Action:   permissions.WriteObjectAction,
+			Resource: permissions.ObjectArn("lakehouse", pointer),
+		}), "a member of Admins must not be able to write a catalog key through fs:")
+		require.False(t, gcDenied(t, f, "alice", permissions.Permission{
+			Action:   permissions.WriteObjectAction,
+			Resource: permissions.ObjectArn("lakehouse", "data/part-00000.parquet"),
+		}), "ordinary writes are untouched by the deny")
+	})
+
+	t.Run("no auth service is an error, not a silent skip", func(t *testing.T) {
+		t.Parallel()
+		err := EnsureReservedPrefixProtectPolicy(t.Context(), nil, gcNow, nil)
+		require.ErrorIs(t, err, ErrNoAuthorizer)
 	})
 }
 

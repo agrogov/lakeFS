@@ -10,7 +10,9 @@
 //     policy-based RBAC groups.
 //  5. Mounts the datasets control plane (/api/v1/datasets) and the Apache Iceberg
 //     REST catalog (/iceberg/api, /iceberg/relative_to) by registering extra route
-//     builders, each of which is disabled unless its config section is enabled.
+//     builders, each of which is disabled unless its config section is enabled, and
+//     installs the Iceberg catalog's GC controls (the _lakefs_iceberg/ deny policy and
+//     the uncommitted-GC grace) with a third builder that mounts no route.
 //
 // Merge-friendliness: the upstream cmd/lakefs directory is untouched except for
 // cmd/lakefs/cmd/hooks.go (new file) and 2 lines in cmd/lakefs/cmd/run.go.
@@ -21,6 +23,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/spf13/cobra"
 	lakefsCmd "github.com/treeverse/lakefs/cmd/lakefs/cmd"
 	"github.com/treeverse/lakefs/contrib/auth/acl"
@@ -55,6 +58,15 @@ func main() {
 	// error envelope in either case.
 	lakefsCmd.AddExtraRoutesBuilder(icebergcatalog.RoutesBuilder)
 
+	// Install the two installation-wide controls that do not live on a route, before the first GC
+	// prepare run and the first catalog request: the uncommitted-GC grace over the client-written
+	// _iceberg/ area and the iceberg-reserved-prefix-protect deny policy over _lakefs_iceberg/
+	// (ICEBERG_CATALOG_PLAN.md §6.1, §6.3). The builder mounts nothing and is a no-op while
+	// iceberg.enabled is false, so the plain lakefs binary keeps the upstream GC defaults.
+	lakefsCmd.AddExtraRoutesBuilder(func(ctx context.Context, deps lakefsCmd.ServerDeps, _ *chi.Mux) error {
+		return icebergcatalog.Bootstrap(ctx, deps, guardGroups())
+	})
+
 	lakefsCmd.Execute()
 }
 
@@ -67,6 +79,21 @@ func buildAuthService(ctx context.Context, cfg config.Config, logger logging.Log
 		return datasets.NewImmutabilityAuthService(svc, datasets.NewDatasetRepoSet(kvStore))
 	}
 	return svc
+}
+
+// guardGroups returns the groups that must carry the installation-wide
+// iceberg-reserved-prefix-protect deny policy: the base groups of both group templates plus
+// datasets.immutable_guard_groups, which is the same set datasets-pins-protect covers. The deny
+// keeps a principal that holds fs:* from writing the catalog's own _lakefs_iceberg/ keys through the
+// object API and thereby forging catalog state (ICEBERG_CATALOG_PLAN.md §6.1).
+//
+// It lives here, and not in pkg/icebergcatalog, because pkg/datasets imports that package
+// (materialize.go) and the dependency cannot be reversed.
+func guardGroups() []string {
+	if dcfg, err := datasets.LoadConfig(); err == nil {
+		return datasets.PinsProtectGroups(dcfg.ImmutableGuardGroups)
+	}
+	return datasets.PinsProtectGroups(nil)
 }
 
 // newSSOmigrateCmd returns the "sso-migrate" cobra command that copies the existing
