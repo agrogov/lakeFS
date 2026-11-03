@@ -107,7 +107,7 @@ func signingMainRefResolver() signRefResolver {
 // focus on the URI check and the authorization matrix without materializing metadata.json.
 func newTestSigningService(adapter block.Adapter, authz *Authorizer, location string, refs RefResolver) *remoteSigningService {
 	return &remoteSigningService{
-		locate: func(context.Context, Address) (string, error) {
+		locate: func(context.Context, Address, AuthorizeFunc) (string, error) {
 			return location, nil
 		},
 		authz:   authz,
@@ -357,7 +357,7 @@ func TestRemoteSigning(t *testing.T) {
 		adapter := signingEnabledAdapter()
 		authz := newAuthzUser(t, authzReadStatements())
 		service := &remoteSigningService{
-			locate: func(context.Context, Address) (string, error) {
+			locate: func(context.Context, Address, AuthorizeFunc) (string, error) {
 				return "", &NoSuchTableException{
 					Repo: signTestRepo, Ref: signTestRef,
 					Namespace: Namespace{"inventory", "books"}, Table: signTestTable,

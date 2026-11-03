@@ -206,6 +206,9 @@ func (s *registerService) handleRegisterTable(w http.ResponseWriter, r *http.Req
 		s.writeRegisterError(w, err)
 		return
 	}
+	if !s.requireWritableNamespace(w, addr) {
+		return
+	}
 
 	result, err := s.registerTable(r.Context(), addr, request)
 	if err != nil {

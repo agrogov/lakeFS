@@ -220,8 +220,11 @@ type tableDataScope struct {
 // surface the route table needs - Routes and Enabled - so mounting vending is one entry in
 // server.ownRoutes (http.go).
 type credentialService struct {
-	// scope resolves the table's physical root and location for an address.
-	scope func(ctx context.Context, addr Address) (tableDataScope, error)
+	// scope resolves the table's physical root and location for an address, authorizing the
+	// addresses the table resolver names on the way (resolver.go): the redirect of a virtual table
+	// happens here, so a vended session is scoped to the table the resolver read - the companion
+	// repository's table - while the caller was authorized on the data repository (§5.3).
+	scope func(ctx context.Context, addr Address, authorize AuthorizeFunc) (tableDataScope, error)
 
 	// authz is the §7.2 authorizer.
 	authz *Authorizer
@@ -260,7 +263,7 @@ func NewCredentialService(store *Store, authz *Authorizer, cfg *Config, assumer 
 	var (
 		vending CredentialsVendingConfig
 		adapter block.Adapter
-		scope   func(context.Context, Address) (tableDataScope, error)
+		scope   func(context.Context, Address, AuthorizeFunc) (tableDataScope, error)
 	)
 	if cfg != nil {
 		vending = cfg.CredentialsVending
@@ -392,7 +395,18 @@ func (s *credentialService) Vend(ctx context.Context, caller Caller, req Request
 	if err := s.authz.Authorize(ctx, caller, req); err != nil {
 		return nil, err
 	}
-	scope, err := s.tableScope(ctx, req.Address)
+	// The table is resolved here, after the decision above and through the registered table
+	// resolver (resolver.go): a virtual table is vended from where it actually lives - the
+	// companion repository - while the caller was authorized on the data repository. A different
+	// authorization address is checked inside the resolver, so a redirect can never grant more
+	// than the caller had.
+	scope, err := s.tableScope(ctx, req.Address, func(ctx context.Context, authzAddr Address) error {
+		return s.authz.Authorize(ctx, caller, Request{
+			Op:          req.Op,
+			Address:     authzAddr,
+			RefIsBranch: req.RefIsBranch,
+		})
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -642,34 +656,49 @@ func sanitizeSessionName(name string) string {
 	}, name)
 }
 
-// tableScope resolves the scope of req's table.
-func (s *credentialService) tableScope(ctx context.Context, addr Address) (tableDataScope, error) {
+// tableScope resolves the scope of req's table, authorizing any address the table resolver names
+// on the way.
+func (s *credentialService) tableScope(ctx context.Context, addr Address, authorize AuthorizeFunc) (tableDataScope, error) {
 	if s.scope == nil {
 		return tableDataScope{}, errNoTableScope
 	}
-	return s.scope(ctx, addr)
+	return s.scope(ctx, addr, authorize)
 }
 
 // newTableScopeResolver builds the production table scope resolver out of the catalog store: the
 // table's root is <storage_namespace>/_iceberg/<table-uuid> (§6.3, Q-I5), and the location it is
 // compared with is metadata.json's `location`, the same field remote signing trusts.
-func newTableScopeResolver(store *Store) func(ctx context.Context, addr Address) (tableDataScope, error) {
-	return func(ctx context.Context, addr Address) (tableDataScope, error) {
-		table, err := store.GetTable(ctx, addr)
+//
+// The table is read through the registered table resolver (resolver.go), so a vended session is
+// scoped to the prefix of the table that was actually read - for the Metadata Search virtual table,
+// the table in the companion repository - and the caller needed no access to that repository
+// (§5.3). Authorization of the resolved address, when it differs from the requested one, is the
+// callback's: it runs before the read.
+func newTableScopeResolver(store *Store) func(ctx context.Context, addr Address, authorize AuthorizeFunc) (tableDataScope, error) {
+	return func(ctx context.Context, addr Address, authorize AuthorizeFunc) (tableDataScope, error) {
+		resolved, err := store.ResolveAuthorized(ctx, addr, authorize)
 		if err != nil {
 			return tableDataScope{}, err
 		}
+		table, err := store.GetTable(ctx, resolved.Target)
+		if err != nil {
+			return tableDataScope{}, err
+		}
+		// The root and the repository are those of the table that was read, which is the target of
+		// the resolution and not necessarily the address the client named: a vended session must
+		// cover the files of the table it will read.
+		target := resolved.Target
 		tableUUID, err := uuid.Parse(table.Pointer.TableUUID)
 		if err != nil {
 			return tableDataScope{}, fmt.Errorf("%w: table %q has no usable UUID: %w",
-				ErrInvalidPointer, addr.Table, err)
+				ErrInvalidPointer, target.Table, err)
 		}
 		if table.Metadata == nil {
 			return tableDataScope{}, fmt.Errorf("%w: metadata.json has no location", ErrInvalidPointer)
 		}
-		repo, err := store.catalog.GetRepository(ctx, addr.Repo)
+		repo, err := store.catalog.GetRepository(ctx, target.Repo)
 		if err != nil {
-			return tableDataScope{}, fmt.Errorf("resolve repository %q: %w", addr.Repo, err)
+			return tableDataScope{}, fmt.Errorf("resolve repository %q: %w", target.Repo, err)
 		}
 		root, err := TableRoot(repo.StorageNamespace, tableUUID)
 		if err != nil {

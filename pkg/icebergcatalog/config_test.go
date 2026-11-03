@@ -250,3 +250,57 @@ func TestStoreOptions(t *testing.T) {
 			"a cap of zero would refuse every commit, so it cannot be a setting")
 	})
 }
+
+// TestLoadConfigMetadataSearch pins iceberg.metadata_search.enabled (METADATA_SEARCH_DESIGN.md
+// §5.5): it is off by default, an installation can switch it on from the file or from the
+// environment, and a disabled section leaves Config.MetadataSearchEnabled false - which is what
+// keeps the mount from registering the table resolver (http.go).
+func TestLoadConfigMetadataSearch(t *testing.T) {
+	t.Run("default is off", func(t *testing.T) {
+		useConfig(t, "{}\n")
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.False(t, cfg.MetadataSearch.Enabled, "the catalog hook is off unless it is switched on")
+		require.False(t, cfg.MetadataSearchEnabled())
+	})
+
+	t.Run("enabled from the file", func(t *testing.T) {
+		useConfig(t, "iceberg:\n  enabled: true\n  metadata_search:\n    enabled: true\n")
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.True(t, cfg.MetadataSearch.Enabled)
+		require.True(t, cfg.MetadataSearchEnabled())
+	})
+
+	t.Run("an explicit false is off", func(t *testing.T) {
+		useConfig(t, "iceberg:\n  metadata_search:\n    enabled: false\n")
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.False(t, cfg.MetadataSearchEnabled())
+	})
+
+	t.Run("enabled from the environment", func(t *testing.T) {
+		useConfig(t, "iceberg:\n  enabled: true\n")
+		t.Setenv("LAKEFS_ICEBERG_METADATA_SEARCH_ENABLED", "true")
+		viper.SetEnvPrefix("LAKEFS")
+		viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+		viper.AutomaticEnv()
+
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.True(t, cfg.MetadataSearchEnabled(), "a per-key environment variable must reach the section")
+	})
+
+	t.Run("a nil config is disabled", func(t *testing.T) {
+		require.False(t, (*Config)(nil).MetadataSearchEnabled())
+	})
+
+	t.Run("the section is absorbed by the core configuration", func(t *testing.T) {
+		useConfig(t, "iceberg:\n  metadata_search:\n    enabled: true\n")
+		c := &config.ConfigImpl{}
+		require.NoError(t, config.Unmarshal(c), "iceberg.metadata_search must not fail UnmarshalExact")
+		section, ok := c.Iceberg["metadata_search"]
+		require.True(t, ok, "the nested section is kept verbatim in the absorbed map")
+		require.Equal(t, map[string]any{"enabled": true}, section)
+	})
+}

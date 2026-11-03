@@ -217,6 +217,10 @@ type Store struct {
 	catalog Catalog
 	block   block.Adapter
 
+	// resolver is the registered table-resolution hook (resolver.go). It is nil by default, which
+	// is what makes every read of a catalog without the hook exactly the read it always was.
+	resolver TableResolver
+
 	// maxStagedFiles is the cap on the number of table-file entries one commit may stage, i.e.
 	// iceberg.max_staged_files (§10). It is enforced by StageTableFiles before anything is
 	// written, and it is a Store field rather than a parameter of Commit because the commit body
@@ -238,6 +242,22 @@ func WithMaxStagedFiles(maxFiles int) StoreOption {
 	return func(s *Store) {
 		if maxFiles > 0 {
 			s.maxStagedFiles = maxFiles
+		}
+	}
+}
+
+// WithTableResolver registers the table-resolution hook (resolver.go, METADATA_SEARCH_DESIGN.md
+// §5.1). The hook is what makes a virtual table such as the Metadata Search table of §5.2
+// addressable, and it is off by default: without this option every catalog read is exactly the
+// read it was before the hook existed.
+//
+// The mount registers it only while the feature that owns the resolver is enabled
+// (iceberg.metadata_search.enabled, §5.5); a nil resolver is ignored, so a caller that has no
+// resolver to register cannot accidentally clear one.
+func WithTableResolver(resolver TableResolver) StoreOption {
+	return func(s *Store) {
+		if resolver != nil {
+			s.resolver = resolver
 		}
 	}
 }

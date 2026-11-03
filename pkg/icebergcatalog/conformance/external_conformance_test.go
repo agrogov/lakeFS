@@ -36,6 +36,7 @@ import (
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/catalogtest"
+	"github.com/apache/iceberg-go/table"
 
 	// Blank import: catalog.Load resolves "type": "rest" through the catalog registry, and
 	// catalog/rest is what registers "rest" (and the http/https aliases) in its init. Without this
@@ -169,4 +170,95 @@ func catalogEnv(t *testing.T) (uri, credential, warehouse string) {
 	}
 
 	return uri, credential, warehouse
+}
+
+// CatalogMetadataSearchEnv switches on the Metadata Search conformance check and names nothing by
+// itself: the data repository is the one the warehouse already names. Any non-empty value enables
+// the test, because the only thing it can be is a statement that the installation under test has
+// Metadata Search enabled AND indexed the warehouse's repository.
+const CatalogMetadataSearchEnv = "REST_CATALOG_METADATA_SEARCH"
+
+// TestExternalMetadataSearchVirtualTable is the external half of METADATA_SEARCH_DESIGN.md §5.2-5.4:
+// the suite catalogtest cannot reach, because a virtual table is a lakeFS extension rather than a
+// REST operation every catalog has.
+//
+// It runs the same client catalogtest does, over the same relative_to URI, and asserts the three
+// things a client sees: the data repository's ref lists the `system` namespace, that namespace
+// lists `object_metadata`, and the table loads. The catalog resolves all three out of the
+// companion repository (<repo>-metadata), which the client never names and needs no access to
+// (§5.3) - the credential used here is the one the rest of the suite uses.
+//
+// It is skipped unless REST_CATALOG_METADATA_SEARCH is set, since a catalog without the feature
+// answers 404 for all three and an installation only has the table after the indexer ran. README.md
+// has the invocation.
+func TestExternalMetadataSearchVirtualTable(t *testing.T) {
+	uri, credential, warehouse := catalogEnv(t)
+	if strings.TrimSpace(os.Getenv(CatalogMetadataSearchEnv)) == "" {
+		t.Skipf("set %s to run the Metadata Search virtual-table check against a catalog with lakefs.metadata_search.enabled and an indexed warehouse; see README.md",
+			CatalogMetadataSearchEnv)
+	}
+
+	ctx := context.Background()
+	cat, err := catalog.Load(ctx, catalogName, iceberg.Properties{
+		"type":       "rest",
+		"uri":        uri,
+		"credential": credential,
+		"warehouse":  warehouse,
+	})
+	if err != nil {
+		t.Fatalf("load the REST catalog at %s: %v", uri, err)
+	}
+	if closer, ok := cat.(catalog.Closer); ok {
+		t.Cleanup(func() { _ = closer.Close() })
+	}
+
+	// §5.4: the data repository's ref lists the reserved namespace.
+	namespaces, err := cat.ListNamespaces(ctx, nil)
+	if err != nil {
+		t.Fatalf("list namespaces of %s: %v", warehouse, err)
+	}
+	var hasSystem bool
+	for _, namespace := range namespaces {
+		if len(namespace) == 1 && namespace[0] == "system" {
+			hasSystem = true
+		}
+	}
+	if !hasSystem {
+		t.Fatalf("the warehouse %s does not list the Metadata Search namespace %q: %v (is iceberg.metadata_search.enabled set, and has the indexer run?)",
+			warehouse, "system", namespaces)
+	}
+
+	// §5.4: the namespace lists the virtual table, although no pointer entry exists for it.
+	var tables []table.Identifier
+	for identifier, err := range cat.ListTables(ctx, table.Identifier{"system"}) {
+		if err != nil {
+			t.Fatalf("list tables of system in %s: %v", warehouse, err)
+		}
+		tables = append(tables, identifier)
+	}
+	var hasObjectMetadata bool
+	for _, identifier := range tables {
+		if len(identifier) > 0 && identifier[len(identifier)-1] == "object_metadata" {
+			hasObjectMetadata = true
+		}
+	}
+	if !hasObjectMetadata {
+		t.Fatalf("the namespace %q of %s does not list %q: %v", "system", warehouse, "object_metadata", tables)
+	}
+
+	// §5.2/§5.3: the load resolves the table out of the companion repository with the same
+	// credential, which has no grant on that repository.
+	loaded, err := cat.LoadTable(ctx, table.Identifier{"system", "object_metadata"})
+	if err != nil {
+		t.Fatalf("load system.object_metadata of %s: %v", warehouse, err)
+	}
+	if loaded.Location() == "" {
+		t.Fatal("the loaded table has no location: the response is not a table metadata document")
+	}
+	if loaded.Schema() == nil || len(loaded.Schema().Fields()) == 0 {
+		t.Fatalf("the loaded table has no schema: %+v", loaded.Schema())
+	}
+	if loaded.MetadataLocation() == "" {
+		t.Fatal("the loaded table has no metadata-location")
+	}
 }

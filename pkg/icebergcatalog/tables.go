@@ -464,6 +464,11 @@ func (s *tableService) handleListTables(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, err)
 		return
 	}
+	// A resolver may own tables that have no pointer entry at all (resolver.go, §5.4): they are
+	// added to the walk's answer before the emptiness check below and before the per-table
+	// authorization filter, so a virtual table is listed - and authorized - exactly like a walked
+	// one. Nothing is added while no resolver is registered.
+	names = mergeListings(names, s.store.VirtualTables(addr))
 
 	// A namespace that has no table and no marker does not exist: the spec's listTables answers
 	// 404 NoSuchNamespaceException for it. A namespace with markers of its own but no table is an
@@ -615,6 +620,9 @@ func (s *tableService) handleCreateTable(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, err)
 		return
 	}
+	if !s.requireWritableNamespace(w, addr) {
+		return
+	}
 
 	result, err := s.createTable(r.Context(), addr, request)
 	if err != nil {
@@ -726,6 +734,9 @@ func (s *tableService) handleDropTable(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !s.requireWritableNamespace(w, addr) {
+		return
+	}
 	if err := s.dropTable(r.Context(), addr); err != nil {
 		s.writeError(w, err)
 		return
@@ -820,11 +831,11 @@ func tableUUIDOfPointer(pointerPath string, entry *catalog.DBEntry) (uuid.UUID, 
 // not model, or does not model yet, is still accepted: refusing it would fail a request whose only
 // possible outcome is that both sides lose the data (file comment).
 func (s *tableService) handleReportMetrics(w http.ResponseWriter, r *http.Request) {
-	addr, ok := s.authorizeTableWrite(w, r, OpUpdateTable)
+	target, ok := s.authorizeTableRead(w, r, OpUpdateTable)
 	if !ok {
 		return
 	}
-	if _, err := s.requireTablePointer(r.Context(), addr); err != nil {
+	if _, err := s.requireTablePointer(r.Context(), target); err != nil {
 		s.writeError(w, err)
 		return
 	}
@@ -872,10 +883,14 @@ func (s *tableService) requireTableEntry(ctx context.Context, addr Address) (str
 	return pointerPath, entry, nil
 }
 
-// authorizeTableWrite parses and authorizes the table address of a write endpoint of this file that
-// carries no body: drop and report metrics. It is the write counterpart of authorizeTable, and it
-// writes the error itself when a step fails so the two verbs cannot diverge on what they accept or
+// authorizeTableWrite parses and authorizes the table address of a write endpoint that addresses the
+// table it writes: the drop and the commit. It is the write counterpart of authorizeTable, and it
+// writes the error itself when a step fails so the write verbs cannot diverge on what they accept or
 // who may ask.
+//
+// A write never resolves: a table resolver redirects reads (resolver.go), and the virtual address a
+// resolver owns is read-only on a data repository, so writing to it is refused by
+// requireWritableNamespace before anything is staged.
 //
 // The ref is resolved before the decision so that Request.RefIsBranch is truthful (Q-I4); a ref that
 // is not a branch makes Authorizer answer the read-only 403, and a caller without the action gets
@@ -930,32 +945,96 @@ func (s *tableService) isBranchRef(ctx context.Context, addr Address) (bool, err
 	}
 }
 
+// requireWritableNamespace refuses a catalog write into a namespace a table resolver reserves on a
+// data repository (resolver.go, METADATA_SEARCH_DESIGN.md §5.4): on a Metadata Search installation
+// the system namespace of a data repository belongs to the virtual table, so a client cannot create,
+// commit, register, drop or rename anything in it - 403 ForbiddenException. In <repo>-metadata the
+// same namespace is ordinary, which is where the indexer writes.
+//
+// It runs after the permission decision: a caller who may not write the repository gets its
+// permission refusal, not a description of a namespace it could not reach anyway. Nothing is
+// refused while no resolver is registered.
+//
+// Every catalog write that reaches a handler calls it - create, commit, register, drop, the view
+// writes and the namespace writes. Rename is on the same list in §5.4 and needs no check here: this
+// catalog serves no rename operation at all (it is a v1 non-goal and http.go refuses to advertise
+// one), so a rename request is answered as the unknown endpoint it is rather than by a handler.
+func (s *tableService) requireWritableNamespace(w http.ResponseWriter, addr Address) bool {
+	if err := s.store.RequireWritableNamespace(addr); err != nil {
+		s.writeError(w, err)
+		return false
+	}
+	return true
+}
+
 // authorizeTable parses, authorizes and resolves the table address of GET and HEAD, writing the
 // error itself when a step fails. The two verbs share it so they cannot diverge on what they
 // accept, who may ask, or what "exists" means.
 func (s *tableService) authorizeTable(w http.ResponseWriter, r *http.Request) (*Table, bool) {
-	if !s.checkPrefix(w, r) {
-		return nil, false
-	}
-	addr, err := ParseTable(chi.URLParam(r, "namespace"), chi.URLParam(r, "table"))
-	if err != nil {
-		s.writeError(w, err)
-		return nil, false
-	}
-	caller, ok := s.caller(w, r)
+	target, ok := s.authorizeTableRead(w, r, OpReadTable)
 	if !ok {
 		return nil, false
 	}
-	if err := s.authz.Authorize(r.Context(), caller, Request{Op: OpReadTable, Address: addr}); err != nil {
-		s.writeError(w, err)
-		return nil, false
-	}
-	table, err := s.store.GetTable(r.Context(), addr)
+	table, err := s.store.GetTable(r.Context(), target)
 	if err != nil {
 		s.writeError(w, err)
 		return nil, false
 	}
 	return table, true
+}
+
+// authorizeTableRead parses and authorizes the table address of a request that only reads, and
+// resolves it through the registered table resolver (resolver.go): the load, the head and the
+// metrics report answer about the table the resolver names, not necessarily the one the caller
+// named.
+//
+// The order is the one every read path has always had - authorize first, resolve second - so a
+// caller without the action cannot learn anything from a resolution, not even whether the
+// companion repository of a virtual table exists (§12). When the resolver answers with a different
+// authorization address, that address is authorized too (Store.ResolveAuthorized); the built-in
+// virtual table answers the data repository the caller named, so a Metadata Search read is one
+// catalog:ReadTable check on it and nothing on <repo>-metadata (§5.3).
+//
+// op is OpReadTable for GET and HEAD and OpUpdateTable for the metrics report, whose §7.2 row is the
+// write row even though it stores nothing; the Q-I4 branch rule of a write operation is enforced
+// here like it is on every write.
+func (s *tableService) authorizeTableRead(w http.ResponseWriter, r *http.Request, op Operation) (Address, bool) {
+	if !s.checkPrefix(w, r) {
+		return Address{}, false
+	}
+	addr, err := ParseTable(chi.URLParam(r, "namespace"), chi.URLParam(r, "table"))
+	if err != nil {
+		s.writeError(w, err)
+		return Address{}, false
+	}
+	caller, ok := s.caller(w, r)
+	if !ok {
+		return Address{}, false
+	}
+	refIsBranch := true
+	if op.IsWrite() {
+		refIsBranch, err = s.isBranchRef(r.Context(), addr)
+		if err != nil {
+			s.writeError(w, err)
+			return Address{}, false
+		}
+	}
+	if err := s.authz.Authorize(r.Context(), caller, Request{
+		Op:          op,
+		Address:     addr,
+		RefIsBranch: refIsBranch,
+	}); err != nil {
+		s.writeError(w, err)
+		return Address{}, false
+	}
+	resolved, err := s.store.ResolveAuthorized(r.Context(), addr, func(ctx context.Context, authzAddr Address) error {
+		return s.authz.Authorize(ctx, caller, Request{Op: op, Address: authzAddr, RefIsBranch: refIsBranch})
+	})
+	if err != nil {
+		s.writeError(w, err)
+		return Address{}, false
+	}
+	return resolved.Target, true
 }
 
 // namespaceAddress parses and validates the namespace path parameter of a listing. Listing tables
@@ -1238,6 +1317,7 @@ func (s *tableService) writeError(w http.ResponseWriter, err error) {
 	var (
 		denied       *PermissionDeniedError
 		readOnly     *ReadOnlyRefError
+		reserved     *ReservedNamespaceError
 		authzFailure *AuthorizationError
 		noTable      *NoSuchTableException
 		noNamespace  *NoSuchNamespaceException
@@ -1252,6 +1332,10 @@ func (s *tableService) writeError(w http.ResponseWriter, err error) {
 		writeIcebergError(w, http.StatusConflict, ErrTypeAlreadyExists, err.Error())
 	case errors.As(err, &readOnly):
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, readOnly.Message())
+	case errors.As(err, &reserved):
+		// A write into a namespace a table resolver owns (resolver.go, §5.4): the caller may write
+		// the repository, just not the namespace the catalog serves from it.
+		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, reserved.Error())
 	case errors.As(err, &denied):
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, denied.Error())
 	case errors.As(err, &authzFailure):

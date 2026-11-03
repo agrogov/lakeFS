@@ -487,6 +487,9 @@ func (n *namespaceService) handleCreateNamespace(w http.ResponseWriter, r *http.
 	if !n.authorizeWrite(w, r, OpCreateNamespace, addr) {
 		return
 	}
+	if !n.requireWritableNamespace(w, addr) {
+		return
+	}
 	if err := n.store.CreateNamespace(r.Context(), addr, body.Properties); err != nil {
 		n.writeError(w, err)
 		return
@@ -525,6 +528,9 @@ func (n *namespaceService) handleUpdateNamespaceProperties(w http.ResponseWriter
 	// Authorize before the body is decoded: the address is entirely in the path, so the caller's
 	// grant (and the Q-I4 branch rule) can be decided without touching the request body.
 	if !n.authorizeWrite(w, r, OpUpdateNamespace, addr) {
+		return
+	}
+	if !n.requireWritableNamespace(w, addr) {
 		return
 	}
 	var body updateNamespacePropertiesRequest
@@ -607,6 +613,9 @@ func (n *namespaceService) handleDeleteNamespace(w http.ResponseWriter, r *http.
 		return
 	}
 	if !n.authorizeWrite(w, r, OpDeleteNamespace, addr) {
+		return
+	}
+	if !n.requireWritableNamespace(w, addr) {
 		return
 	}
 	ctx := r.Context()
@@ -706,6 +715,22 @@ func (n *namespaceService) authorizeWrite(w http.ResponseWriter, r *http.Request
 			n.writeError(w, &NoSuchWarehouseException{Repo: addr.Repo, Ref: addr.Ref})
 			return false
 		}
+		n.writeError(w, err)
+		return false
+	}
+	return true
+}
+
+// requireWritableNamespace refuses a namespace write into a namespace a table resolver reserves on
+// a data repository (resolver.go, METADATA_SEARCH_DESIGN.md §5.4). It is the namespace endpoint's
+// use of the same rule the table and view writes apply: create, update-properties and drop under a
+// reserved namespace are 403 ForbiddenException, and in <repo>-metadata the namespace is ordinary.
+// Nothing is refused while no resolver is registered.
+//
+// It runs after the permission decision, so an unauthorized caller gets its permission refusal
+// rather than a description of a namespace it could not reach anyway.
+func (n *namespaceService) requireWritableNamespace(w http.ResponseWriter, addr Address) bool {
+	if err := n.store.RequireWritableNamespace(addr); err != nil {
 		n.writeError(w, err)
 		return false
 	}
@@ -959,6 +984,11 @@ func (n *namespaceService) listChildNamespaces(ctx context.Context, caller Calle
 		}
 		namespaces = append(namespaces, fullNamespace(parent, child))
 	}
+	// A resolver may own child namespaces that have no marker (resolver.go, §5.4): the system
+	// namespace of a Metadata Search data repository is one, and it is listed only while the
+	// resolver that declares it is registered. The order of the listing is by name, so the added
+	// levels are merged into it rather than appended after it.
+	namespaces = withVirtualNamespaces(parent, namespaces, n.store.VirtualNamespaces(parent))
 	return namespaces, nil
 }
 
@@ -1052,6 +1082,23 @@ func childNamespace(parent Namespace, entryPath string) (string, error) {
 	return child, nil
 }
 
+// withVirtualNamespaces merges the child namespaces a resolver adds into the child namespaces a
+// listing discovered, keeping the listing in name order (resolver.go, §5.4). With nothing to add
+// the discovered namespaces are returned as they are, so a listing of a catalog without a resolver
+// is unchanged.
+func withVirtualNamespaces(parent Address, discovered []Namespace, virtual []string) []Namespace {
+	if len(virtual) == 0 {
+		return discovered
+	}
+	merged := make([]Namespace, 0, len(discovered)+len(virtual))
+	merged = append(merged, discovered...)
+	for _, name := range virtual {
+		merged = append(merged, fullNamespace(parent, name))
+	}
+	sort.SliceStable(merged, func(i, j int) bool { return merged[i].Dotted() < merged[j].Dotted() })
+	return merged
+}
+
 // fullNamespace returns the full namespace path of addr plus one optional child level, in the
 // shape of the spec's Namespace type: the repository and ref macro levels first, then the real
 // namespace levels.
@@ -1102,6 +1149,7 @@ func (n *namespaceService) writeError(w http.ResponseWriter, err error) {
 	var (
 		denied       *PermissionDeniedError
 		readOnly     *ReadOnlyRefError
+		reserved     *ReservedNamespaceError
 		authzFailure *AuthorizationError
 		noNamespace  *NoSuchNamespaceException
 		noWarehouse  *NoSuchWarehouseException
@@ -1112,6 +1160,9 @@ func (n *namespaceService) writeError(w http.ResponseWriter, err error) {
 		writeIcebergError(w, http.StatusBadRequest, ErrTypeBadRequest, err.Error())
 	case errors.As(err, &readOnly):
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, readOnly.Message())
+	case errors.As(err, &reserved):
+		// A write into a namespace a table resolver owns (resolver.go, §5.4).
+		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, reserved.Error())
 	case errors.As(err, &denied):
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, denied.Error())
 	case errors.As(err, &authzFailure):

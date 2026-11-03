@@ -41,11 +41,14 @@ iceberg:
   uncommitted_gc_grace: 24h        # see "Garbage collection"
   max_staged_files: 50000          # cap on the table files one commit may stage; see "Garbage collection"
   ignore_compaction_commits: true   # auto-resolve compaction-only conflicts at merge; see "Merge"
+  metadata_search:
+    enabled: false                  # serve <repo>.<ref>.system.object_metadata; see "Metadata Search"
 ```
 
 Every key also has an environment variable (`LAKEFS_ICEBERG_ENABLED`, `LAKEFS_ICEBERG_TOKEN_TTL`,
 `LAKEFS_ICEBERG_MAX_REQUEST_BODY`, `LAKEFS_ICEBERG_UNCOMMITTED_GC_GRACE`,
-`LAKEFS_ICEBERG_MAX_STAGED_FILES`, `LAKEFS_ICEBERG_IGNORE_COMPACTION_COMMITS`). An invalid `iceberg:`
+`LAKEFS_ICEBERG_MAX_STAGED_FILES`, `LAKEFS_ICEBERG_IGNORE_COMPACTION_COMMITS`,
+`LAKEFS_ICEBERG_METADATA_SEARCH_ENABLED`). An invalid `iceberg:`
 section fails startup: a prefix other than `lakefs`, a non-positive `token_ttl`, a negative
 `max_request_body`, a negative `uncommitted_gc_grace` or a negative `max_staged_files` are all
 configuration errors rather than settings that silently do nothing. The
@@ -313,6 +316,85 @@ never orphan a view pointer. Views of descendant namespaces count too, exactly a
 The **web UI is not required**: the repository Tables tab lists namespaces and tables, and views are
 managed by an Iceberg client through the REST API. Reading them from the UI is not a prerequisite for
 creating or replacing them, and no UI surface has to be present for a catalog client to use views.
+
+## Metadata Search
+
+Metadata Search makes a repository's object metadata queryable with any Iceberg engine: path, size,
+last modified, etag, content type, committer and user metadata, across the commits of a branch. It is
+off by default and, like the rest of the catalog, it is a server setting rather than a client one.
+
+```
+iceberg:
+  enabled: true
+  metadata_search:
+    enabled: true
+```
+
+The catalog half of the feature is a **virtual table** in the reserved `system` namespace of every
+data repository:
+
+```
+<repo>.<ref>.system.object_metadata
+```
+
+That identifier resolves to the real table `system.object_metadata` of the companion repository
+`<repo>-metadata`, on the branch of the same name. The companion repository is an ordinary lakeFS
+repository: it is created and indexed by the Metadata Search indexer, its branches mirror the branches
+of the data repository, and it holds one Iceberg table whose rows are replaced as the data repository
+changes. The catalog only resolves the read; nothing is written through the virtual table.
+
+```python
+# PyIceberg, the relative_to form: the URL fixes the repository and the branch.
+catalog.load_table("system.object_metadata").scan().to_pandas()
+
+# The /iceberg/api form names all four components.
+catalog.load_table("my-repo.main.system.object_metadata")
+```
+
+### Refs
+
+| Ref you ask about | Where the table is read |
+|---|---|
+| a branch of `<repo>` | branch of the **same name** in `<repo>-metadata` |
+| a tag or a commit of `<repo>` | the ref the indexer's ref mapper names for that source commit, as recorded in the snapshot summaries (`lakefs.mds.source-commit`) |
+
+A tag or a commit is not a branch, so there is no mirrored branch to read. Until the indexer
+registers its ref mapper, such a request answers `404 NoSuchTableException` rather than guessing the
+table of a branch the ref does not name. Existence checks (`HEAD`) follow the same rule.
+
+### Authorization
+
+A read of the virtual table is authorized with **one** `catalog:ReadTable` (and, for vended
+credentials or remote signing, one `catalog:ReadTableData`) check on the **data** repository, on
+`<repo>.<ref>.system.object_metadata`. The read of `<repo>-metadata` then runs with the server's own
+identity, and the caller needs no permission on that repository at all. A caller who may read
+`<repo>` can therefore search its metadata.
+
+That permission covers the metadata of **all objects on all refs** of the repository: `catalog:`
+ARNs are branch-agnostic and address the table, so a policy that narrows another table, a namespace or
+an object path does not narrow this one. Grant it deliberately.
+
+The `system` namespace of a data repository is read-only for clients: while Metadata Search is
+enabled, `create table`, `commit`, `register`, `drop table`, `create/replace/drop view`, `create
+namespace`, `update namespace properties` and `drop namespace` under `system` answer `403
+ForbiddenException`, and `GET`/`HEAD` of the namespace itself is `404` (it has no marker — it is
+virtual). Namespace and table **listings** do show it: `ListNamespaces` on a data repository reports
+`system`, and `ListTables` in it reports `object_metadata`, subject to the usual `catalog:*` filter.
+In `<repo>-metadata` itself `system` is an ordinary namespace, which is where the indexer writes.
+`rename` is on the same list of refusals (§5.4) but needs no special case: this catalog serves no
+rename operation at all, so a rename request is the unknown endpoint it always was.
+
+### What it is not
+
+- It is not an indexer: the catalog serves the virtual table, it does not write it. A repository
+  whose `<repo>-metadata` was never indexed answers `404 NoSuchTableException` for the virtual table,
+  and a query is only as fresh as the last indexed commit — the feature is eventually consistent by
+  design.
+- It is not a query service: there is no SQL endpoint and no UI tab in OSS. Queries run in the
+  engine that connects to the catalog (PyIceberg, Spark, Trino, DuckDB).
+- It does not change anything when it is off. With `metadata_search.enabled: false` (the default) no
+  address resolves anywhere but to itself, no namespace is reserved, and no listing has extra
+  entries — exactly the catalog of a release without the feature.
 
 ## Access
 
@@ -785,6 +867,8 @@ iceberg:
   uncommitted_gc_grace: 24h         # 0 protects every _iceberg/ object regardless of age
   max_staged_files: 50000           # cap on the table files one commit may stage
   ignore_compaction_commits: true    # auto-resolve compaction-only conflicts at merge (see "Merge")
+  metadata_search:
+    enabled: false                  # serve the virtual table of "Metadata Search" (default false)
 
 blockstore:
   s3:

@@ -375,6 +375,9 @@ func (s *viewService) handleCreateView(w http.ResponseWriter, r *http.Request) {
 		s.writeViewError(w, err)
 		return
 	}
+	if !s.requireWritableNamespace(w, addr) {
+		return
+	}
 
 	result, err := s.createView(r.Context(), addr, request)
 	if err != nil {
@@ -460,6 +463,9 @@ func (s *viewService) handleReplaceView(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	if !s.requireWritableNamespace(w, addr) {
+		return
+	}
 	body, ok := s.readCommitBody(w, r)
 	if !ok {
 		return
@@ -508,6 +514,9 @@ func decodeViewCommitRequest(body []byte) (ViewCommitRequest, error) {
 func (s *viewService) handleDropView(w http.ResponseWriter, r *http.Request) {
 	addr, ok := s.authorizeViewWrite(w, r, OpDeleteView)
 	if !ok {
+		return
+	}
+	if !s.requireWritableNamespace(w, addr) {
 		return
 	}
 	if err := s.dropView(r.Context(), addr); err != nil {

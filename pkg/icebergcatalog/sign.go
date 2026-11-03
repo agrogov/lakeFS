@@ -163,8 +163,11 @@ type RefResolver interface {
 // the future route-table change needs: Routes, TableConfig and Enabled. Tests in this package
 // build it directly with a fixed table location and a fake block adapter.
 type remoteSigningService struct {
-	// locate resolves the current table location (metadata.json's `location`) for an address.
-	locate func(ctx context.Context, addr Address) (string, error)
+	// locate resolves the current table location (metadata.json's `location`) for an address,
+	// authorizing the addresses the table resolver names on the way (resolver.go): a virtual table
+	// is signed from where it actually lives - the companion repository - while the caller was
+	// authorized on the data repository (§5.3).
+	locate func(ctx context.Context, addr Address, authorize AuthorizeFunc) (string, error)
 
 	// authz is the §7.2 authorizer.
 	authz *Authorizer
@@ -188,10 +191,14 @@ type remoteSigningService struct {
 // blockstore that signs; when it is nil the store's own adapter is used. cfg supplies the prefix
 // (an empty configuration falls back to CatalogPrefix, like server.prefix in http.go).
 func NewRemoteSigningService(store *Store, authz *Authorizer, adapter block.Adapter, refs RefResolver, cfg *Config) *remoteSigningService {
-	var locate func(ctx context.Context, addr Address) (string, error)
+	var locate func(ctx context.Context, addr Address, authorize AuthorizeFunc) (string, error)
 	if store != nil {
-		locate = func(ctx context.Context, addr Address) (string, error) {
-			table, err := store.GetTable(ctx, addr)
+		locate = func(ctx context.Context, addr Address, authorize AuthorizeFunc) (string, error) {
+			resolved, err := store.ResolveAuthorized(ctx, addr, authorize)
+			if err != nil {
+				return "", err
+			}
+			table, err := store.GetTable(ctx, resolved.Target)
 			if err != nil {
 				return "", err
 			}
@@ -359,7 +366,12 @@ func (s *remoteSigningService) handleSign(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	location, err := s.tableLocation(r.Context(), addr)
+	// The location is the one of the table the resolver reads (resolver.go), not necessarily the
+	// one of the address the caller named; the signature is therefore scoped to the files of the
+	// table that will actually be read.
+	location, err := s.tableLocation(r.Context(), addr, func(ctx context.Context, authzAddr Address) error {
+		return s.authz.Authorize(ctx, caller, Request{Op: op, Address: authzAddr, RefIsBranch: refIsBranch})
+	})
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -453,12 +465,13 @@ func (s *remoteSigningService) refIsBranch(ctx context.Context, addr Address) (b
 	}
 }
 
-// tableLocation resolves the current location of the table at addr.
-func (s *remoteSigningService) tableLocation(ctx context.Context, addr Address) (string, error) {
+// tableLocation resolves the current location of the table at addr, authorizing any address the
+// table resolver names on the way.
+func (s *remoteSigningService) tableLocation(ctx context.Context, addr Address, authorize AuthorizeFunc) (string, error) {
 	if s.locate == nil {
 		return "", errNoTableLocator
 	}
-	return s.locate(ctx, addr)
+	return s.locate(ctx, addr, authorize)
 }
 
 // checkPrefix validates the {prefix} path segment against the catalog's configured prefix

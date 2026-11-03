@@ -141,7 +141,17 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 	// router serves no catalog operation. The lakefs-sso binary always supplies both.
 	var services []routeSource
 	if deps.Catalog != nil && deps.BlockAdapter != nil && deps.AuthService != nil {
-		store := NewStore(deps.Catalog, deps.BlockAdapter)
+		// The store is built with the operator's settings, and - only while Metadata Search is
+		// enabled - with the built-in table resolver (resolver.go, METADATA_SEARCH_DESIGN.md §5.1,
+		// §5.5). Registering it is what makes R.<ref>.system.object_metadata resolvable and the
+		// system namespace of a data repository read-only; without it the catalog behaves exactly
+		// as it did before the hook existed.
+		storeOptions := cfg.StoreOptions()
+		if cfg.MetadataSearchEnabled() {
+			storeOptions = append(storeOptions, WithTableResolver(
+				NewMetadataSearchResolver(deps.Catalog, metadataSearchRefMapper(deps.Catalog))))
+		}
+		store := NewStore(deps.Catalog, deps.BlockAdapter, storeOptions...)
 		authorizer := NewAuthorizer(deps.AuthService)
 		services = append(services,
 			NewNamespaceService(store, authorizer, deps.Catalog, cfg),

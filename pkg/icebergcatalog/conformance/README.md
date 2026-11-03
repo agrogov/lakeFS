@@ -12,6 +12,7 @@ Both are skipped, not failed, when they are not configured; see each section for
 means.
 
 - [1. iceberg-go catalogtest](#1-iceberg-go-catalogtest)
+- [1.5 Metadata Search](#15-metadata-search)
 - [2. Apache RCK](#2-apache-rck)
 - [3. Recorded runs](#3-recorded-runs)
 - [4. Clean-room and licensing](#4-clean-room-and-licensing)
@@ -102,6 +103,41 @@ commits only, so this suite's green run says nothing about views. The view surfa
   replace over HTTP (`assert-view-uuid` + `add-view-version` + `set-current-view-version` +
   `set-properties`), the staged metadata entries, a tag read and the drop. That suite is the closest
   thing to a conformance run for views until the RCK (or a client with view tests) is available.
+
+### 1.5 Metadata Search
+
+`TestExternalMetadataSearchVirtualTable` is the one lakeFS-specific addition to the external
+suites: a virtual table is an extension (METADATA_SEARCH_DESIGN.md §5.2-5.4), so no upstream suite
+can describe it. It runs the same client, over the same URI and with the same credential, and
+asserts what a client sees when the feature is on and the indexer has run for the warehouse's
+repository:
+
+1. `ListNamespaces` on the warehouse lists `system`;
+2. `ListTables(["system"])` lists `object_metadata`;
+3. `LoadTable(["system", "object_metadata"])` returns a table with a location, a schema and a
+   metadata-location.
+
+All three are served out of `<repo>-metadata`, which the client never names: the credential needs
+`fs:ReadRepository` and `catalog:ReadTable` on the data repository only (§5.3). The suite is skipped
+unless a fourth variable is set, because a catalog without the feature - or before the first
+indexer tick - answers 404 for all three:
+
+```shell
+REST_CATALOG_URI=http://127.0.0.1:8000/iceberg/relative_to/conformance.main/api \
+REST_CATALOG_CREDENTIAL=AKIAIOSFOLQUICKSTART:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY \
+REST_CATALOG_WAREHOUSE=conformance.main \
+REST_CATALOG_METADATA_SEARCH=1 \
+  go test -count=1 -v -run TestExternalMetadataSearchVirtualTable ./pkg/icebergcatalog/conformance/
+```
+
+The server needs `iceberg.enabled: true` and `iceberg.metadata_search.enabled: true`, and the
+indexer has to have mirrored `conformance` into `conformance-metadata` on the branch the URI fixes.
+Unit coverage of the same rules - including the read-only `system` namespace, the listings and the
+authorization matrix - is in `pkg/icebergcatalog/resolver_test.go` and does not need a server.
+
+| Variable | Meaning |
+|---|---|
+| `REST_CATALOG_METADATA_SEARCH` | Any non-empty value: "this installation has Metadata Search enabled and indexed the warehouse". |
 
 ## 2. Apache RCK
 

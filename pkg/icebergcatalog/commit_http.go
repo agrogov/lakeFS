@@ -79,6 +79,9 @@ func (s *tableService) handleCommitTable(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+	if !s.requireWritableNamespace(w, addr) {
+		return
+	}
 	body, ok := s.readCommitBody(w, r)
 	if !ok {
 		return

@@ -100,7 +100,7 @@ func credsTestVending() CredentialsVendingConfig {
 
 // credsTestScope answers the table scope of the fixture table: its root and the location its
 // metadata names, which is the root itself.
-func credsTestScope(_ context.Context, _ Address) (tableDataScope, error) {
+func credsTestScope(_ context.Context, _ Address, _ AuthorizeFunc) (tableDataScope, error) {
 	return tableDataScope{Root: credsTestRoot, Location: credsTestRoot}, nil
 }
 
@@ -111,7 +111,7 @@ func credsTestAdapter() block.Adapter {
 
 // newTestCredentialService builds the vended-credentials service the way NewCredentialService
 // does, with the scope and the STS client supplied by the test.
-func newTestCredentialService(adapter block.Adapter, authz *Authorizer, vending CredentialsVendingConfig, assumer STSAssumer, scope func(context.Context, Address) (tableDataScope, error)) *credentialService {
+func newTestCredentialService(adapter block.Adapter, authz *Authorizer, vending CredentialsVendingConfig, assumer STSAssumer, scope func(context.Context, Address, AuthorizeFunc) (tableDataScope, error)) *credentialService {
 	if scope == nil {
 		scope = credsTestScope
 	}
@@ -243,7 +243,7 @@ func TestCredentialVending(t *testing.T) {
 		stsFake := &credsFakeSTS{}
 		authz := newAuthzUser(t, authzGrantsExceptAction(permissions.CatalogReadTableDataAction))
 		service := newTestCredentialService(credsTestAdapter(), authz.authz, credsTestVending(), stsFake,
-			func(context.Context, Address) (tableDataScope, error) {
+			func(context.Context, Address, AuthorizeFunc) (tableDataScope, error) {
 				t.Error("the table must not be resolved before the authorization decision")
 				return tableDataScope{}, nil
 			})
@@ -257,7 +257,7 @@ func TestCredentialVending(t *testing.T) {
 		stsFake := &credsFakeSTS{}
 		authz := newAuthzUser(t, authzReadStatements())
 		service := newTestCredentialService(credsTestAdapter(), authz.authz, credsTestVending(), stsFake,
-			func(context.Context, Address) (tableDataScope, error) {
+			func(context.Context, Address, AuthorizeFunc) (tableDataScope, error) {
 				return tableDataScope{}, &NoSuchTableException{
 					Repo: credsTestRepo, Ref: credsTestRef,
 					Namespace: Namespace{"inventory", "books"}, Table: credsTestTable,
@@ -302,7 +302,7 @@ func TestCredentialVending(t *testing.T) {
 		stsFake := &credsFakeSTS{}
 		authz := newAuthzUser(t, authzReadStatements())
 		service := newTestCredentialService(credsTestAdapter(), authz.authz, credsTestVending(), stsFake,
-			func(context.Context, Address) (tableDataScope, error) {
+			func(context.Context, Address, AuthorizeFunc) (tableDataScope, error) {
 				return tableDataScope{
 					Root:     credsTestRoot,
 					Location: credsTestStorageNamespace + "/_iceberg/some-other-table",
@@ -803,7 +803,7 @@ func TestVendMinIO(t *testing.T) {
 
 	ctx := context.Background()
 	root := "s3://" + bucket + "/" + DataPrefix + "/" + credsTestTableUUID
-	scope := func(context.Context, Address) (tableDataScope, error) {
+	scope := func(context.Context, Address, AuthorizeFunc) (tableDataScope, error) {
 		return tableDataScope{Root: root, Location: root}, nil
 	}
 	authz := newAuthzUser(t, authzWriteStatements())

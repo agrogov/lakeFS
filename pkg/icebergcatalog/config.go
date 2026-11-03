@@ -117,6 +117,19 @@ type CredentialsVendingConfig struct {
 	Endpoint string `mapstructure:"endpoint"`
 }
 
+// MetadataSearchConfig is the iceberg.metadata_search section (METADATA_SEARCH_DESIGN.md §5.5).
+// It switches on the catalog side of Metadata Search: the virtual table R.<ref>.system.object_metadata
+// resolves to R-metadata, and the system namespace of a data repository becomes read-only for
+// clients. The indexer, the companion repositories and the query path are not part of the catalog
+// and not part of this section.
+type MetadataSearchConfig struct {
+	// Enabled registers the built-in table resolver (resolver.go) and with it the virtual table of
+	// §5.2 and the reserved system namespace of §5.4. False is the default and the documented
+	// behaviour of every catalog without Metadata Search: no address resolves anywhere but to
+	// itself, no namespace is reserved and no listing has extra entries.
+	Enabled bool `mapstructure:"enabled"`
+}
+
 // Configured reports whether vended credentials were asked for at all, i.e. whether the
 // operator named a role to assume. It is the setting-side half of §8's mode table: while it is
 // false the catalog advertises no credentials endpoint and every client keeps using its own
@@ -171,6 +184,10 @@ type Config struct {
 	// from blockstore.s3.credentials_vending, the key the public lakeFS documentation names, and
 	// from iceberg.credentials_vending; see CredentialsVendingConfig.
 	CredentialsVending CredentialsVendingConfig `mapstructure:"credentials_vending"`
+
+	// MetadataSearch is the iceberg.metadata_search section (METADATA_SEARCH_DESIGN.md §5.5): the
+	// catalog side of Metadata Search, which is off by default.
+	MetadataSearch MetadataSearchConfig `mapstructure:"metadata_search"`
 }
 
 // LoadConfig reads and validates the "iceberg:" configuration section through viper. It is
@@ -202,6 +219,7 @@ func (c *Config) applyViperOverrides() {
 		uncommittedGCGraceKey      = ConfigKey + ".uncommitted_gc_grace"
 		ignoreCompactionCommitsKey = ConfigKey + ".ignore_compaction_commits"
 		maxStagedFilesKey          = ConfigKey + ".max_staged_files"
+		metadataSearchEnabledKey   = ConfigKey + ".metadata_search.enabled"
 	)
 	if viper.IsSet(enabledKey) {
 		c.Enabled = viper.GetBool(enabledKey)
@@ -231,6 +249,20 @@ func (c *Config) applyViperOverrides() {
 	if viper.IsSet(maxStagedFilesKey) {
 		c.MaxStagedFiles = viper.GetInt(maxStagedFilesKey)
 	}
+	// The default is false, and a missing key is the documented off state, so only a value the
+	// installation wrote has to be read: an explicit false is the zero value and needs no branch.
+	if viper.IsSet(metadataSearchEnabledKey) {
+		c.MetadataSearch.Enabled = viper.GetBool(metadataSearchEnabledKey)
+	}
+}
+
+// MetadataSearchEnabled reports whether the catalog side of Metadata Search is enabled
+// (iceberg.metadata_search.enabled, METADATA_SEARCH_DESIGN.md §5.5). The mount registers the
+// built-in table resolver only when it is: registration is what makes the virtual table and the
+// reserved system namespace exist, so a disabled section leaves the catalog exactly as it was.
+// A nil *Config answers false, like every other accessor of this type.
+func (c *Config) MetadataSearchEnabled() bool {
+	return c != nil && c.MetadataSearch.Enabled
 }
 
 // applyCredentialsVending reads the vended-credentials setting (§8) from both keys it is
