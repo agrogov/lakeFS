@@ -3,14 +3,17 @@
 This file is the record of what was **actually executed** against a real `lakefs-sso` serving the
 Apache Iceberg REST catalog, on which machine, with which tool versions, and with which result.
 It exists because the previous state of the tree had no live evidence at all: `ICEBERG_CATALOG_PLAN.md`
-§15.4 says so ("no green conformance run is recorded") and `README.md` §3 records a run that failed
-before it reached the catalog, on the OAuth token endpoint.
+§15.4 **said so** at the time ("no green conformance run is recorded") and `README.md` §3 records a run
+that failed before it reached the catalog, on the OAuth token endpoint. That is no longer the state:
+§0 records the fixes and the now-green external suite, and §15.4 was updated to match while these
+measurements are kept as the historical record.
 
 Where a thing did not run, or did not pass, this file says so and gives the reason. Rows marked
 **measured** were produced by a command whose output is quoted or summarised here. Where a conclusion
 comes from reading the code rather than from a run — D-2 and D-4 in §10, and the GC consequence in
 N-3 — the entry says so, and those three are the only such claims in this file.
 
+- [0. Resolution status](#0-resolution-status)
 - [1. Environment](#1-environment)
 - [2. What was run, and the result](#2-what-was-run-and-the-result)
 - [3. The catalog server: it does not start in the default auth mode](#3-the-catalog-server-it-does-not-start-in-the-default-auth-mode)
@@ -23,6 +26,60 @@ N-3 — the entry says so, and those three are the only such claims in this file
 - [10. Defects to file](#10-defects-to-file)
 - [11. Known gaps](#11-known-gaps)
 - [12. Reproducing this](#12-reproducing-this)
+
+## 0. Resolution status
+
+The measurements in §3-§9 are the state of tree `66d2d170e` and are preserved here unchanged as the
+historical record. Every catalog defect that record reported has since been fixed on
+`feature/iceberg-catalog`, and the fixes were verified against the code and, where noted, against a
+live server built from this tree.
+
+| # | What was wrong | Fixing commit | What changed |
+|---|---|---|---|
+| **D-1** | `relative_to` was defined but not mounted (`relativeTo.Mount(relativeToPattern, handler)`) | `089cd8ef1` | `http.go` mounts `RelativeTo(handler)` on the `relative_to` pattern, so both published forms bind the warehouse they name; a request with no `parent` lists the ref's namespaces (or the refs of the repository for the `{repo}` form). |
+| **D-2** | the namespace in the JSON body of `POST /v1/namespaces` was not rewritten | `089cd8ef1` | `RelativeTo` binds the scope to the request context and `handleCreateNamespace` prepends the URL's fixed levels to the decoded body before parsing it — after decoding, so the body is still read through `iceberg.max_request_body`. |
+| **D-4** | responses were not un-prefixed | `089cd8ef1` | `clientNamespace` drops exactly the levels the URL fixed from every address a response carries (get/create/list namespaces, the table identifiers of `ListTables`), so a client's own short names round-trip. |
+| **D-3** | the server refused to start when the auth service cannot store the deny policy | `d06a46308` | `policyBackendUnavailable` narrows the capability-missing case to `auth.ErrNotImplemented`; there the catalog logs a warning and continues **without attaching** `iceberg-reserved-prefix-protect`. Any other error is still fatal. |
+| **N-3** | a drop released only the pointer, not the table's file entries | `236a679c6` (option a) | The drop commit now stages the removal of the pointer **and** of every `_lakefs_iceberg/files/<table-uuid>/…` entry, so the committed GC can reclaim a dropped table's objects. |
+
+**The 18-subtest suite is now green.** The exact command of §4, re-run through the same `relative_to`
+URI against a `lakefs-sso` built from this tree (`blockstore.type=local`, `database.type=local`,
+`iceberg.enabled=true`, **default auth mode — no `sso:` section**), reports 18 of 18 subtests **PASS, 0
+skip**:
+
+```
+REST_CATALOG_URI=http://127.0.0.1:8001/iceberg/relative_to/conformance.main/api \
+REST_CATALOG_CREDENTIAL=<key>:<secret> REST_CATALOG_WAREHOUSE=conformance.main \
+  go test -count=1 -v ./pkg/icebergcatalog/conformance/
+
+--- PASS: TestExternalCatalogConformance (1.06s)
+    --- PASS: TestExternalCatalogConformance/BasicCreateTable (0.10s)
+    ... all 18 subtests PASS ...
+PASS
+ok  	github.com/treeverse/lakefs/pkg/icebergcatalog/conformance	1.955s
+```
+
+(The recorded run used port `8000`; the re-run above used `8001` because the original evidence server
+was no longer running.) So **D-1 and D-3 are no longer blockers** and the I-2 exit gate (§2) is met: the
+external suite passes through `relative_to`, the addressing form DuckDB and Starburst can use.
+
+Two caveats the fixes make explicit rather than remove:
+
+- **D-2 and D-4 were never measured** — they were masked by D-1, so no `relative_to` request ever
+  reached the code paths they describe. They are not "re-measured after the fact" so much as *now
+  covered*: the fix landed with a round-trip test that drives the router `RoutesBuilder` builds
+  (`TestRelativeToRoundTripThroughTheMountedCatalog`), and the 18/18 re-run exercises both at once —
+  every `catalogtest` subtest names its namespace after a UUID and reads that same UUID back, which is
+  D-2 (create with the client's name) and D-4 (read it back un-prefixed).
+- **D-3's fix is a degradation, not a repair of the deny.** In the default auth mode
+  `iceberg-reserved-prefix-protect` is still **not attached**, so `_lakefs_iceberg/` is not blocked at
+  the `fs:` layer in that deployment. That is a real security gap for those deployments (run a
+  policy-capable auth backend where the deny must be in force); the server now starts and says so in a
+  warning instead of refusing to run.
+
+The gaps in §11 that were **not** addressed — no Apache RCK, no S3-compatible blockstore, the esti
+suite still unexecuted, only `gc/prepare_commits` and never the Spark sweep, and the v1 non-goals
+(views, `/plan`, `/tasks`, rename, multi-table transactions) — are unchanged and remain gaps.
 
 ## 1. Environment
 
@@ -70,6 +127,10 @@ middleware. `README.md` §3 is superseded by §4 below for everything else it re
 
 ## 2. What was run, and the result
 
+> **Status when re-read.** The table below records the state at tree `66d2d170e`. Rows 4, 6, 9 and 11
+> are the failures of defects D-1 and D-3; both are fixed and the suite is now 18/18 PASS, 0 skip (§0,
+> §10). The rows are kept as measured.
+
 | # | Suite / check | Result |
 |---|---|---|
 | 1 | `go build ./cmd/lakefs-sso` | **pass** |
@@ -89,9 +150,13 @@ middleware. `README.md` §3 is superseded by §4 below for everything else it re
 So: the catalog's read and write paths work as a client experiences them through `/iceberg/api`, and
 the `relative_to` addressing form — one of the two forms `docs/iceberg.md` publishes and the only one
 DuckDB and Starburst can use — is not mounted. The I-2 exit gate (iceberg-go `catalogtest` green) is
-**not met**.
+**not met**. (Both of these were the state at `66d2d170e`; both are now fixed — see §0.)
 
 ## 3. The catalog server: it does not start in the default auth mode
+
+> **Resolved since.** D-3 was fixed by `d06a46308`: with the default auth mode the server now starts,
+> logs a warning that `iceberg-reserved-prefix-protect` is not attached, and answers
+> `GET /api/v1/healthcheck` 204. The fatal log below is the record of the pre-fix failure.
 
 **Measured.** With the catalog enabled and the default auth mode (no `sso:` section, which is what
 `esti/iceberg_utils.go` used to generate and what `README.md` §1.2 documents):
@@ -148,6 +213,10 @@ answered `200` with the esti admin credentials and left the catalog answering `2
 `GET /iceberg/api/v1/config`.
 
 ## 4. iceberg-go `catalogtest` — 0 of 18 subtests pass
+
+> **Resolved since.** D-1 was fixed by `089cd8ef1`. The exact command below, re-run through the same
+> `relative_to` URI against a server built from this tree in the default auth mode, now reports 18 of 18
+> subtests **PASS, 0 skip** (§0). The failure log below is kept as the record.
 
 **Measured.** Exactly the command `README.md` §1.3 documents:
 
@@ -363,6 +432,11 @@ unreachable on a local blockstore.
 
 ### 6.2 The same client through `relative_to` — fails
 
+> **Resolved since.** The addressing defects this subsection reproduces (D-1, D-2, D-4) were fixed by
+> `089cd8ef1` and are now covered by the round-trip test and the 18/18 iceberg-go re-run (§0). PyIceberg
+> itself was not re-run — it is not installed on this host — so this subsection is the pre-fix record;
+> the PyIceberg calls it shows failing go through the fixed code path but were not re-executed here.
+
 ```python
 RestCatalog(uri="http://127.0.0.1:8000/iceberg/relative_to/conformance.main/api",
             credential="…", warehouse="conformance.main")
@@ -377,6 +451,10 @@ load_table(('sales','orders'))    -> BadRequestException: namespace "sales" must
 Same defect (D-1) as §4, reproduced by a published client.
 
 ## 7. DuckDB 2.0.0 — attach works, queries do not
+
+> **Resolved since.** D-1 was fixed by `089cd8ef1`, so the DuckDB failure this section diagnoses is
+> fixed in the code path. DuckDB itself was not re-run here (the extension and Python environment of §7
+> were not reinstalled), so the queries below are the pre-fix record.
 
 The iceberg extension installs and loads from `extensions.duckdb.org` without extra authorisation:
 
@@ -432,6 +510,12 @@ Note that even with a JDK, the RCK could not have got further than iceberg-go's 
 same `relative_to` URI, so D-1 would stop it in the same place.
 
 ## 9. esti (`esti/iceberg_test.go`) — attempted, skipped
+
+> **Resolved since.** D-3 was fixed by `d06a46308` and N-3 by `236a679c6`, so the `sso:` workaround this
+> section describes (N-2) is now unnecessary and the N-3 comment in `esti/iceberg_test.go` is stale.
+> Both live in Go files outside this record's file scope and were not edited here; the esti suite is
+> still unexecuted (it compiles and skips), so no esti assertion has run and none of the fixes is
+> covered by esti.
 
 **Measured.** The suite compiles, starts, and every Iceberg test skips with its own reason. Neither
 skip is a pass: no esti assertion has been executed.
@@ -509,29 +593,33 @@ Coverage of the operations this task asked for, by test:
   cannot boot at all (D-3). This is a workaround for a catalog defect and is commented as one.
 
 `TestIcebergReadPath` and `TestIcebergTagRead` assert through `requireLoadTableAgrees`/`refTableURL` on
-the `relative_to` form, so they would fail on this tree for D-1 as well — before reaching any of the
-behaviour they are written to check.
+the `relative_to` form, so they would have failed on the tree this record measured for D-1 as well —
+before reaching any of the behaviour they are written to check. (D-1 is now fixed — see §0 — so the
+addressing layer is no longer the obstacle; the suite is still unexecuted, §9.)
 
 ## 10. Defects to file
 
-Found while producing this evidence. **None of them is fixed here**: this change is the evidence,
-and the catalog's own files were left alone.
+Found while producing this evidence. They were all **open** when this record was written; all four are
+now **fixed** — see the Resolution column and §0. The defect descriptions and their evidence are kept
+verbatim as the historical record.
 
-| # | Severity | Defect | Where | Evidence |
-|---|---|---|---|---|
-| **D-1** | blocker | The `relative_to` addressing form is not mounted: `RelativeTo` is defined and unit-tested but the mount passes the bare `handler`, so the `{warehouse}` segment is captured and ignored. Every namespace-scoped request through `/iceberg/relative_to/…` is answered as if no warehouse was named; requests without a `parent` list repositories instead of the ref's namespaces. | `pkg/icebergcatalog/http.go:166` (`relativeTo.Mount(relativeToPattern, handler)`), `pkg/icebergcatalog/relative.go:138` (`RelativeTo`), doc at `relative.go:132` | §4 (18/18 fail), §4 curl outputs, §6.2, §7 |
-| **D-2** | blocker (latent) | Under `relative_to`, the namespace carried in the **JSON body** of `POST /v1/namespaces` is not rewritten, so a client cannot create a namespace at all through that form even once D-1 is fixed (`relative.go` documents a rewrite of the `{namespace}` path parameter and the `parent` query parameter only). | `pkg/icebergcatalog/relative.go` (rewrite covers path + `parent` only) | **Not re-measured** — masked by D-1. Recorded because `README.md` §3 finding 2 reported it and nothing in this tree appears to have changed it. |
-| **D-3** | blocker | `iceberg.enabled: true` makes the server exit at startup when the auth service cannot store policies, which is the **default** auth mode of `lakefs-sso` (and of `lakefs`): `auth.BasicAuthService` returns `auth.ErrNotImplemented` for `GetPolicy`, and `EnsureReservedPrefixProtectPolicy` turns every non-`ErrNotFound` error into a fatal startup error. The deny policy is a hardening measure, so its absence should be a warning, not a reason to refuse to run. | `pkg/icebergcatalog/bootstrap.go:149-170` (`bootstrap.go:169` is the fatal branch); `pkg/auth/basic_service.go:424` | §3 (fatal log), reproduced with `LAKEFS_ICEBERG_ENABLED=true` and no `sso:` section |
-| **D-4** | gap (predicted) | Under `relative_to`, responses are not un-prefixed: `ListNamespaces` returns the server-side path `[repo, ref, ns]` where the client sent `[ns]`, so a REST client sees its own identifiers change and `catalogtest`'s `ListNamespaces` subtest cannot pass. `relative.go` states this is deliberate ("nothing is un-prefixed on the way out"), but §5 says the *client* namespace under `relative_to` is `ns…` and a client has no way to strip a server-imposed prefix. | `pkg/icebergcatalog/relative.go` (top-of-file doc), `namespaces.go` listing | **Not measured in this run** (D-1 masks it); `README.md` §3 finding 3 recorded the same, with local patches applied. |
+| # | Severity | Defect | Where | Evidence | Resolution |
+|---|---|---|---|---|---|
+| **D-1** | blocker | The `relative_to` addressing form is not mounted: `RelativeTo` is defined and unit-tested but the mount passes the bare `handler`, so the `{warehouse}` segment is captured and ignored. Every namespace-scoped request through `/iceberg/relative_to/…` is answered as if no warehouse was named; requests without a `parent` list repositories instead of the ref's namespaces. | `pkg/icebergcatalog/http.go:166` (`relativeTo.Mount(relativeToPattern, handler)`), `pkg/icebergcatalog/relative.go:138` (`RelativeTo`), doc at `relative.go:132` | §4 (18/18 fail), §4 curl outputs, §6.2, §7 | **FIXED** by `089cd8ef1` — `http.go` now mounts `RelativeTo(handler)`; both forms bind the warehouse. The `relative_to` re-run is now 18/18 PASS (§0). |
+| **D-2** | blocker (latent) | Under `relative_to`, the namespace carried in the **JSON body** of `POST /v1/namespaces` is not rewritten, so a client cannot create a namespace at all through that form even once D-1 is fixed (`relative.go` documents a rewrite of the `{namespace}` path parameter and the `parent` query parameter only). | `pkg/icebergcatalog/relative.go` (rewrite covers path + `parent` only) | **Not re-measured** — masked by D-1. Recorded because `README.md` §3 finding 2 reported it and nothing in this tree appears to have changed it. | **FIXED** by `089cd8ef1` — the body namespace is prepended inside the handler, after decoding. *Never measured before* (masked by D-1); now covered by the round-trip test and the 18/18 re-run (§0). |
+| **D-3** | blocker | `iceberg.enabled: true` makes the server exit at startup when the auth service cannot store policies, which is the **default** auth mode of `lakefs-sso` (and of `lakefs`): `auth.BasicAuthService` returns `auth.ErrNotImplemented` for `GetPolicy`, and `EnsureReservedPrefixProtectPolicy` turns every non-`ErrNotFound` error into a fatal startup error. The deny policy is a hardening measure, so its absence should be a warning, not a reason to refuse to run. | `pkg/icebergcatalog/bootstrap.go:149-170` (`bootstrap.go:169` is the fatal branch); `pkg/auth/basic_service.go:424` | §3 (fatal log), reproduced with `LAKEFS_ICEBERG_ENABLED=true` and no `sso:` section | **FIXED** by `d06a46308` — it now warns and continues without attaching the deny; only `auth.ErrNotImplemented` degrades, every other error stays fatal. Verified live: the default-auth-mode server starts and `/api/v1/healthcheck` answers 204 (§0). |
+| **D-4** | gap (predicted) | Under `relative_to`, responses are not un-prefixed: `ListNamespaces` returns the server-side path `[repo, ref, ns]` where the client sent `[ns]`, so a REST client sees its own identifiers change and `catalogtest`'s `ListNamespaces` subtest cannot pass. `relative.go` states this is deliberate ("nothing is un-prefixed on the way out"), but §5 says the *client* namespace under `relative_to` is `ns…` and a client has no way to strip a server-imposed prefix. | `pkg/icebergcatalog/relative.go` (top-of-file doc), `namespaces.go` listing | **Not measured in this run** (D-1 masks it); `README.md` §3 finding 3 recorded the same, with local patches applied. | **FIXED** by `089cd8ef1` — `clientNamespace` drops the URL-fixed levels from responses. *Never measured before* (masked by D-1); now covered by the 18/18 re-run (§0). |
 
-Also recorded, so none of it is mistaken for something else. **N-3 is a defect candidate** for the
-owner of §6.3; N-1 and N-2 are environment/harness notes, not catalog defects.
+Also recorded, so none of it is mistaken for something else. **N-3 was a defect candidate** for the
+owner of §6.3 and is now fixed (`236a679c6`, option a); N-1 and N-2 are environment/harness notes, not
+catalog defects. N-2's workaround is now unnecessary but still present in `esti/iceberg_utils.go`, a Go
+file outside this record's scope.
 
 | # | Observation | Where |
 |---|---|---|
 | N-1 | `POST /gc/prepare_commits` answers **400** with `local adapter presigned URL: operation not supported` after performing the run, when the blockstore cannot presign. A client that reads the presigned URL gets an error for a run that succeeded. | core GC + `blockstore.type=local` (§6, step 13) |
-| N-2 | The `sso:` section `esti/iceberg_utils.go` now generates is a workaround for D-3, not a property of the suite. Delete it when D-3 is fixed. | `esti/iceberg_utils.go` `icebergServerConfig` |
-| N-3 | **A drop does not release the table's files to the committed GC.** `dropTable` (`tables.go:722`) deletes the pointer entry and nothing else, so the `_lakefs_iceberg/files/<uuid>/…` entries §6.3 staged in an earlier commit survive the drop. Measured diff of a create+append commit followed by a drop commit: `removed _lakefs_iceberg/tables/probe/t2/.pointer` — and no other path. Because the committed GC's live set is the addresses reachable from the active commits, those entries keep the dropped table's objects alive for as long as the branch does. Whether that is a defect or an accepted v1 limitation is a decision for the owner of §6.3/§14 Q-I8 (the plan does not say what a drop should do to the entries); what is certain is that it is not what §6.3's stated goal — "file entries exist so the GC protects exactly the live files" — implies for a table that no longer exists. Not fixed here. | `pkg/icebergcatalog/tables.go:722` (`dropTable`), measured in §6 step 12 |
+| N-2 | The `sso:` section `esti/iceberg_utils.go` now generates is a workaround for D-3, not a property of the suite. Delete it when D-3 is fixed. (D-3 is now fixed by `d06a46308`; the workaround is still in the harness because this record may not edit Go files.) | `esti/iceberg_utils.go` `icebergServerConfig` |
+| N-3 | **A drop does not release the table's files to the committed GC.** `dropTable` (`tables.go:722`) deletes the pointer entry and nothing else, so the `_lakefs_iceberg/files/<uuid>/…` entries §6.3 staged in an earlier commit survive the drop. Measured diff of a create+append commit followed by a drop commit: `removed _lakefs_iceberg/tables/probe/t2/.pointer` — and no other path. Because the committed GC's live set is the addresses reachable from the active commits, those entries keep the dropped table's objects alive for as long as the branch does. Whether that is a defect or an accepted v1 limitation is a decision for the owner of §6.3/§14 Q-I8 (the plan does not say what a drop should do to the entries); what is certain is that it is not what §6.3's stated goal — "file entries exist so the GC protects exactly the live files" — implies for a table that no longer exists. Not fixed when this record was written; **resolved since** by `236a679c6` (option a): the drop commit now removes the pointer **and** every `_lakefs_iceberg/files/<uuid>/…` entry, so the committed GC can reclaim a dropped table's objects. Verified live: a create+commit followed by a drop staged `removed …/tables/probe/t1/.pointer` **and** `removed …/files/<uuid>/metadata/…`. | `pkg/icebergcatalog/tables.go:722` (`dropTable`), measured in §6 step 12 |
 
 ## 11. Known gaps
 
@@ -553,29 +641,34 @@ owner of §6.3; N-1 and N-2 are environment/harness notes, not catalog defects.
 - **`supports-names-with-dot=false`** is not re-validated here, because no RCK run happened (§8).
   What *was* measured is the property the flag exists to avoid relying on: on the identifier form a
   namespace level containing a dot round-trips unchanged (§5.1).
-- **Dropping a table does not release its files** (§10 N-3): the pointer goes, the
-  `_lakefs_iceberg/files/<uuid>/…` entries stay, so a dropped table's objects remain GC-live. Measured
-  here only as the drop commit's diff and reasoned from how the committed GC builds its live set; the
-  Spark sweep itself was not run (§11), so the retention itself is not observed end to end.
+- **~~Dropping a table does not release its files~~ — resolved.** N-3 (§10) was fixed by `236a679c6`
+  (option a): the drop commit now removes the pointer *and* every `_lakefs_iceberg/files/<uuid>/…`
+  entry, so a dropped table's objects are released to the committed GC. Verified live: a create+commit
+  followed by a drop staged `removed …/tables/probe/t1/.pointer` **and**
+  `removed …/files/<uuid>/metadata/…`. The Spark sweep itself was still not run (§11), so reclamation end
+  to end is not observed — only that the entries are gone.
 - **No esti assertion was executed** (§9): the suite compiles, starts and skips on two missing
   environment dependencies, so the two tests added by this change are unverified by execution.
 
 ## 12. Reproducing this
 
-Prerequisites: Go (the repo's toolchain), a writable directory, and — for §3 onwards — a policy-capable
-auth mode (`sso:` section per §3); Python 3.10+ with `pyiceberg==0.12.0` and `duckdb` for §6-§7.
+Prerequisites: Go (the repo's toolchain), a writable directory, and — for §6-§7 — Python 3.10+ with
+`pyiceberg==0.12.0` and `duckdb`. A policy-capable auth mode (`sso:` section per §3) is **no longer
+required to start the server**: since D-3's fix the default auth mode starts with a warning; the `sso:`
+section appears in §3 because that is how the original measurements were taken.
 
 ```shell
-# 1. build and start a server whose catalog can boot (see §3 for why the sso: section is needed)
+# 1. build and start a server whose catalog can boot (default auth mode is enough since D-3's fix;
+#    §3 used sso.enabled + a stub issuer, which is no longer necessary)
 go build -o /tmp/evidence/lakefs-sso ./cmd/lakefs-sso
-# ... a config.yaml with database/blockstore local, iceberg.enabled, sso.enabled + a stub issuer ...
+# ... a config.yaml with database/blockstore local, iceberg.enabled (optionally sso.enabled + a stub issuer) ...
 /tmp/evidence/lakefs-sso run --config /tmp/lfsconf/config.yaml --quickstart
 curl -u AKIAIOSFOLQUICKSTART:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY -X POST \
   http://127.0.0.1:8000/api/v1/repositories -H 'Content-Type: application/json' \
   -d '{"name":"conformance","storage_namespace":"local:///tmp/lfsconf/block/conformance",
        "default_branch":"main","exist_ok":false}'
 
-# 2. the external suite (fails today, D-1)
+# 2. the external suite (passes today: 18 of 18 subtests, 0 skip, through relative_to — §0)
 REST_CATALOG_URI=http://127.0.0.1:8000/iceberg/relative_to/conformance.main/api \
 REST_CATALOG_CREDENTIAL=AKIAIOSFOLQUICKSTART:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY \
 REST_CATALOG_WAREHOUSE=conformance.main \

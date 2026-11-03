@@ -40,7 +40,7 @@ iceberg:
   max_request_body: 8388608        # 8 MiB; larger bodies are 413
   uncommitted_gc_grace: 24h        # see "Garbage collection"
   max_staged_files: 50000          # cap on the table files one commit may stage; see "Garbage collection"
-  ignore_compaction_commits: true   # see "Merge"
+  ignore_compaction_commits: true   # auto-resolve compaction-only conflicts at merge; see "Merge"
 ```
 
 Every key also has an environment variable (`LAKEFS_ICEBERG_ENABLED`, `LAKEFS_ICEBERG_TOKEN_TTL`,
@@ -75,10 +75,17 @@ of addressing that the public lakeFS Iceberg documentation describes are served:
 | `GET /iceberg/relative_to/{repo}.{branch}/api/v1/…/namespaces/{ns…}` | repository and ref fixed by the URL; every namespace level in the parameter is a real namespace level |
 | `GET /iceberg/relative_to/{repo}/api/v1/…/namespaces/{ref%1Fns…}` | repository fixed by the URL; the first level of the parameter is the ref |
 
-Both `relative_to` shapes answer identically to the `/iceberg/api` form for the same table: the URL
-fixes two of the four components and the parser in `pkg/icebergcatalog/ident.go` binds the rest. A
-`relative_to` path that does not have the `<repo>[.<branch>]/api` shape is
-`404 NoSuchWarehouseException`.
+Both `relative_to` shapes are mounted, and they are **identity-preserving**: the URL fixes two of the
+four components, and a client addresses namespaces and tables with the names it chose and reads those
+same names back. On the way in, `pkg/icebergcatalog/relative.go` prepends the levels the URL fixed to
+the namespace path parameter *and* to the namespace in the JSON body of a namespace create; on the way
+out it drops exactly those fixed levels from every address a response carries — the namespace of a get,
+create or list, and the table identifiers of a table listing. So a client of the `{repo}.{branch}` form
+creates and lists `inventory`, and reads `inventory` back, while a client of the `{repo}` form sees the
+ref as its first level (`main␟inventory`). Only a namespace that starts with exactly the levels the URL
+fixed is stripped, so the fixed scope cannot be escaped or partially matched, and a `relative_to` path
+that does not have the `<repo>[.<branch>]/api` shape is `404 NoSuchWarehouseException` (the parser is
+`pkg/icebergcatalog/ident.go`).
 
 Rules that apply to every form:
 
@@ -210,7 +217,7 @@ _lakefs_iceberg/                              on the branch: ordinary lakeFS ent
                                                   iceberg.metadata-location = physical URI
                                                   iceberg.table-uuid
                                                   iceberg.format-version
-  files/<table-uuid>/<relative path>           one entry per table file the commit staged
+  files/<table-uuid>/<relative path>           one entry per table file the commit or create staged
                                                   (metadata, manifest-list, manifest, data)
 
 <storage_namespace>/_iceberg/<table-uuid>/     in object storage: the files themselves
@@ -243,7 +250,7 @@ two lakeFS actions on the repository and its reserved key area:
 | create / update properties / drop namespace | `catalog:CreateNamespace`, `catalog:UpdateNamespace`, `catalog:DeleteNamespace` | `CatalogNamespaceArn(repo, ns)` |
 | list tables (filtered per table with a `catalog:TableName` `StringLike` condition) | `catalog:ListTables` | `CatalogNamespaceArn(repo, ns)` |
 | load / HEAD table | `catalog:ReadTable` | `CatalogTableArn(repo, ns, table)` |
-| create / commit / metrics | `catalog:CreateTable`, `catalog:UpdateTable` | `CatalogTableArn(repo, ns, table)` |
+| create / register / commit / metrics | `catalog:CreateTable`, `catalog:UpdateTable` | `CatalogTableArn(repo, ns, table)` |
 | drop table | `catalog:DeleteTable` | `CatalogTableArn(repo, ns, table)` |
 | data-plane read: remote signing, vended read credentials | `catalog:ReadTableData` | `CatalogTableArn(repo, ns, table)` |
 | data-plane write: remote signing, vended write credentials | `catalog:WriteTableData` | `CatalogTableArn(repo, ns, table)` |
@@ -310,6 +317,20 @@ not lakeFS entries until the catalog stages them. Two consequences and two contr
    file, `lakectl diff` shows file-level changes, and a merge carries them. `iceberg.max_staged_files`
    (default 50 000) caps one commit's staging: a larger commit is refused with `400` before any entry
    is written, instead of being registered partially.
+
+   Two other writes use the same mechanism:
+
+   - **A create stages the initial `metadata.json`.** Before the pointer is staged,
+     `Store.CreateTableWithMetadata` registers the table's first metadata file as a
+     `_lakefs_iceberg/files/<table-uuid>/metadata/…` entry, so a table that is created and never
+     appended to still has a referenced metadata file and survives a committed-GC sweep. (An earlier
+     build staged only the pointer, whose metadata file no retained commit referenced.)
+   - **A drop releases the table's file entries.** The drop commit stages the removal of the pointer
+     *and* of every `_lakefs_iceberg/files/<table-uuid>/…` entry the table's commits staged
+     (`releaseTableFiles` in `pkg/icebergcatalog/files.go`), in one future lakeFS commit, so the
+     committed GC can reclaim a dropped table's objects instead of protecting them for as long as the
+     branch keeps the earlier commits. The objects themselves are not deleted — they are shared by every
+     ref that still names them — only the entries that keep them GC-live are removed.
 2. **An uncommitted-GC grace window**, `iceberg.uncommitted_gc_grace` (default 24h). The uncommitted GC
    lists staged entries, so a staged table file is collectable exactly like any other uncommitted
    lakeFS write. The grace keeps an entry under `_iceberg/` out of the report while it is younger than
@@ -344,18 +365,41 @@ The same bootstrap creates and attaches the installation-wide deny policy
 only on a `lakefs-sso` server with `iceberg.enabled`; a plain `lakefs` server installs no protector and
 keeps its unchanged GC defaults.
 
+**The deny needs an auth backend that can store policies.** The reserved-prefix deny is a stored policy,
+so it only exists where the auth service can create and attach policies. In the **default** auth mode
+(`lakefs-sso` and `lakefs` both run `auth.BasicAuthService`, whose policy methods return
+`auth.ErrNotImplemented`) the catalog now logs a warning and **continues** instead of refusing to start
+— but the deny is **not attached** in that deployment, so `_lakefs_iceberg/` is not blocked at the `fs:`
+layer and any principal holding `fs:WriteObject` on the repository can write the reserved area directly.
+That is a real security gap for those deployments, not a cosmetic warning: run a policy-capable auth
+backend (SSO / external auth) wherever the reserved-prefix deny has to be in force. A genuine error from
+a policy-capable backend — anything other than `auth.ErrNotImplemented` — still fails startup.
+
 ## Merge
 
 The table pointer is one entry, so two branches that change the same table conflict at merge — the
 table's metadata is, in lakeFS terms, just a file: when both branches appended, the conflict is
 reported, and nothing guesses a three-way merge of snapshots.
 
-The catalog also knows how to do better for one case. A commit whose message carries
-`lakefs.compaction.operation-id` is a background compaction, and a conflict caused *only* by such a
-commit is meant to be auto-resolved when `iceberg.ignore_compaction_commits` is true (the default) and
-the pointer's base metadata is still an ancestor. That decision logic exists
-(`Store.ResolvePointerConflict` in `pkg/icebergcatalog/commit.go`, with its unit tests), but the merge
-path does not call it yet, so in this build a compaction commit still surfaces as an ordinary conflict.
+The catalog also does better for one case. A **snapshot that carries the
+`lakefs.compaction.operation-id` snapshot property** is a background compaction — that property, set
+with `snapshotProperty("lakefs.compaction.operation-id", …)` as the public lakeFS Iceberg documentation
+instructs, is the marker. It is deliberately *not* the lakeFS commit message: an earlier rule keyed on
+the message and so never saw the mark a real compaction writes. A conflict caused *only* by compaction
+snapshots — every snapshot one side added on top of the merge base is a compaction snapshot, and the
+base snapshot is still on that side's parent chain — is auto-resolved when
+`iceberg.ignore_compaction_commits` is true (the default). The resolution keeps one side's pointer
+unchanged and never rewrites metadata; a side whose base snapshot was expired or rewritten is not
+resolved, because that is no longer "base plus a compaction" (`Store.ResolvePointerConflict` in
+`pkg/icebergcatalog/commit.go`).
+
+The decision is **wired into a real merge**, not only unit-tested: `icebergcatalog.Bootstrap` installs
+it as the `pkg/catalog` merge-conflict hook (`catalog.SetMergeConflictResolver`, consulted by
+`Catalog.Merge` after the ordinary strategy resolver) when both `iceberg.enabled` and
+`iceberg.ignore_compaction_commits` are true, and clears the hook otherwise — it is a process-wide
+pointer, so the documented opt-out must not leave one installed. The hook may return only one of the
+two conflicting entries, never a third value, so it can never manufacture a table pointer. With the
+flag off, a compaction conflict is reported as an ordinary one, exactly as before.
 
 ## Endpoints
 
@@ -371,7 +415,7 @@ only when it is mounted and tested.
 | `GET`, `POST /v1/{prefix}/namespaces/{namespace}/tables` | served |
 | `GET`, `HEAD`, `POST`, `DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}` | served |
 | `POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics` | served (accepted and discarded) |
-| `POST /v1/{prefix}/namespaces/{namespace}/register` | not served |
+| `POST /v1/{prefix}/namespaces/{namespace}/register` | served (adopts a client-written `metadata.json`) |
 | `GET …/tables/{table}/credentials`, `POST …/tables/{table}/sign` | served and advertised only when supported: S3 blockstore for signing, S3 plus `credentials_vending.role_arn` for vending |
 | `tables/rename`, `transactions/commit`, `views/*`, `plan`, `tasks` | out of scope for v1, never advertised |
 
@@ -398,20 +442,19 @@ receives the full response; `HEAD` sets no tag.
 
 ## Current limitations
 
-- **`register` is not served.** A table must be created through the catalog; adopting an existing
-  `metadata.json` is not available yet, and the operation is therefore not advertised.
 - **Table load does not advertise the data-plane mechanisms.** `/credentials` and `/sign` are mounted
   and advertised in `GET /v1/config`, but the `LoadTableResult` still carries an empty `config`, with
   no `storage-credentials` and no `s3.remote-signing-enabled`. A standard client therefore keeps its own
   `FileIO` unless it calls an endpoint directly (see [Data-plane access](#data-plane-access)).
-- **System tests are written but not green in this branch.** `esti/iceberg_test.go` covers the
-  PyIceberg/DuckDB read path, append → lakeFS commit → GC prepare → still readable, and branch/merge
-  including the conflict. The read-path test skips because the catalog does not advertise `register`,
-  and no green run against a live deployment is recorded here: the catalogtest run in
-  `pkg/icebergcatalog/conformance/README.md` §3 predates these fixes and failed the I-2 gate, so that
-  gate still has no green evidence.
-- **A compaction commit still conflicts at merge.** The auto-resolve decision is implemented but not
-  called by the merge path (see [Merge](#merge)).
+- **The esti system tests are written but have no executed assertion here.** `esti/iceberg_test.go`
+  covers the PyIceberg/DuckDB read path, append → lakeFS commit → GC prepare → still readable, and
+  branch/merge including the conflict. It compiles and *skips*: this evidence host has no docker daemon
+  and no S3-compatible blockstore, so no esti assertion has run. The **iceberg-go external conformance
+  suite is green** — 18 of 18 subtests, 0 skipped — through the `relative_to` URI against a `lakefs-sso`
+  server built from this tree in the default auth mode; that run is recorded in
+  `pkg/icebergcatalog/conformance/RESULTS.md`. Apache RCK was not run (no JDK/Gradle on the host), and
+  every measurement used a local blockstore, so S3 presigning, credential vending and remote signing
+  remain unvalidated.
 - **Iceberg format v3, views, functions, server-side scan planning and multi-table transactions** are
   out of scope for v1 and are never advertised. `add-encryption-key` (format v3 only) decodes and is
   refused with a `400` naming the reason rather than failing as a server error.
@@ -431,7 +474,7 @@ iceberg:
   max_request_body: 8388608         # bytes; larger bodies are 413
   uncommitted_gc_grace: 24h         # 0 protects every _iceberg/ object regardless of age
   max_staged_files: 50000           # cap on the table files one commit may stage
-  ignore_compaction_commits: true    # decision logic for compaction-only conflicts (see "Merge")
+  ignore_compaction_commits: true    # auto-resolve compaction-only conflicts at merge (see "Merge")
 
 blockstore:
   s3:

@@ -1,7 +1,9 @@
 # OSS Iceberg REST Catalog — Implementation Plan
 
-Status: implemented on `feature/iceberg-catalog`; spike findings folded into §15, and §15.4 records what is
-landed versus still unwired. The user-facing documentation is [`docs/iceberg.md`](docs/iceberg.md).
+Status: implemented and closed on `feature/iceberg-catalog`; spike findings folded into §15, and §15.4
+records the close-out — every v1 capability is landed, and the remaining gaps are environmental (no RCK
+run, no S3 blockstore, esti unexecuted) or v1 non-goals. The user-facing documentation is
+[`docs/iceberg.md`](docs/iceberg.md).
 Unblocks: DATASETS_DESIGN.md §1.2 (non-goal), §3 parity row "Items: `table`, `namespace`", §7.4, §17 Phase 5, §18 Q4.
 
 All external facts carry a source link. Statements about lakeFS Enterprise come from its **public docs only**
@@ -652,24 +654,35 @@ PyIceberg versions other than 0.12, real object storage, and credentials vending
 
 ### 15.4 Close-out status of the plan
 
-The board this plan was broken into (`tasks.json`) is closed; the implementation status below is what the
-public documentation states as behaviour, and it is the honest list of what is and is not wired:
+The board this plan was broken into (`tasks.json`) is closed. The implementation status below is what the
+public documentation states as behaviour: every v1 capability is now landed, and what remains is the list
+of gaps at the end of this section, not unwired work:
 
 | Area | Status |
 |---|---|
-| Read path: `GET /v1/config`, namespace and table reads on any ref, `relative_to` in both forms | **landed** |
+| Read path: `GET /v1/config`, namespace and table reads on any ref, `relative_to` in both forms | **landed**; `relative_to` is identity-preserving — a client's own short names round-trip |
 | Write path: namespace create/update/drop, table create, drop, metrics, commit (§6.2) | **landed** |
 | Commit over HTTP: `POST …/tables/{table}`, staged, CAS, `400` above `iceberg.max_staged_files` | **landed** |
-| `register` (§I-2) | not served, not advertised |
-| §6.3 file registration as lakeFS entries | **landed and called by the commit path** (`files.go`, step 5), capped by `iceberg.max_staged_files` |
-| §6.3 uncommitted-GC grace and the `_lakefs_iceberg/` deny | **landed and wired**: `Bootstrap` installs the grace via `catalog.SetUncommittedGCProtector` and attaches `iceberg-reserved-prefix-protect` |
+| `register` (§I-2) | **landed and advertised**: `POST /v1/{prefix}/namespaces/{namespace}/register` adopts a client-written `metadata.json`, staging its files and then the pointer (`register.go`) |
+| §6.3 file registration as lakeFS entries | **landed and called by the commit path** (`files.go`, step 5), capped by `iceberg.max_staged_files`; **a create stages the initial `metadata.json`** (`Store.CreateTableWithMetadata`) and **a drop releases the table's file entries** in the same commit that removes the pointer (`releaseTableFiles`) |
+| §6.3 uncommitted-GC grace and the `_lakefs_iceberg/` deny | **landed and wired**: `Bootstrap` installs the grace via `catalog.SetUncommittedGCProtector` and attaches `iceberg-reserved-prefix-protect`. An auth backend that cannot store policies (the **default** auth mode) degrades to a warning and the deny is **not attached** — a real security gap for those deployments |
 | §8 remote signing and vended credentials | **services mounted and advertised** when the blockstore supports them; the table load still returns an empty `config` |
 | §7.1 OAuth token endpoint | **landed**: the catalog's own auth middleware serves `POST /v1/oauth/tokens` (form `client_id`/`client_secret` or HTTP Basic) |
 | §7.2 `catalog:ReadTableData` / `catalog:WriteTableData` and the `CatalogRead` grant | **landed** |
-| §6.4 compaction auto-resolve | decision logic landed (`ResolvePointerConflict`), merge wiring pending |
+| §6.4 compaction auto-resolve | **landed and wired**: keyed on the `lakefs.compaction.operation-id` snapshot property (not the commit message), installed as the `pkg/catalog` merge hook by `Bootstrap` when `iceberg.enabled` and `iceberg.ignore_compaction_commits` are both true (`commit.go`, `pkg/catalog/merge_conflict.go`) |
 | I-5 ETag / `If-None-Match` | **landed** on table load, varying with `snapshots`; no tag on `HEAD` |
 | §9 datasets `table` / `namespace` items | **landed**: accepted when `iceberg.enabled`, materialised, authorized at the source, readable through the catalog |
-| §12 conformance and esti | iceberg-go external suite and the documented RCK invocation landed; esti suites written, but the read path skips without `register` and no green conformance run is recorded |
+| §12 conformance and esti | iceberg-go external suite **green: 18 of 18 subtests, 0 skipped**, through the `relative_to` URI (`pkg/icebergcatalog/conformance/RESULTS.md`); esti suites written but unexecuted (no docker daemon, no S3 bucket) |
+
+**Remaining gaps** — none of these is unwired work; each is environmental or a v1 non-goal:
+
+- Apache RCK was never run: the evidence host has no JDK or Gradle, so it cannot start.
+- No S3-compatible blockstore was available, so every measurement used `blockstore.type=local` with a
+  `local://` FileIO shim; S3 presigning, credential vending and remote signing are unvalidated.
+- The esti suite compiles and skips — no esti assertion has executed (no docker daemon, no S3 bucket).
+- Only `gc/prepare_commits` was run, never the real Spark GC sweep it feeds.
+- Views, `/plan`, `/tasks`, rename and multi-table transactions remain v1 non-goals (§1.2) and are never
+  advertised.
 
 The user-facing summary of this table lives in [`docs/iceberg.md`](docs/iceberg.md), including the
 uncommitted-GC window and the RBAC note for policies written before the data-plane actions existed.
