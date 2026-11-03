@@ -1,13 +1,16 @@
 package icebergcatalog
 
-// Tests for the read half of the catalog store (ICEBERG_CATALOG_PLAN.md §6.1, §12 "unit tests:
-// identifier parsing" and "CAS race" neighbours). The fixture is a real catalog store (graveler +
-// committed ranges) on an in-memory KV store and an in-memory block adapter, like the datasets
-// fixture, so "staged wins over committed" and "a tag/commit is readable" are facts of the same
-// graveler code the server runs, not assumptions of a mock.
+// Tests for the catalog store: the read half (§6.1, §12 "unit tests: identifier parsing" and "CAS
+// race" neighbours), the conditional writes of the write half (TestStoreWrite, TestPointerCAS) and
+// the create path's file registration (TestCreateTableWithMetadata, §6.3). The fixture is a real
+// catalog store (graveler + committed ranges) on an in-memory KV store and an in-memory block
+// adapter, like the datasets fixture, so "staged wins over committed", "a tag/commit is readable"
+// and "the uncommitted GC lists a staged table file" are facts of the same graveler and GC code the
+// server runs, not assumptions of a mock.
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
@@ -17,6 +20,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/table"
+	"github.com/google/uuid"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/block"
@@ -720,6 +726,164 @@ func TestStoreWrite(t *testing.T) {
 		require.ErrorIs(t, f.store.CreateNamespace(f.ctx, addr, properties), ErrInvalidIdentifier,
 			"a namespace level cannot escape the reserved prefix")
 	})
+}
+
+// TestCreateTableWithMetadata covers the create path's file registration (§6.3): the initial
+// metadata.json a create writes is not a lakeFS entry by itself - the pointer names it from entry
+// *user metadata*, not from an entry address - so a table that is created and never appended to
+// would have a metadata file that no retained commit references. The create path therefore stages
+// it through the commit path's own registration (StageTableFiles): the same entry key, the same
+// foreign-location check and the same iceberg.max_staged_files cap, before the pointer.
+//
+// The metadata documents here are built the way the create handler builds them
+// (table.NewMetadataWithUUID, no base, no snapshots), so the plan these tests exercise is the plan
+// a create produces and not one shaped for a commit.
+func TestCreateTableWithMetadata(t *testing.T) {
+	namespace := Namespace{"inventory", "books"}
+	const metadataFileKey = "_iceberg/" + storeTestUUID + "/metadata/00001-" + storeTestUUID + ".metadata.json"
+
+	// createNamespace stages the marker the create path requires of the table's namespace.
+	createNamespace := func(t *testing.T, f *storeFixture) {
+		t.Helper()
+		require.NoError(t, f.store.CreateNamespace(f.ctx, Address{
+			Repo: storeTestRepo, Ref: "main", Namespace: namespace,
+		}, nil), "create the namespace")
+	}
+
+	t.Run("stages the initial metadata file and then the pointer", func(t *testing.T) {
+		f := newStoreFixture(t)
+		addr := Address{Repo: storeTestRepo, Ref: "main", Namespace: namespace, Table: "orders"}
+		createNamespace(t, f)
+
+		// §6.2 step 4: the create writes the metadata file first, then registers and stages it.
+		metadata, document := newTableTestMetadata(t, "mem://"+storeTestRepo+"-ns/_iceberg/"+storeTestUUID)
+		metadataLocation := f.putMetadata(t, metadataFileKey, string(document))
+		pointer := TablePointer{MetadataLocation: metadataLocation, TableUUID: storeTestUUID, FormatVersion: 2}
+
+		headBefore := f.headRef(t)
+		require.NoError(t, f.store.CreateTableWithMetadata(f.ctx, addr, pointer, metadata, int64(len(document))))
+
+		// §6.3: the key is the commit path's - _lakefs_iceberg/files/<table-uuid>/<path relative to
+		// the table root> - so a create and every later commit of the table address one directory,
+		// and a retried create overwrites the same key instead of adding a second entry.
+		entryPath, err := TableFilePath(tableUUIDForTest(t, storeTestUUID), "metadata/00001-"+storeTestUUID+".metadata.json")
+		require.NoError(t, err)
+		require.Equal(t, "_lakefs_iceberg/files/"+storeTestUUID+"/metadata/00001-"+storeTestUUID+".metadata.json",
+			entryPath, "the create registers the metadata file where §6.3 puts table files")
+
+		staged, err := f.entryAt(t, "main", entryPath)
+		require.NoError(t, err, "the initial metadata file is a lakeFS entry")
+		require.Equal(t, metadataLocation, staged.PhysicalAddress, "the entry points at the object the create wrote")
+		require.Equal(t, catalog.AddressTypeFull, staged.AddressType,
+			"the object is the one the catalog wrote under the storage namespace, shared by every branch")
+		require.Equal(t, int64(len(document)), staged.Size, "the size is the metadata file's, not a HEAD")
+		require.Equal(t, metadata.LastUpdatedMillis(), staged.CreationDate.UnixMilli(),
+			"the GC ages the entry by the metadata's last-updated-ms")
+		require.Empty(t, staged.Metadata, "a table file entry carries no user metadata")
+
+		// Staged, not committed, and visible to the uncommitted GC: staging is what puts a table file
+		// into the report (spike S-I2 §4), and that is the mechanism the grace window protects.
+		require.Equal(t, headBefore, f.headRef(t), "a create must not commit the branch")
+		_, err = f.entryAt(t, headBefore, entryPath)
+		require.ErrorIs(t, err, graveler.ErrNotFound, "the entry is staged, not committed")
+		require.Contains(t, prepareUncommittedReport(t, f), strings.TrimPrefix(metadataLocation, "mem://"+storeTestRepo+"-ns/"),
+			"the initial metadata file is a staged table file, so the uncommitted GC can see it")
+
+		// The pointer is staged after the entry, so a reader never resolves a table whose metadata
+		// file is unregistered.
+		got, err := f.store.GetTable(f.ctx, addr)
+		require.NoError(t, err)
+		require.Equal(t, pointer, got.Pointer)
+
+		// An explicit lakeFS commit makes both part of the repository, which is the point of the fix:
+		// the metadata file no longer depends on the client ever appending to the table.
+		commit := f.commit(t, "create the table")
+		committed, err := f.entryAt(t, commit, entryPath)
+		require.NoError(t, err, "the metadata entry must survive the lakeFS commit")
+		require.Equal(t, metadataLocation, committed.PhysicalAddress)
+		require.NotContains(t, prepareUncommittedReport(t, f),
+			strings.TrimPrefix(metadataLocation, "mem://"+storeTestRepo+"-ns/"),
+			"a committed table file is no longer an uncommitted entry")
+	})
+
+	t.Run("a metadata file outside the table area stages nothing", func(t *testing.T) {
+		f := newStoreFixture(t)
+		addr := Address{Repo: storeTestRepo, Ref: "main", Namespace: namespace, Table: "orders"}
+		createNamespace(t, f)
+
+		// The document declares a location outside <storage_namespace>/_iceberg/, which is the §13
+		// security control the commit path applies to every file it would stage. The object itself is
+		// written under the fixture's namespace: what is checked is the location metadata.json
+		// declares, and it is checked before the file is read.
+		metadata, document := newTableTestMetadata(t, "mem://another-bucket/_iceberg/"+storeTestUUID)
+		metadataLocation := f.putMetadata(t, metadataFileKey, string(document))
+		pointer := TablePointer{MetadataLocation: metadataLocation, TableUUID: storeTestUUID, FormatVersion: 2}
+
+		err := f.store.CreateTableWithMetadata(f.ctx, addr, pointer, metadata, int64(len(document)))
+		var foreign *ForeignTableFileError
+		require.ErrorAs(t, err, &foreign, "a table location outside the area is refused, got %v", err)
+		require.ErrorIs(t, err, ErrTableLocationOutsideArea)
+
+		// Nothing was staged: not the file entry, and not the pointer that would name it.
+		require.Empty(t, f.stagedFileEntries(t, storeTestRepo, "main", storeTestUUID), "a refused create stages no table file")
+		_, err = f.store.GetTable(f.ctx, addr)
+		var missing *NoSuchTableException
+		require.ErrorAs(t, err, &missing, "a refused create stages no pointer, got %v", err)
+	})
+
+	t.Run("the cap the store was built with applies to the create", func(t *testing.T) {
+		f := newStoreFixture(t)
+		limited := NewStore(f.catalog, f.catalog.BlockAdapter, WithMaxStagedFiles(1))
+		require.Equal(t, 1, limited.MaxStagedFiles())
+
+		addr := Address{Repo: storeTestRepo, Ref: "main", Namespace: namespace, Table: "orders"}
+		createNamespace(t, f)
+		metadata, document := newTableTestMetadata(t, "mem://"+storeTestRepo+"-ns/_iceberg/"+storeTestUUID)
+		metadataLocation := f.putMetadata(t, metadataFileKey, string(document))
+
+		// The registration runs with the store's configured cap rather than the default, and a create
+		// has exactly one metadata file, so a cap of one admits it: the cap bounds a create without
+		// refusing the very file the create exists to write.
+		require.NoError(t, limited.CreateTableWithMetadata(f.ctx, addr,
+			TablePointer{MetadataLocation: metadataLocation, TableUUID: storeTestUUID, FormatVersion: 2},
+			metadata, int64(len(document))))
+		require.Len(t, f.stagedFileEntries(t, storeTestRepo, "main", storeTestUUID), 1,
+			"the create registered exactly its one metadata file")
+	})
+}
+
+// newTableTestMetadata builds and serializes the metadata document of a newly created table, the
+// way the create handler does: table.NewMetadataWithUUID over the client's schema, with no base
+// metadata and therefore no snapshots.
+func newTableTestMetadata(t *testing.T, tableLocation string) (table.Metadata, []byte) {
+	t.Helper()
+	schema := iceberg.NewSchema(0, iceberg.NestedField{
+		ID: 1, Name: "x", Type: iceberg.PrimitiveTypes.Int64, Required: true,
+	})
+	metadata, err := table.NewMetadataWithUUID(schema, nil, table.UnsortedSortOrder, tableLocation,
+		iceberg.Properties{"owner": "data-team"}, tableUUIDForTest(t, storeTestUUID))
+	require.NoError(t, err, "build the initial table metadata")
+	document, err := json.Marshal(metadata)
+	require.NoError(t, err, "serialize the initial table metadata")
+	return metadata, document
+}
+
+// tableUUIDForTest parses a table UUID a test hard-codes.
+func tableUUIDForTest(t *testing.T, raw string) uuid.UUID {
+	t.Helper()
+	value, err := uuid.Parse(raw)
+	require.NoError(t, err, "parse the table uuid %q", raw)
+	return value
+}
+
+// stagedFileEntries lists the staged entries under _lakefs_iceberg/files/<table-uuid>/ on ref of
+// repo, i.e. what the create path (or a commit) registered for that table.
+func (f *storeFixture) stagedFileEntries(t *testing.T, repo, ref, tableUUID string) []*catalog.DBEntry {
+	t.Helper()
+	prefix := ReservedPrefix + "/" + FilesDirectory + "/" + tableUUID + "/"
+	entries, _, err := f.catalog.ListEntries(f.ctx, repo, ref, prefix, "", "", -1)
+	require.NoError(t, err, "list the staged table files under %s", prefix)
+	return entries
 }
 
 // TestPointerCAS is the §12 "CAS race" unit test at pointer granularity: two clients built their

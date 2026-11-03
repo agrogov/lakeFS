@@ -4,16 +4,19 @@ package icebergcatalog
 // head on any ref), the staged create of §11 I-2 / task I2-4 (§2.1 protocol facts, §5
 // "Addressing rules", §6.2 "Atomic commit", §7.2 "Authorization"), and the drop and metrics sink
 // of task I2-5 (§11 I-2, §14 Q-I8). The read tests are named TestTablesRead, the create tests
-// TestCreateTable and the drop and metrics tests TestDropTable and TestReportMetrics, so each
-// task's validation command (`go test -run TestTablesRead`, `-run TestCreateTable`,
-// `-run TestDropTable`) runs the tests it names.
+// TestCreateTable, the create's file registration and commit behaviour
+// TestCreateTableStagesMetadataFile (§6.3), and the drop and metrics tests TestDropTable and
+// TestReportMetrics, so each task's validation command (`go test -run TestTablesRead`,
+// `-run TestCreateTable`, `-run TestDropTable`) runs the tests it names.
 //
 // The fixture is the real read path end to end: a catalog store (graveler + committed ranges) on
 // an in-memory KV store, an in-memory block adapter, the simplified-ACL auth service the
 // lakefs-sso binary uses, and the production middleware stack built by newRouter. Pointers are
 // staged with the store's own create path and metadata.json files are written through the block
 // adapter, so the entries and the documents the endpoints read are the ones the write path of I2
-// will produce.
+// will produce. The read tree is built with store.CreateTable directly - it stages a pointer and
+// nothing else - while the create tests go through the endpoint, whose create also registers the
+// initial metadata file (§6.3, TestCreateTableStagesMetadataFile).
 //
 // The metadata document below is deliberately not the spec example: it carries three snapshots of
 // which only two are referenced (by the implicit main branch and by a tag), and its snapshot IDs
@@ -21,12 +24,14 @@ package icebergcatalog
 // ID into a float or returns every snapshot regardless of the query parameter.
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,6 +39,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/model"
@@ -1151,6 +1157,188 @@ func TestCreateTable(t *testing.T) {
 			require.Contains(t, response.Endpoints, endpoint)
 		}
 	})
+}
+
+// TestCreateTableStagesMetadataFile covers the one thing the create of TestCreateTable cannot show
+// on its own: a created table's initial metadata.json is a lakeFS entry (§6.3), so a table that is
+// created and never appended to survives a lakeFS commit and the committed GC that follows it, and
+// diff, merge and a dataset materialisation see the file and not only the pointer.
+//
+// The commit half is what makes it a test of the fix rather than of a staged entry: the pointer and
+// the file entry are staged together, one lakeFS commit publishes both, and the metadata file then
+// belongs to a retained commit instead of to no one.
+func TestCreateTableStagesMetadataFile(t *testing.T) {
+	t.Run("the created table's metadata file is an entry a lakeFS commit keeps", func(t *testing.T) {
+		f := newTablesFixture(t)
+		sales := Namespace{"sales"}
+		salesParam := tablesNamespaceParam(tablesTestRef, sales)
+		head := f.headRef(t)
+
+		created := decodeLoadTable(t, f.postTable(t, salesParam, "carol",
+			createTableBody("staged_metadata", createTableSchema)))
+		var tableUUID string
+		require.NoError(t, json.Unmarshal(created.Metadata["table-uuid"], &tableUUID))
+
+		// The entry key is the commit path's (§6.3): _lakefs_iceberg/files/<table-uuid>/<path relative
+		// to the table root>, built with the production helper so the test cannot pin a key the code
+		// does not produce.
+		entryPath := metadataFileEntryPath(t, tableUUID, created.MetadataLocation)
+		staged, err := f.entryOn(t, tablesTestRef, entryPath)
+		require.NoError(t, err, "the initial metadata file must be a lakeFS entry")
+		require.Equal(t, created.MetadataLocation, staged.PhysicalAddress,
+			"the entry points at the metadata.json the pointer names")
+		require.Equal(t, catalog.AddressTypeFull, staged.AddressType)
+		require.Equal(t, int64(len(f.tableObject(t, created.MetadataLocation))), staged.Size)
+
+		// Staged, not committed, like every other catalog write (§14 Q-I2).
+		require.Equal(t, head, f.headRef(t), "create must not commit the branch")
+		_, err = f.entryOn(t, head, entryPath)
+		require.ErrorIs(t, err, graveler.ErrNotFound, "the entry is staged, not committed")
+		require.Equal(t, created.MetadataLocation, decodeLoadTable(t, f.request(t, http.MethodGet,
+			tablesLoadTarget(salesParam, "staged_metadata", nil), "alice")).MetadataLocation)
+
+		// One lakeFS commit publishes the pointer and the file entry together: the point of the fix
+		// is that the metadata file is referenced by a retained commit, so it is no longer only a
+		// client-written object that nothing protects.
+		ref := f.commitCatalog(t)
+		committed, err := f.entryOn(t, ref, entryPath)
+		require.NoError(t, err, "the metadata entry must survive the lakeFS commit")
+		require.Equal(t, staged.PhysicalAddress, committed.PhysicalAddress)
+		require.Equal(t, created.MetadataLocation, decodeLoadTable(t, f.request(t, http.MethodGet,
+			tablesLoadTarget(salesParam, "staged_metadata", nil), "alice")).MetadataLocation,
+			"the table is still readable on the branch after the commit")
+
+		// And it is readable at the commit itself, next to the pointer it belongs to.
+		pointerPath, err := tablePointerPath(tableAddressOf(sales, "staged_metadata"))
+		require.NoError(t, err)
+		_, err = f.entryOn(t, ref, pointerPath)
+		require.NoError(t, err, "the pointer is committed next to the file entry")
+	})
+
+	t.Run("stage-create stages no metadata file entry", func(t *testing.T) {
+		f := newTablesFixture(t)
+		salesParam := tablesNamespaceParam(tablesTestRef, Namespace{"sales"})
+
+		created := decodeLoadTable(t, f.postTable(t, salesParam, "carol", createTableBody("staged_only",
+			createTableSchema, `"stage-create": true`)))
+		var tableUUID string
+		require.NoError(t, json.Unmarshal(created.Metadata["table-uuid"], &tableUUID))
+
+		// stage-create initializes the metadata and creates no table, so there is no pointer for a
+		// file entry to belong to: an entry without a table would be an uncommitted entry nobody can
+		// read and nothing can commit into a table. (The phase-two commit such a client sends is not
+		// served yet - see the create's file comment - so a table created that way registers its
+		// metadata file when the table itself is created.)
+		_, err := f.entryOn(t, tablesTestRef, metadataFileEntryPath(t, tableUUID, created.MetadataLocation))
+		require.ErrorIs(t, err, graveler.ErrNotFound, "a staged create stages no table file")
+		require.Empty(t, f.stagedFileEntries(t, tablesTestRepo, tablesTestRef, tableUUID),
+			"nothing is staged under the table's uuid")
+	})
+
+	t.Run("a duplicate create leaves the winner's metadata entry alone", func(t *testing.T) {
+		f := newTablesFixture(t)
+		salesParam := tablesNamespaceParam(tablesTestRef, Namespace{"sales"})
+
+		first := decodeLoadTable(t, f.postTable(t, salesParam, "carol",
+			createTableBody("created_twice", createTableSchema)))
+		var tableUUID string
+		require.NoError(t, json.Unmarshal(first.Metadata["table-uuid"], &tableUUID))
+		winnerPath := metadataFileEntryPath(t, tableUUID, first.MetadataLocation)
+		winner, err := f.entryOn(t, tablesTestRef, winnerPath)
+		require.NoError(t, err, "the winner registered its metadata file")
+
+		// The losing request writes and registers its own metadata under its own fresh table uuid
+		// before the assert-create of the pointer refuses it:
+		requireEnvelope(t, f.postTable(t, salesParam, "carol",
+			createTableBody("created_twice", createTableSchema)), http.StatusConflict, ErrTypeAlreadyExists)
+
+		// The winner's entry and pointer are untouched, and the table still reads what it read before.
+		after, err := f.entryOn(t, tablesTestRef, winnerPath)
+		require.NoError(t, err)
+		require.Equal(t, winner.PhysicalAddress, after.PhysicalAddress)
+		require.Equal(t, first.MetadataLocation, decodeLoadTable(t, f.request(t, http.MethodGet,
+			tablesLoadTarget(salesParam, "created_twice", nil), "alice")).MetadataLocation)
+	})
+
+	t.Run("a failure after the metadata write keeps the create path's mapping", func(t *testing.T) {
+		f := newTablesFixture(t)
+		salesParam := tablesNamespaceParam(tablesTestRef, Namespace{"sales"})
+		cfg := &Config{Prefix: CatalogPrefix}
+
+		// The registration step runs after metadata.json was written and before the pointer: its
+		// failures must surface exactly as a create failure always did, not as a new status. The
+		// staging write is redirected so that this stays a test of the mapping rather than of
+		// graveler's branch protection (whose rules the fixture's own writes have already cached):
+		// a write the repository refuses is still 403 and anything unexpected is still the server's
+		// internal error.
+		for name, tc := range map[string]struct {
+			stageErr   error
+			wantStatus int
+			wantType   string
+		}{
+			"a staging write the repository refuses": {
+				stageErr:   graveler.ErrWriteToProtectedBranch,
+				wantStatus: http.StatusForbidden,
+				wantType:   ErrTypeForbidden,
+			},
+			"an unexpected staging failure": {
+				stageErr:   fmt.Errorf("%w: the KV store is unavailable", ErrTableFileRegistration),
+				wantStatus: http.StatusInternalServerError,
+				wantType:   ErrTypeInternalServerError,
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				service := NewTableService(
+					NewStore(failingStageCatalog{Catalog: f.catalog, err: tc.stageErr}, f.catalog.BlockAdapter),
+					f.authz.authz, f.catalog, cfg)
+				router, err := newRouter(tablesUser, cfg, catalogServerWith(cfg, service.Routes()...))
+				require.NoError(t, err, "build the catalog router")
+
+				req := httptest.NewRequest(http.MethodPost, tablesCreateTarget(salesParam),
+					strings.NewReader(createTableBody("refused_create", createTableSchema)))
+				req.Header.Set("X-Test-User", "carol")
+				req.Header.Set("Content-Type", contentTypeJSON)
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, req)
+				requireEnvelope(t, rec, tc.wantStatus, tc.wantType)
+
+				// The pointer was never staged, so the table does not exist whatever the failure was.
+				pointerPath, err := tablePointerPath(tableAddressOf(Namespace{"sales"}, "refused_create"))
+				require.NoError(t, err)
+				_, err = f.entryOn(t, tablesTestRef, pointerPath)
+				require.ErrorIs(t, err, graveler.ErrNotFound,
+					"a create whose file registration failed must not stage a pointer")
+			})
+		}
+	})
+}
+
+// failingStageCatalog delegates to a catalog but fails the staging write of table file entries, so
+// a test can exercise what the create path answers when the registration that runs after the
+// metadata write fails. Everything else - reads, the pointer write, the namespace marker - is the
+// fixture's real catalog.
+type failingStageCatalog struct {
+	Catalog
+	err error
+}
+
+func (c failingStageCatalog) CreateEntry(ctx context.Context, repositoryID, branch string, entry catalog.DBEntry,
+	opts ...graveler.SetOptionsFunc) error {
+	if strings.HasPrefix(entry.Path, ReservedPrefix+"/"+FilesDirectory+"/") {
+		return c.err
+	}
+	return c.Catalog.CreateEntry(ctx, repositoryID, branch, entry, opts...)
+}
+
+// metadataFileEntryPath builds the entry key of a created table's initial metadata file (§6.3) with
+// the production helper: _lakefs_iceberg/files/<table-uuid>/<path relative to the table root>.
+func metadataFileEntryPath(t *testing.T, tableUUID, metadataLocation string) string {
+	t.Helper()
+	value, err := uuid.Parse(tableUUID)
+	require.NoError(t, err, "the create response carries a table uuid")
+	entryPath, err := TableFilePath(value, path.Join(MetadataDirectory, path.Base(metadataLocation)))
+	require.NoError(t, err, "build the table file entry key")
+	return entryPath
 }
 
 // sortedFieldNames returns the field names of currentSchemaFieldIDs in lexical order, so a test can

@@ -86,16 +86,29 @@ package icebergcatalog
 //     (§6.1, and the alternative §6.3 rejects);
 //  3. the initial metadata.json is written under <location>/metadata/, so the pointer a reader
 //     finds never names a file that is not there (metadata.go);
-//  4. the pointer is staged with the assert-create condition of store.CreateTable - a
+//  4. that metadata file becomes a lakeFS entry, _lakefs_iceberg/files/<table-uuid>/metadata/<file>,
+//     because the pointer names it from entry user metadata and nothing else would reference it
+//     (§6.3): a table created and never appended to must survive the committed GC and must show up
+//     in diff and merge. The registration is the commit path's (files.go StageTableFiles) - the
+//     same foreign-location check, the same iceberg.max_staged_files cap, the same deterministic
+//     key - so create and commit cannot drift apart;
+//  5. the pointer is staged with the assert-create condition of store.CreateTable - a
 //     compare-and-swap on an absent value, i.e. If-None-Match: * (§6.2). A name that is already
 //     taken is 409 AlreadyExistsException, and the metadata.json of the losing request is left
 //     unreferenced for GC, exactly like the orphan of a lost commit (§6.2 step 4).
+//
+// Steps 4 and 5 are store.CreateTableWithMetadata, in that order: the file entry is staged before
+// the pointer, so a failure of file registration never leaves a pointer naming an unregistered
+// metadata file. Such a failure happens after the metadata write and answers exactly what the
+// create path answered before this step existed.
 //
 // The response is the LoadTableResult of the spec's CreateTableResponse, built from the bytes that
 // were just written, so a client sees the same document a later load returns.
 //
 // The spec's `stage-create` member is honoured in its documented sense: with stage-create=true the
-// metadata is initialized and returned and the table is *not* created, so no pointer is staged.
+// metadata is initialized and returned and the table is *not* created, so neither a pointer nor a
+// table-file entry is staged (a file entry without a table would be an uncommitted entry for a
+// table no one can read).
 // The phase-two commit such a client sends next (assert-create against a table that does not exist
 // yet) is not served by Store.Commit, which requires a base pointer; until that path exists, a
 // client that asks for a staged create gets the initializing half of it and no table.
@@ -598,12 +611,15 @@ func (s *tableService) handleCreateTable(w http.ResponseWriter, r *http.Request)
 }
 
 // createTable is the create itself, once the request is parsed and authorized: initialize the
-// metadata, write it, and stage the pointer (§6.2, §14 Q-I5).
+// metadata, write it, register it, and stage the pointer (§6.2, §14 Q-I5, §6.3).
 //
-// Every failure before the pointer write leaves nothing behind that a reader can see. A failure of
+// Every failure before the pointer write leaves nothing behind that a reader can see: the table
+// does not exist, so a load is 404 whatever staged file entries a failed attempt left. A failure of
 // the pointer write after metadata.json exists leaves an unreferenced metadata file, which is the
 // same orphan a lost commit leaves and which GC collects (§6.2 step 4); a duplicate create
-// therefore costs one collectable object, and nothing can point a table at the loser's document.
+// therefore costs one collectable object and one collectable entry, and nothing can point a table
+// at the loser's document. Every failure after the metadata write - including one of the file
+// registration of step 4 - answers what this path answered before that step existed.
 func (s *tableService) createTable(ctx context.Context, addr Address, request createTableRequest) (*loadTableResult, error) {
 	if request.Schema == nil {
 		return nil, fmt.Errorf("%w: the request carries no schema", ErrInvalidCreateTable)
@@ -661,9 +677,10 @@ func (s *tableService) createTable(ctx context.Context, addr Address, request cr
 		FormatVersion:    version,
 	}
 	if !request.StageCreate {
-		// The assert-create staging of §6.2: a value where an absent one was required is
-		// ErrAlreadyExists, which the HTTP layer answers 409 AlreadyExistsException.
-		if err := s.store.CreateTable(ctx, addr, pointer); err != nil {
+		// Steps 4-5 of the file comment: the metadata file becomes a lakeFS entry (§6.3) and the
+		// pointer is staged with assert-create semantics (§6.2). A duplicate create is
+		// ErrAlreadyExists there, which the HTTP layer answers 409 AlreadyExistsException.
+		if err := s.store.CreateTableWithMetadata(ctx, addr, pointer, metadata, int64(len(metadataJSON))); err != nil {
 			return nil, err
 		}
 	}

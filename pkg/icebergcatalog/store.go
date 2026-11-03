@@ -12,12 +12,14 @@ package icebergcatalog
 //	                                           iceberg.metadata-location = physical URI of metadata.json
 //	                                           iceberg.table-uuid       = table UUID
 //	                                           iceberg.format-version   = 1 | 2
+//	  files/<table-uuid>/<relative path>     one entry per table file (§6.3, files.go): the files a
+//	                                           commit added, and the initial metadata.json a create wrote
 //
 // The read half resolves the marker and the pointer on a branch, tag or commit, decodes the
 // pointer's user metadata and loads the referenced metadata.json through the block adapter.
 //
-// The write half creates and updates those two entries with a check-and-put: every write is a
-// catalog.CreateEntry gated by graveler.WithCondition (§6.2 steps 5-6), so it is:
+// The write half creates and updates those entries with a check-and-put: every marker and pointer
+// write is a catalog.CreateEntry gated by graveler.WithCondition (§6.2 steps 5-6), so it is:
 //
 //   - a compare-and-swap. A table pointer write is conditioned on the pointer's
 //     iceberg.metadata-location, the field §6.2 step 6 swaps. A lost race returns
@@ -31,7 +33,11 @@ package icebergcatalog
 // No write passes graveler.SetOptions.Force. A protected branch therefore rejects a catalog write
 // with graveler.ErrWriteToProtectedBranch and a read-only (datasets-immutable) repository rejects
 // it with graveler.ErrReadOnlyRepository - the same answers an fs: write gets (§6.2 "why stage
-// instead of auto-commit").
+// instead of auto-commit"). That includes the table file entries of §6.3 (files.go): they are
+// staged through the same catalog.CreateEntry without Force, so branch protection, repository
+// immutability and the reserved-prefix policy apply to them unchanged. A file entry is not
+// conditioned, because it is not a compare-and-swap target: its key is derived from the file's own
+// path, so a retried write overwrites it instead of racing another writer.
 //
 // Writes are staged, never committed: a namespace or table created through the catalog becomes
 // visible on the branch immediately (staged reads, above) and becomes part of the repository only
@@ -448,6 +454,10 @@ func (s *Store) UpdateNamespace(ctx context.Context, addr Address, properties ma
 // is already taken returns ErrAlreadyExists instead of replacing an existing table's pointer and
 // orphaning the metadata.json it named. Metadata files are never overwritten; a pointer write is
 // the only way to change which one is current (§6.1).
+//
+// This call stages the pointer and nothing else. The create path of the catalog uses
+// CreateTableWithMetadata, which first registers the initial metadata.json as a lakeFS entry, so a
+// table that is created and never appended to still has a referenced metadata file (§6.3).
 func (s *Store) CreateTable(ctx context.Context, addr Address, pointer TablePointer) error {
 	pointerPath, err := tablePointerPath(addr)
 	if err != nil {
@@ -465,6 +475,49 @@ func (s *Store) CreateTable(ctx context.Context, addr Address, pointer TablePoin
 		return nil
 	})
 	return asAlreadyExists(err, "table", addr.Namespace.Dotted()+"."+addr.Table, addr)
+}
+
+// CreateTableWithMetadata stages a new table on addr.Ref: the lakeFS entry of the initial
+// metadata.json the create path wrote (§6.3), and then the table pointer (CreateTable).
+//
+// The initial metadata file needs its own entry for the reason every table file does (§6.3): the
+// pointer names it from entry *user metadata*, not from an entry address, so nothing else makes it
+// a lakeFS entry. A table that is created and never appended to would therefore have a metadata
+// file no entry and no commit references - collectable by the committed GC sweep, and invisible to
+// `lakectl diff` and to a merge. The commit path registers the metadata file it writes with
+// StageTableFiles (§6.2 step 5); a create is the same situation with no base metadata and no
+// snapshots, so it goes through the same call, which is what makes the rules identical rather than
+// a second, weaker copy of them:
+//
+//   - the foreign-location check against the table's own root, so a create can never register a
+//     file outside <storage_namespace>/_iceberg/ (§13);
+//   - the iceberg.max_staged_files cap (this store's configured value), refused before anything is
+//     staged;
+//   - the deterministic entry key _lakefs_iceberg/files/<table-uuid>/metadata/<file name>, the one
+//     the commit path uses for the metadata file it writes, so the create and a later commit of the
+//     same table address one directory and a retried request overwrites the same key.
+//
+// metadata is the document pointer names and metadataSize is its length in bytes, i.e. what the
+// create path just wrote through WriteMetadata (§6.2 step 4); a create has exactly one such file.
+//
+// Order matters and is the commit path's: the file entry is staged first, so a failure of file
+// registration leaves no pointer that names an unregistered metadata file, and the create answers
+// the same error it would answer without this call - a failure after the metadata write, which the
+// HTTP layer maps as it did before. The pointer write keeps the create-on-absent-value semantics of
+// CreateTable, so a duplicate create is still ErrAlreadyExists; the losing request's entries are
+// keyed by its own fresh table uuid, so they cannot shadow the winner's and GC collects them.
+func (s *Store) CreateTableWithMetadata(ctx context.Context, addr Address, pointer TablePointer, metadata table.Metadata, metadataSize int64) error {
+	if _, err := s.StageTableFiles(ctx, addr, StageTableFilesRequest{
+		// A create has no base metadata (Base stays nil: every snapshot of Next would count as
+		// new) and a newly initialized metadata.json has no snapshots at all, so the plan is
+		// exactly the one metadata file.
+		Next:          metadata,
+		MetadataFiles: []TableMetadataFile{{Location: pointer.MetadataLocation, Size: metadataSize}},
+		MaxFiles:      s.maxStagedFiles,
+	}); err != nil {
+		return err
+	}
+	return s.CreateTable(ctx, addr, pointer)
 }
 
 // UpdateTablePointer swaps the table pointer from base to next on addr.Ref: the check-and-put of
