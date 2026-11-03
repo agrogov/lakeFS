@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 import { iceberg } from '../../api/iceberg';
@@ -28,6 +28,23 @@ const catalogEnvelope = (status: number, type: string, message: string) =>
 const config = () => jsonResponse(200, { defaults: {}, overrides: { prefix: 'lakefs' }, endpoints: [] });
 
 const namespacesOf = (namespaces: string[][]) => jsonResponse(200, { namespaces });
+
+/**
+ * The namespaces the catalog reports below the `parent` the client asked for. The listing is keyed
+ * by that query (`repo%1Fmain`, i.e. the levels joined by the separator), because a catalog answers
+ * with the *children* of the parent and never with the parent itself: `inventory` is a leaf, so the
+ * listing below it is empty. Answering every parent with the ref's child namespace instead would
+ * echo `inventory` back as its own child and make the namespace tree render itself recursively,
+ * one level per request round trip - which is uncontrolled async work inside the test.
+ */
+const namespacesBelow = (url: string) => {
+    const parent = new URL(url, 'http://localhost').searchParams.get('parent') ?? '';
+    const childrenByParent: Record<string, string[][]> = {
+        'repo\u001fmain': [['repo', 'main', 'inventory']],
+        'repo\u001fmain\u001finventory': [],
+    };
+    return namespacesOf(childrenByParent[parent] ?? []);
+};
 
 const tablesOf = (names: string[]) =>
     jsonResponse(200, { identifiers: names.map((name) => ({ namespace: ['repo', 'main', 'inventory'], name })) });
@@ -81,7 +98,7 @@ const serveCatalog = (fetchMock: ReturnType<typeof vi.fn>, overrides: Record<str
         if (url.endsWith('/v1/config')) return config();
         if (url.includes('/tables/')) return loadedTable();
         if (url.includes('/tables')) return tablesOf(['books']);
-        if (url.includes('/namespaces?')) return namespacesOf([['repo', 'main', 'inventory']]);
+        if (url.includes('/namespaces?')) return namespacesBelow(url);
         return jsonResponse(404, { error: { message: `no mock for ${url}`, type: 'NotFoundException' } });
     });
 };
@@ -151,7 +168,10 @@ describe('TablesTab', () => {
         render(<TablesTab repository="repo" refId="main" />);
 
         // The top-level namespace is open, so its tables are visible without a click.
-        expect(await screen.findByText('inventory')).toBeInTheDocument();
+        const tree = await screen.findByTestId('iceberg-namespace-tree');
+        expect(await within(tree).findByText('inventory')).toBeInTheDocument();
+        // One namespace node: `inventory` is a leaf, so it must not list itself as a child.
+        expect(within(tree).getAllByText('inventory')).toHaveLength(1);
         const table = await screen.findByRole('button', { name: /books/ });
 
         await user.click(table);
