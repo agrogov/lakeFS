@@ -4,7 +4,7 @@ import Card from 'react-bootstrap/Card';
 import Table from 'react-bootstrap/Table';
 import dayjs from 'dayjs';
 
-import { AlertError, Loading } from '../controls';
+import { Loading } from '../controls';
 import { useAPI } from '../../hooks/api';
 import {
     IcebergLoadTableResult,
@@ -14,13 +14,12 @@ import {
     currentSnapshot,
     formatIcebergType,
     iceberg,
-    isIcebergForbiddenError,
     namespaceLabel,
     snapshotHistory,
     snapshotOperation,
     sourceFieldName,
 } from '../../api/iceberg';
-import { TablesPermissionRequired } from './tablesStates';
+import { TablesError } from './tablesStates';
 
 /** A timestamp of the metadata document, which is in epoch milliseconds. */
 const formatTimestamp = (millis: number | undefined): string =>
@@ -48,12 +47,9 @@ export const IcebergTableDetails: FC<{
     );
 
     if (loading) return <Loading />;
-    if (error) {
-        if (isIcebergForbiddenError(error)) {
-            return <TablesPermissionRequired what={`Reading the table ${table}`} />;
-        }
-        return <AlertError error={error} />;
-    }
+    // A `401` or a `403` on the load says the same thing here as it does in the listing, so the
+    // same states are rendered - never a login redirect.
+    if (error) return <TablesError error={error} what={`Reading the table ${table}`} />;
     if (!response) return <></>;
 
     const result = response as IcebergLoadTableResult;

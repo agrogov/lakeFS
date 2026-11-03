@@ -5,10 +5,12 @@ import userEvent from '@testing-library/user-event';
 import { iceberg } from '../../api/iceberg';
 import { TablesTab } from './tablesExplorer';
 
-// useAPI() reports authentication failures through the auth context; these tests never take that
-// path, but the hook reads the context on every render.
+// useAPI() reports authentication failures through the auth context; a catalog 401 must never
+// reach it (that is the point of the client keeping its own error class), so the spy stays
+// uncalled and the tests assert exactly that.
+const { onUnauthenticated } = vi.hoisted(() => ({ onUnauthenticated: vi.fn() }));
 vi.mock('../../auth/authContext', () => ({
-    useAuth: () => ({ onUnauthenticated: () => {} }),
+    useAuth: () => ({ onUnauthenticated }),
 }));
 
 const jsonResponse = (status: number, body: unknown) => ({
@@ -110,6 +112,7 @@ describe('TablesTab', () => {
         fetchMock = vi.fn();
         vi.stubGlobal('fetch', fetchMock);
         iceberg.clearCache();
+        onUnauthenticated.mockClear();
     });
 
     afterEach(() => {
@@ -128,15 +131,43 @@ describe('TablesTab', () => {
         expect(screen.queryByTestId('iceberg-namespace-tree')).not.toBeInTheDocument();
     });
 
-    it('says no session on a 401 authentication answer instead of an upsell', async () => {
-        // The API client turns this 401 into AuthenticationError, which useAPI answers with the
-        // login redirect; the tab itself must not claim Enterprise.
+    it('shows a sign-in state on a 401 instead of the Enterprise upsell or a login redirect', async () => {
         fetchMock.mockResolvedValue(catalogEnvelope(401, 'NotAuthorizedException', 'authentication required'));
 
         render(<TablesTab repository="repo" refId="main" />);
 
-        expect(await screen.findByText('authentication required')).toBeInTheDocument();
+        expect(await screen.findByText('Sign in to read Iceberg tables')).toBeInTheDocument();
+        expect(screen.getByText(/not valid for the Iceberg catalog/)).toBeInTheDocument();
+        // The way back is a plain link the reader follows, not an automatic redirect: useAPI()'s
+        // onUnauthenticated() (the login redirect) must not be called at all.
+        expect(screen.getByRole('link', { name: 'Sign in' })).toHaveAttribute('href', '/auth/login');
+        expect(onUnauthenticated).not.toHaveBeenCalled();
         expect(screen.queryByText('Tables is an Enterprise feature')).not.toBeInTheDocument();
+        expect(screen.getByTestId('iceberg-session-required')).toBeInTheDocument();
+    });
+
+    it('shows the sign-in state when the catalog rejects the session after the config read', async () => {
+        serveCatalog(fetchMock, {
+            '/namespaces?': () => catalogEnvelope(401, 'NotAuthorizedException', 'authentication required'),
+        });
+
+        render(<TablesTab repository="repo" refId="main" />);
+
+        expect(await screen.findByText('Sign in to read Iceberg tables')).toBeInTheDocument();
+        expect(onUnauthenticated).not.toHaveBeenCalled();
+    });
+
+    it('shows the sign-in state in the table view when the load is rejected', async () => {
+        const user = userEvent.setup();
+        serveCatalog(fetchMock, {
+            '/tables/': () => catalogEnvelope(401, 'NotAuthorizedException', 'authentication required'),
+        });
+
+        render(<TablesTab repository="repo" refId="main" />);
+        await user.click(await screen.findByRole('button', { name: /books/ }));
+
+        expect(await screen.findByText('Sign in to read Iceberg tables')).toBeInTheDocument();
+        expect(onUnauthenticated).not.toHaveBeenCalled();
     });
 
     it('shows the permission state on a 403 from the catalog', async () => {
@@ -148,6 +179,9 @@ describe('TablesTab', () => {
 
         expect(await screen.findByText('Permission required')).toBeInTheDocument();
         expect(screen.getByText('catalog:ListTables')).toBeInTheDocument();
+        // A denial is not a lost session: no sign-in state, no redirect.
+        expect(screen.queryByTestId('iceberg-session-required')).not.toBeInTheDocument();
+        expect(onUnauthenticated).not.toHaveBeenCalled();
     });
 
     it('shows the empty state when the ref has no namespaces and therefore no tables', async () => {

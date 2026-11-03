@@ -10,12 +10,13 @@ import {
     iceberg,
     isIcebergDisabledError,
     isIcebergForbiddenError,
+    isIcebergUnauthenticatedError,
     namespaceLevelsBelowRef,
     namespaceOf,
 } from '../../api/iceberg';
 import { TablesEnterpriseInfo } from './tablesEnterpriseInfo';
 import { IcebergTableDetails } from './tablesDetails';
-import { NoTables, TablesPermissionRequired } from './tablesStates';
+import { NoTables, TablesError } from './tablesStates';
 
 /**
  * The repository Tables tab (DATA_VIEW_TABLES in
@@ -29,18 +30,18 @@ import { NoTables, TablesPermissionRequired } from './tablesStates';
  *
  * Reads only, deliberately: creating, dropping and committing tables stays an Iceberg client's
  * job, and the catalog accepts the UI's session cookie for GET and HEAD alone
- * (`pkg/icebergcatalog/auth.go`). Authorization is the catalog's `catalog:*` checks; this file only
- * turns their `403` into a state that says so.
+ * (`pkg/icebergcatalog/auth.go`). Two refusals are rendered in place rather than escalated: a
+ * `401` (the catalog does not accept the browser's session) becomes a sign-in state with a plain
+ * link, and a `403` (the catalog's `catalog:*` checks denied the read) becomes the permission
+ * state. Neither one navigates - in particular the tab never sends the reader to the login page,
+ * because the catalog's answer says nothing about the core session (`TablesError`).
  */
 export const TablesTab: FC<{ repository: string; refId: string }> = ({ repository, refId }) => {
     const { loading, disabled, error } = useIcebergConfig();
 
     if (loading) return <Loading />;
     if (disabled) return <TablesEnterpriseInfo />;
-    if (error) {
-        if (isIcebergForbiddenError(error)) return <TablesPermissionRequired />;
-        return <AlertError error={error} />;
-    }
+    if (error) return <TablesError error={error} />;
     return <IcebergTablesExplorer repository={repository} refId={refId} />;
 };
 
@@ -87,11 +88,7 @@ const IcebergTablesExplorer: FC<{ repository: string; refId: string }> = ({ repo
                     {loading ? (
                         <Loading />
                     ) : error ? (
-                        isIcebergForbiddenError(error) ? (
-                            <TablesPermissionRequired />
-                        ) : (
-                            <AlertError error={error} />
-                        )
+                        <TablesError error={error} />
                     ) : namespaces.length === 0 ? (
                         <NoTables refLabel={refLabel} />
                     ) : (
@@ -188,14 +185,7 @@ const NamespaceBranch: FC<NamespaceBranchProps> = ({ repository, refId, levels, 
             {expanded && (
                 <div>
                     {loading && <div className="ps-4 py-1 small text-muted">Loading namespaces and tables…</div>}
-                    {error &&
-                        (isIcebergForbiddenError(error) ? (
-                            <div className="ps-4 py-1 small text-muted">
-                                You are not allowed to read this namespace.
-                            </div>
-                        ) : (
-                            <AlertError error={error} />
-                        ))}
+                    {error && <NamespaceError error={error} />}
                     {tables.map((table) => {
                         const isSelected =
                             selected !== null && selected.name === table && selected.levels.join('\u001f') === path;
@@ -232,6 +222,29 @@ const NamespaceBranch: FC<NamespaceBranchProps> = ({ repository, refId, levels, 
                     )}
                 </div>
             )}
+        </div>
+    );
+};
+
+/**
+ * A failed read of one node, rendered inside the tree where the node is.
+ *
+ * A node is too small for the full cards of `TablesError`, so the two refusals become one muted
+ * line each: a `401` is the catalog not accepting the session, a `403` is the missing permission.
+ * Anything else is a real failure and keeps the alert, which carries the message and the status.
+ */
+const NamespaceError: FC<{ error: unknown }> = ({ error }) => {
+    let refusal: string | null = null;
+    if (isIcebergUnauthenticatedError(error)) {
+        refusal = 'Your session is not valid for the Iceberg catalog. Sign in again to read this namespace.';
+    } else if (isIcebergForbiddenError(error)) {
+        refusal = 'You are not allowed to read this namespace.';
+    }
+
+    if (refusal !== null) return <div className="ps-4 py-1 small text-muted">{refusal}</div>;
+    return (
+        <div className="ps-4 py-1">
+            <AlertError error={error as Error} />
         </div>
     );
 };

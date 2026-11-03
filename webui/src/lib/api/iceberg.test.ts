@@ -10,6 +10,7 @@ import {
     IcebergError,
     isIcebergDisabledError,
     isIcebergForbiddenError,
+    isIcebergUnauthenticatedError,
     namespaceLevelsBelowRef,
     namespaceOf,
     namespaceParam,
@@ -85,6 +86,8 @@ describe('iceberg client error mapping', () => {
         expect(error.type).toBe('ForbiddenException');
         expect(error.message).toBe('user u insufficient permissions');
         expect(isIcebergForbiddenError(error)).toBe(true);
+        // A denial is about the permission, not about the session.
+        expect(isIcebergUnauthenticatedError(error)).toBe(false);
         expect(isIcebergDisabledError(error)).toBe(false);
     });
 
@@ -113,15 +116,22 @@ describe('iceberg client error mapping', () => {
         expect(isIcebergForbiddenError(error)).toBe(false);
     });
 
-    it('throws AuthenticationError on a 401 that means "no session", so the login redirect runs', async () => {
+    it('keeps a 401 as an IcebergError, so useAPI() never redirects to the login page', async () => {
         fetchMock.mockResolvedValue(
             jsonResponse(401, { error: { message: 'authentication required', type: 'NotAuthorizedException' } }),
         );
 
         const error = await iceberg.loadTable(['repo', 'main'], 'books').catch((e) => e);
 
-        expect(error).toBeInstanceOf(AuthenticationError);
+        // The catalog's 401 says nothing about the core lakeFS session (pkg/icebergcatalog/auth.go),
+        // so it stays the catalog's own error: the Tables tab shows it in place.
+        expect(error).toBeInstanceOf(IcebergError);
+        expect(error).not.toBeInstanceOf(AuthenticationError);
         expect(error.status).toBe(401);
+        expect(error.message).toBe('authentication required');
+        expect(isIcebergUnauthenticatedError(error)).toBe(true);
+        expect(isIcebergForbiddenError(error)).toBe(false);
+        expect(isIcebergDisabledError(error)).toBe(false);
     });
 
     it('falls back to the status line when the body is not the catalog envelope', async () => {

@@ -1,14 +1,16 @@
-import { AuthenticationError, defaultAPIHeaders } from './index';
+import { defaultAPIHeaders } from './index';
 
 /**
  * Typed, read-only client for the Apache Iceberg REST catalog (`pkg/icebergcatalog`, see
  * `docs/iceberg.md`).
  *
  * The transport mirrors `lib/api/index.js` and `lib/api/datasets.ts`: `fetch` with the lakeFS
- * default headers, a status switch per call and errors surfaced as exceptions. The catalog is
- * mounted at `/iceberg/api`, next to `/api/v1` rather than below it, and it addresses a table as
- * `repo␟ref␟namespace…␟table` - the repository and the ref are the first two namespace levels
- * (docs/iceberg.md, "Addressing"). The `␟` separator is `%1F` on the wire.
+ * default headers, a status switch per call and errors surfaced as exceptions. It differs from
+ * them in one deliberate way: no answer becomes an `AuthenticationError`, so `useAPI()` cannot
+ * redirect a reader of the Tables tab to the login page (see "Error handling" below). The
+ * catalog is mounted at `/iceberg/api`, next to `/api/v1` rather than below it, and it addresses a
+ * table as `repo␟ref␟namespace…␟table` - the repository and the ref are the first two namespace
+ * levels (docs/iceberg.md, "Addressing"). The `␟` separator is `%1F` on the wire.
  *
  * Only the catalog's own read endpoints are used here: `GET /v1/config`, the namespace listing,
  * the table listing and the table load. The repository Tables tab is a viewer; creating, dropping
@@ -41,6 +43,11 @@ export const ICEBERG_DISABLED_MESSAGE = 'The Iceberg catalog is disabled on this
  * A failed catalog request. The catalog answers every failure in the Iceberg envelope,
  * `{"error": {"message": …, "type": …, "code": …}}`, where `type` is the exception class the
  * Iceberg clients map to an error (`ForbiddenException`, `NoSuchTableException`, …).
+ *
+ * Every status, a `401` included, is this error and nothing else: the catalog's `401` means the
+ * request carried no credential the catalog could use (`pkg/icebergcatalog/auth.go`), which says
+ * nothing about the reader's core lakeFS session, so the tab shows the answer in place instead of
+ * handing the reader to the login page.
  */
 export class IcebergError extends Error {
     readonly status: number;
@@ -64,15 +71,22 @@ export const isIcebergDisabledError = (error: unknown): boolean =>
     error instanceof IcebergError && (error.status === 501 || error.status === 404);
 
 /**
+ * True when the catalog could not authenticate the caller: the session cookie the browser sent is
+ * missing, expired or not valid for the catalog, and the catalog answers the constant `401` of
+ * `pkg/icebergcatalog/auth.go`. The Tables tab says so in place and offers a plain sign-in link;
+ * it never turns it into a login redirect (see the error-handling comment above).
+ */
+export const isIcebergUnauthenticatedError = (error: unknown): boolean =>
+    error instanceof IcebergError && error.status === 401;
+
+/**
  * True when the caller is authenticated but not allowed: the catalog answers a denied
  * `catalog:*` check with `403 ForbiddenException` (`pkg/icebergcatalog/authz.go`). Authorization
- * stays the catalog's decision; this only picks the UI state for it.
+ * stays the catalog's decision; this only picks the UI state for it. A `401` is deliberately not
+ * merged into this: it is about the session, not about the permission.
  */
 export const isIcebergForbiddenError = (error: unknown): boolean =>
     error instanceof IcebergError && error.status === 403;
-
-/** A 401 that means "no valid session": the catalog's constant authentication message. */
-const UNAUTHENTICATED_MESSAGES = ['authentication required', 'error authenticating request'];
 
 const parseErrorBody = async (response: Response): Promise<{ message: string; type?: string }> => {
     try {
@@ -107,17 +121,11 @@ const icebergRequest = async <T>(path: string, requestData: RequestInit = {}): P
         headers,
     });
 
-    if (response.status === 401) {
-        // Keep the shared auth flow working: useAPI() redirects to the login page on this class.
-        // A 401 the catalog uses for a permission denial is not a missing session (the catalog
-        // reports denials as 403, and the message check keeps the two apart either way).
-        const { message, type } = await parseErrorBody(response);
-        if (UNAUTHENTICATED_MESSAGES.includes(message)) {
-            throw new AuthenticationError(message, response.status);
-        }
-        throw new IcebergError(message, response.status, type);
-    }
     if (!response.ok) {
+        // Every failure, a 401 included, stays an IcebergError. This client never throws the shared
+        // AuthenticationError of `lib/api/index.js`, so `useAPI()` never treats a catalog answer as
+        // a lost core session and never redirects to the login page: the repository Tables tab
+        // reports the failure in place, the way the Datasets and Repositories pages do.
         const { message, type } = await parseErrorBody(response);
         throw new IcebergError(message, response.status, type);
     }

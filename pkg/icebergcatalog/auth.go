@@ -217,8 +217,11 @@ func (a *catalogAuth) authenticateRequest(r *http.Request) (*model.User, error) 
 //
 // A request without the cookie, or with a session that carries no token, has no cookie
 // credential: (nil, nil), which requireUser answers with 401 - the same answer an anonymous
-// request gets, and the answer the UI turns into a login redirect. A session whose token does not
-// verify is a rejected credential (an error), not an absent one, and is logged as such.
+// request gets. The web UI does not turn that answer into a login redirect: the repository Tables
+// tab reports it in place, with its own "sign in again" state and a plain link
+// (webui/src/lib/api/iceberg.ts), because the catalog's 401 is about this mount's credential, not
+// about the reader's core lakeFS session. A session whose token does not verify is a rejected
+// credential (an error), not an absent one, and is logged as such.
 func (a *catalogAuth) userFromCookie(r *http.Request) (*model.User, error) {
 	// The error is deliberately ignored, as api.GenericAuthMiddleware's cookie_auth scheme ignores
 	// it: gorilla/sessions reports a missing or undecodable cookie as an error while still
