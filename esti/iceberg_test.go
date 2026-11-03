@@ -225,8 +225,12 @@ func TestIcebergBranchMerge(t *testing.T) {
 	// merge carries it as an ordinary change (§6.4) and main's table is the merged one.
 	env.requireMergeSucceeds(t, cl, icebergFeatureBranch, env.branch)
 
-	wantIDs := append(append([]int64{}, base.IDs...), appended.IDs...)
+	// appended.IDs is already the whole table after the feature branch's append - the scan of the
+	// merged table - so it carries the base rows as well as the two the branch added.
+	wantIDs := appended.IDs
 	merged := env.readTable(t, env.branch)
+	require.Equal(t, []int64{1, 2, 3, 4, 5}, merged.PyIcebergIDs,
+		"the merged table on main must be the base rows plus the feature branch's")
 	require.Equal(t, wantIDs, merged.PyIcebergIDs,
 		"after the merge main must read both appends: the base rows and the feature branch's")
 	require.Equal(t, wantIDs, merged.DuckDBIDs,
@@ -270,7 +274,8 @@ func TestIcebergTagRead(t *testing.T) {
 
 	// A later append on the branch, committed after the tag exists: it must not be visible at the
 	// tag, because a tag is an immutable ref and not an alias of the branch.
-	later := env.appendRows(t, env.branch, false, []icebergRow{{3, "gamma"}})
+	laterRows := []icebergRow{{3, "gamma"}}
+	later := env.appendRows(t, env.branch, false, laterRows)
 	env.commitBranch(t, cl, env.branch, "iceberg: rows after the tag")
 
 	read := env.readTable(t, icebergTag)
@@ -278,12 +283,13 @@ func TestIcebergTagRead(t *testing.T) {
 		"PyIceberg must read the rows the tag captured, not the branch's later append")
 	require.Equal(t, tagged.IDs, read.DuckDBIDs,
 		"DuckDB must read the tag through the relative_to form")
-	require.NotContains(t, read.PyIcebergIDs, later.IDs[0],
-		"the append that landed after the tag must not appear through the tag")
+	require.NotContains(t, read.PyIcebergIDs, laterRows[0].ID,
+		"the row appended after the tag must not appear through the tag")
 
-	// The tag still points where it did, and the branch still reads the whole table.
+	// The tag still points where it did, and the branch still reads the whole table: later.IDs is
+	// already the full scan of the branch after its append, tagged rows included.
 	branchRead := env.readTable(t, env.branch)
-	wantBranch := append(append([]int64{}, tagged.IDs...), later.IDs...)
+	wantBranch := later.IDs
 	require.Equal(t, wantBranch, branchRead.PyIcebergIDs,
 		"%s must read every append, including the one after the tag", env.branch)
 
@@ -466,10 +472,30 @@ func requireMergeConflicts(t *testing.T, cl *apigen.ClientWithResponses, repo, s
 		source, destination, res.Status(), res.Body)
 }
 
+// createTableNamespace stages the client-visible namespace of the append step's create_table, the
+// way registerFixtureTable does for the read path (createFixtureNamespace): a table can only be
+// created inside a namespace that exists, and the namespace is a staged marker of its own on the
+// branch (§6.2, I2-2).
+func (e *icebergEnv) createTableNamespace(t *testing.T, branch string) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"namespace":  []string{e.repo, branch, e.namespace},
+		"properties": map[string]string{},
+	})
+	require.NoError(t, err, "marshal the create-namespace request")
+	status, response := e.doJSON(t, http.MethodPost, e.namespacesURL(e.catalogURL), body)
+	require.Equalf(t, http.StatusOK, status, "create namespace %s on %s: %s", e.namespace, branch, response)
+}
+
 // appendRows runs one PyIceberg append through the catalog on branch, creating the table first
 // when create is set, and returns what the step reported about the table afterwards.
 func (e *icebergEnv) appendRows(t *testing.T, branch string, create bool, rows []icebergRow) icebergAppendResult {
 	t.Helper()
+	if create {
+		// create_table needs the namespace to exist on this branch; nothing has written it yet
+		// when the first append runs.
+		e.createTableNamespace(t, branch)
+	}
 	encodedIdentifier, err := json.Marshal([]string{e.repo, branch, e.namespace, e.table})
 	require.NoError(t, err, "marshal the PyIceberg identifier")
 
@@ -579,6 +605,18 @@ func (e *icebergEnv) requireStagedFiles(t *testing.T, cl *apigen.ClientWithRespo
 // pointing at it (§15.2).
 func (e *icebergEnv) requireGCPrepareKeepsCommit(t *testing.T, cl *apigen.ClientWithResponses, commit string) {
 	t.Helper()
+	// The prepare step reads the repository's GC rules; a repository that never had rules set is
+	// 404 "get gc rules: not found", so publish them first (as unified_gc_test.go does).
+	rules, err := cl.SetGCRulesWithResponse(t.Context(), e.repo, apigen.SetGCRulesJSONRequestBody{
+		Branches: []apigen.GarbageCollectionRule{
+			{BranchId: e.branch, RetentionDays: 1},
+			{BranchId: icebergFeatureBranch, RetentionDays: 1},
+		},
+		DefaultRetentionDays: 1,
+	})
+	require.NoError(t, err, "set GC rules")
+	require.Equalf(t, http.StatusNoContent, rules.StatusCode(), "set GC rules: %s", rules.Body)
+
 	res, err := cl.PrepareGarbageCollectionCommitsWithResponse(t.Context(), e.repo)
 	require.NoError(t, err, "prepare GC commits")
 	require.Equalf(t, http.StatusCreated, res.StatusCode(), "prepare GC commits: %s", res.Body)
@@ -817,7 +855,16 @@ table.append(pa.Table.from_pylist(rows, schema=schema))
 # table after the append, i.e. the commit the catalog just staged.
 table = catalog.load_table(identifier)
 snapshot = table.metadata.current_snapshot()
-manifests = [manifest.manifest_path for manifest in table.inspect.manifests()]
+# inspect.manifests() returns a list of ManifestFile objects on PyIceberg before 0.12 and a
+# PyArrow Table (one row per manifest, the path in the "path" column) on 0.12 and later; read both
+# shapes so the step reports the same thing on either client.
+inspection = table.inspect.manifests()
+if hasattr(inspection, "to_pylist"):
+    columns = set(inspection.column_names)
+    path_column = "manifest_path" if "manifest_path" in columns else "path"
+    manifests = [row[path_column] for row in inspection.to_pylist()]
+else:
+    manifests = [manifest.manifest_path for manifest in inspection]
 data_files = [task.file.file_path for task in table.scan().plan_files()]
 
 print("RESULT:" + json.dumps({
