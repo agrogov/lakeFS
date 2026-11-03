@@ -11,7 +11,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	cmdpkg "github.com/treeverse/lakefs/cmd/lakefs/cmd"
-	"github.com/treeverse/lakefs/pkg/api"
 	"github.com/treeverse/lakefs/pkg/auth"
 )
 
@@ -51,9 +50,9 @@ var (
 	ErrMissingDeps = errors.New("icebergcatalog: enabled but the server dependencies are missing")
 
 	// ErrAuthenticationRequired is answered with 401 when a request reaches the catalog without
-	// an authenticated principal. api.GenericAuthMiddleware authenticates but lets an anonymous
-	// request through to the handler (as it does for the core API, where the controller
-	// decides), so the catalog adds an explicit requirement in front of every route (§7.1).
+	// an authenticated principal. The catalog's own middleware (auth.go) authenticates but lets an
+	// anonymous request through to the handler, so the catalog adds an explicit requirement in
+	// front of every route (§7.1).
 	ErrAuthenticationRequired = errors.New("authentication required")
 
 	// errNonGoalEndpoint is returned for a route entry that would advertise an operation §1.2
@@ -102,10 +101,12 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 		return ErrMissingDeps
 	}
 
-	// The core AuthMiddleware is bound to the swagger routes, so the catalog wraps itself with
-	// the exported GenericAuthMiddleware, which honours the same schemes as the core API and
-	// puts the authenticated user on the context (§7.1).
-	authMiddleware, err := newAuthMiddleware(deps)
+	// The catalog authenticates itself: the middleware of auth.go accepts a lakeFS bearer token
+	// or HTTP basic on every route (§7.1) and serves POST /v1/oauth/tokens to a client that
+	// presents an access key pair (oauth.go), so a Spark, Trino, PyIceberg or DuckDB client can
+	// connect with just its credentials. The core AuthMiddleware is bound to the swagger routes
+	// and knows nothing about the token endpoint.
+	authMiddleware, err := newAuthMiddleware(deps, cfg)
 	if err != nil {
 		return err
 	}
@@ -127,7 +128,14 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 			NewNamespaceService(store, authorizer, deps.Catalog, cfg),
 			// The table reads of I1-9, the staged create of I2-4, and the drop and metrics sink
 			// of I2-5.
-			NewTableService(store, authorizer, deps.Catalog, cfg))
+			NewTableService(store, authorizer, deps.Catalog, cfg),
+			// The two data-plane services of §8. Each is enabled only by what it needs - remote
+			// signing by an S3 blockstore whose pre-signer is available, credential vending by an
+			// S3 blockstore plus a configured blockstore.s3.credentials_vending.role_arn - and a
+			// disabled service contributes neither a route nor an endpoint, so GET /v1/config
+			// advertises exactly the data-plane operations that are actually mounted.
+			NewRemoteSigningService(store, authorizer, deps.BlockAdapter, deps.Catalog, cfg),
+			NewCredentialService(store, authorizer, cfg, nil, deps.Logger))
 	}
 	s := newServer(cfg, services...)
 	// Responses to a request that carries an Idempotency-Key are kept in the server's KV. Only
@@ -157,14 +165,14 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 	return nil
 }
 
-// newAuthMiddleware builds the authentication middleware from the server dependencies, the same
-// way the datasets control plane does. I1-5 adds POST /v1/oauth/tokens in front of it and the
-// bearer/basic details behind it; this task is only the wiring and the envelope.
-func newAuthMiddleware(deps cmdpkg.ServerDeps) (func(http.Handler) http.Handler, error) {
-	baseAuthCfg := deps.Config.AuthConfig().GetBaseAuthConfig()
-	oidcConfig := auth.OIDCConfig(baseAuthCfg.OIDC)
-	cookieAuthConfig := auth.CookieAuthConfig(baseAuthCfg.CookieAuthVerification)
-	middleware, err := api.GenericAuthMiddleware(deps.Logger, deps.Authenticator, deps.AuthService, &oidcConfig, &cookieAuthConfig)
+// newAuthMiddleware builds the catalog's authentication middleware from the server dependencies
+// (auth.go). It is the single point at which the catalog's own scheme list replaces the core
+// api.GenericAuthMiddleware, and the one call site where the token endpoint of oauth.go becomes
+// reachable: a catalog mounted with any other middleware answers POST /v1/oauth/tokens with 404.
+//
+// The startup error is wrapped here so that a fatal mount error names the catalog.
+func newAuthMiddleware(deps cmdpkg.ServerDeps, cfg *Config) (func(http.Handler) http.Handler, error) {
+	middleware, err := NewAuthMiddleware(deps, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("icebergcatalog: build auth middleware: %w", err)
 	}
@@ -196,8 +204,9 @@ func DisabledHandler() http.Handler {
 // The middleware stack is ordered the way §12 and I1-3 require, and the order is not
 // interchangeable:
 //
-//  1. authentication (api.GenericAuthMiddleware), whose 401 and 403 answers are rewritten into
-//     the catalog envelope (authenticate);
+//  1. authentication (auth.go), which accepts a lakeFS bearer token or HTTP basic, answers
+//     POST /v1/oauth/tokens itself, and whose 401 and 403 answers are rewritten into the
+//     catalog envelope (authenticate);
 //  2. the authenticated-user requirement: 401 before anything else happens;
 //  3. the request-body limit (iceberg.max_request_body), so no body is buffered unboundedly;
 //  4. the handlers, which validate and decode the request.

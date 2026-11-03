@@ -87,12 +87,12 @@ type catalogAuth struct {
 // (http.go), which is what answers it - the same division of labour api.GenericAuthMiddleware and
 // requireUser already have, so the catalog has one owner for "401 because there is no user".
 //
-// Wiring note: newAuthMiddleware (http.go) is the single call site, and passing NewAuthMiddleware
-// there instead of api.GenericAuthMiddleware is the whole change. This file owns no route and
-// changes nothing about the stack http.go mounts, so until that one line is swapped the catalog
-// keeps the core middleware's scheme list and does not answer POST /v1/oauth/tokens; the tests
-// below build that swapped stack directly (authTestRouter), which is why they cover the endpoint
-// as a client addresses it.
+// Wiring: newAuthMiddleware (http.go) is the single call site, and it builds this middleware
+// rather than api.GenericAuthMiddleware. That is what makes POST /v1/oauth/tokens reachable at
+// <server>/iceberg/api/v1/oauth/tokens and at the relative_to mount; a catalog mounted with the
+// generic core middleware answers the token endpoint with 404. This file owns no route: the
+// token endpoint is served from the middleware chain itself, so it cannot be advertised in
+// GET /v1/config and cannot be mounted twice.
 func NewAuthMiddleware(deps cmdpkg.ServerDeps, cfg *Config) (func(http.Handler) http.Handler, error) {
 	a, err := newCatalogAuth(deps, cfg)
 	if err != nil {

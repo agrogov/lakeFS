@@ -17,6 +17,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/auth/crypt"
 	"github.com/treeverse/lakefs/pkg/auth/model"
 	authparams "github.com/treeverse/lakefs/pkg/auth/params"
+	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/config"
 	"github.com/treeverse/lakefs/pkg/httputil"
 	"github.com/treeverse/lakefs/pkg/kv"
@@ -494,5 +495,111 @@ func TestRoutesBuilderEnabled(t *testing.T) {
 		require.NotPanics(t, func() { api.MountNotImplementedServices(mux) })
 		rec := do(t, mux, http.MethodGet, APIBasePath+configPath, testAccessKeyID, testSecretAccessKey)
 		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	})
+}
+
+// dataPlaneCredentialsPath and dataPlaneSignPath are the two §8 data-plane operations as a client
+// addresses them. The namespace segment is written the way a client writes it (%1F between the
+// levels); it is never decoded here, because these requests only have to route.
+const (
+	dataPlaneCredentialsPath = APIBasePath + "/v1/" + CatalogPrefix +
+		"/namespaces/repo%1Fmain%1Fns/tables/titles/credentials"
+	dataPlaneSignPath = APIBasePath + "/v1/" + CatalogPrefix +
+		"/namespaces/repo%1Fmain%1Fns/tables/titles/sign"
+)
+
+// mountedEndpoints returns the endpoints GET /v1/config advertises on a mounted catalog, read with
+// the fixture's basic credentials.
+func mountedEndpoints(t *testing.T, handler http.Handler) []string {
+	t.Helper()
+	rec := do(t, handler, http.MethodGet, APIBasePath+configPath, testAccessKeyID, testSecretAccessKey)
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	var response CatalogConfig
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+	return response.Endpoints
+}
+
+// requireMethodNotAllowed proves an operation is *mounted*: the path is served, only not with this
+// method, which chi answers 405 for. An operation that is not mounted answers 404 instead, so the
+// two are distinguishable without invoking a service.
+func requireMethodNotAllowed(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	requireEnvelope(t, rec, http.StatusMethodNotAllowed, ErrTypeMethodNotAllowed)
+}
+
+// TestRoutesBuilderMountsDataPlaneServices is the wiring test of §8: the remote-signing and
+// credential-vending services of sign.go and creds.go are contributed to the route table by
+// RoutesBuilder, so each is mounted and advertised exactly when its own precondition holds. A
+// disabled service contributes no route, so GET /v1/config cannot promise a data-plane operation
+// the router does not serve (§2.1), and the endpoint answers 404 rather than sitting half-wired.
+func TestRoutesBuilderMountsDataPlaneServices(t *testing.T) {
+	// A real catalog, so deps.Catalog is the shape the server hands a service (§4.1). Nothing in
+	// this test reaches the catalog: mounting and advertisement are decided at startup.
+	fixture := newStoreFixture(t)
+
+	build := func(t *testing.T, yaml string, adapter block.Adapter) http.Handler {
+		t.Helper()
+		useConfig(t, yaml)
+		deps := newServerDeps(t)
+		deps.Catalog = fixture.catalog
+		deps.BlockAdapter = adapter
+		mux := coreRouter()
+		require.NoError(t, RoutesBuilder(t.Context(), deps, mux))
+		return mux
+	}
+
+	t.Run("no data-plane service is mounted by default", func(t *testing.T) {
+		// The catalog's own mem blockstore: it can neither presign nor vend, and no role is
+		// configured.
+		mux := build(t, "iceberg:\n  enabled: true\n", fixture.catalog.BlockAdapter)
+
+		endpoints := mountedEndpoints(t, mux)
+		require.NotContains(t, endpoints, remoteSigningEndpoint)
+		require.NotContains(t, endpoints, credentialsEndpoint)
+
+		requireEnvelope(t, do(t, mux, http.MethodGet, dataPlaneCredentialsPath, testAccessKeyID, testSecretAccessKey),
+			http.StatusNotFound, ErrTypeNotFound)
+		requireEnvelope(t, do(t, mux, http.MethodPost, dataPlaneSignPath, testAccessKeyID, testSecretAccessKey),
+			http.StatusNotFound, ErrTypeNotFound)
+	})
+
+	t.Run("remote signing is mounted when the blockstore can sign", func(t *testing.T) {
+		// An S3 blockstore with a working pre-signer and no credentials_vending role: the signing
+		// endpoint exists, the credentials endpoint does not.
+		mux := build(t, "iceberg:\n  enabled: true\n", signingEnabledAdapter())
+
+		endpoints := mountedEndpoints(t, mux)
+		require.Contains(t, endpoints, remoteSigningEndpoint)
+		require.NotContains(t, endpoints, credentialsEndpoint)
+
+		requireMethodNotAllowed(t, do(t, mux, http.MethodGet, dataPlaneSignPath, testAccessKeyID, testSecretAccessKey))
+		requireEnvelope(t, do(t, mux, http.MethodGet, dataPlaneCredentialsPath, testAccessKeyID, testSecretAccessKey),
+			http.StatusNotFound, ErrTypeNotFound)
+	})
+
+	t.Run("credential vending is mounted when a role is configured", func(t *testing.T) {
+		// An S3 blockstore whose pre-signer is off, and a configured role: vending is advertised
+		// and remote signing is not, so the two are decided independently.
+		adapter := &signingAdapter{blockstoreType: block.BlockstoreTypeS3, preSignSupported: false}
+		mux := build(t, "iceberg:\n  enabled: true\nblockstore:\n  s3:\n    credentials_vending:\n      role_arn: arn:aws:iam::123456789012:role/lakefs-iceberg\n", adapter)
+
+		endpoints := mountedEndpoints(t, mux)
+		require.Contains(t, endpoints, credentialsEndpoint)
+		require.NotContains(t, endpoints, remoteSigningEndpoint)
+
+		requireMethodNotAllowed(t, do(t, mux, http.MethodPost, dataPlaneCredentialsPath, testAccessKeyID, testSecretAccessKey))
+		requireEnvelope(t, do(t, mux, http.MethodGet, dataPlaneSignPath, testAccessKeyID, testSecretAccessKey),
+			http.StatusNotFound, ErrTypeNotFound)
+	})
+
+	t.Run("both are mounted when both preconditions hold", func(t *testing.T) {
+		mux := build(t, "iceberg:\n  enabled: true\nblockstore:\n  s3:\n    credentials_vending:\n      role_arn: arn:aws:iam::123456789012:role/lakefs-iceberg\n", signingEnabledAdapter())
+
+		endpoints := mountedEndpoints(t, mux)
+		require.Contains(t, endpoints, remoteSigningEndpoint)
+		require.Contains(t, endpoints, credentialsEndpoint)
+
+		requireMethodNotAllowed(t, do(t, mux, http.MethodGet, dataPlaneSignPath, testAccessKeyID, testSecretAccessKey))
+		requireMethodNotAllowed(t, do(t, mux, http.MethodPost, dataPlaneCredentialsPath, testAccessKeyID, testSecretAccessKey))
 	})
 }
