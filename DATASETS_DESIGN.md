@@ -1109,6 +1109,7 @@ vitest component tests (§11.4) and one Playwright smoke test if the repo's e2e 
 | `cmd/lakefs/cmd/run.go` | ~5 lines before `MountNotImplementedServices` | Low |
 | `pkg/config/oss_config.go` | +1 field | Low |
 | `pkg/permissions/actions.go` | +1 `serviceSet` entry | Low |
+| `pkg/api/services.go` | `MountNotImplementedServices` skips a prefix a hook already claimed (chi v5.2.4 panics on a duplicate `Mount`, and a second mount would shadow the real handler); `mountPatternClaimed` consults both `Find` and `Routes()` because a sub-router matches only the paths it serves. `/mds/iceberg/api/` stays a 501 in every build. Covered by `pkg/api/serve_test.go` | Medium: this is the one core file the Iceberg catalog changed, and upstream may renumber or extend `notImplementedMounts`. Any upstream change here must keep the "skip a claimed prefix" behaviour, or `lakefs-sso` panics at startup |
 | `cmd/lakefs-sso/main.go` | +1 line | None (fork-owned) |
 | `webui/src/pages/index.jsx` | datasets route tree | Medium (upstream also touches this file) |
 | `webui/src/pages/repositories/index.*` | filter dataset repos | Low–medium |
@@ -1117,6 +1118,13 @@ vitest component tests (§11.4) and one Playwright smoke test if the repo's e2e 
 
 Rename/keep upstream `design/open/design-datasets.md` untouched (it describes an unrelated table-definition idea); this
 document lives at the repo root next to `AZURE_ENTRA_SSO_PLAN.md`.
+
+The Iceberg REST catalog (`pkg/icebergcatalog`, documented in [`docs/iceberg.md`](docs/iceberg.md) and
+[`ICEBERG_CATALOG_PLAN.md`](ICEBERG_CATALOG_PLAN.md)) adds one more surface to this table and it is the only core file it
+touches: `MountNotImplementedServices` in `pkg/api/services.go` now has to skip the `/iceberg/api/` and
+`/iceberg/relative_to/` prefixes, because the hook mounts the real catalog there. Without that skip, `lakefs-sso` panics at
+startup on chi's duplicate-mount check, or the 501 placeholder shadows the live catalog. Everything else the catalog
+needs is a new package plus the existing hook API (`cmd/lakefs/cmd/hooks.go`).
 
 ---
 

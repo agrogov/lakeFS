@@ -1,6 +1,7 @@
 # OSS Iceberg REST Catalog — Implementation Plan
 
-Status: draft for review. Branch base: `feature/datasets` (HEAD `423222b58`).
+Status: implemented on `feature/iceberg-catalog`; spike findings folded into §15, and §15.4 records what is
+landed versus still unwired. The user-facing documentation is [`docs/iceberg.md`](docs/iceberg.md).
 Unblocks: DATASETS_DESIGN.md §1.2 (non-goal), §3 parity row "Items: `table`, `namespace`", §7.4, §17 Phase 5, §18 Q4.
 
 All external facts carry a source link. Statements about lakeFS Enterprise come from its **public docs only**
@@ -75,28 +76,43 @@ bigger surface than datasets.
 
 ### 2.1 Protocol facts the design depends on
 - **Endpoint negotiation.** `GET /v1/config` returns `{defaults, overrides, endpoints?, idempotency-key-lifetime?}`.
-  Clients call only the advertised endpoints. If `endpoints` is absent, clients assume the default set: namespaces
-  CRUD + properties, tables CRUD, register, metrics, rename, transactions/commit
-  ([spec](https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml)). **We must send an
-  explicit `endpoints` list** so that clients don't call rename or transactions.
+  Clients call only the advertised endpoints. If `endpoints` is absent, each client assumes its own default set, and
+  that set is **not** the spec default: PyIceberg 0.12 assumes 12 endpoints that include `tables/rename` but exclude
+  `transactions/commit`, metrics and the `HEAD` endpoints (§15.3). **We must send an explicit `endpoints` list** so
+  that clients don't call rename or transactions.
+- **The list is a hint, not a fence.** PyIceberg gates a call on the list (raising `NotImplementedError` without an
+  HTTP request); DuckDB ignores it for rename, create and drop and sends the request anyway (§15.3). Security and
+  501/404 answers must therefore never assume the client read the list (§7.2, §12).
 - **Prefix.** The client takes `prefix` from the config overrides and inserts it into every path as `/v1/{prefix}/…`.
+  The entries of `endpoints` keep the **literal** `{prefix}` placeholder — expanding it to `lakefs` makes every
+  PyIceberg call fail after a successful connect (§15.3). The two must not be conflated.
+- **Config response shape.** Always emit both `defaults` and `overrides` objects, even when empty, and keep every
+  value a JSON string: DuckDB hard-fails on a missing object or a non-string value, while PyIceberg tolerates both
+  (§15.3).
 - **Namespace encoding.** Multi-level namespaces are joined with `%1F` in path parameters. The server must also accept
   any advertised `namespace-separator` ([spec](https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml)).
-- **Commit.** `POST /v1/{prefix}/namespaces/{ns}/tables/{t}` takes `{requirements[], updates[]}`.
+- **Commit.** `POST /v1/{prefix}/namespaces/{ns}/tables/{t}` takes `{identifier, requirements[], updates[]}` and the
+  **response** must carry both `metadata` and `metadata-location`: PyIceberg raises after a successful commit if
+  `metadata-location` is missing (§15.3).
   - 409 means `CommitFailedException`, and the client refreshes and retries.
   - 500, 502 and 504 mean `CommitStateUnknownException`, and the client must not assume failure.
   - Requirements (8): `assert-create`, `assert-table-uuid`, `assert-ref-snapshot-id`, `assert-last-assigned-field-id`,
     `assert-current-schema-id`, `assert-last-assigned-partition-id`, `assert-default-spec-id`,
     `assert-default-sort-order-id`.
-- **Errors.** `{"error": {message, type, code, stack?}}`.
+- **Errors.** `{"error": {message, type, code, stack?}}`, with all three fields present: a partial envelope degrades to
+  "unexpected JSON payload" in PyIceberg and to a raw body in DuckDB. The exception *class* is chosen from the HTTP
+  status, not from `type`, and `404` becomes `NoSuchTableError` whatever the endpoint was (§15.3).
 - **ETag / If-None-Match.** Optional. The ETag must vary with the `snapshots` query parameter (`all` or `refs`).
 - **Idempotency-Key.** Optional; advertise `idempotency-key-lifetime` only if responses are actually stored.
-- **Access delegation.** `X-Iceberg-Access-Delegation: vended-credentials | remote-signing`. The server may ignore it.
+- **Access delegation.** `X-Iceberg-Access-Delegation: vended-credentials | remote-signing`. The server may ignore it;
+  both clients fall back to their own credentials when the response carries neither `storage-credentials` nor a
+  signing config, so answering the header with an empty `config` is safe (§15.3).
 - **OAuth.** `POST /v1/oauth/tokens` is deprecated since Iceberg 1.6 and slated for removal in 2.0. Clients should use
   `oauth2-server-uri`, but Spark, PyIceberg and Trino still use it by default with `credential=id:secret`
   ([rest-catalog.md](https://github.com/apache/iceberg/blob/main/docs/docs/rest-catalog.md)). The lakeFS docs use
   `/iceberg/api/v1/oauth/tokens` with `credential=<access_key_id>:<secret_access_key>`
-  ([docs.lakefs.io/iceberg](https://docs.lakefs.io/iceberg/)).
+  ([docs.lakefs.io/iceberg](https://docs.lakefs.io/iceberg/)). PyIceberg calls it twice at connect time and DuckDB
+  sends the credentials through it as HTTP Basic (§15.3).
 
 ---
 
@@ -164,8 +180,9 @@ for the metadata model only:
 - `NewMetadataWithUUID`.
 
 Its write helpers are in `catalog/internal` and cannot be imported, so writing metadata files is our own code.
-**Spike S-I1:** confirm that its Updates/Requirements JSON covers all 23 update actions in the spec version we
-advertise, notably the encryption-key and statistics updates. Implement any that are missing locally.
+**Spike S-I1 (§15.1):** iceberg-go v0.7.0 covers all 23 update actions and all 8 requirement types, so nothing has
+to be implemented locally — but `Requirement.Validate` does not return `ErrCommitFailed` and
+`MetadataBuilderFromBase` takes the location of the *current* metadata file. Both are recorded in §15.1.
 
 ---
 
@@ -234,7 +251,7 @@ one lakeFS commit cover several table updates, and it avoids commit contention o
 applies naturally: writes go through graveler without `Force`, so protected branches reject them, and that is what
 users want.
 
-### 6.3 Table files become lakeFS entries (GC safety) — **design decision, spike S-I2**
+### 6.3 Table files become lakeFS entries (GC safety) — **design decision, spike S-I2 (§15.2)**
 Clients write data and manifest files straight to `<storage_namespace>/_iceberg/<uuid>/…`. Unless those files are
 lakeFS entries:
 - lakeFS GC (and uncommitted-object GC) may delete them, because they sit inside the storage namespace and nothing
@@ -252,12 +269,19 @@ lakeFS entries:
 On `remove-snapshots`, stage tombstones for files no longer reachable. That follows Iceberg's expire semantics;
 Enterprise does not support expire (Q-I8), so v1 can simply ignore `remove-snapshots` for files.
 
-Costs and risks (to be measured in S-I2):
-- One manifest read per commit, and one staged entry per data file. A 10k-file append means 10k staging writes. Batch
-  them through the `DeleteBatch` / `CreateEntries` path or the import mechanism.
-- Uncommitted-GC window: files written by the client before the catalog commit stages them. Mitigation: uncommitted
-  GC must skip `_iceberg/` objects younger than a grace period (config `iceberg.uncommitted_gc_grace`, default 24h).
-  Check how `pkg/catalog` uncommitted GC lists the storage namespace before choosing.
+Costs and risks (**measured** in spike S-I2, §15.2):
+- One manifest read per commit, and one staged entry per data file. A 10k-file append means 10k staging writes:
+  **≈2.3 s** at 32-way concurrency, **≈1.2 s** against a KV with a 1 ms round trip, and **≈76 s** with a plain
+  sequential loop because of `graveler.max_batch_delay=3ms`. Staging must be parallel and bounded, or the batched
+  `WriteRange`/`Store.Import` path must be used — which it cannot be here, because `Store.Import` commits and takes
+  no `WithCondition`, so it would bypass the pointer CAS of §6.2 step 6.
+- Uncommitted-GC window: files written by the client before the catalog commit stages them. `PrepareGCUncommitted`
+  lists **staged entries only** — measured: 0 of 200 raw client writes under `_iceberg/` appear in the report, and a
+  staged entry for the same object does. So the control is an uncommitted-GC grace: skip `_iceberg/` entries younger
+  than `iceberg.uncommitted_gc_grace` (default 24h; `0` protects every `_iceberg/` object regardless of age).
+  Residual window and the interaction with the GC job's own minimum age: §15.2.
+- Staging is what makes a table file visible to the GC at all, so the grace bounds one window and cannot close the
+  other: `[client writes the object → the catalog stages it]` is unprotected by construction.
 
 Rejected alternative: point table locations at the S3 gateway (`s3://<repo>/<branch>/…`). Files become entries
 natively, but absolute paths then embed the branch, so after a merge `main` metadata points into `feature/…`, which
@@ -369,7 +393,7 @@ iceberg:
 
 | Phase | Scope | Exit criteria | Est. |
 |---|---|---|---|
-| **I-0 Spikes** | S-I1 iceberg-go coverage; S-I2 file registration cost and GC window (10k-file append); S-I3 mount-order fix (§4.1); S-I4 PyIceberg + DuckDB against a stub `/v1/config` | Written spike notes appended here | 3 d |
+| **I-0 Spikes** | S-I1 iceberg-go coverage; S-I2 file registration cost and GC window (10k-file append); S-I3 mount-order fix (§4.1); S-I4 PyIceberg + DuckDB against a stub `/v1/config` | Spike notes folded into §15 | 3 d |
 | **I-1 Read path** | config, OAuth token, namespaces list/get/head (repo/ref levels), tables list/load/head on any ref, error model, authz, `relative_to` both forms | PyIceberg, DuckDB and Spark can read a table registered by `register` | 5 d |
 | **I-2 Write path** | create namespace/table (incl. staged create), commit (§6.2), drop, register, properties, metrics (accept and discard) | iceberg-go `catalogtest` external conformance green; RCK green with `supports-names-with-dot=false` | 7 d |
 | **I-3 File registration + GC** | §6.3 staging of table files; uncommitted-GC grace; protect `_lakefs_iceberg/` | Esti: append, commit, GC, then table still readable; branch, write, merge, read on main | 5 d |
@@ -411,7 +435,7 @@ Total ≈ 6–7 weeks. I-1 to I-3 is the usable minimum (≈ 4 weeks).
 | Risk | Mitigation |
 |---|---|
 | iceberg-go lags behind the spec | Pin the version; implement missing updates locally; advertise only the endpoints we pass |
-| Staging thousands of entries per append | Batch staging; measure in S-I2; fallback is to register only manifests and metadata, and protect data files through a per-table GC rule |
+| Staging thousands of entries per append | Batch staging in a bounded worker pool; measured in §15.2 at ≈2.3 s for 10k files at 32-way concurrency. Fallback is to register only manifests and metadata, and protect data files through a per-table GC rule — but that rules out GC safety in v1, because nothing protects the data files |
 | Client writes outside the table location | On commit, reject add-snapshot whose manifests reference paths outside `<storage_namespace>/_iceberg/<uuid>/` (400); this also blocks reads of foreign buckets |
 | Legal: protocol compatibility with Enterprise | Implement from the Apache spec and public docs only. Note it in the PR. Legal sign-off per DATASETS_DESIGN.md §2 / Q5 |
 | Alternative: run Polaris or Nessie beside lakeFS (DATASETS_DESIGN.md Q4) | Rejected for v1: they keep their own commit log, so lakeFS branch, merge and GC semantics would not cover catalog state |
@@ -431,3 +455,215 @@ Total ≈ 6–7 weeks. I-1 to I-3 is the usable minimum (≈ 4 weeks).
 | Q-I7 | Is the iceberg-go dependency acceptable (Apache-2.0)? | Legal and security review |
 | Q-I8 | `remove-snapshots` / expire: support file tombstoning in v1? | No (Enterprise doesn't); accept the update and keep files |
 | Q-I9 | Multi-table transactions and `/sign` in v1? | Not advertised in v1; `/sign` in I-4a |
+
+---
+
+## 15. Spike findings (folded)
+
+The four I-0 spikes ran in parallel and were written up in per-spike notes
+(`ICEBERG_SPIKE_S-I1..S-I4.md`); this section is the single record they were folded into. S-I3 was the
+mount-order fix of §4.1 and shipped as code (`pkg/api/services.go`, `pkg/api/serve_test.go`) rather than
+as a note, which is why there are three notes and four spikes.
+
+Provenance for the whole section: measured and written from the Apache Iceberg REST OpenAPI spec
+(<https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml>), the Apache Iceberg
+table spec (<https://iceberg.apache.org/spec/>) and the clients' public, Apache-2.0 behaviour. No
+lakeFS Enterprise code and nothing from upstream lakeFS >= 1.87 (BUSL 1.1) was read or copied.
+
+### 15.1 S-I1 — iceberg-go update and requirement coverage
+
+**Verdict: covered as-is. Nothing had to be implemented locally for updates or requirements.**
+`github.com/apache/iceberg-go` v0.7.0 (Apache-2.0) decodes and re-encodes **23 of 23** `TableUpdate`
+actions and **8 of 8** `TableRequirement` types, and applies every action in a commit-shaped request.
+The gate is `TestUpdatesCoverage` (`pkg/icebergcatalog/updates_coverage_test.go`); it is driven by the
+spec's own action and requirement lists, so an action added to the spec without a matching case fails it.
+The `apply` column came from a throwaway harness, not from the committed test.
+
+Two corrections to §4.2, both load-bearing for the commit path:
+
+1. **`Requirement.Validate` does not return `ErrCommitFailed`** in v0.7.0 — it returns plain errors, so
+   `errors.Is(err, table.ErrCommitFailed)` is false. The commit path must map a failed requirement to
+   `409 CommitFailedException` itself; a 400 or 500 there makes the client give up instead of refreshing.
+2. **`MetadataBuilderFromBase(base, currentFileLocation)`** takes the location of the *current* (existing)
+   `metadata.json`, not the one about to be written; `UpdateTableMetadata(base, updates, metadataLoc)`
+   forwards the same parameter under a misleading name. Passing the new file's location logs a wrong
+   `metadata-log` entry, and passing `""` does not extend `metadata-log` at all.
+
+What remains ours, because iceberg-go keeps it private (`catalog/internal`) or does not model it:
+
+- writing `metadata.json` itself (object write, file name `v<N>.metadata.json`, location);
+- mapping a failed requirement to 409 and every apply error to 400 — including `add-snapshot`'s
+  "invalid snapshot timestamp", the one refusal that wraps **no** sentinel and therefore has to be
+  recognised by its message or by checking the timestamp first;
+- the pointer CAS and its retry semantics (§6.2);
+- the format-version gate: `add-encryption-key` only applies at format version >= 3, which is a v1
+  non-goal (§1.2) — it must decode and then be refused with a 400 that names the reason.
+
+`add-snapshot` has two behaviours worth owning explicitly: iceberg-go rejects a `timestamp-ms` more than
+one minute behind the base's `last-updated-ms`, and it stamps `last-updated-ms` from `now()` with no way
+to pass an explicit value. A client whose clock is far behind gets a refusal no other catalog produces,
+and the recorded time is iceberg-go's wall clock rather than the lakeFS commit time.
+
+Dependency cost, for the review of `go.mod`: v0.7.0 requires newer versions of libraries this repository
+already uses, and minimal version selection takes the maximum — `gocloud.dev` to v0.46.0,
+`aws-sdk-go-v2` to v1.45.1, `cloud.google.com/go/storage` to v1.66.0, `google.golang.org/api` to
+v0.295.0, `google.golang.org/grpc` to v1.83.2 and `testify` to v1.12.1. The `gocloud.dev` and
+`aws-sdk-go-v2` jumps touch the block adapters, so their integration suites belong in CI.
+
+### 15.2 S-I2 — file-registration cost and the uncommitted-GC window
+
+**Verdict: stage all files, in a bounded worker pool. 24h grace, enforced in the prepare step.**
+
+Measured on a real `catalog.Catalog` with the shapes §6.3 prescribes (`_lakefs_iceberg/files/<uuid>/data/part-NNNNN.parquet`,
+`AddressType=Full`), mem and local KV, mem block adapter, darwin/arm64, `GOMAXPROCS=16`:
+
+| Staging strategy | 10k entries | Per entry |
+|---|---|---|
+| one `CreateEntry` per file, sequential | **≈76 s** | 6.9–7.6 ms |
+| 8 workers | 9.3 s | 0.93 ms |
+| **32 workers** | **2.2–2.4 s** | 0.23 ms |
+| 32 workers, KV with a 1 ms round trip | **1.18–1.20 s** | — |
+| `WriteRange` → `WriteMetaRange` → `Store.Import` | 39–63 ms | not usable (below) |
+
+The sequential floor is not the storage: it is `graveler.max_batch_delay=3ms` paid twice per call in
+`batch.BatchFor` when there is a single producer. With the delay set to `0` the same loop runs at
+11–18 µs/entry. Each staged entry costs **3 KV operations** (one staging write, two reads), so a 10k-file
+append is 30 000 KV operations. The lakeFS commit that publishes the staged entries is cheap by
+comparison: **40–70 ms**, one SSTable of ≈0.7 MB, because the commit path does not touch the KV per file.
+
+The batched `Store.Import` path is **rejected** for §6.3: it creates its own commit and takes no
+`graveler.WithCondition`, so it would bypass the pointer CAS of §6.2 step 6 and break both the
+single-commit guarantee and the 409-on-race semantics. Its import API also rejects source paths inside the
+repository's own storage namespace, which is where `_iceberg/` lives.
+
+**Does the uncommitted GC see a client-written file?** Measured against a real catalog:
+
+| Case | Objects | Listed by `PrepareGCUncommitted` |
+|---|---|---|
+| raw client writes under `_iceberg/`, no lakeFS entry | 200 | **0** |
+| staged `AddressType=Full` entries for 5 of them | 5 | **5** |
+| staged `AddressType=Relative` entry | 1 | **1** |
+| staged entry pointing outside the namespace | 1 | **0** (skipped) |
+| the same entries after `catalog.Commit` | 6 | **0** |
+| 10k staged file entries, one branch | 10k | 10k (prepare took 15 ms) |
+
+`PrepareGCUncommitted` never walks the storage namespace: it walks branches and takes each branch's
+uncommitted diff. **Staging is what puts a table file into the report — nothing else does.** Before
+staging, the hazard is not the uncommitted GC at all but the committed-GC sweep, which deletes namespace
+objects that no retained commit references.
+
+Guidance this hands to the file-registration task, all of it adopted:
+
+1. stage with a bounded pool of 16–32 goroutines calling `catalog.CreateEntry`; never the import path;
+2. order: read the manifest list and manifests, apply the foreign-location check for the whole snapshot
+   **first** so nothing is staged for a snapshot we reject, then stage the files, then swap the pointer —
+   all in one staging area, so one lakeFS commit publishes files and pointer together;
+3. set each entry's `LastModified` from the object's write time (it becomes the `creation_date` the GC job
+   ages staged objects by); take size and ETag from the manifest record, never HEAD 10k files;
+4. put a hard cap on files per commit (`iceberg.max_staged_files`, recommended 50 000 ≈ 6 s) and reject
+   above it — silently skipping files converts a slow commit into a GC-deletable one;
+5. keep entry paths deterministic so a retried commit overwrites the same keys.
+
+**`iceberg.uncommitted_gc_grace`:** default **24h**, enforced on the server in the prepare step, not by the
+GC job. Rationale and residual windows, which the public docs must state:
+
+- 24h comfortably covers "client appended, operator commits the branch the same day"; an unbounded grace
+  would make `_iceberg/` areas permanently uncollectable.
+- A staged entry older than the grace is collectable, exactly like any other uncommitted lakeFS write. The
+  natural fix is committing the branch, which moves the files into the protected, commit-referenced set.
+- The exposure window is `[client writes the object → the branch is committed]`. Server-side protection
+  starts only when the catalog stages the entry, so the existing lakeFS rule — do not run GC while writers
+  are active — applies unchanged to unregistered files.
+- Deletion is decided by the external GC job, which has its own
+  `lakefs.debug.gc.uncommitted_min_age_seconds`. An object goes only if it is both listed *and* old enough,
+  so the effective protection is the larger of the two; keep the grace at or above that setting.
+- A future `lastModified` (clock skew) is protected rather than collected: skew delays, never deletes.
+
+Open items this spike handed on, and where they stand:
+
+| Item | Owner |
+|---|---|
+| Confirm against a real GC run (append → commit → GC → table still readable; stage → wait → GC → files gone) | I3-3 esti — **not yet written** |
+| Decide whether `_iceberg/` may be excluded from the committed-GC sweep; the §13 fallback needs it | §13 / Q-I10 — open |
+| Replace the 1 ms-RTT emulation with real `kv/postgres` numbers | I3-1 — optional, not done |
+| Whether the 3 ms batching floor can be avoided with a bulk staging primitive (2.3 s → ≈0.3 s) | future graveler work, out of scope for v1 |
+
+### 15.3 S-I4 — PyIceberg and DuckDB against a stub catalog
+
+**Verdict: both clients connect and read without an `endpoints` list, and neither rejects an incomplete
+one — but they honour it very differently, and two findings change the design.**
+
+Measured with PyIceberg 0.12.0 and DuckDB 2.0.0 against a ~390-line stub that answered `GET /v1/config`
+plus the read endpoints, logging every request. The full request logs are not reproduced here; the
+conclusions are:
+
+1. **`{prefix}` in the advertised endpoint strings must stay a literal placeholder.** Advertising
+   `GET /v1/lakefs/namespaces` instead of `GET /v1/{prefix}/namespaces` makes **every** PyIceberg call fail
+   with `NotImplementedError` **after** a successful connect — zero HTTP requests. PyIceberg parses each
+   entry with `Endpoint.from_string` and compares it to its capability templates for byte equality. DuckDB
+   tolerates the expanded form. The catalog therefore emits the templates verbatim and a test pins it.
+2. **The `endpoints` list is a hint, not an access-control boundary.** Against a read-only list PyIceberg
+   issued three requests and refused create/rename/drop client-side, while DuckDB against the *same* list
+   sent `DELETE …/tables/{t}?purgeRequested=false` and `POST …/namespaces`. Unimplemented endpoints must
+   answer with a correct error envelope, and authorisation must never rely on the client staying away.
+3. **An absent list is not the spec default.** PyIceberg assumes 12 endpoints that include
+   `tables/rename` but exclude `transactions/commit`, metrics and the `HEAD` endpoints; DuckDB assumes
+   nothing. Sending an explicit list is what keeps renew/transactions out of PyIceberg's reach — the reason
+   to send it is the opposite of what §2.1 originally recorded.
+4. **Multi-table transactions fail cleanly.** With `transactions/commit` advertised, DuckDB commits the
+   transaction; without it, DuckDB refuses client-side with a clear message and sends **no** write request.
+   It does not silently degrade to two single-table commits.
+
+Required versus optional response fields, measured:
+
+| Field | PyIceberg 0.12 | DuckDB 2.0 |
+|---|---|---|
+| `config.defaults` / `config.overrides` | optional | **required**, even when empty, and every value must be a JSON string |
+| `overrides.prefix` | optional (absent ⇒ no path segment) | optional |
+| `idempotency-key-lifetime` | not needed | not needed |
+| `namespaces` / `identifiers` in listings | **required** | optional (absent ⇒ empty list) |
+| `metadata` on load table | **required** | **required** |
+| `metadata-location` on load table | optional | optional |
+| `config` on load table | optional | optional |
+| `storage-credentials` | optional, even when the client asked for vended credentials | optional, same |
+| `metadata` **and** `metadata-location` on the commit response | **both required** | **both required** |
+
+Error handling, measured: both clients read `message` for the user-facing text and choose the exception
+class from the HTTP status, not from `type`; PyIceberg's model requires all three fields. `401` triggers
+one automatic retry in PyIceberg; `404` becomes `NoSuchTableError` on *any* endpoint; commit `409` becomes
+`CommitFailedException` and `500`/`502`/`504` become `CommitStateUnknownException`. Choose the status for
+the client-side class you want, not only for its HTTP meaning.
+
+Also measured: both clients send `X-Iceberg-Access-Delegation` (PyIceberg on every request, DuckDB on the
+table-scoped ones) and both accept a response with no `storage-credentials` — so vending can land later
+without breaking either. And the OAuth flow differs: PyIceberg posts `client_id`/`client_secret` to the
+token endpoint (twice at connect time) and DuckDB sends the same credentials as HTTP Basic.
+
+Corrections folded into §2.1 (already applied above): the absent-list default, the literal `{prefix}`, the
+`identifier` member and the commit response, and the error-class mapping.
+
+Not covered: Spark and Trino (their request patterns and delegation behaviour are unmeasured), pagination,
+PyIceberg versions other than 0.12, real object storage, and credentials vending.
+
+### 15.4 Close-out status of the plan
+
+The board this plan was broken into (`tasks.json`) is closed; the implementation status below is what the
+public documentation states as behaviour, and it is the honest list of what is and is not wired:
+
+| Area | Status |
+|---|---|
+| Read path: `GET /v1/config`, namespace and table reads on any ref, `relative_to` in both forms | **landed** |
+| Write path: namespace create/update/drop, table create, drop, metrics, commit (§6.2) | **landed** |
+| `register` (§I-2) | not served, not advertised |
+| §6.3 file registration as lakeFS entries | code and tests in `pkg/icebergcatalog/files.go`, **not called by the commit path** |
+| §6.3 uncommitted-GC grace and the `_lakefs_iceberg/` deny | predicate and policy builder landed and tested in `gc.go`; **not yet hooked into `pkg/catalog` / bootstrap** |
+| §8 remote signing and vended credentials | implemented in `sign.go` / `creds.go`, **services not mounted**, so not advertised |
+| §7.1 OAuth token endpoint | implemented in `oauth.go` / `auth.go`, **not wired** into the mounted middleware (which still serves Basic and JWT) |
+| §7.2 `catalog:ReadTableData` / `catalog:WriteTableData` and the `CatalogRead` grant | **landed** |
+| §6.4 compaction auto-resolve | decision logic landed (`ResolvePointerConflict`), merge wiring pending |
+| I-5 ETag / `If-None-Match` | not implemented |
+| §9 datasets `table` / `namespace` items | not implemented; they still answer 501 |
+| §12 conformance and esti | iceberg-go external suite and the documented RCK invocation landed; esti suites not yet written |
+
+The user-facing summary of this table lives in [`docs/iceberg.md`](docs/iceberg.md), including the
+uncommitted-GC window and the RBAC note for policies written before the data-plane actions existed.

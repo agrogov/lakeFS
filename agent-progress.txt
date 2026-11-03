@@ -93,15 +93,58 @@ I2-7 + I3-3; v1 complete at I6-3.
 - Q-I8 remove-snapshots keeps files (no tombstoning in v1) unless I0-2 says otherwise.
 - Staging, not auto-commit: catalog writes land on the branch and take effect on an
   explicit lakeFS commit (§6.2).
-- Spike notes live in per-spike files (ICEBERG_SPIKE_S-I1..S-I4.md) so the four spikes can
-  run in parallel; D1 folds them back into ICEBERG_CATALOG_PLAN.md and deletes them.
+- Spike notes lived in per-spike files (ICEBERG_SPIKE_S-I1..S-I4.md) so the four spikes could
+  run in parallel. **D1 folded them into ICEBERG_CATALOG_PLAN.md §15 and deleted them.** Three
+  notes existed, not four: S-I3 was the mount-order fix (I0-3) and shipped as code, not as a note.
 
 ## Status
 
-- Ledger created from ICEBERG_CATALOG_PLAN.md at HEAD 577304b0f on feature/datasets.
-- Wave-1 tasks I0-1..I0-4 and I1-1 are `ready`; the rest are `backlog`.
-- No implementation done by this agent.
+- Ledger created from ICEBERG_CATALOG_PLAN.md at HEAD 577304b0f on `feature/datasets`; the board
+  and its commits live on `feature/iceberg-catalog` (head `5e8d8efa4` + the D1 docs commit).
+- **Closed by D1.** 27 of 34 tasks are `done`, each recording its commit sha and a
+  `validation_result`; D1 re-ran `go test ./pkg/icebergcatalog/`, `./pkg/permissions/... ./pkg/auth/`
+  and `go test -run 'TestNotImplementedServices|TestServices' ./pkg/api/` at close-out (all ok) rather
+  than copying an old result.
+- **Seven tasks have no commit and are deliberately NOT marked done:** I2-6 (register), I2-8 and I3-3
+  (esti), I5-2 (ETag), I6-1..I6-3 (datasets table/namespace items). I2-6 and I5-2 sit at `ready`
+  because their dependencies are done; the rest stay `backlog` behind them.
 - Already-done check: pkg/datasets/authz.go:597 immutabilityDeniedActions ALREADY denies
   catalog:Create*/Update*/Delete* for namespace/table/view, so §7.2's "add these to
-  immutabilityDeniedActions" is a no-op — verify in I1-6, do not re-add.
-- Not in go.mod yet: github.com/apache/iceberg-go (I0-1 adds it).
+  immutabilityDeniedActions" was a no-op — verified in I1-6, not re-added.
+
+### What is wired, and what is only written
+
+Three gaps are code that exists and tests that pass, but no production caller. They are the reason
+`docs/iceberg.md` has a "Current limitations" section and §15.4 of the plan has a status table:
+
+1. `pkg/icebergcatalog/files.go` stages a snapshot's files as lakeFS entries, but `commit.go` never
+   calls `StageTableFiles`. So table files are not in the GC's view, a diff shows only the pointer,
+   and a merge carries only the pointer. §6.3's guarantee is therefore **not** in force yet.
+2. `UncommittedGCProtected` (`gc.go`) and `ReservedPrefixProtectPolicy` are implemented and tested,
+   but nothing in `pkg/catalog` or the auth bootstrap calls them: the grace window does not filter the
+   prepare step, and the `_lakefs_iceberg/` deny is not attached at bootstrap.
+3. `NewRemoteSigningService` and `NewCredentialService` have `Routes()` and handlers, but
+   `RoutesBuilder` appends only the namespace and table services, so neither endpoint is mounted or
+   advertised. `LoadTableResult.config` is empty and clients fall back to their own credentials.
+
+A fourth is a one-line wiring choice rather than missing code: `http.go`'s `newAuthMiddleware` still
+builds `api.GenericAuthMiddleware` instead of the catalog's `NewAuthMiddleware`, so
+`POST /v1/oauth/tokens` is not served. Basic auth and bearer JWTs work; the client-credentials
+exchange that PyIceberg/DuckDB use for `credential=` does not.
+
+### Follow-ups this close-out hands on
+
+| # | Item |
+|---|---|
+| 1 | Hook `UncommittedGCProtected` into the uncommitted-GC prepare step and attach the reserved-prefix deny at bootstrap (the second half of I3-2). |
+| 2 | Call `StageTableFiles` from the commit path, with the bounded worker pool and the `max_staged_files` cap the S-I2 spike sized (§15.2). |
+| 3 | Mount the signing and vended-credentials services, then advertise them and gate them on `catalog:ReadTableData` / `catalog:WriteTableData`. |
+| 4 | Swap `newAuthMiddleware` to `NewAuthMiddleware` so the OAuth token endpoint is served. |
+| 5 | Wire `ResolvePointerConflict` into the merge path; today it is only self-referenced. |
+| 6 | Update the `ICEBERG_SPIKE_*.md` filenames cited in `pkg/icebergcatalog/{commit,files,creds,sign,doc}.go` — the notes are gone and those paths are outside D1's files_expected. The findings are in ICEBERG_CATALOG_PLAN.md §15. |
+| 7 | Run the iceberg-go external conformance suite with `REST_CATALOG_*` set, and write the esti suites (I2-8, I3-3, I6-3). |
+
+Board hygiene note: `917f2d88d` ("I0-5: give every icebergcatalog test its own cache directory")
+has no ledger row, and I1-1 landed twice (`c9ba22872` + follow-up `afa04b3c8` fixing the ACL Read
+expectation). Both are recorded in `tasks.json` under `closeout.unplanned_commits` instead of being
+retrofitted as new rows.
