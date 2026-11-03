@@ -148,3 +148,34 @@ Board hygiene note: `917f2d88d` ("I0-5: give every icebergcatalog test its own c
 has no ledger row, and I1-1 landed twice (`c9ba22872` + follow-up `afa04b3c8` fixing the ACL Read
 expectation). Both are recorded in `tasks.json` under `closeout.unplanned_commits` instead of being
 retrofitted as new rows.
+
+## I6-1 (datasets table/namespace items) — implemented
+
+`IcebergEnabled` in pkg/datasets/validate.go reads `iceberg.enabled` (the key pkg/icebergcatalog
+uses); disabled keeps the old `(501)` problem, so the service still answers 501. Enabled replaces
+it with the §9 shape rules and, in materialize.go, a reserved-item opener that copies
+
+  _lakefs_iceberg/tables/<ns…>/<table>/.pointer     (+ _lakefs_iceberg/files/<uuid>/… for a table)
+  _lakefs_iceberg/ns/<ns…>/.namespace               (+ subtree markers/pointers/files for a namespace)
+
+Contract decisions worth carrying forward:
+- A reserved item's `target` MUST be its catalog path (`<ns>/<table>` or `<ns>`), because the keys
+  are fixed by the repository-wide layout and the dataset must answer `<ds>.<ref>.<ns>.<table>`.
+  This also gives the §5.2 rule-3 check the right meaning for these items.
+- Namespace markers are owned by namespace items only. Table items never copy them: two sibling
+  table items are a valid definition, and both would otherwise claim the same marker key and fail
+  the §6.4 merge (regression covered by TestPublishSiblingTableItems).
+- A namespace item covers its whole subtree and does not copy ancestors' markers, so attaching it
+  together with a table/nested namespace inside it stays an overlap error (one materialisation).
+- Multi-level namespaces come from the dotted string in the definition (`.`), matching the lakeFS
+  ARN/diff notation; the catalog wire separator is 0x1F. A namespace level containing a dot is
+  therefore not expressible — a limitation of the Enterprise-compatible string field.
+- Missing table/namespace at the pinned commit → *ValidationError naming the item (400), not 5xx.
+
+Proof that the placement, not just the copy, is right: TestPublishedTableReadableThroughCatalog and
+TestPublishNamespaceItem read the published version back with `icebergcatalog.Store.GetTable` /
+`GetNamespace`, so the catalog computes the reserved keys itself.
+
+Follow-ups handed to I6-2: api/datasets.yml + pkg/datasets/apigen still say table/namespace are
+"answered with 501"; authz SourceObjectArn still checks the whole repository for a table item; and
+the docs need the target-equals-catalog-path rule plus the marker-ownership note.

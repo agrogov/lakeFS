@@ -655,18 +655,24 @@
       "type": "implement",
       "title": "datasets: accept table and namespace items when iceberg.enabled, and materialise them",
       "scope": "Remove the unconditional 501-rejection of ItemTypeTable/ItemTypeNamespace (pkg/datasets/validate.go:222-225) and gate them on iceberg.enabled. Add a materialiser opener that resolves the table at the source ref and copies the pointer entry plus every _lakefs_iceberg/files/<uuid>/... entry reachable from the pinned snapshot, so absolute paths inside metadata stay valid (§9). Namespace items materialise the namespace marker and their tables.",
-      "refs": ["§9", "§6.3", "DATASETS_DESIGN.md §1.2 §3 §7.4"],
-      "status": "backlog",
+      "refs": ["§9", "§6.1", "§6.3", "DATASETS_DESIGN.md §1.2 §3 §7.4"],
+      "status": "done",
       "depends_on": ["I3-1", "I3-3"],
       "files_expected": ["pkg/datasets/validate.go", "pkg/datasets/validate_test.go", "pkg/datasets/materialize.go", "pkg/datasets/materialize_test.go"],
       "validation": "go test ./pkg/datasets/...",
-      "validation_result": null,
+      "validation_result": {"status": "pass", "command": "go test ./pkg/datasets/...", "details": "go test ./pkg/datasets/... -> ok 60.860s (apigen: no test files); golangci-lint run ./pkg/datasets/... -> no findings in validate.go/materialize.go (7 pre-existing findings remain in service.go/handlers.go/store.go/metadata_validate.go/proposals.go)"},
       "autocommit": true,
       "commit_message": "I6-1: materialise table and namespace items into datasets",
-      "commit": {"sha": null, "at": null},
+      "commit": {"sha": "45920e16bb8bfa51085ae405f5a4a1b0bad34cc2", "at": "2026-11-03T11:31:08+01:00"},
       "notes": [
-        "This is the payoff of §6.3: without staged file entries a table item cannot be materialised at all.",
-        "Keep the existing validation error for table items when iceberg is disabled."
+        "Payoff of §6.3: without staged file entries a table item cannot be materialised at all.",
+        "Gate: IcebergEnabled (pkg/datasets) reads the iceberg.enabled key pkg/icebergcatalog reads (IcebergEnabledKey is pinned to icebergcatalog.ConfigKey by a test). Disabled keeps the existing '(501)' problem at data[i].type, so unsupportedCheck still answers 501.",
+        "Placement: a table/namespace item copies the source's reserved _lakefs_iceberg/ keys unchanged, so the dataset answers /iceberg/api at <ds>.<ref>.<ns>.<table>. Its target must therefore equal the catalog path (<ns>/<table> or <ns>), which also makes the §5.2 rule-3 overlap check answer 'this would materialise twice'.",
+        "Key ownership (decided here, documented in openIcebergItem): a namespace marker belongs to the namespace item that covers it and is never copied by a table item, otherwise two sibling table items (a valid definition) would collide on the same marker key and fail the §6.4 merge. Regression: TestPublishSiblingTableItems.",
+        "Subtree semantics: a namespace item copies its own markers plus every nested marker, table pointer and table file tree; ancestors' markers are left to a namespace item that covers them.",
+        "A missing table/namespace at the pinned ref is a *ValidationError naming the item (400), not a 5xx.",
+        "End-to-end proof: TestPublishedTableReadableThroughCatalog reads the published table with icebergcatalog.Store.GetTable on the dataset repo at the version tag (the catalog computes the pointer path itself); TestPublishNamespaceItem does the same with GetNamespace.",
+        "Out of scope here (I6-2): api/datasets.yml + pkg/datasets/apigen still document table/namespace as 'answered with 501'; authz SourceObjectArn still checks the whole repository for a table item."
       ]
     },
     {
