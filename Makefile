@@ -231,7 +231,7 @@ validate-proto: gen-proto  ## build proto and check if diff found
 validate-mockgen: gen-code
 	git diff --quiet -- pkg/actions/mock/mock_actions.go || (echo "Modification verification failed! pkg/actions/mock/mock_actions.go"; false)
 	git diff --quiet -- pkg/auth/mock/mock_auth_client.go || (echo "Modification verification failed! pkg/auth/mock/mock_auth_client.go"; false)
-	git diff --quiet -- pkg/authentication/api/mock_authentication_client.go || (echo "Modification verification failed! pkg/authentication/api/mock_authentication_client.go"; false)
+	git diff --quiet -- pkg/authentication/mock/mock_authentication_client.go || (echo "Modification verification failed! pkg/authentication/mock/mock_authentication_client.go"; false)
 	git diff --quiet -- pkg/graveler/committed/mock/batch_write_closer.go || (echo "Modification verification failed! pkg/graveler/committed/mock/batch_write_closer.go"; false)
 	git diff --quiet -- pkg/graveler/committed/mock/meta_range.go || (echo "Modification verification failed! pkg/graveler/committed/mock/meta_range.go"; false)
 	git diff --quiet -- pkg/graveler/committed/mock/range_manager.go || (echo "Modification verification failed! pkg/graveler/committed/mock/range_manager.go"; false)
