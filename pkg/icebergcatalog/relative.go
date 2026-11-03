@@ -23,21 +23,37 @@ package icebergcatalog
 // http.go mounts the catalog twice for exactly this reason: at APIBasePath, and at
 // <RelativeToBasePath>/{warehouse}/api, where chi keeps the segment as the "warehouse" URL
 // parameter (relativeToPattern). RelativeTo is the middleware that turns the second mount into
-// the first. It is a pure rewrite of the request and nothing more:
+// the first:
 //
 //  1. it parses the warehouse segment into a Scope (ident.go ParseWarehouse): {repo} fixes the
 //     repository, {repo}.{branch} fixes the repository and the ref;
-//  2. it prefixes the client's own levels with the fixed ones, joined with the Iceberg namespace
+//  2. it binds that Scope to the request context, so the handlers of namespaces.go and tables.go
+//     can tell which form they are serving (requestScope) and translate between the two
+//     addresses;
+//  3. it prefixes the client's own levels with the fixed ones, joined with the Iceberg namespace
 //     separator, so the request the handlers see is the request the same client would have sent
 //     to /iceberg/api;
-//  3. it delegates to the same handler chain, so both forms run the same code, authorize the
-//     same way and answer identically. That identity is the point of I1-10: a table read through
-//     /iceberg/relative_to/{repo}.{branch}/api and through /iceberg/api must be
-//     indistinguishable, which is why nothing is un-prefixed on the way out either. A namespace
-//     in a response is always the full [repo, ref, ns…] path, exactly as the Iceberg Namespace
-//     type and the lakeFS docs describe it, whichever form asked.
+//  4. it delegates to the same handler chain, so both forms run the same code and authorize the
+//     same way.
 //
-// The rewrite covers the two places an address can appear in a catalog request, and only those:
+// The two forms therefore answer the same *address*, and not the same bytes. That distinction is
+// the whole of D-4: an address that /iceberg/api names [repo, ref, ns…] is named [ns…] by a
+// relative_to client, and [ref<sep>ns…] by a client whose URL fixed only the repository, because
+// the repository and the ref are fixed by the URL and were never the client's to name. A client
+// that sent ["inv"] has to read ["inv"] back - not ["repo", "main", "inv"], which it has no way
+// to strip - and that round trip is what catalogtest's ListNamespaces subtest asserts. The
+// translation is symmetric, and this file owns both directions:
+//
+//   - into the catalog: bindRelativeScope rewrites the {namespace} path parameter and the
+//     `parent` query parameter, and absoluteNamespaceLevels rewrites the `namespace` member of a
+//     CreateNamespace request body (D-2). The create asks the handler for that rewrite rather
+//     than the middleware, because the body is bounded by iceberg.max_request_body inside the
+//     catalog's middleware stack, which runs behind this one;
+//   - out of the catalog: clientNamespace, which every response that carries a namespace is
+//     built through (namespaces.go and tables.go), drops the levels the URL fixed again.
+//
+// The rewrite into the catalog covers the three places an address can appear in a catalog
+// request, and only those:
 //
 //   - the {namespace} path parameter of the namespaces and tables routes (namespaces.go
 //     namespacesPattern / namespacePattern; the tables routes of I1-9 use the same parameter).
@@ -50,7 +66,9 @@ package icebergcatalog
 //     {repo}.{branch} fixed, no parent lists the namespaces of that ref (§5 row 4), and with only
 //     {repo} fixed it lists the refs of that repository (§5 row 5). bindRelativeScope supplies
 //     the fixed levels in that case instead of leaving the request parentless, which would
-//     otherwise be answered as "list the repositories".
+//     otherwise be answered as "list the repositories";
+//   - the `namespace` member of a CreateNamespace request body, which namespaces.go rewrites with
+//     absoluteNamespaceLevels once it has decoded it.
 //
 // Everything else in the request - the {prefix} segment, pageToken, pageSize, the table name -
 // is passed through untouched, so pagination, the prefix check (Q-I3) and the response shape of
@@ -74,6 +92,10 @@ package icebergcatalog
 //     contains a percent-escaped separator is decoded once by the handler that validates it
 //     (ident.go), exactly as on the /iceberg/api form. This middleware never re-encodes a level
 //     it did not create.
+//   - clientNamespace drops a prefix only when the levels are exactly the ones the URL fixed. An
+//     address outside the fixed scope cannot be produced by these handlers - the rewrite can only
+//     append to those levels - and if one ever were, returning it unchanged is the honest answer
+//     rather than a value that silently loses a level.
 //   - No I/O and no lookup happen here. A warehouse segment that does not parse names no
 //     warehouse of this catalog, and is answered 404 NoSuchWarehouseException right away (§5,
 //     errors.go). Whether a segment that *does* parse names a repository and a ref that exist is
@@ -89,6 +111,7 @@ package icebergcatalog
 //     document the type.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -148,9 +171,83 @@ func RelativeTo(next http.Handler) http.Handler {
 		}
 		if relative {
 			bindRelativeScope(scope, r)
+			// The scope also travels with the request, because two of the three rewrites - and the
+			// un-prefixing of the response - happen inside the handlers (see the file comment). The
+			// route context chi carries in the same context is preserved: WithContext only adds a
+			// value to it.
+			r = r.WithContext(withRequestScope(r.Context(), scope))
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// requestScopeKey is the context key under which RelativeTo stores the Scope it bound. It is a
+// private struct type, so no other package can collide with it or forge one.
+type requestScopeKey struct{}
+
+// withRequestScope binds scope to ctx: from here on the request is one of the relative_to forms.
+func withRequestScope(ctx context.Context, scope Scope) context.Context {
+	return context.WithValue(ctx, requestScopeKey{}, scope)
+}
+
+// requestScope is withRequestScope's reader. The bool reports whether the request answers one of
+// the relative_to forms; a request on the /iceberg/api mount carries no scope, and every helper
+// below is the identity for it.
+func requestScope(r *http.Request) (Scope, bool) {
+	scope, ok := r.Context().Value(requestScopeKey{}).(Scope)
+	return scope, ok
+}
+
+// clientNamespace returns full - a namespace as the catalog names it internally, with the
+// repository and the ref in front (namespaces.go fullNamespace) - as the client of this request
+// names it.
+//
+// On the /iceberg/api mount that is the same value: the client named the macro levels itself. On
+// a relative_to request the URL fixed them, so the client-visible value is the suffix below them,
+// i.e. the levels the client sent, and this is what makes the two forms identity-preserving for a
+// client: a namespace created as ["inv"] through
+// /iceberg/relative_to/{repo}.{branch}/api is listed and read back as ["inv"], never as
+// ["repo", "branch", "inv"] (conformance/RESULTS.md §10 D-4).
+//
+// Only a namespace that starts with exactly the levels the URL fixed is stripped (see the security
+// note in the file comment). A repository-level entry - which a relative_to request cannot reach,
+// because bindRelativeScope always supplies a parent - is returned unchanged rather than as an
+// empty namespace.
+func clientNamespace(r *http.Request, full Namespace) Namespace {
+	scope, ok := requestScope(r)
+	if !ok {
+		return full
+	}
+	fixed := scopeLevels(scope)
+	if len(full) <= len(fixed) {
+		return full
+	}
+	for i, level := range fixed {
+		if full[i] != level {
+			return full
+		}
+	}
+	return full[len(fixed):]
+}
+
+// absoluteNamespaceLevels is clientNamespace's other direction for an address a client carried in
+// a request body: the levels the URL fixed, followed by the levels the client sent.
+//
+// The create of namespaces.go is the only operation that takes its address from the body
+// (POST /v1/{prefix}/namespaces), and without this rewrite the client of a relative_to URL cannot
+// create a namespace at all: its ["inv"] would be read as a repository and a ref and answered 400
+// (conformance/RESULTS.md §10 D-2). The handler applies it after it has decoded the body, so the
+// body is still read through the iceberg.max_request_body bound of the catalog's own middleware
+// stack, which runs behind RelativeTo.
+func absoluteNamespaceLevels(r *http.Request, levels []string) []string {
+	scope, ok := requestScope(r)
+	if !ok {
+		return levels
+	}
+	fixed := scopeLevels(scope)
+	absolute := make([]string, 0, len(fixed)+len(levels))
+	absolute = append(absolute, fixed...)
+	return append(absolute, levels...)
 }
 
 // relativeScope reads the warehouse segment of a relative_to request. The bool reports whether
@@ -172,7 +269,9 @@ func relativeScope(r *http.Request) (Scope, bool, error) {
 // bindRelativeScope rewrites a relative_to request into the equivalent /iceberg/api request: the
 // fixed warehouse levels are prepended to the address the client sent, wherever that address is
 // (the {namespace} path parameter of the route path, or the parent query parameter), and
-// everything else is left alone.
+// everything else is left alone. The one address this function does not rewrite is the namespace
+// in the body of a create: that request is decoded by the handler, which prepends the same levels
+// with absoluteNamespaceLevels (D-2, see the file comment).
 func bindRelativeScope(scope Scope, r *http.Request) {
 	rctx := chi.RouteContext(r.Context())
 	if rctx == nil {
@@ -185,6 +284,12 @@ func bindRelativeScope(scope Scope, r *http.Request) {
 		// have carried. The client's own segment keeps its encoding: only the levels this
 		// middleware creates are encoded here (see the security note above).
 		rctx.RoutePath = path
+		return
+	}
+	if r.Method != http.MethodGet {
+		// Only ListNamespaces takes an address in the query, and only a GET can be it. A POST on
+		// the same path is the create, whose address is in the body and is rewritten by
+		// absoluteNamespaceLevels; injecting a parent into its query would be meaningless.
 		return
 	}
 	if parent := r.URL.Query().Get(parentParam); parent != "" {

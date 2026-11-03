@@ -156,14 +156,19 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 	r.Mount(APIBasePath, handler)
 
 	// The relative_to form gets its own mount so that a path without the
-	// <warehouse>/api shape is answered by the catalog, not by the core catch-all.
+	// <warehouse>/api shape is answered by the catalog, not by the core catch-all. The catalog
+	// handler is wrapped with RelativeTo (relative.go): the mount pattern keeps the warehouse
+	// segment as the "warehouse" URL parameter, and the middleware turns it into the repository
+	// and the ref that the catalog's own routes read. Mounting the bare handler here would capture
+	// that segment and ignore it, which is defect D-1 of conformance/RESULTS.md §10: every
+	// relative_to request would then be answered as if no warehouse had been named.
 	relativeTo := chi.NewRouter()
 	relativeTo.NotFound(func(w http.ResponseWriter, req *http.Request) {
 		writeIcebergError(w, http.StatusNotFound, ErrTypeNoSuchWarehouse,
 			fmt.Sprintf("%s %s does not name a warehouse: expected %s/{repo}[.{branch}]/api/v1/...",
 				req.Method, req.URL.Path, RelativeToBasePath))
 	})
-	relativeTo.Mount(relativeToPattern, handler)
+	relativeTo.Mount(relativeToPattern, RelativeTo(handler))
 	r.Mount(RelativeToBasePath, relativeTo)
 	return nil
 }

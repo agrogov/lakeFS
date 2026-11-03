@@ -356,8 +356,10 @@ func (s *tableService) Routes() []route {
 }
 
 // tableIdentifier is TableIdentifier (spec: components.schemas.TableIdentifier): the namespace
-// the table lives in and its name. The namespace carries the repository and ref levels, because
-// that is how this catalog addresses a table (§5) and what a client has to send back to load it.
+// the table lives in and its name, in the client's own terms. On the /iceberg/api form the
+// namespace carries the repository and ref levels, because that is how this catalog addresses a
+// table (§5) and what a client has to send back to load it; on a relative_to form it is the same
+// address without the levels the URL already fixed (relative.go clientNamespace).
 type tableIdentifier struct {
 	Namespace Namespace `json:"namespace"`
 	Name      string    `json:"name"`
@@ -474,7 +476,10 @@ func (s *tableService) handleListTables(w http.ResponseWriter, r *http.Request) 
 	identifiers := make([]tableIdentifier, 0, len(visible))
 	for _, name := range visible {
 		identifiers = append(identifiers, tableIdentifier{
-			Namespace: fullNamespace(addr, ""),
+			// The client's own terms, as in every response that carries a namespace: the full
+			// [repo, ref, ns…] address on the /iceberg/api form, the levels below the fixed
+			// warehouse on a relative_to form (relative.go clientNamespace, D-4).
+			Namespace: clientNamespace(r, fullNamespace(addr, "")),
 			Name:      name,
 		})
 	}

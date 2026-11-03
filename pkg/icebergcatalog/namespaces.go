@@ -248,25 +248,30 @@ func (n *namespaceService) Routes() []route {
 }
 
 // listNamespacesResponse is ListNamespacesResponse (spec: components.schemas.ListNamespacesResponse).
-// Namespace is the spec's Namespace type: an array of levels. The macro levels are part of every
-// entry, so a branch level entry is [repo, branch] and a namespace level entry is
-// [repo, ref, ns…] - the same shape a client sent as `parent`, with one more level.
+// Namespace is the spec's Namespace type: an array of levels, in the client's own terms. On the
+// /iceberg/api form the macro levels are part of every entry - a branch level entry is
+// [repo, branch] and a namespace level entry is [repo, ref, ns…] - the same shape a client sent as
+// `parent`, with one more level. A relative_to client named neither macro level (its URL did), so
+// it gets back the levels it sent (relative.go clientNamespace).
 type listNamespacesResponse struct {
 	Namespaces    []Namespace `json:"namespaces"`
 	NextPageToken string      `json:"next-page-token,omitempty"`
 }
 
 // getNamespaceResponse is GetNamespaceResponse (spec: components.schemas.GetNamespaceResponse).
-// Namespace is the full path including the repository and ref levels, and Properties is the
-// user metadata of the namespace marker entry (§6.1).
+// Namespace is the address the client named, in its own terms: the full [repo, ref, ns…] path on
+// the /iceberg/api form, and the levels below the warehouse on a relative_to form. Properties is
+// the user metadata of the namespace marker entry (§6.1).
 type getNamespaceResponse struct {
 	Namespace  Namespace         `json:"namespace"`
 	Properties map[string]string `json:"properties"`
 }
 
 // createNamespaceRequest is CreateNamespaceRequest (spec: components.schemas.CreateNamespaceRequest).
-// Namespace is the full path including the repository and ref levels, in the same shape the
-// listing returns; `namespace` is the only required field of the model.
+// Namespace is the address to create, in the client's own terms: the full [repo, ref, ns…] path on
+// the /iceberg/api form, and the levels below the warehouse on a relative_to form, where
+// handleCreateNamespace prepends what the URL fixed; `namespace` is the only required field of the
+// model.
 type createNamespaceRequest struct {
 	Namespace  []string          `json:"namespace"`
 	Properties map[string]string `json:"properties"`
@@ -355,6 +360,13 @@ func (n *namespaceService) handleListNamespaces(w http.ResponseWriter, r *http.R
 	if page == nil {
 		page = []Namespace{}
 	}
+	// The entries above are the catalog's own addresses, which carry the repository and the ref
+	// (fullNamespace). A relative_to client named neither of them - its URL did - so the fixed
+	// levels are dropped again before the answer goes out, which is what makes the listing
+	// identity-preserving for that client (relative.go clientNamespace, D-4).
+	for i, namespace := range page {
+		page[i] = clientNamespace(r, namespace)
+	}
 	writeJSON(w, http.StatusOK, listNamespacesResponse{Namespaces: page, NextPageToken: next})
 }
 
@@ -376,7 +388,7 @@ func (n *namespaceService) handleGetNamespace(w http.ResponseWriter, r *http.Req
 		properties = map[string]string{}
 	}
 	writeJSON(w, http.StatusOK, getNamespaceResponse{
-		Namespace:  fullNamespace(addr, ""),
+		Namespace:  clientNamespace(r, fullNamespace(addr, "")),
 		Properties: properties,
 	})
 }
@@ -459,6 +471,10 @@ func (n *namespaceService) handleCreateNamespace(w http.ResponseWriter, r *http.
 	if !decodeJSONBody(w, r, &body) {
 		return
 	}
+	// A relative_to client carries only its own levels in the body: the repository and the ref are
+	// fixed by its URL, and the create would otherwise read its first two levels as them and fail
+	// (relative.go absoluteNamespaceLevels, D-2). On the /iceberg/api form this is the identity.
+	body.Namespace = absoluteNamespaceLevels(r, body.Namespace)
 	addr, err := namespaceAddressFromLevels(body.Namespace)
 	if err != nil {
 		n.writeError(w, err)
@@ -483,7 +499,7 @@ func (n *namespaceService) handleCreateNamespace(w http.ResponseWriter, r *http.
 		properties = map[string]string{}
 	}
 	writeJSON(w, http.StatusOK, createNamespaceResponse{
-		Namespace:  fullNamespace(addr, ""),
+		Namespace:  clientNamespace(r, fullNamespace(addr, "")),
 		Properties: properties,
 	})
 }
