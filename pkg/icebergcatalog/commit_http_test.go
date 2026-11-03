@@ -92,6 +92,10 @@ func tablePropertiesOf(t *testing.T, metadata map[string]json.RawMessage) map[st
 // A commit reaches CreateEntry only after it read the base pointer, ran the requirements and wrote
 // its metadata file, so holding two commits there makes them race on exactly the compare-and-swap
 // of §6.2 step 6 - the state a real pair of concurrent commits produces.
+//
+// Only the pointer write is held. A commit also stages the table files it added through the same
+// CreateEntry before the swap (§6.2 step 5, files.go), and those writes must not count as an
+// arrival: the barrier is the swap, not the staging that precedes it.
 type barrierCatalog struct {
 	Catalog
 	arrived func()
@@ -99,8 +103,10 @@ type barrierCatalog struct {
 }
 
 func (c *barrierCatalog) CreateEntry(ctx context.Context, repositoryID, branch string, entry catalog.DBEntry, opts ...graveler.SetOptionsFunc) error {
-	c.arrived()
-	<-c.permit
+	if strings.HasSuffix(entry.Path, "/"+TablePointerName) {
+		c.arrived()
+		<-c.permit
+	}
 	return c.Catalog.CreateEntry(ctx, repositoryID, branch, entry, opts...)
 }
 
