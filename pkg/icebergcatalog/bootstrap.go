@@ -30,6 +30,13 @@ package icebergcatalog
 //     group names are expected to be absent);
 //   - installing the protector, or the merge hook, twice is a no-op.
 //
+// The deny policy is hardening, not a precondition: an auth service with no policy backend at all
+// (auth.BasicAuthService, the default mode of both binaries, answers every policy call with
+// auth.ErrNotImplemented) cannot hold a policy, and a startup that refused to run without one would
+// make iceberg.enabled unusable in that mode (conformance/RESULTS.md D-3). Such a service is logged
+// as a warning naming what is no longer enforced, and Bootstrap continues; every other error -
+// a real failure on a backend that does store policies - still fails startup.
+//
 // Clean-room note (plan §2, DATASETS_DESIGN.md §2): written from the Apache Iceberg specs and the
 // public lakeFS documentation only.
 
@@ -96,8 +103,10 @@ func Bootstrap(ctx context.Context, deps cmdpkg.ServerDeps, extraGroups []string
 	catalog.SetUncommittedGCProtector(UncommittedGCGraceProtector(cfg.UncommittedGCGrace))
 
 	// §6.1: reserve _lakefs_iceberg/ against the fs: object API, for every principal that could
-	// otherwise write it.
-	if err := EnsureReservedPrefixProtectPolicy(ctx, deps.AuthService, time.Now(), extraGroups); err != nil {
+	// otherwise write it. An auth service that cannot manage policies degrades this to a warning
+	// (see EnsureReservedPrefixProtectPolicy); anything else it reports is a startup error.
+	denyAttached, err := EnsureReservedPrefixProtectPolicy(ctx, deps.AuthService, time.Now(), extraGroups)
+	if err != nil {
 		return err
 	}
 
@@ -105,11 +114,20 @@ func Bootstrap(ctx context.Context, deps cmdpkg.ServerDeps, extraGroups []string
 	// caused, while iceberg.ignore_compaction_commits is on (the default).
 	installMergeConflictResolver(cfg, deps)
 
-	deps.Logger.WithFields(logging.Fields{
-		"policy":                    ReservedPrefixProtectPolicyName,
+	fields := logging.Fields{
 		"uncommitted_gc_grace_s":    int64(cfg.UncommittedGCGrace / time.Second),
 		"ignore_compaction_commits": cfg.IgnoresCompactionCommits(),
-	}).Info("iceberg catalog: reserved-prefix deny attached, uncommitted-GC grace and merge hook installed")
+	}
+	if denyAttached {
+		fields["policy"] = ReservedPrefixProtectPolicyName
+		deps.Logger.WithFields(fields).
+			Info("iceberg catalog: reserved-prefix deny attached, uncommitted-GC grace and merge hook installed")
+		return nil
+	}
+	// The warning logReservedPrefixDenyNotAttached wrote says why; this line keeps the startup
+	// summary from claiming the deny was attached when it was not.
+	deps.Logger.WithFields(fields).
+		Info("iceberg catalog: uncommitted-GC grace and merge hook installed; the reserved-prefix deny is not attached")
 	return nil
 }
 
@@ -146,9 +164,21 @@ func installMergeConflictResolver(cfg *Config, deps cmdpkg.ServerDeps) {
 // ts is the creation timestamp recorded when the policy has to be created (the caller passes
 // time.Now(), as the datasets bootstrap does). A nil authService is ErrNoAuthorizer (authz.go): the
 // deny policy is the whole point of the call, so there is nothing to fall back to.
-func EnsureReservedPrefixProtectPolicy(ctx context.Context, authService auth.Service, ts time.Time, extraGroups []string) error {
+//
+// A service that cannot manage policies at all - auth.BasicAuthService, the default auth mode of
+// both lakefs binaries, answers GetPolicy/WritePolicy/AttachPolicyToGroup with auth.ErrNotImplemented
+// - is not an error: the deny is a hardening measure, so its absence degrades the deployment (the
+// reserved prefix stays writable through fs:) instead of refusing to start it. That case is a
+// warning naming the consequence and a nil error; every other error is returned, so a genuine
+// failure on a backend that does store policies still fails startup.
+//
+// The bool is whether the deny is in force: true when the policy was created or found and attached
+// to at least the groups this installation has, false exactly in the degraded case above. It exists
+// so Bootstrap's startup summary does not report an attachment that did not happen; it is not an
+// error channel and never softens the error path.
+func EnsureReservedPrefixProtectPolicy(ctx context.Context, authService auth.Service, ts time.Time, extraGroups []string) (bool, error) {
 	if authService == nil {
-		return ErrNoAuthorizer
+		return false, ErrNoAuthorizer
 	}
 	policy := ReservedPrefixProtectPolicy(ts)
 	existing, err := authService.GetPolicy(ctx, policy.DisplayName)
@@ -156,17 +186,30 @@ func EnsureReservedPrefixProtectPolicy(ctx context.Context, authService auth.Ser
 	case err == nil:
 		if !reservedPrefixProtectStatementsEqual(existing.Statement, policy.Statement) {
 			if err := authService.WritePolicy(ctx, policy, true /* update */); err != nil {
-				return fmt.Errorf("icebergcatalog: rewrite policy %s: %w", ReservedPrefixProtectPolicyName, err)
+				if policyBackendUnavailable(err) {
+					logReservedPrefixDenyNotAttached(ctx, err)
+					return false, nil
+				}
+				return false, fmt.Errorf("icebergcatalog: rewrite policy %s: %w", ReservedPrefixProtectPolicyName, err)
 			}
 			logging.FromContext(ctx).WithField("policy", ReservedPrefixProtectPolicyName).
 				Warn("icebergcatalog: rewrote the reserved-prefix deny policy, whose statements did not match")
 		}
 	case errors.Is(err, auth.ErrNotFound):
 		if err := authService.WritePolicy(ctx, policy, false /* create */); err != nil && !errors.Is(err, auth.ErrAlreadyExists) {
-			return fmt.Errorf("icebergcatalog: create policy %s: %w", ReservedPrefixProtectPolicyName, err)
+			if policyBackendUnavailable(err) {
+				logReservedPrefixDenyNotAttached(ctx, err)
+				return false, nil
+			}
+			return false, fmt.Errorf("icebergcatalog: create policy %s: %w", ReservedPrefixProtectPolicyName, err)
 		}
+	case policyBackendUnavailable(err):
+		// The service has no policy backend, so the deny can be neither created nor attached here.
+		// Degrade loudly: see the comment on this function and Bootstrap.
+		logReservedPrefixDenyNotAttached(ctx, err)
+		return false, nil
 	default:
-		return fmt.Errorf("icebergcatalog: read policy %s: %w", ReservedPrefixProtectPolicyName, err)
+		return false, fmt.Errorf("icebergcatalog: read policy %s: %w", ReservedPrefixProtectPolicyName, err)
 	}
 
 	for _, group := range ReservedPrefixProtectGroups(extraGroups) {
@@ -176,11 +219,41 @@ func EnsureReservedPrefixProtectPolicy(ctx context.Context, authService auth.Ser
 		case errors.Is(err, auth.ErrNotFound):
 			logging.FromContext(ctx).WithField("group", group).
 				Debug("icebergcatalog: group is not part of this installation's template; skipping deny attachment")
+		case policyBackendUnavailable(err):
+			// GetPolicy answered (a stored policy, or none) but the service cannot attach it, so the
+			// deny is no more in force than in the case above.
+			logReservedPrefixDenyNotAttached(ctx, err)
+			return false, nil
 		default:
-			return fmt.Errorf("icebergcatalog: attach policy %s to group %s: %w", ReservedPrefixProtectPolicyName, group, err)
+			return false, fmt.Errorf("icebergcatalog: attach policy %s to group %s: %w", ReservedPrefixProtectPolicyName, group, err)
 		}
 	}
-	return nil
+	return true, nil
+}
+
+// policyBackendUnavailable reports whether err is the auth service saying it has no policy backend
+// at all, rather than that an operation on one that exists failed. auth.BasicAuthService - the
+// default auth mode of lakefs and lakefs-sso - is the case this exists for: it answers every policy
+// call with auth.ErrNotImplemented (pkg/auth/basic_service.go). errors.Is, not ==, because a
+// service is free to wrap the sentinel.
+//
+// The distinction is what keeps startup honest: a backend that cannot store policies degrades the
+// reserved-prefix deny (a warning, D-3 in conformance/RESULTS.md), while a backend that can and
+// failed - a KV error, an external auth service answering 5xx - must still stop the server.
+func policyBackendUnavailable(err error) bool {
+	return errors.Is(err, auth.ErrNotImplemented)
+}
+
+// logReservedPrefixDenyNotAttached reports the one degraded startup Bootstrap accepts: the auth
+// service cannot manage policies, so iceberg-reserved-prefix-protect was neither created nor
+// attached. The message names the consequence rather than the error alone, because an operator who
+// reads only this line has to learn that the reserved prefix is not protected in this deployment.
+func logReservedPrefixDenyNotAttached(ctx context.Context, err error) {
+	logging.FromContext(ctx).WithError(err).WithFields(logging.Fields{
+		"policy":          ReservedPrefixProtectPolicyName,
+		"reserved_prefix": ReservedPrefix,
+	}).Warn("icebergcatalog: the auth service cannot manage policies: the reserved-prefix deny policy is NOT attached, " +
+		"so writes to the " + ReservedPrefix + "/ prefix are not blocked at the fs: layer in this deployment")
 }
 
 // ReservedPrefixProtectGroups returns the groups the reserved-prefix deny is attached to: the base

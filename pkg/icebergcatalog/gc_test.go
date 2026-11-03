@@ -749,8 +749,10 @@ func TestReservedPrefixDeniedBootstrap(t *testing.T) {
 			Statement:   model.Statements{},
 		}, false))
 
-		require.NoError(t, EnsureReservedPrefixProtectPolicy(ctx, f.svc, gcNow,
-			[]string{"custom-operators", "missing-group"}))
+		attached, err := EnsureReservedPrefixProtectPolicy(ctx, f.svc, gcNow,
+			[]string{"custom-operators", "missing-group"})
+		require.NoError(t, err)
+		require.True(t, attached, "a service that stores policies leaves the deny in force")
 
 		stored, err := f.svc.GetPolicy(ctx, ReservedPrefixProtectPolicyName)
 		require.NoError(t, err, "bootstrap creates the deny policy")
@@ -768,7 +770,9 @@ func TestReservedPrefixDeniedBootstrap(t *testing.T) {
 		}
 
 		// Idempotent: a second start changes nothing and fails nothing.
-		require.NoError(t, EnsureReservedPrefixProtectPolicy(ctx, f.svc, gcNow.Add(time.Hour), []string{"custom-operators"}))
+		attachedAgain, err := EnsureReservedPrefixProtectPolicy(ctx, f.svc, gcNow.Add(time.Hour), []string{"custom-operators"})
+		require.NoError(t, err)
+		require.True(t, attachedAgain, "a second start still reports the deny in force")
 		storedAgain, err := f.svc.GetPolicy(ctx, ReservedPrefixProtectPolicyName)
 		require.NoError(t, err)
 		require.True(t, reservedPrefixProtectStatementsEqual(stored.Statement, storedAgain.Statement),
@@ -788,8 +792,9 @@ func TestReservedPrefixDeniedBootstrap(t *testing.T) {
 
 	t.Run("no auth service is an error, not a silent skip", func(t *testing.T) {
 		t.Parallel()
-		err := EnsureReservedPrefixProtectPolicy(t.Context(), nil, gcNow, nil)
+		attached, err := EnsureReservedPrefixProtectPolicy(t.Context(), nil, gcNow, nil)
 		require.ErrorIs(t, err, ErrNoAuthorizer)
+		require.False(t, attached)
 	})
 }
 
