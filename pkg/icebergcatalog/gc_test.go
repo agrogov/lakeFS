@@ -551,9 +551,10 @@ func TestReservedPrefixDeniedBootstrap(t *testing.T) {
 	t.Run("the group list covers both group templates", func(t *testing.T) {
 		t.Parallel()
 		// The expected list is pinned as a literal: it is the non-service group set of
-		// pkg/datasets.PinsProtectGroups, which this package cannot import (pkg/datasets imports it,
-		// see bootstrap.go), and lakefs-sso's main passes that list in. A change on either side that
-		// made the two denies cover different principals is meant to be visible here.
+		// pkg/datasets.PinsProtectGroups, which this package does not import (the dependency runs the
+		// other way - pkg/datasets materialises catalog workspaces - see bootstrap.go), and
+		// lakefs-sso's main passes that list in. A change on either side that made the two denies
+		// cover different principals is meant to be visible here.
 		groups := ReservedPrefixProtectGroups([]string{"custom-operators", "Admins", ""})
 		require.Equal(t, []string{
 			"Admins", "Supers", "Writers", "Readers", "SuperUsers", "Developers", "Viewers",

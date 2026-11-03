@@ -52,9 +52,11 @@ import (
 // adapter, which supplies the unused *chi.Mux, is the caller's); it mounts no route.
 //
 // extraGroups are the additional groups that must carry the deny policy, i.e.
-// datasets.immutable_guard_groups. They are passed in rather than read here because pkg/datasets
-// imports this package (materialize.go), so this package cannot call datasets.PinsProtectGroups
-// itself; the caller adds them to the base groups of both group templates.
+// datasets.immutable_guard_groups. They are passed in rather than read here because the datasets
+// control plane is built on this package's layout, not the other way round (pkg/datasets
+// materialize.go reads the keys from pkg/iceberglayout, the leaf package the two share), so this
+// package does not reach into pkg/datasets for its group list; the caller adds them to the base
+// groups of both group templates.
 //
 // While iceberg.enabled is false it does nothing at all: a disabled catalog writes neither
 // _lakefs_iceberg/ entries nor _iceberg/ objects, so no policy has to be created and the
@@ -147,9 +149,11 @@ func EnsureReservedPrefixProtectPolicy(ctx context.Context, authService auth.Ser
 // groups of both lakeFS group templates (Admins, Supers, Writers, Readers, SuperUsers, Developers,
 // Viewers) plus extra, deduplicated and in a stable order.
 //
-// The list is spelled out here, and not taken from pkg/datasets, because pkg/datasets imports this
-// package (materialize.go): it is the same non-service group set pkg/datasets.PinsProtectGroups
-// returns, and gc_test.go pins the two to each other so they cannot drift apart silently.
+// The list is spelled out here, and not taken from pkg/datasets, because the dependency runs the
+// other way: pkg/datasets materialises catalog workspaces, so pkg/icebergcatalog does not depend on
+// the datasets control plane. It is the same non-service group set that
+// pkg/datasets.PinsProtectGroups returns, and gc_test.go pins the two to each other as literals so
+// they cannot drift apart silently.
 func ReservedPrefixProtectGroups(extra []string) []string {
 	seen := make(map[string]struct{}, len(reservedPrefixProtectBaseGroups)+len(extra))
 	groups := make([]string, 0, len(reservedPrefixProtectBaseGroups)+len(extra))

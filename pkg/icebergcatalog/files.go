@@ -149,6 +149,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/catalog"
+	"github.com/treeverse/lakefs/pkg/iceberglayout"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -159,9 +160,10 @@ const (
 	//	_lakefs_iceberg/files/<table-uuid>/<path relative to the table root>
 	//
 	// It is the third directory of the reserved area, next to NamespaceDirectory ("ns") and
-	// TablesDirectory ("tables"), and like them it is hidden from fs: writes by the deny statement
-	// of gc.go.
-	FilesDirectory = "files"
+	// TablesDirectory ("tables"). Like them it is declared in the leaf package iceberglayout,
+	// which pkg/datasets imports as well, and aliased here (see the note on store.go's layout
+	// const block).
+	FilesDirectory = iceberglayout.FilesDirectory
 
 	// DefaultMaxStagedFiles is the default cap on the number of entries one commit may stage:
 	// 50 000 files is ~6 s of staging at 32 workers over a KV with a 1 ms round trip and ~12 s at

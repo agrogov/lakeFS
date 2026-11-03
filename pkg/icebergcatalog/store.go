@@ -60,42 +60,44 @@ import (
 	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/graveler"
+	"github.com/treeverse/lakefs/pkg/iceberglayout"
 
 	"github.com/apache/iceberg-go/table"
 )
 
+// The reserved-prefix layout constants are declared in the leaf package iceberglayout, which
+// pkg/datasets also imports: it materialises catalog workspaces and must build these exact keys,
+// and it cannot import this package without turning this package's tests - which import
+// pkg/datasets to check the §7.2 authorization matrix against a real auth service - into an
+// import cycle. They are aliased here, under the names this package has always exported, so the
+// surface every caller and test uses is unchanged; iceberglayout documents each one.
 const (
 	// ReservedPrefix is the reserved key prefix that holds all catalog state on the branch.
-	// Session I-3 hides it from fs: writes with a deny statement, the way datasets protects
-	// _lakefs_ds_pin_* (ICEBERG_CATALOG_PLAN.md §6.1).
-	ReservedPrefix = "_lakefs_iceberg"
+	ReservedPrefix = iceberglayout.ReservedPrefix
 
 	// NamespaceDirectory holds one .namespace marker per namespace.
-	NamespaceDirectory = "ns"
+	NamespaceDirectory = iceberglayout.NamespaceDirectory
 
 	// TablesDirectory holds one .pointer entry per table.
-	TablesDirectory = "tables"
+	TablesDirectory = iceberglayout.TablesDirectory
 
 	// NamespaceMarkerName is the file name of a namespace marker.
-	NamespaceMarkerName = ".namespace"
+	NamespaceMarkerName = iceberglayout.NamespaceMarkerName
 
 	// TablePointerName is the file name of a table pointer.
-	TablePointerName = ".pointer"
+	TablePointerName = iceberglayout.TablePointerName
 
 	// MetadataLocationKey is the pointer user-metadata key that holds the physical URI of the
-	// current metadata.json. It is the compare-and-swap field of a commit: the write half
-	// conditions on this exact value (§6.2 step 6).
-	MetadataLocationKey = "iceberg.metadata-location"
+	// current metadata.json, i.e. the compare-and-swap field of a commit (§6.2 step 6).
+	MetadataLocationKey = iceberglayout.MetadataLocationKey
 
-	// TableUUIDKey is the pointer user-metadata key that holds the table UUID, the same UUID
-	// metadata.json carries as table-uuid. Clients use it to detect a table that was dropped
-	// and recreated under the same name.
-	TableUUIDKey = "iceberg.table-uuid"
+	// TableUUIDKey is the pointer user-metadata key that holds the table UUID that metadata.json
+	// also carries as table-uuid.
+	TableUUIDKey = iceberglayout.TableUUIDKey
 
 	// FormatVersionKey is the pointer user-metadata key that holds the Iceberg format version,
-	// 1 or 2. Version 3 is out of scope for v1 (ICEBERG_CATALOG_PLAN.md §1.2), so a pointer that
-	// advertises it is rejected instead of being served by code that does not implement it.
-	FormatVersionKey = "iceberg.format-version"
+	// 1 or 2 (§1.2 rules out serving version 3).
+	FormatVersionKey = iceberglayout.FormatVersionKey
 )
 
 // ErrInvalidPointer is wrapped when the table pointer or the namespace marker exists but its

@@ -34,7 +34,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/graveler"
-	"github.com/treeverse/lakefs/pkg/icebergcatalog"
+	"github.com/treeverse/lakefs/pkg/iceberglayout"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -744,34 +744,43 @@ func (m *Materializer) listSourcePrefix(ctx context.Context, stream *itemStream,
 // still applies to it - the entries are copied the same way as a prefix item's - so its full
 // address names a key no object was ever written at. Nothing reads it; the fields a reader uses are
 // the key and the user metadata.
+//
+// The keys below are built from pkg/iceberglayout's constants rather than
+// pkg/icebergcatalog's, although the latter re-exports the same names: pkg/icebergcatalog's tests
+// import this package (authz_test.go checks the §7.2 matrix against a real auth service), so an
+// import of pkg/icebergcatalog here would close the cycle
+// pkg/icebergcatalog[test] -> pkg/datasets -> pkg/icebergcatalog and stop that test package from
+// compiling at all. iceberglayout is the leaf package the two share; the key builders that
+// validate identifiers (tablePointerPath, namespaceMarkerPath) stay in pkg/icebergcatalog, because
+// a level that cannot be a path component must be rejected before a key is built, not after.
 
 // icebergTablePointerKey is the reserved key of a table pointer, the sibling of
 // pkg/icebergcatalog tablePointerPath for a path that is already joined.
 func icebergTablePointerKey(path string) string {
-	return icebergcatalog.ReservedPrefix + "/" + icebergcatalog.TablesDirectory + "/" + path + "/" + icebergcatalog.TablePointerName
+	return iceberglayout.ReservedPrefix + "/" + iceberglayout.TablesDirectory + "/" + path + "/" + iceberglayout.TablePointerName
 }
 
 // icebergTablesPrefix is the key prefix of every table pointer at or below path, so a namespace
 // item sees the tables of its whole subtree.
 func icebergTablesPrefix(path string) string {
-	return icebergcatalog.ReservedPrefix + "/" + icebergcatalog.TablesDirectory + "/" + path + "/"
+	return iceberglayout.ReservedPrefix + "/" + iceberglayout.TablesDirectory + "/" + path + "/"
 }
 
 // icebergNamespaceMarkerKey is the reserved key of one namespace marker.
 func icebergNamespaceMarkerKey(path string) string {
-	return icebergcatalog.ReservedPrefix + "/" + icebergcatalog.NamespaceDirectory + "/" + path + "/" + icebergcatalog.NamespaceMarkerName
+	return iceberglayout.ReservedPrefix + "/" + iceberglayout.NamespaceDirectory + "/" + path + "/" + iceberglayout.NamespaceMarkerName
 }
 
 // icebergNamespacesPrefix is the key prefix of every namespace marker at or below path.
 func icebergNamespacesPrefix(path string) string {
-	return icebergcatalog.ReservedPrefix + "/" + icebergcatalog.NamespaceDirectory + "/" + path + "/"
+	return iceberglayout.ReservedPrefix + "/" + iceberglayout.NamespaceDirectory + "/" + path + "/"
 }
 
 // icebergFilesPrefix is the key prefix of the staged files of one table (§6.3). The table uuid is
 // what makes the path stable across branches, so it is also what lets materialisation find every
 // file the pinned snapshot reaches without reading a single manifest.
 func icebergFilesPrefix(tableUUID string) string {
-	return icebergcatalog.ReservedPrefix + "/" + icebergcatalog.FilesDirectory + "/" + tableUUID + "/"
+	return iceberglayout.ReservedPrefix + "/" + iceberglayout.FilesDirectory + "/" + tableUUID + "/"
 }
 
 // openIcebergItem opens the iterator of a table or namespace item (§9).
@@ -1016,13 +1025,13 @@ func (m *Materializer) collectSourcePrefix(ctx context.Context, stream *itemStre
 // so it can be used as one path component of the staged-file prefix. A pointer without a uuid is a
 // corrupted source entry (§6.1 lists it as a required field of the pointer).
 func icebergEntryTableUUID(entry *catalog.Entry) (string, error) {
-	raw := entry.Metadata[icebergcatalog.TableUUIDKey]
+	raw := entry.Metadata[iceberglayout.TableUUIDKey]
 	if raw == "" {
-		return "", fmt.Errorf("%w: table pointer has no %q", ErrInvalidSourceEntry, icebergcatalog.TableUUIDKey)
+		return "", fmt.Errorf("%w: table pointer has no %q", ErrInvalidSourceEntry, iceberglayout.TableUUIDKey)
 	}
 	parsed, err := uuid.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("%w: table pointer %q is not a UUID: %w", ErrInvalidSourceEntry, icebergcatalog.TableUUIDKey, err)
+		return "", fmt.Errorf("%w: table pointer %q is not a UUID: %w", ErrInvalidSourceEntry, iceberglayout.TableUUIDKey, err)
 	}
 	return parsed.String(), nil
 }
