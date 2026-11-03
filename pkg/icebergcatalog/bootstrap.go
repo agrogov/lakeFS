@@ -1,17 +1,22 @@
 package icebergcatalog
 
-// bootstrap.go wires the two GC-safety controls of gc.go into a running lakefs-sso server
-// (ICEBERG_CATALOG_PLAN.md §6.1, §6.3):
+// bootstrap.go wires the GC-safety controls of gc.go and the merge-conflict hook of commit.go into
+// a running lakefs-sso server (ICEBERG_CATALOG_PLAN.md §6.1, §6.3, §6.4):
 //
 //  1. the uncommitted-GC grace, installed into pkg/catalog's prepare step with
-//     catalog.SetUncommittedGCProtector, and
+//     catalog.SetUncommittedGCProtector,
 //  2. the installation-wide iceberg-reserved-prefix-protect deny policy, created and attached to
-//     the same non-service groups datasets-pins-protect covers.
+//     the same non-service groups datasets-pins-protect covers, and
+//  3. the table-pointer conflict resolver of §6.4, installed with
+//     catalog.SetMergeConflictResolver so that a merge auto-resolves a pointer conflict caused only
+//     by compactions while iceberg.ignore_compaction_commits is true.
 //
 // It lives in its own file because it is not part of the HTTP surface http.go mounts: the deny has
-// to exist before the first request can be served, whether or not a request ever arrives, and the
-// grace has to be in place before the first GC prepare run. Both are installed from one extra
-// routes builder, so the lakefs-sso diff is one registration and pkg/datasets, pkg/catalog and
+// to exist before the first request can be served, whether or not a request ever arrives, the
+// grace has to be in place before the first GC prepare run, and the merge hook has to be installed
+// before the first merge - and, being a process-wide hook, it must be cleared again (not left
+// installed but inert) when the setting that enables it is off. All of it is installed from one
+// extra routes builder, so the lakefs-sso diff is one registration and pkg/datasets, pkg/catalog and
 // pkg/icebergcatalog/http.go stay untouched.
 //
 // Everything here is idempotent, so it runs on every startup:
@@ -23,7 +28,7 @@ package icebergcatalog
 //     group template does not have is skipped rather than fatal, exactly as pkg/datasets.Bootstrap
 //     does for datasets-pins-protect (no installation runs both templates, so most of the base
 //     group names are expected to be absent);
-//   - installing the protector twice is a no-op.
+//   - installing the protector, or the merge hook, twice is a no-op.
 //
 // Clean-room note (plan §2, DATASETS_DESIGN.md §2): written from the Apache Iceberg specs and the
 // public lakeFS documentation only.
@@ -45,11 +50,13 @@ import (
 
 // ErrMissingDeps (http.go) is returned while the catalog is enabled and the builder was handed no
 // auth service or logger: the deny policy cannot be attached without one, and a startup that
-// silently skipped it would leave the reserved prefix writable.
+// silently skipped it would leave the reserved prefix writable. It also covers a missing catalog or
+// block adapter, which the §6.4 merge hook reads metadata.json through.
 
-// Bootstrap installs the GC controls of §6.1 and §6.3. It is a startup step of the lakefs-sso
-// binary, registered as an extra routes builder after the catalog's own builder (the builder
-// adapter, which supplies the unused *chi.Mux, is the caller's); it mounts no route.
+// Bootstrap installs the GC controls of §6.1 and §6.3 and the merge hook of §6.4. It is a startup
+// step of the lakefs-sso binary, registered as an extra routes builder after the catalog's own
+// builder (the builder adapter, which supplies the unused *chi.Mux, is the caller's); it mounts no
+// route.
 //
 // extraGroups are the additional groups that must carry the deny policy, i.e.
 // datasets.immutable_guard_groups. They are passed in rather than read here because the datasets
@@ -58,20 +65,27 @@ import (
 // package does not reach into pkg/datasets for its group list; the caller adds them to the base
 // groups of both group templates.
 //
-// While iceberg.enabled is false it does nothing at all: a disabled catalog writes neither
-// _lakefs_iceberg/ entries nor _iceberg/ objects, so no policy has to be created and the
-// uncommitted GC keeps its defaults for every repository. A configuration error is returned - and
-// so made fatal by the hook loop in run.go - for the same reason RoutesBuilder fails on one: an
-// installation that meant to enable the catalog must be told that it did not.
+// While iceberg.enabled is false it installs nothing: a disabled catalog writes neither
+// _lakefs_iceberg/ entries nor _iceberg/ objects, so no policy has to be created, the uncommitted GC
+// keeps its defaults for every repository, and no merge hook can change how a conflict is reported.
+// The one thing it does do is clear the merge hook, because that hook is a process-wide pointer and
+// a disabled catalog must not leave one behind. The same holds for the documented opt-out: a catalog
+// with iceberg.ignore_compaction_commits false clears the hook, so a compaction conflict is reported
+// as an ordinary one. A configuration error is returned - and so made fatal by the hook loop in
+// run.go - for the same reason RoutesBuilder fails on one: an installation that meant to enable the
+// catalog must be told that it did not.
 func Bootstrap(ctx context.Context, deps cmdpkg.ServerDeps, extraGroups []string) error {
 	cfg, err := LoadConfig()
 	if err != nil {
 		return err
 	}
 	if !cfg.Enabled {
+		// A process-wide hook, so a disabled catalog has to clear it rather than leave a previous
+		// installation's resolver installed.
+		installMergeConflictResolver(cfg, deps)
 		return nil
 	}
-	if deps.AuthService == nil || deps.Logger == nil {
+	if deps.AuthService == nil || deps.Logger == nil || deps.Catalog == nil || deps.BlockAdapter == nil {
 		return ErrMissingDeps
 	}
 
@@ -86,11 +100,35 @@ func Bootstrap(ctx context.Context, deps cmdpkg.ServerDeps, extraGroups []string
 	if err := EnsureReservedPrefixProtectPolicy(ctx, deps.AuthService, time.Now(), extraGroups); err != nil {
 		return err
 	}
+
+	// §6.4: let a merge auto-resolve a table-pointer conflict that only compaction snapshots
+	// caused, while iceberg.ignore_compaction_commits is on (the default).
+	installMergeConflictResolver(cfg, deps)
+
 	deps.Logger.WithFields(logging.Fields{
-		"policy":                 ReservedPrefixProtectPolicyName,
-		"uncommitted_gc_grace_s": int64(cfg.UncommittedGCGrace / time.Second),
-	}).Info("iceberg catalog: reserved-prefix deny attached and uncommitted-GC grace installed")
+		"policy":                    ReservedPrefixProtectPolicyName,
+		"uncommitted_gc_grace_s":    int64(cfg.UncommittedGCGrace / time.Second),
+		"ignore_compaction_commits": cfg.IgnoresCompactionCommits(),
+	}).Info("iceberg catalog: reserved-prefix deny attached, uncommitted-GC grace and merge hook installed")
 	return nil
+}
+
+// installMergeConflictResolver installs the §6.4 merge-conflict hook, or clears it, according to
+// cfg: the hook exists only for an enabled catalog that keeps the default
+// iceberg.ignore_compaction_commits (or sets it explicitly to true). The documented opt-out therefore
+// does not merely leave the hook inert - the hook is a process-wide pointer, so it is cleared.
+//
+// It is a function of its own, rather than three lines inside Bootstrap, because the decision is
+// testable without a server configuration (TestInstallMergeConflictResolver drives a real merge for
+// each case); the store it builds is the one the mount serves requests with, so the hook reads
+// metadata.json through the server's own block adapter.
+func installMergeConflictResolver(cfg *Config, deps cmdpkg.ServerDeps) {
+	if !cfg.Enabled || !cfg.IgnoresCompactionCommits() {
+		catalog.SetMergeConflictResolver(nil)
+		return
+	}
+	store := NewStore(deps.Catalog, deps.BlockAdapter, cfg.StoreOptions()...)
+	catalog.SetMergeConflictResolver(store.MergeConflictResolver(cfg))
 }
 
 // EnsureReservedPrefixProtectPolicy makes the iceberg-reserved-prefix-protect deny policy exist

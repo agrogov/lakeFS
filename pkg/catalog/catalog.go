@@ -495,7 +495,10 @@ func buildCommittedManager(cfg Config, pebbleSSTableCache *pebble.Cache, rangeFS
 	committedManager := committed.NewCommittedManager(
 		sstableMetaRangeManagers,
 		sstableManagers,
-		[]graveler.ConflictResolver{&committed.StrategyConflictResolver{}},
+		// The strategy first, exactly as before, then the merge-conflict hook: with no hook
+		// installed the second resolver declines every conflict and the merge behaves as it
+		// always has (merge_conflict.go).
+		[]graveler.ConflictResolver{&committed.StrategyConflictResolver{}, mergeConflictHookResolver{}},
 		committedParams,
 	)
 	return committedManager, closers, nil
@@ -2089,6 +2092,17 @@ func (c *Catalog) Merge(ctx context.Context, repositoryID string, destinationBra
 	if err != nil {
 		return "", err
 	}
+
+	// Tell the merge-conflict hook which merge it is being consulted for: the repository and the
+	// two refs, from which the value of a conflicting key at the merge base follows. Nothing is
+	// read here - merge_conflict.go resolves the merge base lazily, and only if a conflict
+	// actually reaches the hook.
+	ctx = withMergeConflictScope(ctx, &mergeConflictScope{
+		catalog:     c,
+		repository:  repository,
+		destination: graveler.Ref(destination),
+		source:      source,
+	})
 
 	commitID, err := c.Store.Merge(ctx, repository, destination, source, commitParams, strategy, opts...)
 	if err != nil {

@@ -55,10 +55,11 @@ package icebergcatalog
 // branch (§6.2 "why stage instead of auto-commit").
 //
 // Compaction commits and the table-pointer merge (§6.4, phase I-5) are also here, at the end of the
-// file: a lakeFS commit whose message carries lakefs.compaction.operation-id is a compaction
-// commit, and a three-way conflict on a table pointer that such a commit alone caused is
-// auto-resolved when iceberg.ignore_compaction_commits is on (the default) instead of being
-// reported (ResolvePointerConflict below).
+// file: a snapshot the compaction operation marked with the lakefs.compaction.operation-id
+// *snapshot property* is a compaction, and a three-way conflict on a table pointer that only
+// compaction snapshots caused is auto-resolved when iceberg.ignore_compaction_commits is on (the
+// default) instead of being reported (ResolvePointerConflict below, installed into merges by
+// MergeConflictResolver).
 //
 // Update actions and requirements are not implemented here: I0-1 (ICEBERG_SPIKE_S-I1.md) proved
 // that the pinned iceberg-go models all 23 TableUpdate actions and all 8 TableRequirement types
@@ -70,9 +71,9 @@ package icebergcatalog
 // (Apache-2.0),
 // https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml, the Apache
 // Iceberg table spec (Apache-2.0), https://iceberg.apache.org/spec/, and the public lakeFS Iceberg
-// documentation (https://docs.lakefs.io/iceberg/) for the compaction commit message and the
-// iceberg.ignore_compaction_commits setting. Tasks I2-3 and I5-1. No code is taken from lakeFS
-// Enterprise or from upstream lakeFS >= 1.87 (BUSL 1.1).
+// documentation (https://docs.lakefs.io/iceberg/) for the lakefs.compaction.operation-id snapshot
+// property and the iceberg.ignore_compaction_commits setting. Tasks I2-3 and I5-1. No code is taken
+// from lakeFS Enterprise or from upstream lakeFS >= 1.87 (BUSL 1.1).
 
 import (
 	"context"
@@ -83,7 +84,9 @@ import (
 	"strings"
 
 	"github.com/apache/iceberg-go/table"
+	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/graveler"
+	"github.com/treeverse/lakefs/pkg/logging"
 )
 
 const (
@@ -404,76 +407,105 @@ func (e *BadRequestError) ErrorType() string { return ErrTypeBadRequest }
 // ---------------------------------------------------------------------------------------------
 //
 // The table pointer is one lakeFS entry, so two branches that both moved it conflict at merge,
-// exactly as the docs describe: "metadata files are treated as ordinary files"
-// (https://docs.lakefs.io/iceberg/). That is the right default - two logical commits to the same
-// table produce two metadata.json files, and there is no way to reconcile them without rewriting
-// one of them - but a *compaction* commit is not a logical change: it rewrites data files and
-// moves the pointer, while the table's contents stay the same. Reporting a conflict against it
-// would make every concurrent append lose to a background rewrite of the table, so lakeFS
-// auto-resolves such a conflict when iceberg.ignore_compaction_commits is on, which is the
-// documented default and DefaultIgnoreCompactionCommits.
+// exactly as the docs describe: "table metadata files are treated as regular files, and no special
+// merge logic is applied to conflicting table changes"
+// (https://docs.lakefs.io/iceberg/, "Merging conflicting table changes"). That is the right
+// default: two logical commits to the same table produce two metadata.json files, and there is no
+// way to reconcile them without rewriting one of them, so nothing here guesses a three-way merge
+// of snapshots.
+//
+// A *compaction* is the exception the same documentation promises, in "Table Maintenance →
+// Conflict Resolution":
+//
+//	When merging branches, lakeFS automatically resolves conflicts if both branches have
+//	compaction commits for the same table and at most one branch has non-compaction data changes.
+//
+// A compaction is recognised exactly as those docs tell the operator to mark it -
+// `snapshotProperty("lakefs.compaction.operation-id", "rewrite-data-files")` on the compaction
+// action, i.e. CompactionCommitMarker as a property of the *snapshot* the compaction wrote, not as
+// a commit message. That is why this code reads metadata.json and never reads lakeFS commit
+// messages: the message is whatever the client's commit said, while the property is the mark the
+// docs instruct the client to set.
 //
 // What "auto-resolve" means here, precisely: the compaction side is ignored, and the merge keeps
-// the pointer of the side that changed the table logically. That is safe only because compaction
+// the pointer of the side that changed the table logically. That is safe only because a compaction
 // leaves the logical contents alone: the data files the ignored commit would have introduced are
 // referenced by no kept metadata.json, so GC collects them, and the kept side's metadata still
-// names every file the kept snapshot needs. Nothing is merged at the snapshot level: "ignore the
-// compaction commit" is not "merge two snapshots", and the note of §6.4 is taken literally - this
-// code never guesses a three-way merge of snapshots.
+// names every file the kept snapshot needs.
 //
 // Two guards keep that from resolving a conflict it cannot prove:
 //
-//   - both sides must still descend from the merge-base metadata file, i.e. base's
-//     metadata-location must appear in the metadata-log chain of the side's metadata.json. A side
-//     that rewrote its history (dropped and recreated the table, hard-reset, a third history) is
-//     not "base plus a compaction", so the conflict is reported;
-//   - the compaction side is identified by the commit message alone: a message that carries
-//     lakefs.compaction.operation-id. Two logical changes, even if one of them also touched data
-//     files, are always a conflict.
+//   - the snapshots a side added since the merge base must be *only* compaction snapshots, and the
+//     base's current snapshot must still be on that side's parent chain. A side whose history was
+//     rewritten (dropped and recreated the table, hard reset to a third history, snapshots expired
+//     or a trimmed metadata.json) is not "base plus a compaction", so the conflict is reported -
+//     which is what the same docs warn about: "Expired or deleted snapshots will very likely lead
+//     to merge conflicts, as lakeFS cannot determine which snapshots to keep";
+//   - the side that is kept must also be shown to descend from the base. It is never assumed.
 //
-// metadata-log is trimmed by write.metadata.previous-versions-max (100 entries by default), so a
-// very old base turns the ancestry guard into "cannot prove it" and the conflict is reported. That
-// is the fail-safe direction: a reported conflict costs a client a refresh, a wrong resolution
-// costs data.
+// The docs describe the common case, in which the compaction job ran on both branches. The rule
+// implemented here is the same rule read one step further: the *ignored* side must be compaction-
+// only, which is what makes ignoring it free. Requiring the kept side to carry a compaction snapshot
+// too would refuse the equally safe - and more common - case where only one branch happened to be
+// compacted, and the conflict would then block a merge for no reason.
+//
+// The decision logic is a pure function of the three pointers and of the metadata files they name
+// (ResolvePointerConflict). Wiring it into a merge is the second half of this section:
+// MergeConflictResolver is the pkg/catalog merge-conflict hook that Bootstrap installs on a
+// lakefs-sso server with iceberg.enabled and iceberg.ignore_compaction_commits.
 
 const (
-	// CompactionCommitMarker is the marker that a lakeFS compaction commit - the Spark metadata
-	// client rewriting a table's data files - carries in its commit message. It is what makes a
-	// commit recognisable as a compaction of a table rather than a logical change to it (§6.4).
+	// CompactionCommitMarker is the Iceberg *snapshot property* that marks a snapshot written by a
+	// compaction operation. The docs instruct clients to set it with
+	// snapshotProperty("lakefs.compaction.operation-id", "rewrite-data-files"), so its presence on
+	// a snapshot is what makes that snapshot recognisable as a compaction rather than a logical
+	// change to the table (§6.4): it is the only mark the public documentation defines.
 	CompactionCommitMarker = "lakefs.compaction.operation-id"
 )
 
-// IsCompactionCommit reports whether a lakeFS commit message marks a compaction commit: the
-// message carries CompactionCommitMarker, wherever it appears and whatever operation id follows.
-func IsCompactionCommit(message string) bool {
-	return strings.Contains(message, CompactionCommitMarker)
+// IsCompactionSnapshot reports whether snapshot was written by a compaction: it carries the
+// lakefs.compaction.operation-id snapshot property. A nil snapshot - a table that has no current
+// snapshot at all - is not a compaction.
+func IsCompactionSnapshot(snapshot *table.Snapshot) bool {
+	if snapshot == nil || snapshot.Summary == nil {
+		return false
+	}
+	return snapshot.Summary.Properties[CompactionCommitMarker] != ""
 }
 
-// PointerRevision is one side of a three-way conflict on a table pointer: the pointer the side's
-// ref holds, and the message of the lakeFS commit that last changed it. The message is what
-// separates a compaction commit from a logical one; it is the message of the commit that produced
-// Pointer, not of the ref's head, which may be a later commit that touched something else.
-type PointerRevision struct {
-	// Pointer is the pointer this side has at its head.
-	Pointer TablePointer
-
-	// CommitMessage is the message of the lakeFS commit that last moved this side's pointer.
-	CommitMessage string
+// IsTablePointerKey reports whether key is a table pointer entry of the on-branch layout (§6.1):
+//
+//	_lakefs_iceberg/tables/<ns1>/<ns2>/…/<table>/.pointer
+//
+// It is the key shape a merge conflict must have for this package to resolve it: every other key,
+// including the _lakefs_iceberg/files/… entries a commit stages and the .namespace markers, is a
+// logical change and stays a conflict.
+func IsTablePointerKey(key graveler.Key) bool {
+	path := string(key)
+	prefix := ReservedPrefix + "/" + TablesDirectory + "/"
+	suffix := "/" + TablePointerName
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return false
+	}
+	// Between the prefix and the file name there must be at least one namespace level and the
+	// table name: /tables/<ns>/<table>/.pointer.
+	remainder := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	return strings.Contains(remainder, "/")
 }
 
 // PointerConflict is the three-way conflict a merge of two branches sees on a table pointer: the
-// merge-base pointer, and the pointer each side has at its head (§6.4). Base is the zero
-// TablePointer when neither side had a table at the merge base, which is a genuine conflict
-// ("both branches created it") and is never auto-resolved.
+// pointer at the merge base, and the pointer each side has. Base is the zero TablePointer when
+// neither side had a table at the merge base, which is a genuine conflict ("both branches created
+// it") and is never auto-resolved.
 type PointerConflict struct {
 	// Base is the pointer at the merge base, i.e. the pointer the two sides forked from.
 	Base TablePointer
 
 	// Destination is the side being merged into.
-	Destination PointerRevision
+	Destination TablePointer
 
 	// Source is the side being merged from.
-	Source PointerRevision
+	Source TablePointer
 }
 
 // PointerMergeResolution is the outcome of a resolved conflict: the pointer the merged branch
@@ -483,9 +515,9 @@ type PointerMergeResolution struct {
 	// resolution never rewrites metadata, it only chooses which side's commit wins.
 	Pointer TablePointer
 
-	// IgnoredCompaction is the pointer of the compaction commit that was ignored, zero when no
-	// compaction commit had to be dropped (i.e. when only one side had moved the pointer). It is
-	// informational: the metadata.json it names is unreferenced after the merge and GC collects it.
+	// IgnoredCompaction is the pointer of the compaction that was ignored, zero when no compaction
+	// had to be dropped. It is informational: the metadata.json it names is unreferenced after the
+	// merge and GC collects it, together with the data files only that snapshot named.
 	IgnoredCompaction TablePointer
 }
 
@@ -499,20 +531,22 @@ type PointerMergeResolution struct {
 //  2. one side still holds the base pointer: resolved, the other side's pointer wins - that side
 //     only moved forward and there is nothing to reconcile;
 //  3. both sides moved it and cfg says compaction commits are not ignored: conflict;
-//  4. both sides changed the table logically (neither commit is a compaction): conflict;
-//  5. otherwise exactly one side is a compaction commit (or both are, in which case both are
-//     logically no-ops and the destination is kept), and the compaction side is ignored - provided
-//     the base metadata file is still an ancestor of both sides (see the file comment above).
+//  4. both sides changed the table logically (neither side's added snapshots are all compaction
+//     snapshots): conflict - the documented "at most one branch has non-compaction data changes";
+//  5. otherwise the compaction-only side is ignored and the logical side wins, provided both sides
+//     still descend from the base snapshot (see the file comment above). When both sides are
+//     compaction-only nothing logical is being dropped, and the destination is kept: either side is
+//     correct, and the destination is the one the merge is already writing.
 //
 // cfg may be nil: it then answers with the documented default, DefaultIgnoreCompactionCommits.
 //
 // A metadata file that cannot be read is returned as an error rather than as a conflict: the guard
 // cannot be evaluated, and a merge must not resolve what it cannot prove. Nothing is written here;
-// applying the resolution (writing the kept pointer on the destination branch) is the merge's job.
+// applying the resolution is the merge's job (see MergeConflictResolver).
 func (s *Store) ResolvePointerConflict(ctx context.Context, repositoryID string, conflict PointerConflict, cfg *Config) (*PointerMergeResolution, error) {
 	base := conflict.Base
-	destination := conflict.Destination.Pointer
-	source := conflict.Source.Pointer
+	destination := conflict.Destination
+	source := conflict.Source
 
 	switch {
 	case destination == source:
@@ -523,63 +557,197 @@ func (s *Store) ResolvePointerConflict(ctx context.Context, repositoryID string,
 		return &PointerMergeResolution{Pointer: destination}, nil
 	}
 
-	// Both sides moved the pointer. Nothing but a compaction commit may be ignored.
+	// Both sides moved the pointer, and there is no base to reconcile them against.
+	if base == (TablePointer{}) {
+		return nil, nil
+	}
+	// Nothing but a compaction may be ignored, and the flag can turn that off.
 	if !cfg.IgnoresCompactionCommits() {
 		return nil, nil
 	}
-	destinationCompaction := IsCompactionCommit(conflict.Destination.CommitMessage)
-	sourceCompaction := IsCompactionCommit(conflict.Source.CommitMessage)
-	if !destinationCompaction && !sourceCompaction {
-		return nil, nil
+
+	baseMetadata, err := s.metadataAt(ctx, repositoryID, base)
+	if err != nil {
+		return nil, err
+	}
+	destinationMetadata, err := s.metadataAt(ctx, repositoryID, destination)
+	if err != nil {
+		return nil, err
+	}
+	sourceMetadata, err := s.metadataAt(ctx, repositoryID, source)
+	if err != nil {
+		return nil, err
 	}
 
-	// The kept side is the one that changed the table logically. When both sides are compaction
-	// commits the destination is kept: both are logically no-ops, so either is correct and the
-	// destination is the one the merge is already writing.
-	kept, ignored := conflict.Destination.Pointer, conflict.Source.Pointer
-	if destinationCompaction && !sourceCompaction {
-		kept, ignored = source, destination
-	}
+	destinationCompaction := isCompactionOnly(destinationMetadata, baseMetadata)
+	sourceCompaction := isCompactionOnly(sourceMetadata, baseMetadata)
 
-	// Both sides must still be base plus their own commits. A side whose metadata-log no longer
-	// contains the base metadata file is not a compaction of the base table, and ignoring it would
-	// silently drop whatever else that side did.
-	for _, location := range []string{kept.MetadataLocation, ignored.MetadataLocation} {
-		descends, err := s.metadataDescendsFrom(ctx, repositoryID, location, base.MetadataLocation)
+	switch {
+	case destinationCompaction && sourceCompaction:
+		// Both sides are physically rewritten and logically unchanged: nothing is lost either way.
+		return &PointerMergeResolution{Pointer: destination, IgnoredCompaction: source}, nil
+	case destinationCompaction:
+		if !descendsFrom(sourceMetadata, baseMetadata) {
+			return nil, nil
+		}
+		return &PointerMergeResolution{Pointer: source, IgnoredCompaction: destination}, nil
+	case sourceCompaction:
+		if !descendsFrom(destinationMetadata, baseMetadata) {
+			return nil, nil
+		}
+		return &PointerMergeResolution{Pointer: destination, IgnoredCompaction: source}, nil
+	}
+	return nil, nil
+}
+
+// MergeConflictResolver returns the pkg/catalog merge-conflict hook of §6.4: the resolver that lets
+// a merge auto-resolve a conflict on a table pointer instead of reporting it. Bootstrap installs it
+// with catalog.SetMergeConflictResolver on a lakefs-sso server whose iceberg.enabled is true, and
+// only while iceberg.ignore_compaction_commits is true; with no hook installed every merge reports
+// its conflicts exactly as upstream lakeFS does.
+//
+// The hook is asked about every unresolved conflict of every merge, so it answers "not resolved"
+// immediately for any key that is not a table pointer. A conflict on a pointer is handed to
+// ResolvePointerConflict, and the winning side's own entry is returned unchanged: a resolution
+// picks a side, it never rewrites one, and the merge writes the winner's value verbatim.
+//
+// A pointer entry this catalog cannot decode is reported as a conflict rather than as an error:
+// there is nothing to prove about it, and reporting the conflict is both the safe answer and the
+// upstream one. A metadata.json that cannot be read is an error, because there the resolver was
+// asked to prove something and could not: the merge then fails instead of guessing.
+func (s *Store) MergeConflictResolver(cfg *Config) catalog.MergeConflictResolver {
+	return func(ctx context.Context, conflict catalog.MergeConflict) (*graveler.ValueRecord, error) {
+		if !IsTablePointerKey(conflict.Key) {
+			return nil, nil
+		}
+		// A table dropped on one side is a logical change: the pointer is a tombstone there and
+		// there is nothing to compare.
+		if isAbsentValue(conflict.Source) || isAbsentValue(conflict.Destination) {
+			return nil, nil
+		}
+		base, destination, source, err := pointerConflictOf(conflict)
+		if err != nil {
+			logging.FromContext(ctx).WithError(err).WithField("key", string(conflict.Key)).
+				Debug("iceberg catalog: a table pointer in a merge conflict cannot be decoded; reporting the conflict")
+			return nil, nil
+		}
+		resolution, err := s.ResolvePointerConflict(ctx, conflict.RepositoryID, PointerConflict{
+			Base:        base,
+			Destination: destination,
+			Source:      source,
+		}, cfg)
 		if err != nil {
 			return nil, err
 		}
-		if !descends {
+		if resolution == nil {
 			return nil, nil
 		}
+		switch resolution.Pointer {
+		case destination:
+			return conflict.Destination, nil
+		case source:
+			return conflict.Source, nil
+		}
+		return nil, fmt.Errorf("%w: the resolved pointer %q is neither side of the conflict",
+			ErrInvalidPointer, resolution.Pointer.MetadataLocation)
 	}
-
-	return &PointerMergeResolution{Pointer: kept, IgnoredCompaction: ignored}, nil
 }
 
-// metadataDescendsFrom reports whether ancestor is metadata-location (location itself, or an entry
-// of the metadata-log chain of the metadata.json at location). It is the "base is still an
-// ancestor" guard of ResolvePointerConflict.
-//
-// Only the chain recorded in the metadata file at location is consulted: an ancestor further back
-// than write.metadata.previous-versions-max was trimmed out of metadata-log and answers false, so
-// the conflict is reported. The zero location or ancestor is never an ancestor of anything - a
-// table that did not exist at the merge base has no history to descend from.
-func (s *Store) metadataDescendsFrom(ctx context.Context, repositoryID, location, ancestor string) (bool, error) {
-	if location == "" || ancestor == "" {
-		return false, nil
+// metadataAt loads the metadata.json a pointer names. It is ResolvePointerConflict's only I/O.
+func (s *Store) metadataAt(ctx context.Context, repositoryID string, pointer TablePointer) (table.Metadata, error) {
+	metadata, _, err := s.loadMetadata(ctx, repositoryID, pointer.MetadataLocation)
+	return metadata, err
+}
+
+// isCompactionOnly reports whether the only snapshots side added on top of base are compaction
+// snapshots: the side rewrote the table's physical layout and changed nothing else. That is the
+// documented "at most one branch has non-compaction data changes", from the side of the side that
+// has none.
+func isCompactionOnly(side, base table.Metadata) bool {
+	added, ok := snapshotsAddedOnTop(side, base)
+	if !ok || len(added) == 0 {
+		return false
 	}
-	if location == ancestor {
-		return true, nil
-	}
-	metadata, _, err := s.loadMetadata(ctx, repositoryID, location)
-	if err != nil {
-		return false, err
-	}
-	for entry := range metadata.PreviousFiles() {
-		if entry.MetadataFile == ancestor {
-			return true, nil
+	for _, snapshot := range added {
+		if !IsCompactionSnapshot(snapshot) {
+			return false
 		}
 	}
-	return false, nil
+	return true
+}
+
+// descendsFrom reports whether side's snapshot chain still reaches base's current snapshot, i.e.
+// whether side is base plus its own work rather than a rewritten history.
+func descendsFrom(side, base table.Metadata) bool {
+	_, ok := snapshotsAddedOnTop(side, base)
+	return ok
+}
+
+// snapshotsAddedOnTop returns the snapshots side added on top of base: the parent chain from side's
+// current snapshot down to base's current snapshot, which is excluded. ok is false when that chain
+// never reaches the base - a base without a snapshot, a snapshot expired out of the metadata, a
+// trimmed metadata.json, a table dropped and recreated under the same name, or a hard reset to a
+// third history.
+//
+// Walking the parent chain, and not metadata-log, is what makes the guard mean "the base snapshot
+// is still in this history": metadata-log is trimmed by write.metadata.previous-versions-max, while
+// an expired snapshot is exactly the case the docs say must not be resolved.
+func snapshotsAddedOnTop(side, base table.Metadata) ([]*table.Snapshot, bool) {
+	baseSnapshot := base.CurrentSnapshot()
+	if baseSnapshot == nil {
+		return nil, false
+	}
+	var added []*table.Snapshot
+	for current := side.CurrentSnapshot(); current != nil; {
+		if current.SnapshotID == baseSnapshot.SnapshotID {
+			return added, true
+		}
+		added = append(added, current)
+		if current.ParentSnapshotID == nil {
+			return nil, false
+		}
+		parent := side.SnapshotByID(*current.ParentSnapshotID)
+		if parent == nil {
+			return nil, false
+		}
+		current = parent
+	}
+	return nil, false
+}
+
+// pointerConflictOf decodes the three pointers of a merge conflict on a table pointer. A side that
+// is absent decodes as the zero TablePointer.
+func pointerConflictOf(conflict catalog.MergeConflict) (base, destination, source TablePointer, err error) {
+	if base, err = tablePointerFromValue(conflict.Base); err != nil {
+		return base, destination, source, err
+	}
+	if destination, err = tablePointerFromValue(conflict.Destination); err != nil {
+		return base, destination, source, err
+	}
+	source, err = tablePointerFromValue(conflict.Source)
+	return base, destination, source, err
+}
+
+// tablePointerFromValue decodes a graveler value as the catalog entry a table pointer is stored in
+// (§6.1) and then as a TablePointer. A nil record - the key is absent on that side - is the zero
+// pointer, not an error.
+func tablePointerFromValue(record *graveler.ValueRecord) (TablePointer, error) {
+	if isAbsentValue(record) {
+		return TablePointer{}, nil
+	}
+	entry, err := catalog.ValueToEntry(record.Value)
+	if err != nil {
+		return TablePointer{}, fmt.Errorf("%w: decode entry: %w", ErrInvalidPointer, err)
+	}
+	pointer, err := DecodeTablePointer(entry.Metadata)
+	if err != nil {
+		return TablePointer{}, err
+	}
+	return pointer, nil
+}
+
+// isAbsentValue reports whether a side of a conflict holds no entry at all: a nil record, or a
+// tombstone (a nil Value), which is how graveler records a deletion.
+func isAbsentValue(record *graveler.ValueRecord) bool {
+	return record == nil || record.Value == nil
 }

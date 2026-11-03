@@ -11,8 +11,9 @@
 //  5. Mounts the datasets control plane (/api/v1/datasets) and the Apache Iceberg
 //     REST catalog (/iceberg/api, /iceberg/relative_to) by registering extra route
 //     builders, each of which is disabled unless its config section is enabled, and
-//     installs the Iceberg catalog's GC controls (the _lakefs_iceberg/ deny policy and
-//     the uncommitted-GC grace) with a third builder that mounts no route.
+//     installs the Iceberg catalog's process-wide controls (the _lakefs_iceberg/ deny
+//     policy, the uncommitted-GC grace, and the table-pointer merge-conflict hook)
+//     with a third builder that mounts no route.
 //
 // Merge-friendliness: the upstream cmd/lakefs directory is untouched except for
 // cmd/lakefs/cmd/hooks.go (new file) and 2 lines in cmd/lakefs/cmd/run.go.
@@ -58,11 +59,14 @@ func main() {
 	// error envelope in either case.
 	lakefsCmd.AddExtraRoutesBuilder(icebergcatalog.RoutesBuilder)
 
-	// Install the two installation-wide controls that do not live on a route, before the first GC
-	// prepare run and the first catalog request: the uncommitted-GC grace over the client-written
-	// _iceberg/ area and the iceberg-reserved-prefix-protect deny policy over _lakefs_iceberg/
-	// (ICEBERG_CATALOG_PLAN.md §6.1, §6.3). The builder mounts nothing and is a no-op while
-	// iceberg.enabled is false, so the plain lakefs binary keeps the upstream GC defaults.
+	// Install the installation-wide controls that do not live on a route, before the first GC
+	// prepare run, the first catalog request and the first merge: the uncommitted-GC grace over the
+	// client-written _iceberg/ area, the iceberg-reserved-prefix-protect deny policy over
+	// _lakefs_iceberg/, and - when iceberg.ignore_compaction_commits is on - the merge-conflict hook
+	// that lets a merge auto-resolve a table-pointer conflict caused only by compactions
+	// (ICEBERG_CATALOG_PLAN.md §6.1, §6.3, §6.4). The builder mounts nothing and is a no-op while
+	// iceberg.enabled is false, so the plain lakefs binary keeps the upstream GC defaults and
+	// reports every merge conflict exactly as upstream does.
 	lakefsCmd.AddExtraRoutesBuilder(func(ctx context.Context, deps lakefsCmd.ServerDeps, _ *chi.Mux) error {
 		return icebergcatalog.Bootstrap(ctx, deps, guardGroups())
 	})
