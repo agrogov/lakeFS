@@ -18,7 +18,8 @@ package icebergcatalog
 //	POST   /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/tables
 //	    CreateTableRequest in, 200 LoadTableResult out, 409 AlreadyExistsException when taken
 //	DELETE /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/tables/{table}
-//	    → 204 after the table's pointer is removed, 404 NoSuchTableException when there is none
+//	    → 204 after the table's pointer and its file entries are removed, 404 NoSuchTableException
+//	      when there is no pointer
 //	POST   /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/tables/{table}/metrics
 //	    ReportMetricsRequest in, 204 out: the report is accepted and discarded
 //
@@ -119,15 +120,21 @@ package icebergcatalog
 // because there the pointer is what makes the table exist; create is the operation that requires
 // the namespace.)
 //
-// The drop removes exactly one entry, the table's pointer, and nothing else (§6.1: a pointer is the
-// only thing that makes a table exist). metadata.json, manifest lists, manifests and data files are
-// the data plane's files and stay where they are: the catalog's job on a drop is to stop pointing at
-// them, and reclaiming them is GC's job once nothing on any ref references them (§6.3, phase I-3).
-// That is the Q-I8 rule of §14 applied to the drop - v1 never expires or tombstones a file - and it
-// is what makes the operation reversible: because the drop is staged like every other catalog write
-// (§6.2, §14 Q-I2) and only removes an entry, reverting the lakeFS commit that carries it brings the
-// table back, and a table dropped on one branch stays readable on a branch or a tag whose pointer
-// still names its metadata.
+// The drop removes the two kinds of entry that make up a table: the pointer, which is the one entry
+// that makes the table exist (§6.1: a pointer is the only thing that makes a table exist), and the
+// _lakefs_iceberg/files/<table-uuid>/… entries that §6.3 staged for it. The files themselves -
+// metadata.json, manifest lists, manifests and data files - stay where they are: the catalog's job on
+// a drop is to stop pointing at them *and* to stop protecting them, and reclaiming them is GC's job
+// once nothing references them (§6.3, phase I-3). Releasing the file entries is what makes the
+// objects reclaimable: the committed GC's live set is the set of addresses reachable from the active
+// commits, so an entry that outlived its table would keep the table's objects alive for as long as
+// the ref keeps the commits that carry it (RESULTS.md N-3).
+//
+// The Q-I8 rule of §14 still holds on the drop - v1 never expires or tombstones a file - and the drop
+// stays reversible: because it is staged like every other catalog write (§6.2, §14 Q-I2) and only
+// removes entries, reverting the lakeFS commit that carries it brings the table back (the entries of
+// the commit being reverted are restored with it), and a table dropped on one branch stays readable
+// on a branch or a tag whose pointer still names its metadata.
 //
 // So a drop sends no delete to object storage. The spec's `purgeRequested` query parameter is
 // accepted and deliberately has no effect whatever its value: purging would make one catalog
@@ -256,12 +263,14 @@ type TableLister interface {
 
 	// GetEntry resolves one entry on a ref - the branch staging area first, then the committed
 	// data - so the table pointer of a staged create is found exactly like a committed one. Drop
-	// and the metrics sink use it to decide existence without loading metadata.json.
+	// and the metrics sink use it to decide existence without loading metadata.json, and the drop
+	// reads the table uuid out of the entry it gets back.
 	GetEntry(ctx context.Context, repositoryID string, reference string, path string, params catalog.GetEntryParams) (*catalog.DBEntry, error)
 
 	// DeleteEntry stages the removal of one entry on a branch: dropping a table removes its
-	// pointer. It is called only after the pointer was found, and it carries no
-	// graveler.SetOptionsFunc, so a protected branch or a read-only repository still refuses it.
+	// pointer, and then the file entries the commits staged for it (files.go releaseTableFiles).
+	// It carries no graveler.SetOptionsFunc, so a protected branch or a read-only repository still
+	// refuses it.
 	DeleteEntry(ctx context.Context, repositoryID string, branch string, path string, opts ...graveler.SetOptionsFunc) error
 }
 
@@ -698,16 +707,20 @@ func (s *tableService) createTable(ctx context.Context, addr Address, request cr
 }
 
 // handleDropTable is DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table} (spec: dropTable):
-// remove the table's pointer from the branch and answer 204 with no body.
+// remove the table's pointer and the table files staged for it from the branch, and answer 204 with
+// no body.
 //
 // The order is the create's without the body: parse, authorize (including the Q-I4 branch rule),
 // resolve, act. A table that has no pointer on addr.Ref is 404 NoSuchTableException, and a pointer
 // that names an unreadable metadata.json is still dropped - see the file comment for why that
-// difference from GET and HEAD is deliberate.
+// difference from GET and HEAD is deliberate. What the drop does need from the pointer is its
+// table uuid, because that uuid - not metadata.json - names the directory of the table's file
+// entries; a pointer too corrupt to carry one is answered as the corrupt pointer it is.
 //
 // The query string is not read at all. The spec's `purgeRequested` parameter asks for the data files
-// to be deleted with the table; v1 accepts every value and deletes nothing but the pointer, because
-// the files are reclaimed by GC once they are unreferenced (§6.3, §14 Q-I8).
+// to be deleted with the table; v1 accepts every value and deletes no object, because the objects
+// are reclaimed by GC once nothing references them (§6.3, §14 Q-I8). The entries that referenced
+// them are removed (dropTable), which is what makes them reclaimable.
 func (s *tableService) handleDropTable(w http.ResponseWriter, r *http.Request) {
 	addr, ok := s.authorizeTableWrite(w, r, OpDeleteTable)
 	if !ok {
@@ -720,12 +733,41 @@ func (s *tableService) handleDropTable(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// dropTable removes the pointer of addr from the branch: the one entry that makes the table exist
-// (§6.1). Nothing else is touched - the metadata.json it named and every data file the metadata
-// references stay in the object store, which is what makes the drop staged, reversible and
-// GC-collected rather than destructive (file comment, §14 Q-I8).
+// dropTable removes the two kinds of entry that make up a table on the branch: its pointer, the one
+// entry that makes the table exist (§6.1), and every table-file entry staged for it under
+// _lakefs_iceberg/files/<table-uuid>/ (§6.3). No object is deleted - the metadata.json the pointer
+// named and every data file the metadata references stay in the object store - which is what keeps
+// the drop staged, reversible and GC-collected rather than destructive (file comment, §14 Q-I8).
+//
+// Why the files are released here and not only by GC: §6.3 stages the file entries so that the
+// committed GC protects exactly the live files, and that GC's live set is the set of addresses
+// reachable from the active commits. For a table that no longer exists, an entry that survives the
+// drop is the opposite of the goal - it keeps the dropped table's objects alive for as long as the
+// ref keeps the commits that carry it. A drop is the reverse of the create and the commit: the same
+// commit removes the pointer and the file entries, so the objects become unreferenced together
+// (measured defect N-3: the drop used to remove the pointer and no other path).
+//
+// Order: the pointer first, then the files. Both writes are staged, so a client's one lakeFS commit
+// publishes them together and no reader ever sees half a drop; the order matters for a failure
+// between the two steps, and only this order is the conservative one. A pointer that is gone with
+// files still staged leaves a table that does not exist whose objects are still protected - exactly
+// what v1 did before this release existed, so the failure cannot lose data - while the other order
+// would leave a table that does exist with its files no longer protected, i.e. a live table the
+// committed GC may collect after the next commit. (The first failure state is not repairable
+// through this endpoint: a second drop finds no pointer and therefore no uuid to release. It is
+// left for an operator, and it is why the two steps are ordered instead of interleaved.)
+//
+// A release that fails is reported as the failure it is: the client did not get its 204, and the
+// entries that were not removed still protect their objects.
 func (s *tableService) dropTable(ctx context.Context, addr Address) error {
-	pointerPath, err := s.requireTablePointer(ctx, addr)
+	pointerPath, entry, err := s.requireTableEntry(ctx, addr)
+	if err != nil {
+		return err
+	}
+	// The uuid is read from the pointer's own user metadata and not from metadata.json: the drop
+	// must keep working for a pointer that names an unreadable document (file comment), and it is
+	// the pointer's uuid that names the files directory files.go stages under.
+	tableUUID, err := tableUUIDOfPointer(pointerPath, entry)
 	if err != nil {
 		return err
 	}
@@ -742,7 +784,31 @@ func (s *tableService) dropTable(ctx context.Context, addr Address) error {
 		}
 		return err
 	}
-	return nil
+	_, err = releaseTableFiles(ctx, s.lister, addr, tableUUID, DefaultStageWorkers)
+	return err
+}
+
+// tableUUIDOfPointer returns the table uuid the pointer entry of pointerPath carries, i.e. the
+// directory name of the table's file entries in the reserved area (§6.3).
+//
+// It decodes the pointer's user metadata, which this catalog wrote (store.go EncodeTablePointer),
+// and never reads the metadata.json the pointer names: a drop must be able to remove a pointer that
+// names a document this catalog cannot read. A pointer whose user metadata is not a pointer this
+// catalog could have written - a missing or non-uuid table-uuid, a format version that is not
+// served - is reported as ErrInvalidPointer, the same error a load of that pointer answers, because
+// nothing can say which directory to release and a drop that removed only the pointer would leave
+// exactly the leak the release exists to close.
+func tableUUIDOfPointer(pointerPath string, entry *catalog.DBEntry) (uuid.UUID, error) {
+	pointer, err := DecodeTablePointer(entry.Metadata)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("decode pointer %q: %w", pointerPath, err)
+	}
+	tableUUID, err := uuid.Parse(pointer.TableUUID)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("decode pointer %q: %w: %q is not a table uuid: %w",
+			pointerPath, ErrInvalidPointer, pointer.TableUUID, err)
+	}
+	return tableUUID, nil
 }
 
 // handleReportMetrics is POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics
@@ -778,22 +844,32 @@ func (s *tableService) handleReportMetrics(w http.ResponseWriter, r *http.Reques
 // reason to read a document it throws away. Both therefore ask the cheaper, more literal question
 // §6.1 defines - "is the pointer there?" - and resolve it the way a reader does, staging area first.
 func (s *tableService) requireTablePointer(ctx context.Context, addr Address) (string, error) {
+	pointerPath, _, err := s.requireTableEntry(ctx, addr)
+	return pointerPath, err
+}
+
+// requireTableEntry is requireTablePointer with the entry it read, for a caller that needs the
+// pointer's own user metadata: the drop reads the table uuid out of it to release the table's file
+// entries (dropTable). The read is one entry read, so the pointer's existence and its metadata are
+// answered together and cannot describe two different states of the ref.
+func (s *tableService) requireTableEntry(ctx context.Context, addr Address) (string, *catalog.DBEntry, error) {
 	pointerPath, err := tablePointerPath(addr)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	if _, err := s.lister.GetEntry(ctx, addr.Repo, addr.Ref, pointerPath, catalog.GetEntryParams{}); err != nil {
+	entry, err := s.lister.GetEntry(ctx, addr.Repo, addr.Ref, pointerPath, catalog.GetEntryParams{})
+	if err != nil {
 		if errors.Is(err, graveler.ErrNotFound) {
-			return "", &NoSuchTableException{
+			return "", nil, &NoSuchTableException{
 				Repo:      addr.Repo,
 				Ref:       addr.Ref,
 				Namespace: addr.Namespace,
 				Table:     addr.Table,
 			}
 		}
-		return "", err
+		return "", nil, err
 	}
-	return pointerPath, nil
+	return pointerPath, entry, nil
 }
 
 // authorizeTableWrite parses and authorizes the table address of a write endpoint of this file that

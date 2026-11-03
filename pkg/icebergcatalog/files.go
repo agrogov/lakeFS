@@ -33,6 +33,18 @@ package icebergcatalog
 // both, and a dataset materialisation copies the entries and keeps the absolute paths inside
 // metadata valid (§9, task I6-1).
 //
+// # What a drop releases
+//
+// The other half of the same idea is releaseTableFiles: the drop stages the removal of every entry
+// under _lakefs_iceberg/files/<table-uuid>/ in the same commit that removes the table's pointer
+// (tables.go dropTable). §6.3 stages the files so that the committed GC protects exactly the live
+// files, and the committed GC's live set is the set of addresses reachable from the active commits;
+// for a table that no longer exists, an entry left behind protects the opposite of a live file - it
+// keeps the dropped table's objects alive for as long as the ref keeps the commits that carry it.
+// The release is the exact reverse of the registration above (same uuid, same directory, nothing
+// else), and it deletes no object: the objects are shared by every commit and every branch that
+// references them, and only the committed GC may decide that none does (§14 Q-I8).
+//
 // # What is registered
 //
 // For every snapshot that the commit added (i.e. every snapshot of the new metadata that the base
@@ -141,6 +153,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -149,6 +162,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/catalog"
+	"github.com/treeverse/lakefs/pkg/graveler"
 	"github.com/treeverse/lakefs/pkg/iceberglayout"
 	"golang.org/x/sync/errgroup"
 )
@@ -226,6 +240,13 @@ var (
 	// written and before the pointer swap, the commit path reports it as
 	// CommitStateUnknownException (§6.2 step 6).
 	ErrTableFileRegistration = errors.New("iceberg table file registration failed")
+
+	// ErrTableFileRelease is wrapped by every failure of the release half of this file: the file
+	// entries of a table that is being dropped could not be listed or removed. It is a 5xx - nothing
+	// on this path is the client's fault - and it is reported rather than skipped, because a drop
+	// that silently removed only some of the entries would leave exactly the half-released table
+	// this path exists to avoid.
+	ErrTableFileRelease = errors.New("iceberg table file release failed")
 
 	// ErrTableLocationOutsideArea is attached to a *ForeignTableFileError when the table's own
 	// location is outside <storage_namespace>/_iceberg/. Such a table can be read, but a commit
@@ -445,6 +466,21 @@ func TableFilePath(tableUUID uuid.UUID, relativePath string) (string, error) {
 	return key, nil
 }
 
+// tableFilesPrefix returns the reserved key prefix that holds every file entry of one table:
+//
+//	_lakefs_iceberg/files/<table-uuid>/
+//
+// It is the parent of every key TableFilePath builds for the table, and it is spelled from the same
+// uuid and the same constants, so the directory a drop empties (releaseTableFiles) is the directory
+// every commit of that table staged into by construction rather than by convention. The trailing
+// slash is what keeps one table's uuid from being a prefix of another's.
+func tableFilesPrefix(tableUUID uuid.UUID) (string, error) {
+	if tableUUID == uuid.Nil {
+		return "", fmt.Errorf("%w: the table has no UUID to release the table files of", ErrTableFileRelease)
+	}
+	return ReservedPrefix + "/" + FilesDirectory + "/" + tableUUID.String() + "/", nil
+}
+
 // tableRootForMetadata resolves the physical root every file of a commit must live under: the
 // table's own location when metadata.json declares one, and the managed
 // <storage_namespace>/_iceberg/<table-uuid> when it does not.
@@ -622,6 +658,98 @@ func (s *Store) stageTableFiles(ctx context.Context, addr Address, files []Table
 		return err
 	}
 	return nil
+}
+
+// releaseTableFiles stages the removal of every table-file entry of one table from addr.Ref: the
+// reverse of StageTableFiles, and the half of the drop that hands the table's objects back to the
+// committed GC (files.go file comment "What a drop releases", tables.go dropTable, RESULTS.md N-3).
+//
+// It walks exactly the table's own directory, _lakefs_iceberg/files/<table-uuid>/ (§6.3), one page
+// at a time: the keys are the ones the table's own commits staged, so a sibling table, the namespace
+// markers and the table pointers are never in reach, and no object is deleted - the entries carry
+// AddressType=Full, and the objects they point at stay readable through every commit, tag and
+// branch that still references them (§14 Q-I8).
+//
+// The caller must already have removed the pointer (tables.go dropTable): the pointer is what makes
+// the table exist, so a failure between the two steps has to leave files that are still protected
+// rather than a table whose files are no longer protected.
+//
+// A listed entry that is already gone is not an error - another writer, or an earlier attempt of
+// this same drop, released it, and the outcome the release asked for is the entry being absent.
+func releaseTableFiles(ctx context.Context, lister TableLister, addr Address, tableUUID uuid.UUID, workers int) (int, error) {
+	prefix, err := tableFilesPrefix(tableUUID)
+	if err != nil {
+		return 0, err
+	}
+	released := 0
+	after := ""
+	for {
+		// A page, cursored by the last path listed rather than by an offset: the staging writes below
+		// remove entries, so the only stable cursor is "the last key I saw". The staging area is read
+		// first (TableLister.ListEntries), so an entry this drop already staged as deleted is either
+		// gone from the next page or tolerated below.
+		entries, hasMore, err := lister.ListEntries(ctx, addr.Repo, addr.Ref, prefix, after, "",
+			catalog.ListEntriesLimitMax)
+		if err != nil {
+			return released, fmt.Errorf("%w: list the table files of %s@%s under %q: %w",
+				ErrTableFileRelease, addr.Repo, addr.Ref, prefix, err)
+		}
+		if len(entries) == 0 {
+			return released, nil
+		}
+		count, err := deleteTableFileEntries(ctx, lister, addr, entries, workers)
+		released += count
+		if err != nil {
+			return released, err
+		}
+		if !hasMore {
+			return released, nil
+		}
+		after = entries[len(entries)-1].Path
+	}
+}
+
+// deleteTableFileEntries stages the removal of one page of table-file entries in a bounded worker
+// pool, the same way and for the same reason as stageTableFiles: a catalog.DeleteEntry pays
+// graveler's batching window (3 ms), so a table whose commits staged thousands of files needs the
+// pool to be released in seconds rather than minutes (spike S-I2 §2.2).
+//
+// It returns how many entries it removed, which is what releaseTableFiles reports, so a test or a
+// log can tell a released table from a table that never staged anything.
+func deleteTableFileEntries(ctx context.Context, lister TableLister, addr Address, entries []*catalog.DBEntry, workers int) (int, error) {
+	if workers <= 0 {
+		workers = DefaultStageWorkers
+	}
+	if workers > len(entries) {
+		workers = len(entries)
+	}
+	var released atomic.Int64
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(workers)
+	for _, entry := range entries {
+		group.Go(func() error {
+			if entry.CommonLevel {
+				// A common prefix is a directory of the listing, not an entry a delete could remove.
+				// The release lists without a delimiter, so this is a guard rather than a case.
+				return nil
+			}
+			if err := lister.DeleteEntry(groupCtx, addr.Repo, addr.Ref, entry.Path); err != nil {
+				if errors.Is(err, graveler.ErrNotFound) {
+					return nil
+				}
+				return fmt.Errorf("%w: release %q: %w", ErrTableFileRelease, entry.Path, err)
+			}
+			released.Add(1)
+			return nil
+		})
+	}
+	// A failure cancels the remaining deletes, exactly like a failed staging write: the entries it did
+	// not remove still protect their objects, which is the conservative direction, and the failure is
+	// reported rather than swallowed.
+	if err := group.Wait(); err != nil {
+		return int(released.Load()), err
+	}
+	return int(released.Load()), nil
 }
 
 // collectSnapshotFiles adds the manifest list, the added manifests and their added files of one new

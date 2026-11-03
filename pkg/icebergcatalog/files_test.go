@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -816,4 +818,287 @@ func countDataEntries(set *TableFileSet) int {
 // pointerTo is a pointer to a copy of value, for the optional manifest-entry fields.
 func pointerTo[T any](value T) *T {
 	return &value
+}
+
+// TestReleaseTableFiles covers the other half of §6.3: what a drop does to the entries a commit
+// staged (files.go "What a drop releases", tables.go dropTable). The registration above exists so
+// that the committed GC protects exactly the live files; the release is the reverse of it, so that a
+// dropped table's files stop being protected and the GC can reclaim them.
+//
+// What the release must be, and what these subtests therefore pin:
+//   - it removes every entry under the table's own directory _lakefs_iceberg/files/<table-uuid>/,
+//     and only those: a sibling table's entries and the reserved area outside the directory survive;
+//   - it deletes no object: the entries are AddressType=Full, so the files themselves stay readable
+//     and a commit, tag or branch that still references them keeps working (§14 Q-I8);
+//   - it is a staged removal like every other catalog write, and it is idempotent: a table whose
+//     entries are already gone releases nothing and answers success, because the outcome it was
+//     asked for - the entries being absent - is what it finds.
+func TestReleaseTableFiles(t *testing.T) {
+	// stageAppendFiles registers the files a commit that adds one snapshot stages: a metadata file,
+	// a manifest list, a manifest and two data files under the table's uuid.
+	stageAppendFiles := func(t *testing.T, f *filesFixture) []string {
+		t.Helper()
+		manifest, _ := f.writeManifest(t, filesTestManifestKey, []iceberg.ManifestEntry{
+			iceberg.NewManifestEntry(iceberg.EntryStatusADDED, nil, nil, nil,
+				f.dataFile(t, filesTestDataKeys[0], filesTestDataSize, filesTestDataCount)),
+			iceberg.NewManifestEntry(iceberg.EntryStatusADDED, nil, nil, nil,
+				f.dataFile(t, filesTestDataKeys[1], 2*filesTestDataSize, 2*filesTestDataCount)),
+		})
+		manifestList := f.writeManifestList(t, filesTestManifestListKey, manifest)
+
+		base := filesTestMetadata(t, filesTestMetadataDocument(f.root, nil, -1))
+		metadataDocument := filesTestMetadataDocument(f.root,
+			[]string{filesTestSnapshotDocument(manifestList)}, filesTestSnapshotID)
+		next := filesTestMetadata(t, metadataDocument)
+		metadataLocation := f.putObject(t, filesTestMetadataKey, []byte(metadataDocument))
+
+		set, err := f.commitFiles(t, base, next, []TableMetadataFile{
+			{Location: metadataLocation, Size: int64(len(metadataDocument))},
+		})
+		require.NoError(t, err, "stage the files of the append")
+		require.Len(t, set.Files, 5, "metadata, manifest list, manifest and two data files")
+		return planPaths(set.Files)
+	}
+
+	t.Run("releases the table's entries and nothing else", func(t *testing.T) {
+		f := newFilesFixture(t)
+		staged := stageAppendFiles(t, f)
+
+		// A sibling table's entries, under its own uuid directory, staged the same way a commit of
+		// that table would stage them. The release must not be able to reach them.
+		siblingPath, err := TableFilePath(uuid.MustParse(storeAltUUID), "data/00000-0-parquet")
+		require.NoError(t, err)
+		require.NoError(t, f.catalog.CreateEntry(f.ctx, storeTestRepo, "main", catalog.DBEntry{
+			Path:            siblingPath,
+			PhysicalAddress: "mem://" + storeTestRepo + "-ns/_iceberg/" + storeAltUUID + "/data/00000-0-parquet",
+			AddressType:     catalog.AddressTypeFull,
+			CreationDate:    time.UnixMilli(filesTestSnapshotTimestampMs).UTC(),
+			Size:            filesTestDataSize,
+		}), "stage the sibling table's file entry")
+		before := f.listReservedArea(t)
+
+		released, err := releaseTableFiles(f.ctx, f.catalog, f.addr, uuid.MustParse(storeTestUUID), 0)
+		require.NoError(t, err, "release the table's files")
+		require.Equal(t, len(staged), released, "every staged entry of the table is released")
+
+		// The entries are gone - from the staging area a reader resolves first - and the objects they
+		// pointed at are untouched: a release stages entry removals, it never deletes a file.
+		for _, entryPath := range staged {
+			_, err := f.entryAt(t, "main", entryPath)
+			require.ErrorIs(t, err, graveler.ErrNotFound, "entry %s must be released", entryPath)
+		}
+		// (The data files are referenced by the manifests but never written by this fixture; the
+		// metadata file, the manifest list and the manifest are the objects that exist.)
+		for _, relativePath := range []string{filesTestMetadataKey, filesTestManifestListKey, filesTestManifestKey} {
+			require.NotEmpty(t, f.storedObject(t, f.location(relativePath)),
+				"the release must not delete the object at %s", f.location(relativePath))
+		}
+
+		// Exactly the table's own directory was emptied: the sibling entry and every other key of
+		// the reserved area are still there.
+		after := f.listReservedArea(t)
+		require.Equal(t, sortedDifference(before, after), sortedPaths(staged),
+			"the release removes the table's entries and nothing else")
+		require.Contains(t, after, siblingPath, "a sibling table's entries are not the release's")
+	})
+
+	t.Run("a table whose entries are already gone releases nothing", func(t *testing.T) {
+		f := newFilesFixture(t)
+		staged := stageAppendFiles(t, f)
+
+		released, err := releaseTableFiles(f.ctx, f.catalog, f.addr, uuid.MustParse(storeTestUUID), 0)
+		require.NoError(t, err)
+		require.Equal(t, len(staged), released)
+
+		// A second release of the same table - a retried drop, or the same directory released twice -
+		// finds nothing to remove and is a success: the entries it was asked to remove are absent,
+		// which is the outcome it asked for.
+		released, err = releaseTableFiles(f.ctx, f.catalog, f.addr, uuid.MustParse(storeTestUUID), 0)
+		require.NoError(t, err, "releasing an empty directory is not a failure")
+		require.Zero(t, released)
+	})
+
+	t.Run("pages over a table with more files than one listing returns", func(t *testing.T) {
+		// The real listing page is catalog.ListEntriesLimitMax, so a fake lister is the only way to
+		// exercise the cursor of the release loop: a table whose files do not fit in one page must be
+		// released completely, and no key may be skipped or revisited.
+		prefix := ReservedPrefix + "/" + FilesDirectory + "/" + storeTestUUID + "/"
+		lister := &releaseLister{pageSize: 1}
+		for i := range 4 {
+			lister.add(prefix + "data/0000" + strconv.Itoa(i) + ".parquet")
+		}
+
+		released, err := releaseTableFiles(context.Background(), lister, filesTestAddr(), uuid.MustParse(storeTestUUID), 1)
+		require.NoError(t, err)
+		require.Equal(t, 4, released)
+		require.Equal(t, []string{
+			prefix + "data/00000.parquet",
+			prefix + "data/00001.parquet",
+			prefix + "data/00002.parquet",
+			prefix + "data/00003.parquet",
+		}, lister.deletedPaths())
+		require.GreaterOrEqual(t, lister.listCalls(), 4, "a page of one entry means at least one call per entry")
+	})
+
+	t.Run("an entry that is already gone is not a failure", func(t *testing.T) {
+		// Two writers release the same table's directory; the listing may still name an entry the
+		// other writer already removed. A delete that finds nothing removed what was asked for.
+		prefix := ReservedPrefix + "/" + FilesDirectory + "/" + storeTestUUID + "/"
+		lister := &releaseLister{pageSize: 10, missing: map[string]bool{prefix + "data/00000.parquet": true}}
+		lister.add(prefix + "data/00000.parquet")
+		lister.add(prefix + "data/00001.parquet")
+
+		released, err := releaseTableFiles(context.Background(), lister, filesTestAddr(), uuid.MustParse(storeTestUUID), 2)
+		require.NoError(t, err)
+		require.Equal(t, 1, released, "only the entry that was there to remove counts as released")
+		require.Equal(t, []string{prefix + "data/00001.parquet"}, lister.deletedPaths())
+	})
+
+	t.Run("a table without a uuid cannot be released", func(t *testing.T) {
+		// The directory name *is* the table uuid, so a release without one has no directory to walk.
+		// It is refused rather than answered with "released nothing", which a caller could mistake for
+		// a released table.
+		_, err := releaseTableFiles(context.Background(), &releaseLister{}, filesTestAddr(), uuid.Nil, 0)
+		require.ErrorIs(t, err, ErrTableFileRelease)
+	})
+}
+
+// filesTestAddr is the address the release tests act on: the table newFilesFixture describes.
+func filesTestAddr() Address {
+	return Address{
+		Repo:      storeTestRepo,
+		Ref:       "main",
+		Namespace: Namespace{"inventory", "books"},
+		Table:     "orders",
+	}
+}
+
+// listReservedArea lists every key of the reserved _lakefs_iceberg/ area on the fixture's branch, so
+// a test can assert which keys a write added or removed rather than only the ones it knows about.
+func (f *filesFixture) listReservedArea(t *testing.T) []string {
+	t.Helper()
+	entries, _, err := f.catalog.ListEntries(f.ctx, storeTestRepo, "main",
+		ReservedPrefix+"/", "", "", catalog.ListEntriesLimitMax)
+	require.NoError(t, err, "list the reserved area")
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		paths = append(paths, entry.Path)
+	}
+	return paths
+}
+
+// storedObject reads one object of the fixture repository through the block adapter, i.e. the way a
+// client (or the committed GC) reads a file the entries point at.
+func (f *filesFixture) storedObject(t *testing.T, location string) string {
+	t.Helper()
+	repo, err := f.catalog.GetRepository(f.ctx, storeTestRepo)
+	require.NoError(t, err, "get the repository")
+	reader, err := f.catalog.BlockAdapter.Get(f.ctx, block.ObjectPointer{
+		StorageID:        repo.StorageID,
+		StorageNamespace: repo.StorageNamespace,
+		Identifier:       location,
+		IdentifierType:   block.IdentifierTypeFull,
+	})
+	require.NoError(t, err, "read the object at %s", location)
+	defer func() { _ = reader.Close() }()
+	data, err := io.ReadAll(reader)
+	require.NoError(t, err, "read the object at %s", location)
+	return string(data)
+}
+
+// sortedPaths is paths sorted, for a set comparison of two listings.
+func sortedPaths(paths []string) []string {
+	sorted := append([]string(nil), paths...)
+	sort.Strings(sorted)
+	return sorted
+}
+
+// sortedDifference returns the keys of before that are not in after, sorted.
+func sortedDifference(before, after []string) []string {
+	kept := make(map[string]struct{}, len(after))
+	for _, path := range after {
+		kept[path] = struct{}{}
+	}
+	removed := make([]string, 0, len(before))
+	for _, path := range before {
+		if _, ok := kept[path]; !ok {
+			removed = append(removed, path)
+		}
+	}
+	return sortedPaths(removed)
+}
+
+// releaseLister is a TableLister whose listing is served in fixed pages and whose deletes are
+// recorded, so a release can be paged over a table with more entries than one listing returns
+// without staging thousands of entries through the real store.
+type releaseLister struct {
+	mu       sync.Mutex
+	paths    []string
+	pageSize int
+	missing  map[string]bool
+	deleted  []string
+	calls    int
+}
+
+// add puts one key in the lister's listing.
+func (l *releaseLister) add(path string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.paths = append(l.paths, path)
+	sort.Strings(l.paths)
+}
+
+// deletedPaths is the keys the release staged a removal of, in the order the actions are recorded.
+func (l *releaseLister) deletedPaths() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.deleted...)
+}
+
+// listCalls is how many listings the release made.
+func (l *releaseLister) listCalls() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.calls
+}
+
+func (l *releaseLister) GetBranchReference(context.Context, string, string) (string, error) {
+	return "", graveler.ErrNotFound
+}
+
+// GetEntry is not part of the release path; the drop reads the pointer through the real lister.
+func (l *releaseLister) GetEntry(context.Context, string, string, string, catalog.GetEntryParams) (*catalog.DBEntry, error) {
+	return nil, graveler.ErrNotFound
+}
+
+// ListEntries serves the release's listing in pages of pageSize entries, cursor and hasMore
+// included, exactly like catalog.ListEntries does at its maximum page size.
+func (l *releaseLister) ListEntries(_ context.Context, _, _, prefix, after, _ string, _ int) ([]*catalog.DBEntry, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls++
+	entries := make([]*catalog.DBEntry, 0, l.pageSize)
+	for _, path := range l.paths {
+		if path <= after || !strings.HasPrefix(path, prefix) {
+			continue
+		}
+		entries = append(entries, &catalog.DBEntry{Path: path, PhysicalAddress: path})
+		if len(entries) == l.pageSize {
+			break
+		}
+	}
+	hasMore := len(entries) > 0 && entries[len(entries)-1].Path < l.paths[len(l.paths)-1]
+	return entries, hasMore, nil
+}
+
+// DeleteEntry stages the removal of one entry, and answers ErrNotFound for the keys the test marks
+// as already gone.
+func (l *releaseLister) DeleteEntry(_ context.Context, _, _, path string, _ ...graveler.SetOptionsFunc) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.missing[path] {
+		return graveler.ErrNotFound
+	}
+	l.deleted = append(l.deleted, path)
+	return nil
 }

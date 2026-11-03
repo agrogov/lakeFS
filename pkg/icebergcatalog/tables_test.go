@@ -5,9 +5,9 @@ package icebergcatalog
 // "Addressing rules", §6.2 "Atomic commit", §7.2 "Authorization"), and the drop and metrics sink
 // of task I2-5 (§11 I-2, §14 Q-I8). The read tests are named TestTablesRead, the create tests
 // TestCreateTable, the create's file registration and commit behaviour
-// TestCreateTableStagesMetadataFile (§6.3), and the drop and metrics tests TestDropTable and
-// TestReportMetrics, so each task's validation command (`go test -run TestTablesRead`,
-// `-run TestCreateTable`, `-run TestDropTable`) runs the tests it names.
+// TestCreateTableStagesMetadataFile (§6.3), and the drop and metrics tests TestDropTable,
+// TestDropTableReleasesTableFiles and TestReportMetrics, so each task's validation command (`go test
+// -run TestTablesRead`, `-run TestCreateTable`, `-run TestDropTable`) runs the tests it names.
 //
 // The fixture is the real read path end to end: a catalog store (graveler + committed ranges) on
 // an in-memory KV store, an in-memory block adapter, the simplified-ACL auth service the
@@ -1419,15 +1419,19 @@ func (f *tablesFixture) pointerEntryGone(t *testing.T, addr Address) {
 	require.ErrorIs(t, err, graveler.ErrNotFound, "the pointer entry %s must be gone", pointerPath)
 }
 
-// TestDropTable covers the drop of §11 I-2 end to end: the pointer-only removal, the data-plane
-// files that stay until GC (§14 Q-I8), the any-ref behaviour of a staged drop, the namespace that
-// becomes droppable once its last table is, and the error paths a client can hit.
+// TestDropTable covers the drop of §11 I-2 end to end: the pointer removal, the release of the
+// table's file entries (its own test, TestDropTableReleasesTableFiles), the data-plane objects that
+// stay until GC (§14 Q-I8), the any-ref behaviour of a staged drop, the namespace that becomes
+// droppable once its last table is, and the error paths a client can hit.
 //
 // What a drop must be, and what these subtests therefore pin:
-//   - it removes exactly one entry, the table's pointer (§6.1). The table stops existing on the ref
-//     it was dropped on and keeps existing on every other ref whose pointer still names its
-//     metadata - the release tag of the fixture proves the any-ref half;
-//   - it deletes no data-plane file: the metadata.json the dropped pointer named is still readable
+//   - the pointer removal is what ends the table: it stops existing on the ref it was dropped on and
+//     keeps existing on every other ref whose pointer still names its metadata - the release tag of
+//     the fixture proves the any-ref half. The file entries §6.3 staged for the table go with the
+//     pointer (TestDropTableReleasesTableFiles); the tables of this fixture are created with
+//     store.CreateTable, which stages a pointer and no file entry, so for them the pointer is the
+//     whole of the drop;
+//   - it deletes no data-plane object: the metadata.json the dropped pointer named is still readable
 //     from the object store afterwards, which is the Q-I8 rule of §14 and the reason a drop is a
 //     staged, revertible lakeFS change rather than a destructive purge;
 //   - the spec's `purgeRequested` query parameter changes nothing, whatever its value;
@@ -1445,7 +1449,7 @@ func TestDropTable(t *testing.T) {
 	titlesPointer := f.tablePointer(t, titlesAddr)
 	ordersDocument := f.tableObject(t, ordersPointer.MetadataLocation)
 
-	t.Run("drops the pointer and leaves the data-plane files in place", func(t *testing.T) {
+	t.Run("drops the pointer and leaves the data-plane objects in place", func(t *testing.T) {
 		head := f.tablesCatalogRef(t)
 
 		rec := f.deleteTable(t, booksParam, "orders", "carol", nil)
@@ -1465,9 +1469,10 @@ func TestDropTable(t *testing.T) {
 		f.pointerEntryGone(t, ordersAddr)
 		require.Equal(t, titlesPointer, f.tablePointer(t, titlesAddr), "the sibling pointer is unchanged")
 
-		// §14 Q-I8: the drop removed the pointer, not the files it named. The metadata.json of the
-		// dropped table is still in the object store, and so are the data/manifest files it
-		// references; GC reclaims them once nothing references them (§6.3, phase I-3).
+		// §14 Q-I8: the drop removed the pointer, not the objects the table's files are. The
+		// metadata.json of the dropped table is still in the object store, and so are the data/manifest
+		// files it references; releasing the entries that protected them (a table of this fixture has
+		// none) hands the objects to GC instead of deleting them (§6.3, phase I-3).
 		require.Equal(t, ordersDocument, f.tableObject(t, ordersPointer.MetadataLocation),
 			"the dropped table's metadata.json must stay until GC")
 
@@ -1478,8 +1483,9 @@ func TestDropTable(t *testing.T) {
 
 	t.Run("a table dropped on a branch is still readable on a tag", func(t *testing.T) {
 		// release tagged the commit the fixture made before any drop, so the tag's pointer still
-		// names the dropped table's metadata. That is the any-ref read of §1.1 goal 1, and the
-		// reason a drop has to be a pointer removal: nothing on the tag's side changed.
+		// names the dropped table's metadata. That is the any-ref read of §1.1 goal 1, and the reason
+		// a drop may only touch the ref it is staged on: the tag is its own commit, so neither the
+		// pointer removal nor the file-entry release can reach it.
 		tagged := tablesNamespaceParam(tablesTestTag, books)
 		body := decodeLoadTable(t, f.request(t, http.MethodGet, tablesLoadTarget(tagged, "orders", nil), "alice"))
 		require.Equal(t, ordersPointer.MetadataLocation, body.MetadataLocation,
@@ -1499,8 +1505,9 @@ func TestDropTable(t *testing.T) {
 
 		requireEnvelope(t, f.request(t, http.MethodGet, tablesLoadTarget(booksParam, "titles", nil), "alice"),
 			http.StatusNotFound, ErrTypeNoSuchTable)
-		// ... and the commit it superseded still serves the table: a drop is revertible because
-		// only an entry was removed.
+		// ... and the commit it superseded still serves the table: a drop is revertible because only
+		// entries were removed - no object was touched - so reverting the commit restores the pointer
+		// and the entries together.
 		previous := tablesNamespaceParam(before, books)
 		require.Equal(t, titlesPointer.MetadataLocation,
 			decodeLoadTable(t, f.request(t, http.MethodGet,
@@ -1509,8 +1516,10 @@ func TestDropTable(t *testing.T) {
 
 	t.Run("purgeRequested is accepted and purges nothing", func(t *testing.T) {
 		// iceberg-go sends purgeRequested=false for DropTable and true for PurgeTable. v1 answers
-		// both with the same pointer-only drop: the files are GC's to reclaim, and one catalog
-		// request must not delete files another ref may still reference (§14 Q-I8).
+		// both with the same drop: no object is deleted, because the files are GC's to reclaim and one
+		// catalog request must not delete files another ref may still reference (§14 Q-I8). The
+		// entries that protected them are released with the pointer (§6.3,
+		// TestDropTableReleasesTableFiles).
 		const uuid = "77777777-7777-7777-7777-777777777777"
 		sales := Namespace{"sales"}
 		salesParam := tablesNamespaceParam(tablesTestRef, sales)
@@ -1549,7 +1558,7 @@ func TestDropTable(t *testing.T) {
 	})
 
 	t.Run("a namespace becomes droppable once its last table is dropped", func(t *testing.T) {
-		// The last half of "drop removes the pointer entry only": the namespace emptiness check of
+		// The last half of "a drop no longer keeps the table alive": the namespace emptiness check of
 		// I2-2 walks the same `tables/<ns>/` prefix a drop cleans up, so a table that is dropped
 		// stops keeping its namespace alive, and nothing else has to be deleted.
 		//
@@ -1832,4 +1841,175 @@ func TestETagTableLoad(t *testing.T) {
 			"the old tag must not match the committed table, body: %s", rec.Body.String())
 		require.NotEqual(t, allTag, rec.Header().Get("ETag"), "the new representation has a new tag")
 	})
+}
+
+// TestDropTableReleasesTableFiles is the release half of the drop (files.go "What a drop releases",
+// RESULTS.md N-3): a drop removes the table's file entries together with its pointer, in one lakeFS
+// commit, so the committed GC can reclaim the dropped table's objects instead of protecting them for
+// as long as the ref keeps the commits that carry them.
+//
+// The measurement this pins is a diff, not a status code. §6.3 stages _lakefs_iceberg/files/
+// <table-uuid>/… so that the GC protects exactly the live files, and the defect was that the drop
+// commit removed the pointer and no other path - which protected exactly the dead ones. So the test
+// builds a table the way the write path does (a create through the endpoint, whose metadata file the
+// production create path registers, plus the file entries a later append commit stages), commits it,
+// drops it, and then asserts the two diffs: the branch's uncommitted diff after the drop and the
+// drop commit's own diff are both exactly the pointer plus every file entry, and nothing else.
+func TestDropTableReleasesTableFiles(t *testing.T) {
+	sales := Namespace{"sales"}
+	salesParam := tablesNamespaceParam(tablesTestRef, sales)
+
+	t.Run("the drop commit removes the pointer and every file entry", func(t *testing.T) {
+		f := newTablesFixture(t)
+
+		// Created through the endpoint: the create path registers the initial metadata.json under
+		// the table's uuid (§6.3 step 1, TestCreateTableStagesMetadataFile).
+		created := decodeLoadTable(t, f.postTable(t, salesParam, "carol",
+			createTableBody("released", createTableSchema)))
+		var tableUUID string
+		require.NoError(t, json.Unmarshal(created.Metadata["table-uuid"], &tableUUID))
+		tableUUIDValue, err := uuid.Parse(tableUUID)
+		require.NoError(t, err, "the create response carries a table uuid")
+		tableRoot := f.storageNamespace + "/_iceberg/" + tableUUID
+
+		// The entries an append commit of the same table stages: a manifest list, a manifest and two
+		// data files. The commit path registers exactly these keys (TestCommitStagesTableFiles); here
+		// they stand for "the table has files from an earlier commit", which is the state the drop has
+		// to release.
+		fileEntries := []string{metadataFileEntryPath(t, tableUUID, created.MetadataLocation)}
+		for index, relativePath := range []string{
+			"metadata/snap-1-1-" + tableUUID + ".avro",
+			"metadata/" + tableUUID + "-m0.avro",
+			"data/00000-0-" + tableUUID + ".parquet",
+			"data/00001-0-" + tableUUID + ".parquet",
+		} {
+			entryPath, err := TableFilePath(tableUUIDValue, relativePath)
+			require.NoError(t, err, "build the entry key of %s", relativePath)
+			fileEntries = append(fileEntries, entryPath)
+			require.NoError(t, f.catalog.CreateEntry(f.ctx, tablesTestRepo, tablesTestRef, catalog.DBEntry{
+				Path:            entryPath,
+				PhysicalAddress: tableRoot + "/" + relativePath,
+				AddressType:     catalog.AddressTypeFull,
+				CreationDate:    time.UnixMilli(1602638574000).UTC(),
+				Size:            int64(index + 1),
+			}), "stage the table file %s", relativePath)
+		}
+		pointerPath, err := tablePointerPath(tableAddressOf(sales, "released"))
+		require.NoError(t, err, "build the pointer path")
+
+		// One commit publishes the pointer and the table's files together - the create's and the
+		// append's - which is the state that keeps the table's objects alive (§6.3).
+		before := f.commitCatalog(t)
+		for _, entryPath := range append(append([]string{}, fileEntries...), pointerPath) {
+			_, err := f.entryOn(t, before, entryPath)
+			require.NoError(t, err, "entry %s must be part of the commit", entryPath)
+		}
+		wantRemoved := append(append([]string{}, fileEntries...), pointerPath)
+		sort.Strings(wantRemoved)
+
+		rec := f.deleteTable(t, salesParam, "released", "carol", nil)
+		require.Equal(t, http.StatusNoContent, rec.Code, "body: %s", rec.Body.String())
+
+		// Before any commit the drop is a staged removal of exactly those paths: the pointer and every
+		// file entry, and nothing else on the branch.
+		uncommitted, _, err := f.catalog.DiffUncommitted(f.ctx, tablesTestRepo, tablesTestRef, "", "", -1, "")
+		require.NoError(t, err, "read the branch's uncommitted diff")
+		require.Equal(t, wantRemoved, removedPaths(t, uncommitted),
+			"the drop stages the removal of the pointer and of every file entry")
+		for _, entryPath := range fileEntries {
+			_, err := f.entryOn(t, tablesTestRef, entryPath)
+			require.ErrorIs(t, err, graveler.ErrNotFound, "the file entry %s must be released", entryPath)
+		}
+
+		// No object was deleted: the drop releases entries, and the committed GC is what decides that
+		// an object is unreferenced (§14 Q-I8).
+		require.NotEmpty(t, f.tableObject(t, created.MetadataLocation),
+			"a drop must not delete the metadata.json it released the entry of")
+
+		// And the commit a client makes next carries the whole release.
+		after := f.commitCatalog(t)
+		require.NotEqual(t, before, after, "the drop was committed")
+		differences, _, err := f.catalog.Diff(f.ctx, tablesTestRepo, before, after, catalog.DiffParams{Limit: -1})
+		require.NoError(t, err, "diff the drop commit")
+		require.Equal(t, wantRemoved, removedPaths(t, differences),
+			"the drop commit removes the pointer and every file entry of the table")
+
+		// The table is gone, and the ref it was dropped on still serves its neighbours.
+		requireEnvelope(t, f.request(t, http.MethodGet, tablesLoadTarget(salesParam, "released", nil), "alice"),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+	})
+
+	t.Run("a drop releases the files of its own table only", func(t *testing.T) {
+		// Two tables in one namespace, each with a file entry of its own: dropping one must leave the
+		// other's entries and the pointer of the other table in place. This is the "no half release"
+		// half of the ordering - the release walks one directory, not the files area.
+		f := newTablesFixture(t)
+		created := map[string]string{}
+		for _, table := range []string{"kept", "dropped"} {
+			body := decodeLoadTable(t, f.postTable(t, salesParam, "carol", createTableBody(table, createTableSchema)))
+			var tableUUID string
+			require.NoError(t, json.Unmarshal(body.Metadata["table-uuid"], &tableUUID))
+			created[table] = metadataFileEntryPath(t, tableUUID, body.MetadataLocation)
+		}
+		f.commitCatalog(t)
+
+		require.Equal(t, http.StatusNoContent, f.deleteTable(t, salesParam, "dropped", "carol", nil).Code)
+
+		_, err := f.entryOn(t, tablesTestRef, created["dropped"])
+		require.ErrorIs(t, err, graveler.ErrNotFound, "the dropped table's file entry is released")
+		_, err = f.entryOn(t, tablesTestRef, created["kept"])
+		require.NoError(t, err, "the other table's file entry is untouched")
+		_, err = f.entryOn(t, tablesTestRef,
+			mustPointerPath(t, tableAddressOf(sales, "kept")))
+		require.NoError(t, err, "the other table's pointer is untouched")
+	})
+
+	t.Run("a pointer that carries no table uuid is not dropped halfway", func(t *testing.T) {
+		// The drop reads the table uuid out of the pointer's own user metadata, because that uuid -
+		// not metadata.json - names the directory the files are released from (dropTable). A pointer
+		// this catalog could not have written cannot say which directory to release, and a drop that
+		// removed only its pointer would leave exactly the leak the release exists to close. It is
+		// therefore refused as the corrupt pointer it is, *before* the pointer is removed: the client
+		// gets a 5xx and nothing is staged.
+		f := newTablesFixture(t)
+		addr := tableAddressOf(sales, "corrupt")
+		pointerPath := mustPointerPath(t, addr)
+		f.stageEntryOn(t, tablesTestRepo, tablesTestRef, pointerPath, map[string]string{
+			MetadataLocationKey: f.storageNamespace + "/_iceberg/" + tableUUIDOrNone + "/metadata/00001.metadata.json",
+			FormatVersionKey:    "2",
+		})
+
+		rec := f.deleteTable(t, salesParam, "corrupt", "carol", nil)
+		requireEnvelope(t, rec, http.StatusInternalServerError, ErrTypeInternalServerError)
+
+		_, err := f.entryOn(t, tablesTestRef, pointerPath)
+		require.NoError(t, err, "a refused drop must not remove the pointer")
+	})
+}
+
+// tableUUIDOrNone is the table uuid of the corrupt pointer above: a valid uuid, so that the only
+// thing wrong with that pointer is the missing table-uuid field.
+const tableUUIDOrNone = "88888888-8888-8888-8888-888888888888"
+
+// mustPointerPath is the pointer key of addr, for a test that would otherwise repeat the error
+// handling of tablePointerPath.
+func mustPointerPath(t *testing.T, addr Address) string {
+	t.Helper()
+	pointerPath, err := tablePointerPath(addr)
+	require.NoError(t, err, "build the pointer path of %s", addr.Table)
+	return pointerPath
+}
+
+// removedPaths is the sorted paths a diff removes, and fails the test on any other kind of change:
+// the drop's diffs are removals only, so an addition or a change is a defect of its own.
+func removedPaths(t *testing.T, differences catalog.Differences) []string {
+	t.Helper()
+	removed := make([]string, 0, len(differences))
+	for _, difference := range differences {
+		require.Equal(t, catalog.DifferenceTypeRemoved, difference.Type,
+			"the drop changes only removals, got %s", difference)
+		removed = append(removed, difference.Path)
+	}
+	sort.Strings(removed)
+	return removed
 }
