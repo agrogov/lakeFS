@@ -23,8 +23,10 @@ Because a dataset *is* a repository, every existing read path works unchanged: `
 browser in the UI. All new code lives in a new package (`pkg/datasets`), wired through the existing
 `lakefs-sso` wrapper binary, with a core diff of ~25 lines.
 
-Scope of the MVP: `object` and `prefix` items. Iceberg `table` / `namespace` items are out of scope because OSS has no
-Iceberg REST catalog (the routes return 501 via `api.MountNotImplementedServices`).
+Scope of the MVP: `object` and `prefix` items. The OSS Iceberg REST catalog that landed in this fork
+([`ICEBERG_CATALOG_PLAN.md`](ICEBERG_CATALOG_PLAN.md), phase I-6) adds `table` and `namespace` items: with `iceberg.enabled`
+a definition can name an Iceberg table or namespace, and the dataset answers it at
+`catalog.<ds>.<ref>.<ns>.<table>`. Without the catalog both types answer `501`.
 
 ---
 
@@ -48,13 +50,15 @@ Iceberg REST catalog (the routes return 501 via `api.MountNotImplementedServices
 
 ### 1.2 Non-Goals (MVP)
 
-- Iceberg `table` / `namespace` items and `catalog.<ds>.<ref>.<ns>.<table>` addressing (Phase 5, needs
-  an Iceberg REST catalog; see [`ICEBERG_CATALOG_PLAN.md`](ICEBERG_CATALOG_PLAN.md)). Those items decode and
-  answer `501`.
 - Wire compatibility with the Enterprise REST API beyond the compatibility target below.
 - Datasets spanning different storage IDs (multi-blockstore) — rejected at validation time.
 - Version deletion / retention policies for dataset versions.
 - Copy-on-publish ("snapshot") mode that physically copies data.
+
+Iceberg `table` / `namespace` items and `catalog.<ds>.<ref>.<ns>.<table>` addressing were a non-goal of this document
+because they need an Iceberg REST catalog, which OSS did not have. The OSS catalog
+([`ICEBERG_CATALOG_PLAN.md`](ICEBERG_CATALOG_PLAN.md)) has since landed, so both item types are implemented (§7.4): they
+require `iceberg.enabled` and answer `501` without it.
 
 **Compatibility target.** The public Enterprise OpenAPI, **ent-swagger v1.108**
 (`docs.lakefs.io/reference/api/enterprise/v1.108/swagger.yml`), is the specification this control plane
@@ -90,7 +94,7 @@ source ref may be a `branch` or `tag` as well as a `commit` (stored definitions 
 |---|---|---|
 | Global unique name `^[a-z0-9][a-z0-9-]{2,62}$` | ✅ | Same regex as repository IDs; shares the repository namespace. |
 | Items: `object`, `prefix` | ✅ | |
-| Items: `table`, `namespace` (Iceberg) | ❌ Phase 5 | Workaround: include a file-based table directory as a `prefix` (see §7.4). |
+| Items: `table`, `namespace` (Iceberg) | ✅ with `iceberg.enabled` | §7.4: the item copies the pointer and the staged file entries of the pinned snapshot, so the absolute paths inside metadata stay valid. Without the catalog the two types answer `501`. |
 | Sources pinned to commit | ✅ | Branch/tag refs accepted on input, resolved to a commit and stored as `type: commit`. |
 | Versions `v1..vN`, `latest` | ✅ | Tags `vN`, default branch `latest`. |
 | Version diff `GET /datasets/{ds}/refs/{l}/diff/{r}` | ✅ | Definition diff + data diff. |
@@ -291,7 +295,7 @@ type SourceRef struct {
 	ID   string  `json:"id"`
 }
 
-type ItemType string // "object" | "prefix" ("table" | "namespace" rejected with 501 in MVP)
+type ItemType string // "object" | "prefix" | "table" | "namespace" (§7.4, the reserved types need iceberg.enabled)
 
 type PathSource struct {
 	Path string `json:"path"`
@@ -605,13 +609,22 @@ All blocked:
 - `ReadOnly=true` → `ErrReadOnlyRepository` (`403`/`409` from REST, `AccessDenied` from S3) for any request without `force`.
 - `force=true` requests are denied by policy (§9.4) for everyone except the service.
 
-### 7.4 Tables without Iceberg
+### 7.4 Iceberg tables
 
 File-based tables (Parquet directories, Delta Lake, Hudi, Iceberg tables read through a Hadoop catalog) can be included
 as `prefix` items. Delta tables work when the whole table directory (including `_delta_log/`) is the prefix; the
 relative paths in `_delta_log` resolve relative to the new location because the target keeps the same layout.
-Iceberg metadata contains **absolute** paths (`s3://bucket/...`) and isn't portable, so it's documented as unsupported
-until Phase 5.
+
+Iceberg metadata contains **absolute** paths (`s3://bucket/...`), so an Iceberg table cannot be moved by copying its bytes.
+The OSS Iceberg REST catalog ([`ICEBERG_CATALOG_PLAN.md`](ICEBERG_CATALOG_PLAN.md) §6.3, §9) makes it portable instead:
+every metadata, manifest-list, manifest and data file is a lakeFS entry under the reserved `_lakefs_iceberg/` prefix, and
+its address is the full physical URI. A `table` item therefore copies the table pointer and the staged file entries of the
+pinned snapshot — never the objects — and the dataset reads them through the same blockstore, while the dataset's pin
+branch keeps them out of GC (§8). A `namespace` item does the same for every table in the namespace subtree, plus the
+namespace markers. Both types require `iceberg.enabled`; their `target` is the catalog path (`<ns>/<table>` or `<ns>`),
+because the reserved keys are repository-wide; and the dataset is read back through `/iceberg/api` at
+`<ds>.<ref>.<ns>.<table>`, read-only through the immutability deny (§9.4). A namespace level containing a `.` is not
+expressible, because the definition carries the namespace as one dotted string.
 
 ---
 
@@ -733,6 +746,12 @@ On create, publish, and proposal create/update, for every item the service check
 
 - `fs:ReadCommit` on `RepoArn(src)` and
 - `fs:ReadObject` + `fs:ListObjects` on `ObjectArn(src, path)` (object) or `ObjectArn(src, prefix+"*")` (prefix).
+
+A `table` item is checked against the catalog instead: `catalog:ReadTable` and `catalog:ReadTableData` on
+`CatalogTableArn(src, ns, table)` — the pair `/iceberg/api` itself requires (`ICEBERG_CATALOG_PLAN.md` §7.2, §9).
+`fs:ReadRepository` on the source repository is checked first for every item, and `SourceReader.CheckObject` still
+authorizes each entry the materialiser reads (SEC-3). A `namespace` item keeps the repository-wide object requirement,
+because it covers every table below it.
 
 Any failure → `403` naming the item. When a proposal is merged, the check runs for the **author** (at creation) and the
 **merger** (at merge) — the merger is publishing the data under their authority.
@@ -881,7 +900,8 @@ Task: {id, status, version, error, created_at, updated_at}
 
 `400` validation (body lists every problem: `{"message": "...", "errors": [{"path": "data[2].target", "message": "overlaps data[0]"}]}`),
 `401` unauthenticated, `403` missing permission (dataset or source), `404`, `409` name taken / version conflict /
-publish in progress / no changes, `422` storage ID mismatch, `501` `table`/`namespace` items or datasets disabled.
+publish in progress / no changes, `422` storage ID mismatch, `501` datasets disabled or a `table`/`namespace` item while
+`iceberg.enabled` is false.
 
 ---
 
@@ -1137,9 +1157,11 @@ needs is a new package plus the existing hook API (`cmd/lakefs/cmd/hooks.go`).
 | **2. Authz + versions** | actions, source checks, managed policies, immutability guard, built-in policies/groups, versions list/get, diff, reconciler | 4–5 d |
 | **3. UI** | list, overview, data browser, versions, compare, editor, access, settings; repositories filter | 6–8 d |
 | **4. Proposals, CLI, metadata keys** | proposals backend + UI, `lakectl-datasets`, metadata keys CRUD + editor form, esti tests, docs | 5–6 d |
-| **5. (later)** | Iceberg tables via a REST catalog, Python helper, strict access model, snapshot mode, version retention | — |
+| **5. Iceberg items** | Delivered by the OSS Iceberg REST catalog (`pkg/icebergcatalog`, `ICEBERG_CATALOG_PLAN.md` phase I-6): `table`/`namespace` items, `catalog.<ds>.<ref>.<ns>.<table>` reads | — |
+| **6. (later)** | Python helper, strict access model, snapshot mode, version retention | — |
 
-MVP (phases 0–3) ≈ 3–4 weeks for one engineer; full (0–4) ≈ 5 weeks.
+MVP (phases 0–3) ≈ 3–4 weeks for one engineer; full (0–4) ≈ 5 weeks. Phase 5 shipped with the Iceberg REST catalog, not
+as part of this document's estimate.
 
 Definition of done for MVP: create/publish/read/diff/delete datasets from UI and API, data readable via S3 gateway and
 `lakectl fs`, GC-safe, unit + esti green, `make lint` and `make checks-validator` clean.
@@ -1157,5 +1179,5 @@ Definition of done for MVP: create/publish/read/diff/delete datasets from UI and
 | Q1 | Should consumers be able to see source lineage (repo + commit) if they can't read the source? | Default: show repo name + commit ID only (no links) to non-readers. Confirm with stakeholders. |
 | Q2 | Version deletion / retention for datasets (e.g. keep last N)? | Out of MVP; design pin release accordingly (refcount already supports it). |
 | Q3 | Strict access model under simplified ACL (no global read)? | Separate design: per-repository ACL policies instead of global `Readers`. |
-| Q4 | Iceberg table items. | Phase 5: requires an OSS Iceberg REST catalog; evaluate Apache Polaris / Nessie in front of lakeFS. |
+| Q4 | Iceberg table items. | **Resolved.** The OSS Iceberg REST catalog (`pkg/icebergcatalog`, `ICEBERG_CATALOG_PLAN.md`) landed: a `table` item copies the pointer and staged file entries of the pinned snapshot, so the absolute paths in metadata stay valid (§7.4). No Polaris/Nessie shim. |
 | Q5 | Legal sign-off on clean-room approach and naming. | Legal review before production rollout (§2). |

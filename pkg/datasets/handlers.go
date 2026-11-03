@@ -901,9 +901,10 @@ func metadataValueStrings(value any) []string {
 	}
 }
 
-// dataItemFromAPI converts one wire data item. The reserved table/namespace descriptors are
-// carried through so that a structural validation problem (or a 501) describes them instead
-// of silently dropping them.
+// dataItemFromAPI converts one wire data item. The table/namespace descriptors are carried
+// through, because a reserved item is only materialisable with its source: without the member a
+// `table` item would fail validation with a missing descriptor, and the 501 of a disabled catalog
+// would describe the wrong problem.
 func dataItemFromAPI(in apigen.DataItem) DataItem {
 	out := DataItem{
 		Target:     in.Target,
@@ -916,6 +917,16 @@ func dataItemFromAPI(in apigen.DataItem) DataItem {
 	}
 	if in.Prefix != nil {
 		out.Prefix = &PathSource{Path: in.Prefix.Path}
+	}
+	if in.Table != nil {
+		table := TableSrc{}
+		if in.Table.Namespace != nil {
+			table.Namespace = *in.Table.Namespace
+		}
+		if in.Table.Name != nil {
+			table.Name = *in.Table.Name
+		}
+		out.Table = &table
 	}
 	// DOC-13: ent-swagger declares a namespace item's `namespace` member as a string, so the
 	// generated type is *string and the package model keeps just the name.
@@ -939,6 +950,10 @@ func dataItemToAPI(in DataItem) apigen.DataItem {
 	}
 	if in.Prefix != nil {
 		out.Prefix = &apigen.PathSource{Path: in.Prefix.Path}
+	}
+	if in.Table != nil {
+		namespace, name := in.Table.Namespace, in.Table.Name
+		out.Table = &apigen.TableSource{Namespace: &namespace, Name: &name}
 	}
 	if in.Namespace != nil {
 		namespace := *in.Namespace

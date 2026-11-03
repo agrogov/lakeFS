@@ -297,9 +297,10 @@ func TestSourceReadNode(t *testing.T) {
 	commitRef := SourceRef{Type: RefTypeCommit, ID: "30f9eb1c"}
 
 	tests := []struct {
-		name       string
-		item       DataItem
-		wantObject string
+		name            string
+		item            DataItem
+		wantObject      string
+		wantPermissions []permissions.Permission
 	}{
 		{
 			name:       "object",
@@ -317,8 +318,39 @@ func TestSourceReadNode(t *testing.T) {
 			wantObject: "arn:lakefs:fs:::repository/lakehouse-repo/object/*",
 		},
 		{
-			name:       "table falls back to the whole repository",
+			// §9 of the Iceberg plan: a table is authorized on the catalog ARNs the catalog
+			// itself checks, not on an fs object glob.
+			name:       "table",
+			item:       DataItem{Repository: "lakehouse-repo", Ref: commitRef, Type: ItemTypeTable, Table: &TableSrc{Namespace: "analytics", Name: "orders"}},
+			wantObject: "arn:lakefs:fs:::repository/lakehouse-repo/object/*",
+			wantPermissions: []permissions.Permission{
+				{Action: "catalog:ReadTable", Resource: "arn:lakefs:catalog:::table/lakehouse-repo/analytics/orders"},
+				{Action: "catalog:ReadTableData", Resource: "arn:lakefs:catalog:::table/lakehouse-repo/analytics/orders"},
+			},
+		},
+		{
+			// A multi-level namespace is dotted in a definition, which is the form the
+			// catalog ARN carries, so the two builds agree without a conversion.
+			name:       "table in a multi-level namespace",
+			item:       DataItem{Repository: "lakehouse-repo", Ref: commitRef, Type: ItemTypeTable, Table: &TableSrc{Namespace: "analytics.sales", Name: "orders"}},
+			wantObject: "arn:lakefs:fs:::repository/lakehouse-repo/object/*",
+			wantPermissions: []permissions.Permission{
+				{Action: "catalog:ReadTable", Resource: "arn:lakefs:catalog:::table/lakehouse-repo/analytics.sales/orders"},
+				{Action: "catalog:ReadTableData", Resource: "arn:lakefs:catalog:::table/lakehouse-repo/analytics.sales/orders"},
+			},
+		},
+		{
+			// A table item without its descriptor cannot be named, so it keeps the
+			// whole-repository object requirement: fail closed, never an unnameable grant.
+			name:       "table without a descriptor falls back to the whole repository",
 			item:       DataItem{Repository: "lakehouse-repo", Ref: commitRef, Type: ItemTypeTable},
+			wantObject: "arn:lakefs:fs:::repository/lakehouse-repo/object/*",
+		},
+		{
+			// A namespace has no single catalog ARN: it covers every table below it, so the
+			// object requirement stays repository-wide (stricter, never wider).
+			name:       "namespace falls back to the whole repository",
+			item:       DataItem{Repository: "lakehouse-repo", Ref: commitRef, Type: ItemTypeNamespace, Namespace: ptr("analytics")},
 			wantObject: "arn:lakefs:fs:::repository/lakehouse-repo/object/*",
 		},
 	}
@@ -326,12 +358,56 @@ func TestSourceReadNode(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			node := SourceReadNode(tt.item)
+			want := tt.wantPermissions
+			if want == nil {
+				want = []permissions.Permission{
+					{Action: "fs:ListObjects", Resource: "arn:lakefs:fs:::repository/" + tt.item.Repository},
+					{Action: "fs:ReadObject", Resource: tt.wantObject},
+				}
+			}
 			require.Equal(t, permissions.NodeTypeAnd, node.Type)
-			require.Equal(t, []permissions.Permission{
-				{Action: "fs:ListObjects", Resource: "arn:lakefs:fs:::repository/" + tt.item.Repository},
-				{Action: "fs:ReadObject", Resource: tt.wantObject},
-			}, requiredPermissions(node))
+			require.Equal(t, want, requiredPermissions(node))
 			require.Equal(t, tt.wantObject, SourceObjectArn(tt.item))
+		})
+	}
+}
+
+// TestSourceTableArn pins the table ARN SourceReadNode authorizes on, including the cases where
+// it refuses to name one: the descriptor is missing, or a part of the catalog path is empty. An
+// item the authorizer cannot name keeps the repository-wide requirement instead.
+func TestSourceTableArn(t *testing.T) {
+	t.Parallel()
+	repo := "lakehouse-repo"
+
+	tests := []struct {
+		name string
+		item DataItem
+		want string
+		ok   bool
+	}{
+		{
+			name: "table",
+			item: DataItem{Repository: repo, Type: ItemTypeTable, Table: &TableSrc{Namespace: "analytics", Name: "orders"}},
+			want: "arn:lakefs:catalog:::table/lakehouse-repo/analytics/orders",
+			ok:   true,
+		},
+		{
+			name: "multi-level namespace",
+			item: DataItem{Repository: repo, Type: ItemTypeTable, Table: &TableSrc{Namespace: "analytics.sales", Name: "orders"}},
+			want: "arn:lakefs:catalog:::table/lakehouse-repo/analytics.sales/orders",
+			ok:   true,
+		},
+		{name: "not a table item", item: DataItem{Repository: repo, Type: ItemTypePrefix, Prefix: &PathSource{Path: "data/"}}},
+		{name: "missing descriptor", item: DataItem{Repository: repo, Type: ItemTypeTable}},
+		{name: "empty namespace", item: DataItem{Repository: repo, Type: ItemTypeTable, Table: &TableSrc{Name: "orders"}}},
+		{name: "empty table name", item: DataItem{Repository: repo, Type: ItemTypeTable, Table: &TableSrc{Namespace: "analytics"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := SourceTableArn(tt.item)
+			require.Equal(t, tt.ok, ok)
+			require.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -507,6 +583,143 @@ func TestAuthorizerSourceCheckMatrix(t *testing.T) {
 			require.Contains(t, err.Error(), "forbidden")
 		})
 	}
+}
+
+// TestAuthorizerTableSourceCheck is the table half of the §9.3 source check (ICEBERG_CATALOG_PLAN.md
+// §9): attaching a table item requires the catalog read pair on the table's own catalog ARN - the
+// same gate /iceberg/api applies - and nothing else about the table.
+func TestAuthorizerTableSourceCheck(t *testing.T) {
+	t.Parallel()
+	const (
+		creator = "creator"
+		src     = "src-repo"
+	)
+	tableItem := DataItem{
+		Target:     "analytics/orders",
+		Repository: src,
+		Ref:        SourceRef{Type: RefTypeCommit, ID: "aaa"},
+		Type:       ItemTypeTable,
+		Table:      &TableSrc{Namespace: "analytics", Name: "orders"},
+	}
+	const tableArn = "arn:lakefs:catalog:::table/src-repo/analytics/orders"
+
+	readTable := model.Statement{
+		Effect:   model.StatementEffectAllow,
+		Action:   []string{permissions.CatalogReadTableAction},
+		Resource: tableArn,
+	}
+	readTableData := model.Statement{
+		Effect:   model.StatementEffectAllow,
+		Action:   []string{permissions.CatalogReadTableDataAction},
+		Resource: tableArn,
+	}
+
+	tests := []struct {
+		name       string
+		statements model.Statements
+		items      []DataItem
+		wantErr    bool
+		wantItem   string
+	}{
+		{
+			name:    "no grants at all",
+			items:   []DataItem{tableItem},
+			wantErr: true, wantItem: `data[0] "analytics/orders"`,
+		},
+		{
+			name:       "the catalog read pair on the table ARN",
+			statements: model.Statements{readTable, readTableData},
+			items:      []DataItem{tableItem},
+		},
+		{
+			// ReadTable alone loads metadata; copying the table also copies its data files.
+			name:       "metadata read without the data read",
+			statements: model.Statements{readTable},
+			items:      []DataItem{tableItem},
+			wantErr:    true, wantItem: `data[0] "analytics/orders"`,
+		},
+		{
+			name:       "data read without the metadata read",
+			statements: model.Statements{readTableData},
+			items:      []DataItem{tableItem},
+			wantErr:    true, wantItem: `data[0] "analytics/orders"`,
+		},
+		{
+			// The ARN names one table: a grant on a sibling does not carry over.
+			name: "the pair on another table",
+			statements: model.Statements{
+				{Effect: model.StatementEffectAllow, Action: []string{permissions.CatalogReadTableAction}, Resource: "arn:lakefs:catalog:::table/src-repo/analytics/customers"},
+				{Effect: model.StatementEffectAllow, Action: []string{permissions.CatalogReadTableDataAction}, Resource: "arn:lakefs:catalog:::table/src-repo/analytics/customers"},
+			},
+			items:   []DataItem{tableItem},
+			wantErr: true, wantItem: `data[0] "analytics/orders"`,
+		},
+		{
+			// fs access to the source is not the table gate: catalog actions are.
+			name: "fs read on the source repository",
+			statements: model.Statements{
+				{Effect: model.StatementEffectAllow, Action: []string{"fs:*"}, Resource: permissions.All},
+			},
+			items:   []DataItem{tableItem},
+			wantErr: true, wantItem: `data[0] "analytics/orders"`,
+		},
+		{
+			name: "a wildcard catalog grant covers the table",
+			statements: model.Statements{
+				{Effect: model.StatementEffectAllow, Action: []string{"catalog:Read*"}, Resource: "arn:lakefs:catalog:::table/src-repo/*"},
+			},
+			items: []DataItem{tableItem},
+		},
+		{
+			name: "an explicit deny on the data read beats the allow",
+			statements: model.Statements{
+				readTable, readTableData,
+				{Effect: model.StatementEffectDeny, Action: []string{permissions.CatalogReadTableDataAction}, Resource: tableArn},
+			},
+			items:   []DataItem{tableItem},
+			wantErr: true, wantItem: `data[0] "analytics/orders"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			f := newAuthzFixture(t)
+			ctx := t.Context()
+			f.user(t, creator)
+			if tt.statements != nil {
+				f.policy(t, "creator-grants", tt.statements)
+				f.attachToUser(t, "creator-grants", creator)
+			}
+
+			err := f.authz.CheckSources(ctx, Caller{Username: creator}, tt.items)
+			if !tt.wantErr {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorIs(t, err, ErrPermissionDenied, "a source denial must match ErrPermissionDenied: %v", err)
+			var permErr *PermissionError
+			require.ErrorAs(t, err, &permErr)
+			require.Equal(t, http.StatusForbidden, permErr.HTTPStatusCode())
+			require.Contains(t, err.Error(), tt.wantItem, "the error must name the offending item (§9.3)")
+			// The 403 names the actions that were required, so an operator can see it was the
+			// catalog pair and not an fs permission.
+			require.Contains(t, err.Error(), "catalog:ReadTable", "the denial names the catalog actions")
+		})
+	}
+}
+
+// TestSourceItemNameReserved verifies that a table or namespace denial names the catalog name a
+// reader recognises, rather than an empty path.
+func TestSourceItemNameReserved(t *testing.T) {
+	t.Parallel()
+	ref := SourceRef{Type: RefTypeCommit, ID: "abc"}
+	table := DataItem{Target: "analytics/orders", Repository: "src", Ref: ref, Type: ItemTypeTable,
+		Table: &TableSrc{Namespace: "analytics.sales", Name: "orders"}}
+	namespace := DataItem{Target: "analytics", Repository: "src", Ref: ref, Type: ItemTypeNamespace, Namespace: ptr("analytics.sales")}
+
+	require.Equal(t, `data[0] "analytics/orders" (table src@abc:analytics.sales.orders)`, SourceItemName(0, table))
+	require.Equal(t, `data[1] "analytics" (namespace src@abc:analytics.sales)`, SourceItemName(1, namespace))
 }
 
 // TestCheckSourcesRespectsSubPathDeny is the unit half of SEC-3. CheckSources matches the caller's

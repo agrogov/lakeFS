@@ -417,10 +417,38 @@ func MetadataKeyPermission(action string) permissions.Node {
 // authoritative check is SourceReader.CheckObject, which authorizes fs:ReadObject on every
 // object the materialiser reads.
 //
-// "table" and "namespace" items are rejected by validation in the MVP (§1.2); they fall back to
-// requiring the whole repository, which is stricter, so a future implementation that forgets to
-// extend this function fails closed.
+// A "table" item is not read as an object tree: it is read through the Iceberg REST catalog, so
+// its requirement is the catalog read pair of ICEBERG_CATALOG_PLAN.md §9:
+//
+//	catalog:ReadTable     on arn:lakefs:catalog:::table/<src>/<namespace>/<table>
+//	catalog:ReadTableData on the same ARN
+//
+// That is the gate /iceberg/api itself applies when a client loads the table and reads its data
+// files (pkg/icebergcatalog/authz.go, §7.2 of the plan), so a principal who may read a table
+// through the catalog can also attach it to a dataset - and one who may not, cannot. The catalog
+// ARNs are deliberately branch-agnostic (plan §7.2): the catalog state of every ref shares the
+// names, and the item's pinned ref is checked by the resolver, not by the ARN. fs:ReadRepository
+// on the source repository is checked separately, first, by CheckSourceRepositories; the
+// per-object check of SourceReader.CheckObject keeps authorizing every entry the materialiser
+// reads, so the pair is not a replacement for it. The staged-file keys of a table are named by
+// its pointer (the table UUID is only known once the table is resolved), so the attach-time node
+// cannot name them: a caller who holds the pair but not fs:ReadObject is refused later, per
+// object, naming the item and the first path.
+//
+// A "namespace" item has no equivalent single ARN - it materialises the namespace and every table
+// below it - so it keeps the whole-repository object requirement below. That is stricter, never
+// wider, and it is what an item the authorizer cannot name (a missing descriptor) gets too: a
+// future item type that forgets to extend this function fails closed.
 func SourceReadNode(item DataItem) permissions.Node {
+	if arn, ok := SourceTableArn(item); ok {
+		return permissions.Node{
+			Type: permissions.NodeTypeAnd,
+			Nodes: []permissions.Node{
+				{Permission: permissions.Permission{Action: permissions.CatalogReadTableAction, Resource: arn}},
+				{Permission: permissions.Permission{Action: permissions.CatalogReadTableDataAction, Resource: arn}},
+			},
+		}
+	}
 	return permissions.Node{
 		Type: permissions.NodeTypeAnd,
 		Nodes: []permissions.Node{
@@ -440,8 +468,33 @@ func SourceReadNode(item DataItem) permissions.Node {
 	}
 }
 
+// SourceTableArn returns the catalog table ARN a "table" item is authorized on (§9.3,
+// ICEBERG_CATALOG_PLAN.md §9), and whether the item names a table at all:
+//
+//	arn:lakefs:catalog:::table/<src>/<namespace>/<table>
+//
+// The ARN is the one pkg/icebergcatalog builds for the same table (CatalogTableArn with the
+// dotted namespace), so the attach-time check and the catalog's own check are the same
+// permission. It reports false when the item is not a table or names no usable namespace/table
+// (a missing descriptor; validation reports that separately), which makes SourceReadNode fall
+// back to the whole-repository requirement instead of authorizing an unnameable table.
+func SourceTableArn(item DataItem) (string, bool) {
+	if item.Type != ItemTypeTable || item.Table == nil {
+		return "", false
+	}
+	if item.Table.Namespace == "" || item.Table.Name == "" {
+		return "", false
+	}
+	return permissions.CatalogTableArn(item.Repository, item.Table.Namespace, item.Table.Name), true
+}
+
 // SourceObjectArn returns the object ARN a source item is read from (§9.3): the exact object for
 // an "object" item, and the path glob "<prefix>*" for a "prefix" item.
+//
+// A "table" item is not read from one object ARN: SourceReadNode authorizes it on the catalog
+// table ARN (SourceTableArn) instead, and its entries are read one at a time through the
+// per-object check. A "namespace" item, and any item whose descriptor is missing, keeps the
+// whole-repository glob below - the strictest object requirement, which is what fails closed.
 func SourceObjectArn(item DataItem) string {
 	if item.Type == ItemTypePrefix {
 		return permissions.ObjectArn(item.Repository, itemSourcePath(item)+"*")
@@ -454,6 +507,10 @@ func SourceObjectArn(item DataItem) string {
 
 // itemSourcePath returns the source path of item, which is empty when the matching descriptor is
 // missing (validation reports that separately).
+//
+// The reserved items answer the name a reader recognises: "<namespace>.<table>" for a table
+// (the dotted form a definition uses) and "<namespace>" for a namespace. Only SourceItemName
+// uses it, so a table item is still described by its catalog name in a 403 that names the item.
 func itemSourcePath(item DataItem) string {
 	switch item.Type {
 	case ItemTypeObject:
@@ -463,6 +520,14 @@ func itemSourcePath(item DataItem) string {
 	case ItemTypePrefix:
 		if item.Prefix != nil {
 			return item.Prefix.Path
+		}
+	case ItemTypeTable:
+		if item.Table != nil {
+			return item.Table.Namespace + "." + item.Table.Name
+		}
+	case ItemTypeNamespace:
+		if item.Namespace != nil {
+			return *item.Namespace
 		}
 	}
 	return ""

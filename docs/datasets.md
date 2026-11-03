@@ -67,8 +67,9 @@ Fields:
 | `data[].target` | Path of the item inside the dataset. No leading `/`, no `.`/`..` segments. |
 | `data[].repository` | Source repository. It must exist, must not be a dataset, and must live on the same storage as the dataset. |
 | `data[].ref` | `{"type": "commit", "id": "<commit>"}`. On input, `branch` and `tag` are also accepted and resolved to a commit — an input superset of the Enterprise schema, which only has `commit`; stored definitions only contain commits. |
-| `data[].type` | `object` or `prefix`. `table` and `namespace` items decode (an Enterprise `namespace` is a string) and are answered with `501`, see [Current limitations](#current-limitations). |
+| `data[].type` | `object`, `prefix`, or - with the Iceberg REST catalog enabled (`iceberg.enabled`) - `table` and `namespace`. See [Iceberg table and namespace items](#iceberg-table-and-namespace-items). |
 | `data[].object.path` / `data[].prefix.path` | The source path. Prefix paths always end with `/`; an empty prefix is the whole repository. |
+| `data[].table` / `data[].namespace` | The Iceberg source of a `table`/`namespace` item: `{"namespace": ..., "name": ...}` for a table, the dotted namespace string for a namespace. |
 | `publish` | Optional on create: it names version `v1`. A create always publishes `v1`; `message` defaults to `Create dataset <name>`. |
 
 Target semantics:
@@ -77,6 +78,8 @@ Target semantics:
 |---|---|---|---|
 | `object` | `geo/countries.csv` | `reference/countries.csv` | exactly `reference/countries.csv` |
 | `prefix` | `data/customers/` | `customers` | `customers/<relative path>` for every `data/customers/<relative path>` |
+| `table` | table `analytics.orders` | `analytics/orders`, fixed | the table's reserved `_lakefs_iceberg/` entries |
+| `namespace` | namespace `analytics` | `analytics`, fixed | the reserved `_lakefs_iceberg/` entries of the whole subtree |
 
 Targets must not overlap: a target may not equal, or be a path prefix of, another target
 (`a` and `a/b` collide; `a` and `a-b` do not). That is what makes each dataset key resolve to
@@ -86,6 +89,59 @@ Validation also checks that the submitted definition is internally consistent an
 caller may read every source it attaches (see [Access](#access)). Publishing the same
 definition twice is rejected as "no changes", and a publish that passes `expected_version`
 older than the current `latest_version` is rejected with a conflict.
+
+### Iceberg table and namespace items
+
+When the lakeFS Iceberg REST catalog is enabled (`iceberg.enabled`, see
+[Iceberg REST catalog](iceberg.md)) a definition may name Iceberg tables instead of file trees:
+
+```json
+{
+  "target": "analytics/orders",
+  "repository": "lakehouse-repo",
+  "ref": { "type": "commit", "id": "30f9eb1c9d0d4bb4b0d3d9a6f1f2a8b5a11f0c4e" },
+  "type": "table",
+  "table": { "namespace": "analytics", "name": "orders" }
+}
+```
+
+```json
+{
+  "target": "analytics",
+  "repository": "lakehouse-repo",
+  "ref": { "type": "commit", "id": "30f9eb1c9d0d4bb4b0d3d9a6f1f2a8b5a11f0c4e" },
+  "type": "namespace",
+  "namespace": "analytics"
+}
+```
+
+- A `table` item copies the table's pointer entry and every staged file entry of the pinned
+  snapshot (`_lakefs_iceberg/files/<table-uuid>/…`). A `namespace` item copies the namespace
+  markers, the pointers of every table below it, and their files. A multi-level namespace is a
+  dotted string: `analytics.sales` is the two-level namespace `[analytics, sales]`. A namespace
+  level that contains a `.` cannot be expressed.
+- The `target` of both types is fixed to the catalog path — `<namespace>/<table>` for a table,
+  `<namespace>` for a namespace — because the reserved keys a dataset copies are repository-wide.
+  Targets are also what the overlap rule compares, so a namespace item and a table inside it
+  still collide: the namespace item already copies that table.
+- Only a namespace item copies namespace markers. A dataset of table items alone exposes those
+  tables but lists no namespaces; add a namespace item when the namespace itself should be
+  readable. Table items never copy a marker, so two sibling tables can be attached together.
+- The data is not copied: the source objects are shared and the dataset's pin branch keeps them
+  out of garbage collection ([Garbage collection safety](#garbage-collection-safety)). That is
+  what keeps the absolute `s3://…` paths inside Iceberg metadata valid.
+- A table or namespace that does not exist at the pinned commit is a `400` naming the item.
+- The result is read through the catalog at `<dataset>.<ref>.<namespace>.<table>`, and it is
+  read-only like every dataset.
+
+Attaching a `table` item requires the pair the catalog itself checks — `catalog:ReadTable` and
+`catalog:ReadTableData` on `arn:lakefs:catalog:::table/<source-repo>/<namespace>/<table>` — plus
+`fs:ReadRepository` and the per-object `fs:ReadObject` of every entry the materialiser reads. A
+`namespace` item keeps the repository-wide object requirement, because one namespace covers many
+tables.
+
+Without the catalog (`iceberg.enabled` unset or false) both item types answer `501`, exactly as
+before: nothing could materialise them and no catalog could serve the result.
 
 ## Versions
 
@@ -157,6 +213,11 @@ supports presigning (S3, GS and Azure Blob do; the local filesystem blockstore d
 
 Writes are refused. The backing repository is read-only, so uploads, deletes, commits, tag
 changes and branch changes through the data plane fail with a "read-only repository" error.
+
+A dataset built from Iceberg `table`/`namespace` items is also read through the lakeFS Iceberg
+REST catalog: the dataset name is the repository and the version is the ref, so listing
+namespaces and loading a table answer `<dataset>.<ref>.<namespace>.<table>`. The dataset is
+read-only there as well.
 
 ## Garbage collection safety
 
@@ -259,6 +320,12 @@ materialised; a failure names the item and the first path that could not be read
 documented pair. On a merge the source check runs for the merging principal, because the merge
 publishes the data under their authority.
 
+A `table` item is authorized on the catalog ARN instead: `catalog:ReadTable` and
+`catalog:ReadTableData` on `arn:lakefs:catalog:::table/<src>/<namespace>/<table>`, the same pair
+`/iceberg/api` checks when it loads a table and reads its data files. `fs:ReadRepository` on the
+source repository is required for every item, and every entry the materialiser reads is still
+authorized per object.
+
 When datasets are configured, the RBAC bootstrap creates the four documented policies on
 `arn:lakefs:dataset:::dataset/*`: `DatasetsFullAccess` (`dataset:*`), `DatasetsReadWriteAll`,
 `DatasetsReadAll` and `DatasetsManageMetadataKeys`, and maps `Admins` to `DatasetsFullAccess`,
@@ -343,14 +410,14 @@ span storage IDs are rejected.
 
 ## Current limitations
 
-- **Items are `object` and `prefix` only.** Iceberg `table` and `namespace` items are not
-  supported, and neither is `catalog.<dataset>.<ref>.<namespace>.<table>` addressing: there is
-  no Iceberg REST catalog in this build, so those items answer `501`. The gap and the planned
-  OSS Iceberg REST catalog are tracked in
-  [`ICEBERG_CATALOG_PLAN.md`](../ICEBERG_CATALOG_PLAN.md). File-based tables (Parquet
-  directories, Delta Lake, Hudi, Iceberg tables read through a Hadoop catalog) can be included
-  as `prefix` items. Iceberg metadata that embeds absolute `s3://…` paths is not portable this
-  way.
+- **Iceberg `table` and `namespace` items need the Iceberg REST catalog.** They are accepted
+  when `iceberg.enabled` is on (see
+  [Iceberg table and namespace items](#iceberg-table-and-namespace-items)) and answer `501`
+  otherwise. Remaining gaps: a namespace level may not contain a `.`, a table item does not copy
+  its namespace marker, and metadata a client writes outside lakeFS is not tracked. File-based
+  tables (Parquet directories, Delta Lake, Hudi, Iceberg tables read through a Hadoop catalog)
+  can still be included as `prefix` items. Iceberg metadata that embeds absolute `s3://…` paths
+  needs a `table` item, because it is not portable as a `prefix`.
 - **No version deletion or retention policies.** Versions are immutable and kept; a dataset's
   pins are released when the dataset is deleted.
 - **No copy-on-publish ("snapshot") mode.** A dataset is always zero-copy, so it depends on

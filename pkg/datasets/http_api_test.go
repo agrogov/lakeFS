@@ -277,6 +277,39 @@ func TestGeneratedDefinitionTypes(t *testing.T) {
 	require.Equal(t, def, decoded)
 }
 
+// TestDataItemReservedAPIRoundTrip pins that the table and namespace descriptors survive the
+// wire conversion. dataItemFromAPI/dataItemToAPI are the only place a definition crosses between
+// the generated types and the package model: dropping the `table` member there would make a
+// table item unattachable through the REST API, and validation would report a missing descriptor
+// instead of the real problem (ICEBERG_CATALOG_PLAN.md §9).
+func TestDataItemReservedAPIRoundTrip(t *testing.T) {
+	t.Parallel()
+	ref := SourceRef{Type: RefTypeCommit, ID: "30f9eb1c"}
+
+	table := DataItem{
+		Target: "analytics/orders", Repository: "lakehouse-repo", Ref: ref,
+		Type: ItemTypeTable, Table: &TableSrc{Namespace: "analytics.sales", Name: "orders"},
+	}
+	namespace := DataItem{
+		Target: "analytics", Repository: "lakehouse-repo", Ref: ref,
+		Type: ItemTypeNamespace, Namespace: ptr("analytics.sales"),
+	}
+	for _, item := range []DataItem{table, namespace} {
+		t.Run(string(item.Type), func(t *testing.T) {
+			t.Parallel()
+			wire := dataItemToAPI(item)
+			if item.Table != nil {
+				require.NotNil(t, wire.Table, "the table descriptor must reach the wire")
+				require.NotNil(t, wire.Table.Namespace)
+				require.Equal(t, "analytics.sales", *wire.Table.Namespace)
+				require.NotNil(t, wire.Table.Name)
+				require.Equal(t, "orders", *wire.Table.Name)
+			}
+			require.Equal(t, item, dataItemFromAPI(wire), "the item the control plane serves is the item it accepted")
+		})
+	}
+}
+
 // TestDatasetsUnauthenticated401 is the 401 mapping of §10.4: every route is behind
 // api.GenericAuthMiddleware plus the authenticated-user requirement.
 func TestDatasetsUnauthenticated401(t *testing.T) {

@@ -1129,9 +1129,12 @@ components:
     Forbidden:
       description: |
         The caller is missing a required dataset permission, or cannot read one of the source
-        repositories/objects referenced by the definition (§9.3). This status is configurable:
-        the documented `auth.authorization_failure_status` selects `401` (the default, as in the
-        core API) or `403` for denials, so a client must accept either.
+        repositories/objects referenced by the definition (§9.3). A `table` item needs
+        `catalog:ReadTable` and `catalog:ReadTableData` on
+        `arn:lakefs:catalog:::table/<src>/<namespace>/<table>` - the same pair the Iceberg REST
+        catalog checks - and the materialiser still authorizes every source entry it reads. This
+        status is configurable: the documented `auth.authorization_failure_status` selects `401`
+        (the default, as in the core API) or `403` for denials, so a client must accept either.
       content:
         application/json:
           schema:
@@ -1161,8 +1164,8 @@ components:
             $ref: "#/components/schemas/Error"
     NotImplemented:
       description: |
-        `table`/`namespace` items are not supported by this build, or datasets are disabled on
-        this server (§10.4).
+        Datasets are disabled on this server, or a submitted `table`/`namespace` item needs the
+        Iceberg REST catalog and `iceberg.enabled` is false (§10.4).
       content:
         application/json:
           schema:
@@ -1279,8 +1282,17 @@ components:
             the source key lands exactly at `target`.
           * `type: prefix`  requires `prefix` and forbids `object`/`table`/`namespace`;
             `prefix/<rel>` lands at `target/<rel>`.
-          * `type: table` or `type: namespace` are reserved for the Iceberg phase and answered
-            with `501` (§1.2, §10.4).
+          * `type: table`   requires `table` and forbids `object`/`prefix`/`namespace`; it
+            copies an Iceberg table - its pointer and the files of the pinned snapshot - and
+            needs the Iceberg REST catalog (`iceberg.enabled`), otherwise the item is answered
+            with `501` (§10.4). `target` must be the catalog path `<namespace>/<table>`.
+          * `type: namespace` requires `namespace` and forbids `object`/`prefix`/`table`; it
+            copies an Iceberg namespace and its whole subtree. Same `iceberg.enabled`
+            requirement; `target` must be the namespace path.
+
+        A dataset built from table and namespace items is itself a catalog workspace: read it
+        with the lakeFS Iceberg REST catalog at `<dataset>.<ref>.<namespace>.<table>`. It is
+        read-only, like every dataset (the immutability deny policy, §9.4).
 
         The union is modelled as one object with optional per-type members rather than a literal
         OpenAPI `oneOf` because the oapi-codegen release pinned by this repository (v1.5.6, see
@@ -1321,9 +1333,12 @@ components:
         namespace:
           type: string
           description: |
-            Iceberg namespace name. ent-swagger v1.108 declares `namespace` as a string, so an
-            Enterprise definition decodes; this build still answers the item with `501` (§1.2,
-            ICEBERG_CATALOG_PLAN.md).
+            Iceberg namespace of a `namespace` item, with its levels joined by `.`
+            (`analytics.sales` is the two-level namespace `[analytics, sales]`). An Enterprise
+            definition declares `namespace` as a string, so it decodes unchanged. Requires the
+            Iceberg REST catalog (`iceberg.enabled`); the catalog wire separator is not accepted
+            here. `target` must be this path.
+          example: "analytics"
 
     SourceRef:
       type: object
@@ -1356,8 +1371,24 @@ components:
 
     TableSource:
       type: object
-      description: Reserved for Iceberg `table` items; answered with `501` in this build (§1.2)
+      description: |
+        The source of a `table` item: an Iceberg table of the source repository, read at the
+        pinned ref. Requires the Iceberg REST catalog (`iceberg.enabled`); without it the item is
+        answered with `501` (§10.4). The item's `target` must be the catalog path
+        `<namespace>/<table>`, because a dataset answers the table at
+        `<dataset>.<ref>.<namespace>.<table>` (ICEBERG_CATALOG_PLAN.md §9).
       additionalProperties: {}
+      properties:
+        namespace:
+          type: string
+          description: |
+            Iceberg namespace holding the table, levels joined by `.`
+            (`analytics.sales` is the two-level namespace `[analytics, sales]`).
+          example: "analytics"
+        name:
+          type: string
+          description: Iceberg table name inside the namespace
+          example: "orders"
 
     Dataset:
       type: object
