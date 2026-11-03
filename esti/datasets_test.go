@@ -25,7 +25,13 @@
 //     dataset still readable;
 //  4. pull requests: create with a preview branch, browse the preview, merge, and close;
 //  5. access: a grant read by a user who is in no base ACL group (§9.6), while the sources stay
-//     unreadable to that user.
+//     unreadable to that user;
+//  6. table items: a dataset with an Iceberg `table` item is published and then read through
+//     /iceberg/api at `<dataset>.<ref>.<namespace>.<table>` with PyIceberg, and a write through
+//     that catalog into the dataset repository is denied. This is the I-6 exit criterion of
+//     ICEBERG_CATALOG_PLAN.md §11 and the read path of §9 of that plan; unlike the scenarios above
+//     it needs an S3-compatible blockstore and docker for the client steps, and it skips itself
+//     when the catalog does not serve the append it needs.
 //
 // Clean-room note (§2): this file was written from DATASETS_DESIGN.md and the public lakeFS
 // documentation only. It contains no code, SQL, protobuf or UI asset from lakeFS Enterprise and
@@ -63,6 +69,7 @@ import (
 	"github.com/thanhpk/randstr"
 	"github.com/treeverse/lakefs/pkg/api/apigen"
 	"github.com/treeverse/lakefs/pkg/api/apiutil"
+	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/testutil"
 )
@@ -90,13 +97,22 @@ type dsPath struct {
 	Path string `json:"path"`
 }
 
+// dsTableSource is the TableSource schema of api/datasets.yml (ICEBERG_CATALOG_PLAN.md §9): the
+// Iceberg table a `table` item materialises. Namespace levels are joined with ".", the form a
+// dataset definition stores and the form the catalog builds its ARNs from.
+type dsTableSource struct {
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+}
+
 type dsDataItem struct {
-	Target     string  `json:"target"`
-	Repository string  `json:"repository"`
-	Ref        dsRef   `json:"ref"`
-	Type       string  `json:"type"`
-	Object     *dsPath `json:"object,omitempty"`
-	Prefix     *dsPath `json:"prefix,omitempty"`
+	Target     string         `json:"target"`
+	Repository string         `json:"repository"`
+	Ref        dsRef          `json:"ref"`
+	Type       string         `json:"type"`
+	Object     *dsPath        `json:"object,omitempty"`
+	Prefix     *dsPath        `json:"prefix,omitempty"`
+	Table      *dsTableSource `json:"table,omitempty"`
 }
 
 type dsDefinition struct {
@@ -295,6 +311,7 @@ func (c *datasetsClient) must(ctx context.Context, want int, method, path string
 // datasetsEnv is one running lakefs-sso server with the datasets control plane enabled.
 type datasetsEnv struct {
 	t             *testing.T
+	baseURL       string // http://host:port, the server root
 	endpoint      string // http://host:port/api/v1
 	s3Host        string // host:port, for the S3 gateway clients
 	key           string
@@ -372,6 +389,12 @@ sso:
   storage_namespace_prefix: %q
   reconcile_interval: "24h"
   publish_timeout: "10m"
+# The Iceberg REST catalog is mounted for the whole suite, not only for the table-item scenario: a
+# table or namespace item is accepted only while iceberg.enabled is on (pkg/datasets IcebergEnabled,
+# ICEBERG_CATALOG_PLAN.md §9), and a dataset built from one is read back through /iceberg/api. The
+# other scenarios do not use the catalog, so enabling it changes nothing for them.
+iceberg:
+  enabled: true
 `, hostPort, dbSection, issuer, hostPort, blockstore.BlockstoreSection, blockstore.StorageNamespacePrefix)
 
 	configPath := filepath.Join(dir, "lakefs.yaml")
@@ -417,6 +440,7 @@ sso:
 
 	env := &datasetsEnv{
 		t:             t,
+		baseURL:       baseURL,
 		endpoint:      baseURL + apiutil.BaseURL,
 		s3Host:        hostPort,
 		key:           DefaultAdminAccessKeyID,
@@ -1285,3 +1309,420 @@ func testDatasetsAccessGrant(t *testing.T, env *datasetsEnv) {
 		require.Error(t, err, "after the revoke the consumer must lose access again")
 	})
 }
+
+// --- the Iceberg catalog read path of a dataset (I-6) ---------------------------------------
+
+// TestDatasetTableItem is the I-6 exit criterion of ICEBERG_CATALOG_PLAN.md §11: "Esti: dataset
+// with table item, published, then read via catalog at <ds>.v1", plus the §12 security assertion
+// that a write into a dataset repository is refused.
+//
+// The scenario is the §9 read path end to end:
+//
+//  1. PyIceberg creates a table and appends rows through the catalog of a *source* repository, so
+//     the catalog stages the pointer and every table file as lakeFS entries on the source branch
+//     (§6.2, §6.3), and the suite commits that branch;
+//  2. a dataset is defined with one `table` item pinned to that commit and published, which makes
+//     pkg/datasets copy the pointer and the pinned snapshot's files into the dataset repository;
+//  3. the published table is read back with PyIceberg through /iceberg/api at
+//     `<dataset>.v1.<namespace>.<table>`, and it must answer the source's metadata.json and rows:
+//     the copied pointer keeps the absolute physical addresses of §9, so nothing has to be
+//     rewritten for the dataset to serve it;
+//  4. a write through the same catalog into the dataset repository - a table create with PyIceberg
+//     and, with plain HTTP, a namespace create - must be denied. The branch, not the v1 tag, is the
+//     write target on purpose: a refusal there can only be the dataset immutability deny policy of
+//     §9.4 and not the catalog's read-only-ref rule of §14 Q-I4.
+//
+// It is a top-level test rather than a TestDatasets subtest so that it can be run on its own (§11's
+// validation command names it); it starts its own server, and `make esti` picks it up with the rest
+// of the package.
+func TestDatasetTableItem(t *testing.T) {
+	// §9 states the dataset read path as the catalog itself, and PyIceberg reads the table's files
+	// with its own FileIO, so this scenario needs what the Iceberg suite needs: an S3-compatible
+	// blockstore and a docker daemon for the client steps. Both are checked before the server
+	// starts, because the datasets harness picks its blockstore from the ambient environment.
+	requireIcebergS3Blockstore(t)
+	requireIcebergDocker(t)
+
+	env := newDatasetsEnv(t)
+	clients := env.icebergClients(t)
+	// The source table is populated through the catalog (§6.2, §6.3), which a catalog that does not
+	// advertise the commit operation cannot do. That is a skip with a reason, exactly as in
+	// esti/iceberg_test.go: without an append the table the dataset serves would be empty.
+	clients.requireCatalogAppend(t)
+
+	uid := uniqueSuffix()
+	source := "ds-iceberg-" + uid
+	env.createRepo(t, source, mainBranch)
+
+	const namespace, table = "analytics", "orders"
+
+	// The managed table location of §6.1 on the source repository: <storage_namespace>/_iceberg/<uuid>.
+	// It is what the append's commit validates (§13), and it is the location the dataset will serve
+	// unchanged because the dataset copies the files' full addresses (§9).
+	tableLocation := env.storageNamespace(t, source) + "/" + icebergcatalog.DataPrefix + "/" + uid
+
+	// The namespace has to exist before a table can be created in it: the spec's createTable answers
+	// 404 NoSuchNamespaceException otherwise (§6.1). Creating it through the catalog also stages its
+	// marker on the source branch, so the commit below is one ordinary lakeFS commit either way.
+	clients.createCatalogNamespace(t, source, mainBranch, namespace)
+
+	written := clients.runClient(t, "dataset-table-write", datasetTableWriteScript, map[string]string{
+		"ICEBERG_WAREHOUSE":      env.storageNamespace(t, source),
+		"ICEBERG_IDENTIFIER":     catalogIdentifier(t, source, mainBranch, namespace, table),
+		"ICEBERG_CREDENTIAL":     env.key + ":" + env.secret,
+		"ICEBERG_CATALOG_URI":    clients.dockerReachableURL(clients.catalogURL),
+		"ICEBERG_TABLE_LOCATION": tableLocation,
+	})
+	metadataLocation := stringField(t, written, "metadata_location")
+	tableUUID := stringField(t, written, "table_uuid")
+	sourceIDs := int64SliceField(t, written, "ids")
+	require.NotEmpty(t, sourceIDs, "the source table must have rows before it is published")
+	require.Truef(t, strings.HasPrefix(metadataLocation, tableLocation+"/"),
+		"the source metadata.json %q must live inside the managed table location %q", metadataLocation, tableLocation)
+
+	// The lakeFS commit publishes what the catalog staged on the source branch: the pointer and one
+	// entry per table file (§6.2, §6.3). Only a commit can be pinned, so the dataset definition
+	// below names its id.
+	sourceCommit := env.commit(t, source, mainBranch, "iceberg: source table for the dataset")
+
+	dataset := "table-item-" + uid
+	created := env.createDataset(t, dataset, dsDefinition{
+		FormatVersion: 1,
+		Description:   "A published Iceberg table",
+		Data: []dsDataItem{{
+			// §9: the target of a table item is the catalog path <namespace>/<table>, which is the
+			// <namespace>.<table> suffix the dataset answers the table at.
+			Target:     namespace + "/" + table,
+			Repository: source,
+			Ref:        dsRef{Type: "commit", ID: sourceCommit},
+			Type:       "table",
+			Table:      &dsTableSource{Namespace: namespace, Name: table},
+		}},
+	}, "publish the source table")
+	require.Equal(t, 1, created.Version, "create with publish produces v1")
+	require.Equal(t, "active", created.State)
+
+	read := clients.runClient(t, "dataset-table-read", datasetTableReadScript, map[string]string{
+		"ICEBERG_WAREHOUSE":        env.storageNamespace(t, dataset),
+		"ICEBERG_IDENTIFIER":       catalogIdentifier(t, dataset, "v1", namespace, table),
+		"ICEBERG_WRITE_IDENTIFIER": catalogIdentifier(t, dataset, "latest", namespace, "forged"),
+		"ICEBERG_CREDENTIAL":       env.key + ":" + env.secret,
+		"ICEBERG_CATALOG_URI":      clients.dockerReachableURL(clients.catalogURL),
+	})
+
+	require.Equal(t, sourceIDs, int64SliceField(t, read, "ids"),
+		"PyIceberg must read the published table's rows through %s at %s.v1.%s.%s",
+		clients.catalogURL, dataset, namespace, table)
+	require.Equal(t, metadataLocation, stringField(t, read, "metadata_location"),
+		"the dataset must serve the source's metadata.json, unrewritten (§9: the absolute paths stay valid)")
+	// The refusal comes from the catalog, so it is PyIceberg's ForbiddenError - the class it raises
+	// for a 403 - and not a transport failure or a client-side rejection.
+	writeError := stringField(t, read, "write_error")
+	require.True(t, boolField(t, read, "write_denied"),
+		"a catalog write into the dataset repository must be denied (§9.4 immutability deny); the step reported: %s",
+		writeError)
+	require.Truef(t, strings.HasPrefix(writeError, "ForbiddenError"),
+		"the denied write must be the catalog's 403 converted to PyIceberg's ForbiddenError; the step reported: %s",
+		writeError)
+	require.Equal(t, sourceIDs, int64SliceField(t, read, "ids_after"),
+		"the denied write must not change the published version")
+
+	t.Run("files_are_materialised", func(t *testing.T) {
+		// §9: a table item copies the pointer *and* every file of the pinned snapshot, so the files
+		// are entries of the dataset repository and not only of the source. That is what the
+		// dataset's own GC pins, and it is the property that makes the published version
+		// independent of what happens to the source branch afterwards.
+		entries := env.objectEntries(t, dataset, "v1", icebergTableFileEntryPrefix(tableUUID))
+		require.NotEmptyf(t, entries, "the dataset must carry the table's files under %q",
+			icebergTableFileEntryPrefix(tableUUID))
+		addresses := make([]string, 0, len(entries))
+		for _, address := range entries {
+			addresses = append(addresses, address)
+		}
+		require.Containsf(t, sortedValueList(addresses), metadataLocation,
+			"the dataset must stage an entry addressing the metadata.json it serves; staged addresses: %v",
+			sortedValueList(addresses))
+	})
+
+	t.Run("catalog_write_is_denied", func(t *testing.T) {
+		// §12 "Security tests / writes into a dataset repo get 403", asserted without a client, so
+		// the status cannot be a client's own refusal: a namespace create on the dataset's branch
+		// goes through the catalog's authorization (§7.2) and must be refused by the immutability
+		// deny policy of §9.4.
+		body, err := json.Marshal(map[string]any{
+			"namespace":  []string{dataset, "latest", "forbidden"},
+			"properties": map[string]string{},
+		})
+		require.NoError(t, err, "marshal the catalog namespace create")
+		status, response := clients.doJSON(t, http.MethodPost, clients.namespacesURL(clients.catalogURL), body)
+		require.Equalf(t, http.StatusForbidden, status,
+			"a catalog write into the dataset repository must be denied: %s", response)
+		require.Containsf(t, string(response), icebergcatalog.ErrTypeForbidden,
+			"the refusal must be the catalog's ForbiddenException: %s", response)
+	})
+}
+
+// requireCatalogAppend skips the test when the catalog does not advertise the commit operation.
+//
+// The source table is created *and appended to* through the catalog, which is what makes the
+// catalog stage the pointer and the table files the dataset copies (§6.2, §6.3). GET /v1/config is
+// the catalog's own statement about what it serves (§2.1), so an operation missing from it is not
+// implemented and the I-6 exit criterion has no rows to read: a skip with the reason, not a failure.
+func (e *icebergEnv) requireCatalogAppend(t *testing.T) {
+	t.Helper()
+	status, body := e.doJSON(t, http.MethodGet, e.catalogURL+"/v1/config", nil)
+	require.Equalf(t, http.StatusOK, status, "GET /v1/config: %s", body)
+
+	var config struct {
+		Endpoints []string `json:"endpoints"`
+	}
+	require.NoErrorf(t, json.Unmarshal(body, &config), "decode GET /v1/config: %s", body)
+	if !containsString(config.Endpoints, icebergCommitEndpoint) {
+		t.Skipf("the catalog does not advertise %q, so the source table cannot be appended to through "+
+			"it and the published dataset would hold an empty table; skipping the I-6 exit criterion",
+			icebergCommitEndpoint)
+	}
+}
+
+// objectEntries lists the entries of repo at ref below prefix and returns them by path with the
+// physical address each one points at. A materialised table file is staged with AddressType=Full
+// (§6.3), so the address is the object the client wrote - which is also the object the catalog
+// reads when it serves the table.
+func (e *datasetsEnv) objectEntries(t *testing.T, repo, ref, prefix string) map[string]string {
+	t.Helper()
+	entries := make(map[string]string)
+	after := apigen.PaginationAfter("")
+	for {
+		amount := apigen.PaginationAmount(icebergCommitPageSize)
+		objectPrefix := apigen.PaginationPrefix(prefix)
+		params := &apigen.ListObjectsParams{Prefix: &objectPrefix, Amount: &amount}
+		if after != "" {
+			params.After = &after
+		}
+		res, err := e.core.ListObjectsWithResponse(t.Context(), repo, ref, params)
+		require.NoErrorf(t, err, "list %q at %s/%s", prefix, repo, ref)
+		require.Equalf(t, http.StatusOK, res.StatusCode(), "list %q at %s/%s: %s", prefix, repo, ref, res.Body)
+		require.NotNilf(t, res.JSON200, "list %q at %s/%s: %s", prefix, repo, ref, res.Body)
+		for _, object := range res.JSON200.Results {
+			entries[object.Path] = object.PhysicalAddress
+		}
+		if !res.JSON200.Pagination.HasMore {
+			return entries
+		}
+		after = apigen.PaginationAfter(res.JSON200.Pagination.NextOffset)
+	}
+}
+
+// icebergClients returns the client half of the Iceberg esti harness (iceberg_utils.go) pointed at
+// this datasets server: the S3 configuration the server and the client containers share, the docker
+// image the client steps run in, and runClient, the only part of that harness reused here. Nothing
+// starts a second server - the struct is a carrier for the client plumbing, and the catalog URL is
+// the one this suite's server mounts.
+func (e *datasetsEnv) icebergClients(t *testing.T) *icebergEnv {
+	t.Helper()
+	return &icebergEnv{
+		baseURL:     e.baseURL,
+		catalogURL:  e.baseURL + icebergcatalog.APIBasePath,
+		key:         e.key,
+		secret:      e.secret,
+		clientImage: icebergClientImage(),
+		s3:          icebergS3Settings(t),
+		workDir:     t.TempDir(),
+	}
+}
+
+// storageNamespace returns the storage namespace of repo as the core API reports it, so the client
+// steps are pointed at the namespace the server actually created rather than one reassembled here.
+func (e *datasetsEnv) storageNamespace(t *testing.T, repo string) string {
+	t.Helper()
+	res, err := e.core.GetRepositoryWithResponse(t.Context(), repo)
+	require.NoErrorf(t, err, "get repository %s", repo)
+	require.Equalf(t, http.StatusOK, res.StatusCode(), "get repository %s: %s", repo, res.Body)
+	require.NotNilf(t, res.JSON200, "get repository %s: %s", repo, res.Body)
+	return res.JSON200.StorageNamespace
+}
+
+// createCatalogNamespace creates the catalog namespace repo.ref.levels through the REST API, with
+// the spec's CreateNamespace body: the levels carry the repository and the ref first (§5), exactly
+// like every other catalog identifier.
+func (e *icebergEnv) createCatalogNamespace(t *testing.T, repo, ref string, levels ...string) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"namespace":  append([]string{repo, ref}, levels...),
+		"properties": map[string]string{},
+	})
+	require.NoError(t, err, "marshal the catalog namespace create")
+	status, response := e.doJSON(t, http.MethodPost, e.namespacesURL(e.catalogURL), body)
+	require.Equalf(t, http.StatusOK, status, "create the catalog namespace %v: %s", levels, response)
+}
+
+// catalogIdentifier encodes a client-visible identifier of §5 - repository, ref, then the table's
+// own namespace levels and the table - in the form the client steps read from their environment.
+func catalogIdentifier(t *testing.T, repo, ref string, levels ...string) string {
+	t.Helper()
+	identifier := append([]string{repo, ref}, levels...)
+	encoded, err := json.Marshal(identifier)
+	require.NoError(t, err, "marshal the catalog identifier %v", identifier)
+	return string(encoded)
+}
+
+// boolField reads one boolean out of a step's result.
+func boolField(t *testing.T, result map[string]any, key string) bool {
+	t.Helper()
+	raw, ok := result[key]
+	require.Truef(t, ok, "the step result has no %q field: %v", key, result)
+	value, ok := raw.(bool)
+	require.Truef(t, ok, "%q of the step result is not a boolean: %v", key, raw)
+	return value
+}
+
+// datasetTableWriteScript writes the source table of the table-item scenario: PyIceberg creates and
+// appends through the catalog, so every file and the pointer are staged as lakeFS entries on the
+// source branch (ICEBERG_CATALOG_PLAN.md §6.2, §6.3). It prints the metadata.json it committed, the
+// table uuid that names its file entries, and the rows a reader gets back.
+//
+// Both client steps authenticate with HTTP basic rather than with a `credential`:
+// the token exchange of POST /v1/oauth/tokens is a subject of its own (I1-5), while what is under
+// test here is the dataset's read path, and §7.1 says the catalog accepts basic on every route.
+const datasetTableWriteScript = `
+import json
+import os
+
+import pyarrow as pa
+from pyiceberg.catalog.rest import RestCatalog
+
+
+def required(name):
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit("missing environment variable " + name)
+    return value
+
+
+def basic_auth():
+    # The catalog accepts HTTP basic on every route (§7.1), which is one of the two ways a client
+    # can present its access key pair. This scenario is about the dataset, not about the token
+    # exchange, so it does not go through POST /v1/oauth/tokens.
+    access_key, secret_key = required("ICEBERG_CREDENTIAL").split(":", 1)
+    return {"type": "basic", "basic": {"username": access_key, "password": secret_key}}
+
+
+file_io_properties = {
+    "s3.access-key-id": required("ICEBERG_S3_KEY"),
+    "s3.secret-access-key": required("ICEBERG_S3_SECRET"),
+    "s3.region": os.environ.get("ICEBERG_S3_REGION", "us-east-1"),
+}
+if os.environ.get("ICEBERG_S3_ENDPOINT"):
+    file_io_properties["s3.endpoint"] = os.environ["ICEBERG_S3_ENDPOINT"]
+    file_io_properties["s3.path-style-access"] = os.environ.get("ICEBERG_S3_PATH_STYLE", "true")
+
+catalog = RestCatalog(
+    name="lakefs",
+    uri=required("ICEBERG_CATALOG_URI"),
+    warehouse=required("ICEBERG_WAREHOUSE"),
+    auth=basic_auth(),
+    **file_io_properties,
+)
+identifier = tuple(json.loads(required("ICEBERG_IDENTIFIER")))
+schema = pa.schema([
+    pa.field("id", pa.int64(), nullable=False),
+    pa.field("name", pa.string(), nullable=False),
+])
+rows = [{"id": 1, "name": "alpha"}, {"id": 2, "name": "beta"}, {"id": 3, "name": "gamma"}]
+
+# The explicit location is the managed table location of §6.1, which is what the append's commit
+# validates (§13) and what the uncommitted-GC grace protects (§6.3).
+table = catalog.create_table(identifier, schema=schema, location=required("ICEBERG_TABLE_LOCATION"))
+table.append(pa.Table.from_pylist(rows, schema=schema))
+
+# Reload, so the reported metadata-location and rows describe the commit the catalog just staged.
+table = catalog.load_table(identifier)
+print("RESULT:" + json.dumps({
+    "metadata_location": table.metadata_location,
+    "table_uuid": str(table.metadata.table_uuid),
+    "ids": sorted(row["id"] for row in table.scan().to_arrow().to_pylist()),
+}))
+`
+
+// datasetTableReadScript is the I-6 assertion: read the published dataset table through the catalog
+// with PyIceberg, and try to write through the same catalog into the dataset repository.
+//
+// The read identifier names the dataset's version tag, <dataset>.<ref>.<namespace>.<table>, which
+// is the address §9 promises. The write identifier names a table on the dataset's *branch*, so a
+// refusal cannot be the catalog's read-only-ref rule for tags (§14 Q-I4): it can only be the
+// immutability deny policy that makes a dataset repository read-only (§9.4).
+const datasetTableReadScript = `
+import json
+import os
+
+import pyarrow as pa
+from pyiceberg.catalog.rest import RestCatalog
+
+
+def required(name):
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit("missing environment variable " + name)
+    return value
+
+
+def basic_auth():
+    # The catalog accepts HTTP basic on every route (§7.1), which is one of the two ways a client
+    # can present its access key pair. This scenario is about the dataset, not about the token
+    # exchange, so it does not go through POST /v1/oauth/tokens.
+    access_key, secret_key = required("ICEBERG_CREDENTIAL").split(":", 1)
+    return {"type": "basic", "basic": {"username": access_key, "password": secret_key}}
+
+
+file_io_properties = {
+    "s3.access-key-id": required("ICEBERG_S3_KEY"),
+    "s3.secret-access-key": required("ICEBERG_S3_SECRET"),
+    "s3.region": os.environ.get("ICEBERG_S3_REGION", "us-east-1"),
+}
+if os.environ.get("ICEBERG_S3_ENDPOINT"):
+    file_io_properties["s3.endpoint"] = os.environ["ICEBERG_S3_ENDPOINT"]
+    file_io_properties["s3.path-style-access"] = os.environ.get("ICEBERG_S3_PATH_STYLE", "true")
+
+catalog = RestCatalog(
+    name="lakefs",
+    uri=required("ICEBERG_CATALOG_URI"),
+    warehouse=required("ICEBERG_WAREHOUSE"),
+    auth=basic_auth(),
+    **file_io_properties,
+)
+read_identifier = tuple(json.loads(required("ICEBERG_IDENTIFIER")))
+write_identifier = tuple(json.loads(required("ICEBERG_WRITE_IDENTIFIER")))
+
+# The read: the published table of the dataset, scanned exactly like any other Iceberg table.
+table = catalog.load_table(read_identifier)
+metadata_location = table.metadata_location
+ids = sorted(row["id"] for row in table.scan().to_arrow().to_pylist())
+
+# The write: a table create through the catalog into the dataset repository, which must be refused.
+# It is a catalog-only write - no data file is written before it - so a refusal cannot be a
+# data-plane failure, and the name it would create must not exist. The refusal is the assertion, so
+# any exception counts and is reported verbatim; a success is what fails the test. PyIceberg raises
+# ForbiddenError for the catalog's 403, which the Go side pins.
+schema = pa.schema([
+    pa.field("id", pa.int64(), nullable=False),
+    pa.field("name", pa.string(), nullable=False),
+])
+write_denied = False
+write_error = ""
+try:
+    catalog.create_table(write_identifier, schema=schema)
+    write_error = "the catalog accepted a table create in the dataset repository"
+except Exception as exc:
+    write_denied = True
+    write_error = type(exc).__name__ + ": " + str(exc)
+
+# And the published version is untouched by the attempt.
+after = catalog.load_table(read_identifier)
+print("RESULT:" + json.dumps({
+    "metadata_location": metadata_location,
+    "ids": ids,
+    "write_denied": write_denied,
+    "write_error": write_error,
+    "ids_after": sorted(row["id"] for row in after.scan().to_arrow().to_pylist()),
+}))
+`
