@@ -76,7 +76,7 @@ import { ConfirmationModal } from '../../../lib/components/modals';
 import { Link } from '../../../lib/components/nav';
 import Card from 'react-bootstrap/Card';
 import { mergeResults } from '../../../lib/components/repository/mergeResults';
-import { TablesEnterpriseInfo } from '../../../lib/components/repository/tablesEnterpriseInfo';
+import { TablesTab } from '../../../lib/components/repository/tablesExplorer';
 
 const README_FILE_NAME = 'README.md';
 const REPOSITORY_AGE_BEFORE_GC = 14;
@@ -1541,7 +1541,14 @@ const ObjectsBrowser = ({ storageConfig }) => {
                 }}
             >
                 {dataView === DATA_VIEW_TABLES ? (
-                    <TablesEnterpriseInfo />
+                    // The Iceberg catalog explorer when the catalog is enabled; when it answers 501
+                    // (iceberg.enabled=false) the tab keeps the Enterprise upsell, and a 403 shows
+                    // the catalog's permission state (tablesExplorer.tsx).
+                    reference ? (
+                        <TablesTab repository={repo.id} refId={reference.id} />
+                    ) : (
+                        <Loading />
+                    )
                 ) : (
                     <>
                         <TreeContainer

@@ -4,7 +4,7 @@ package icebergcatalog
 // tests of §12).
 //
 // A catalog client is a machine: Spark, Trino, PyIceberg, DuckDB or iceberg-go. It has no browser
-// and no session cookie, so the catalog accepts exactly the two schemes such a client can send:
+// and no session cookie, so the catalog accepts these two schemes from it:
 //
 //   - Authorization: Bearer <token>, a lakeFS JWT - either minted by POST /v1/oauth/tokens
 //     (oauth.go) or handed to the client as a static token - verified with auth.VerifyToken
@@ -14,15 +14,29 @@ package icebergcatalog
 //     scheme uses, so access keys, external principals and any configured Authenticator behave
 //     identically here and there.
 //
-// There is no browser flow (§7.1): an SSO user reaches the catalog with an access key. Every
-// interactive scheme (cookie session, OIDC, SAML) needs a browser that a catalog client does not
-// have, and accepting one here would authenticate the server's user rather than the client's.
+// One more scheme is served, for the *browser* rather than for a catalog client: the lakeFS login
+// session cookie (the cookie_auth scheme of api.GenericAuthMiddleware, read here as the same
+// internal_auth_session session carrying the same token). The web UI authenticates by cookie, and
+// the repository Tables tab explores the catalog's own read endpoints through it, so without the
+// cookie a signed-in user's browser could not read the tables it is allowed to read. The cookie is
+// accepted for GET and HEAD only:
+//
+//   - a cookie is the one credential a browser attaches by itself, so accepting it for a write
+//     would let any page the user visits issue that write on their behalf. Reads cannot change
+//     catalog state, which is what keeps the UI path free of a CSRF-exposed write;
+//   - catalog clients never send one, so no client loses an option it had;
+//   - POST /v1/oauth/tokens is a POST and is served before this decision is made (middleware), so
+//     a cookie cannot be exchanged for a token either.
+//
+// Every other interactive scheme (OIDC, SAML) stays out (§7.1): those need a browser flow and a
+// cookie verification configuration that a catalog client cannot drive, and a catalog mount has
+// no login or callback route to host it.
 //
 // Two answers are deliberately detail-free (§7.1, and §12 "OAuth with bad creds gets 401 and
 // leaks no detail"): a rejected credential is answered 401 with the constant message of
 // authFailureMessage, and the token endpoint's invalid_client carries no error_description. The
 // cause goes to the server log, never to the client, so a caller cannot learn whether an access
-// key exists, whether the secret was close, or which of the two schemes matched.
+// key exists, whether the secret was close, or which of the schemes matched.
 //
 // Clean-room note: written from ICEBERG_CATALOG_PLAN.md, the Apache Iceberg REST OpenAPI spec
 // (https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml), RFC 6749 and
@@ -37,6 +51,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/gorilla/sessions"
 	cmdpkg "github.com/treeverse/lakefs/cmd/lakefs/cmd"
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/model"
@@ -56,6 +71,16 @@ const (
 	bearerScheme = "Bearer"
 )
 
+// cookieAuthMethods are the methods the login session cookie authenticates. They are exactly the
+// methods a catalog read uses: GET for the operations themselves and HEAD for TableExists and
+// NamespaceExists. Everything else - POST, PUT, PATCH, DELETE, and the token endpoint's POST -
+// requires a bearer token or HTTP basic, so no state-changing request is ever authorised by a
+// credential the browser supplies on its own (see the file comment).
+var cookieAuthMethods = map[string]bool{
+	http.MethodGet:  true,
+	http.MethodHead: true,
+}
+
 // catalogAuth is the catalog's authentication: it turns the credentials of a request into the
 // lakeFS user behind them, and it is the only place that mints a token (§7.1).
 type catalogAuth struct {
@@ -63,6 +88,10 @@ type catalogAuth struct {
 	authService   auth.Service
 	authenticator auth.Authenticator
 	cfg           *Config
+	// sessionStore reads the browser's login session, with the same key and the same session
+	// name api.GenericAuthMiddleware uses for the core API's cookie_auth scheme: the cookie the
+	// UI is signed in with is the cookie this middleware verifies.
+	sessionStore sessions.Store
 	// now is the clock the token's issue and expiry times are taken from. It is a field so that a
 	// test can pin it and assert the iat/exp claims exactly.
 	now func() time.Time
@@ -118,6 +147,7 @@ func newCatalogAuth(deps cmdpkg.ServerDeps, cfg *Config) (*catalogAuth, error) {
 		authService:   deps.AuthService,
 		authenticator: deps.Authenticator,
 		cfg:           cfg,
+		sessionStore:  sessions.NewCookieStore(deps.AuthService.SecretStore().SharedSecret()),
 		now:           time.Now,
 	}, nil
 }
@@ -173,7 +203,40 @@ func (a *catalogAuth) authenticateRequest(r *http.Request) (*model.User, error) 
 	if accessKey, secretKey, ok := r.BasicAuth(); ok {
 		return a.userFromCredentials(r.Context(), accessKey, secretKey)
 	}
+	if cookieAuthMethods[r.Method] {
+		return a.userFromCookie(r)
+	}
 	return nil, nil //nolint:nilnil // "no credentials" is not an error: requireUser answers it.
+}
+
+// userFromCookie resolves the lakeFS login session cookie the web UI is signed in with. It is the
+// same session and the same token key the core API's cookie_auth scheme reads
+// (api.GenericAuthMiddleware, pkg/api/auth_middleware.go), verified the same way - through
+// auth.UserByToken, so the signature, the expiry, the audience and the existence of the user are
+// all checked exactly as they are on a core route.
+//
+// A request without the cookie, or with a session that carries no token, has no cookie
+// credential: (nil, nil), which requireUser answers with 401 - the same answer an anonymous
+// request gets, and the answer the UI turns into a login redirect. A session whose token does not
+// verify is a rejected credential (an error), not an absent one, and is logged as such.
+func (a *catalogAuth) userFromCookie(r *http.Request) (*model.User, error) {
+	// The error is deliberately ignored, as api.GenericAuthMiddleware's cookie_auth scheme ignores
+	// it: gorilla/sessions reports a missing or undecodable cookie as an error while still
+	// returning a session to read, so the token - not the error - decides whether there is a
+	// cookie credential.
+	session, _ := a.sessionStore.Get(r, auth.InternalAuthSessionName)
+	token := ""
+	if session != nil {
+		token, _ = session.Values[auth.TokenSessionKeyName].(string)
+	}
+	if token == "" {
+		return nil, nil //nolint:nilnil // no cookie credential: requireUser answers it.
+	}
+	user, err := auth.UserByToken(r.Context(), a.authService, token)
+	if err != nil {
+		return nil, fmt.Errorf("%w: session cookie: %w", auth.ErrAuthenticatingRequest, err)
+	}
+	return user, nil
 }
 
 // requestPath is the path of the request relative to the catalog mount, which is the path the

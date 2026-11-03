@@ -5,12 +5,15 @@ package icebergcatalog
 // 401 without detail. The token endpoint those credentials can be exchanged at is in oauth_test.go.
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/gorilla/sessions"
 	"github.com/stretchr/testify/require"
 	cmdpkg "github.com/treeverse/lakefs/cmd/lakefs/cmd"
 	"github.com/treeverse/lakefs/pkg/auth"
@@ -181,4 +184,178 @@ func TestAuthMiddlewareNeedsDeps(t *testing.T) {
 	middleware, err := NewAuthMiddleware(cmdpkg.ServerDeps{}, nil)
 	require.ErrorIs(t, err, ErrMissingDeps)
 	require.Nil(t, middleware)
+}
+
+// sessionCookie builds the lakeFS login session cookie the web UI sends: the same
+// internal_auth_session session, signed with the same auth service secret, carrying the same
+// token key that api.GenericAuthMiddleware's cookie_auth scheme reads. It is written by the same
+// gorilla/sessions store the middleware reads, so the test proves the cookie path end to end
+// rather than by mocking the session.
+func sessionCookie(t *testing.T, deps cmdpkg.ServerDeps, token string) *http.Cookie {
+	t.Helper()
+	store := sessions.NewCookieStore(deps.AuthService.SecretStore().SharedSecret())
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	session, err := store.New(req, auth.InternalAuthSessionName)
+	require.NoError(t, err)
+	session.Values[auth.TokenSessionKeyName] = token
+	rec := httptest.NewRecorder()
+	require.NoError(t, session.Save(req, rec))
+	cookies := rec.Result().Cookies()
+	require.Len(t, cookies, 1, "the session store wrote exactly one cookie")
+	return cookies[0]
+}
+
+// cookieRequest sends a request authenticated only by the cookie the browser holds.
+func cookieRequest(t *testing.T, handler http.Handler, method, path string, cookie *http.Cookie) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestAuthAcceptsCookieOnReads is the UI half of §7.1: the web UI authenticates by cookie, so the
+// catalog's read endpoints accept the lakeFS login session for GET and HEAD. Without it a
+// signed-in user's browser could not read the tables it is allowed to read at all.
+func TestAuthAcceptsCookieOnReads(t *testing.T) {
+	cfg := &Config{Prefix: CatalogPrefix, TokenTTL: time.Hour, MaxRequestBody: DefaultMaxRequestBody}
+	router, deps := authTestRouter(t, cfg)
+	cookie := sessionCookie(t, deps, mintToken(t, router))
+
+	t.Run("GET is served", func(t *testing.T) {
+		rec := cookieRequest(t, router, http.MethodGet, catalogPath(configPath), cookie)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		var response CatalogConfig
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+		require.Equal(t, map[string]string{"prefix": CatalogPrefix}, response.Overrides)
+	})
+
+	t.Run("HEAD is authenticated", func(t *testing.T) {
+		// GET /v1/config is the only route this minimal router serves, so HEAD reaches the router
+		// and is answered 405 there. That is the proof: 405 means the request got past
+		// authentication and the authenticated-user requirement; a cookie the middleware did not
+		// accept would be answered 401 by requireUser.
+		rec := cookieRequest(t, router, http.MethodHead, catalogPath(configPath), cookie)
+		require.Equal(t, http.StatusMethodNotAllowed, rec.Code, "body: %s", rec.Body.String())
+	})
+}
+
+// TestAuthRejectsCookieOnWrites pins the boundary the UI path must not cross: a cookie is the one
+// credential a browser attaches by itself, so it authenticates no state-changing request. A
+// session cookie on a POST or a DELETE is 401 - the caller has no credential the catalog accepts -
+// which is what keeps the cookie path free of a CSRF-exposed write.
+func TestAuthRejectsCookieOnWrites(t *testing.T) {
+	cfg := &Config{Prefix: CatalogPrefix, TokenTTL: time.Hour, MaxRequestBody: DefaultMaxRequestBody}
+	router, deps := authTestRouter(t, cfg)
+	cookie := sessionCookie(t, deps, mintToken(t, router))
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			rec := cookieRequest(t, router, method, catalogPath(configPath), cookie)
+			requireUnauthorized(t, rec)
+		})
+	}
+
+	t.Run("POST "+OAuthTokenPath+" is not authenticated by a cookie", func(t *testing.T) {
+		// The token endpoint is the one POST an unauthenticated caller may make, and it must not
+		// accept the browser session either: a cookie is not an access key pair, so a
+		// client_credentials request whose pair does not verify is answered 401 invalid_client and
+		// mints no token.
+		body := strings.NewReader("grant_type=" + grantTypeClientCredentials + "&client_id=nobody&client_secret=wrong")
+		req := httptest.NewRequest(http.MethodPost, catalogPath(OAuthTokenPath), body)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusUnauthorized, rec.Code, "body: %s", rec.Body.String())
+		require.NotContains(t, rec.Body.String(), "access_token")
+	})
+}
+
+// TestAuthAcceptsCookieOnTheTableRoutes proves the cookie works where the UI needs it: on the
+// read routes the repository Tables tab calls, with the user on the request context the handlers
+// read (not only on GET /v1/config). The route table is a stand-in that echoes the authenticated
+// user, because this task changes authentication and not the table handlers.
+func TestAuthAcceptsCookieOnTheTableRoutes(t *testing.T) {
+	cfg := &Config{Prefix: CatalogPrefix, TokenTTL: time.Hour, MaxRequestBody: DefaultMaxRequestBody}
+	deps := newServerDeps(t)
+	middleware, err := NewAuthMiddleware(deps, cfg)
+	require.NoError(t, err)
+
+	whoami := func(w http.ResponseWriter, r *http.Request) {
+		user, err := auth.GetUser(r.Context())
+		if err != nil {
+			writeIcebergError(w, http.StatusUnauthorized, ErrTypeNotAuthorized, authFailureMessage(http.StatusUnauthorized))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"user": user.Username})
+	}
+	serve := testServer(cfg,
+		route{method: http.MethodGet, pattern: "/v1/{prefix}/namespaces", handler: whoami},
+		route{method: http.MethodGet, pattern: "/v1/{prefix}/namespaces/{namespace}", handler: whoami},
+		route{method: http.MethodGet, pattern: "/v1/{prefix}/namespaces/{namespace}/tables", handler: whoami},
+		route{method: http.MethodGet, pattern: "/v1/{prefix}/namespaces/{namespace}/tables/{table}", handler: whoami},
+	)
+	router, err := newRouter(middleware, cfg, serve)
+	require.NoError(t, err)
+	mux := coreRouter()
+	mux.Mount(APIBasePath, router)
+
+	cookie := sessionCookie(t, deps, mintToken(t, mux))
+	for _, path := range []string{
+		"/v1/" + CatalogPrefix + "/namespaces",
+		"/v1/" + CatalogPrefix + "/namespaces/repo%1Fmain",
+		"/v1/" + CatalogPrefix + "/namespaces/repo%1Fmain/tables",
+		"/v1/" + CatalogPrefix + "/namespaces/repo%1Fmain%1Finventory/tables/books",
+	} {
+		t.Run(path, func(t *testing.T) {
+			rec := cookieRequest(t, mux, http.MethodGet, catalogPath(path), cookie)
+			require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+			require.JSONEq(t, `{"user":"`+testUsername+`"}`, rec.Body.String(),
+				"the handler sees the user the cookie authenticated")
+		})
+	}
+}
+
+// TestAuthRejectsBadCookie: a session cookie the catalog cannot trust is a rejected credential,
+// not an accepted one - an expired login token, a token signed with another key, and a cookie the
+// session store cannot decode.
+func TestAuthRejectsBadCookie(t *testing.T) {
+	cfg := &Config{Prefix: CatalogPrefix, TokenTTL: time.Hour, MaxRequestBody: DefaultMaxRequestBody}
+	router, deps := authTestRouter(t, cfg)
+	secret := deps.AuthService.SecretStore().SharedSecret()
+
+	expired, err := auth.GenerateJWTLogin(secret, testUsername, time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour))
+	require.NoError(t, err)
+	foreignKey, err := auth.GenerateJWTLogin([]byte("a-different-secret"), testUsername, time.Now(), time.Now().Add(time.Hour))
+	require.NoError(t, err)
+
+	for name, token := range map[string]string{
+		"an expired session token":          expired,
+		"a session token for another key":   foreignKey,
+		"a session token that is not a jwt": "not-a-jwt",
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := cookieRequest(t, router, http.MethodGet, catalogPath(configPath), sessionCookie(t, deps, token))
+			requireUnauthorized(t, rec, token)
+		})
+	}
+
+	t.Run("a cookie this server did not sign", func(t *testing.T) {
+		rec := cookieRequest(t, router, http.MethodGet, catalogPath(configPath),
+			&http.Cookie{Name: auth.InternalAuthSessionName, Value: "forged"})
+		requireUnauthorized(t, rec)
+	})
+
+	t.Run("a session without a token authenticates nothing", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		store := sessions.NewCookieStore(secret)
+		session, err := store.New(req, auth.InternalAuthSessionName)
+		require.NoError(t, err)
+		rec := httptest.NewRecorder()
+		require.NoError(t, session.Save(req, rec))
+		got := cookieRequest(t, router, http.MethodGet, catalogPath(configPath), rec.Result().Cookies()[0])
+		requireUnauthorized(t, got)
+	})
 }
