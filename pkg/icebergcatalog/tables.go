@@ -22,6 +22,12 @@ package icebergcatalog
 //	POST   /v1/{prefix}/namespaces/{repo<sep>ref<sep>ns…}/tables/{table}/metrics
 //	    ReportMetricsRequest in, 204 out: the report is accepted and discarded
 //
+// The seventh operation of the path, the commit (POST on the table rather than on tables or
+// metrics), is served by commit_http.go; its route and endpoint constant are part of the table
+// service here, so mounting the table surface mounts the whole of it. This file also owns the entity
+// tag of a table load (tableLoadETag): a 304 is an answer of the load handler, so the tag belongs
+// next to it.
+//
 // A table is read on Address.Ref, which may be a branch, a tag or a commit: that is the any-ref
 // read of §1.1 goal 1, the reason the pointer and its metadata.json are resolved through the
 // store's ref-agnostic path rather than through a branch name.
@@ -151,6 +157,8 @@ package icebergcatalog
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -182,6 +190,7 @@ const (
 
 	// The wire forms advertised in GET /v1/config once this file's routes are mounted. They are
 	// the operation paths of the REST OpenAPI spec with the catalog's {prefix} segment.
+	// commitTableEndpoint itself is declared in commit_http.go, next to the handler it advertises.
 	listTablesEndpoint    = "GET /v1/{prefix}/namespaces/{namespace}/tables"
 	loadTableEndpoint     = "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}"
 	tableExistsEndpoint   = "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}"
@@ -251,6 +260,11 @@ type tableService struct {
 	authz  *Authorizer
 	lister TableLister
 	prefix string
+
+	// maxBody is iceberg.max_request_body: the bound this service applies to a request body it
+	// reads itself (the commit of commit_http.go). The router's middleware already bounds every
+	// body, but a service mounted without it must still refuse an unbounded one (§10, §12).
+	maxBody int64
 }
 
 // NewTableService builds the table read surface. The prefix is the value of GET /v1/config
@@ -267,7 +281,13 @@ func NewTableService(store *Store, authz *Authorizer, lister TableLister, cfg *C
 	if prefix == "" {
 		prefix = CatalogPrefix
 	}
-	return &tableService{store: store, authz: authz, lister: lister, prefix: prefix}
+	return &tableService{
+		store:   store,
+		authz:   authz,
+		lister:  lister,
+		prefix:  prefix,
+		maxBody: maxRequestBody(cfg),
+	}
 }
 
 // Routes is this file's contribution to the catalog route table (server.ownRoutes in http.go).
@@ -298,6 +318,14 @@ func (s *tableService) Routes() []route {
 			pattern:  tablesPattern,
 			handler:  s.handleCreateTable,
 			endpoint: createTableEndpoint,
+		},
+		{
+			// The commit of §6.2 / commit_http.go. It shares its path with the load and the drop;
+			// only the method tells the three apart.
+			method:   http.MethodPost,
+			pattern:  tablePattern,
+			handler:  s.handleCommitTable,
+			endpoint: commitTableEndpoint,
 		},
 		{
 			method:   http.MethodDelete,
@@ -476,6 +504,16 @@ func (s *tableService) handleLoadTable(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		metadata = filtered
+	}
+
+	// The entity tag of this representation, and the conditional answer of §2.1 / I5-2: a client
+	// that already holds this exact table (and this exact snapshots mode) is answered 304 with no
+	// body. The tag is set on the 304 too, as RFC 9110 requires of a validator response.
+	etag := tableLoadETag(table.Pointer.MetadataLocation, mode)
+	w.Header().Set("ETag", etag)
+	if ifNoneMatchMatches(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
 	}
 	writeJSON(w, http.StatusOK, loadTableResult{
 		// The physical URI of the pointer's metadata.json, never a lakeFS path: the client reads
@@ -895,6 +933,64 @@ func tableNameOfPointer(prefix, entryPath string) (string, bool, error) {
 		return "", false, fmt.Errorf("table pointer %q: %w", entryPath, err)
 	}
 	return name, true, nil
+}
+
+// ---------------------------------------------------------------------------------------------
+// Table-load entity tags (§2.1 "ETag / If-None-Match", §11 I-5)
+// ---------------------------------------------------------------------------------------------
+//
+// ETags are optional in the spec, but the one requirement it does put on them is load-bearing: the
+// tag must vary with the `snapshots` query parameter. `all` and `refs` are two different
+// representations of the same table - the second carries only the snapshots a branch or a tag
+// points at - so a tag derived from the table alone would let a client that cached `all` be handed
+// that representation for a `refs` request, or the reverse: a silently wrong answer instead of a
+// 304. The tag below is therefore a digest of both the thing that changes on every commit (the
+// pointer's metadata-location) and the mode that selects the representation.
+//
+// The tag is strong: the same location and the same mode always describe the same document, because
+// a metadata.json is never rewritten in place (§6.2, metadata.go) and refs-mode filtering is
+// deterministic over it. A client that sends no If-None-Match is unaffected - it gets the full
+// response, and the tag is only information it may use later.
+
+// tableLoadETag returns the entity tag of a table-load response for a metadata location and a
+// snapshots mode. The digest is quoted, as an ETag header value must be (RFC 9110 §8.8.3).
+func tableLoadETag(metadataLocation, snapshotsMode string) string {
+	digest := sha256.Sum256([]byte(metadataLocation + "\x1f" + snapshotsMode))
+	return `"` + hex.EncodeToString(digest[:]) + `"`
+}
+
+// ifNoneMatchMatches reports whether an If-None-Match header value matches etag.
+//
+// The comparison is the weak one RFC 9110 §13.1.2 defines for If-None-Match: a W/ prefix is
+// ignored and only the opaque tag is compared, so a client that stored a weak tag still gets its
+// 304. A list is honoured as a list (If-None-Match takes one or more entity tags), and `*` matches
+// any current representation.
+func ifNoneMatchMatches(header, etag string) bool {
+	if header == "" {
+		return false
+	}
+	opaque := etagOpaque(etag)
+	for _, candidate := range strings.Split(header, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if candidate == "*" {
+			return true
+		}
+		if etagOpaque(candidate) == opaque {
+			return true
+		}
+	}
+	return false
+}
+
+// etagOpaque strips the weak marker and the quotes from one entity tag, so two tags are compared
+// by the value they carry rather than by how a client happened to write it down.
+func etagOpaque(tag string) string {
+	tag = strings.TrimSpace(tag)
+	tag = strings.TrimPrefix(tag, "W/")
+	return strings.Trim(tag, `"`)
 }
 
 // parseSnapshotsMode reads the optional `snapshots` query parameter

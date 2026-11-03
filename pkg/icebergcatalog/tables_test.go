@@ -731,7 +731,7 @@ func TestTablesRead(t *testing.T) {
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
 		require.Equal(t, []string{
 			listTablesEndpoint, loadTableEndpoint, tableExistsEndpoint, createTableEndpoint,
-			dropTableEndpoint, reportMetricsEndpoint,
+			commitTableEndpoint, dropTableEndpoint, reportMetricsEndpoint,
 		}, response.Endpoints, "the advertised list is the route table of this file")
 	})
 }
@@ -1539,5 +1539,109 @@ func TestReportMetrics(t *testing.T) {
 		var response CatalogConfig
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
 		require.Contains(t, response.Endpoints, reportMetricsEndpoint)
+	})
+}
+
+// ---------------------------------------------------------------------------------------------
+// Table-load entity tags (§2.1 "ETag / If-None-Match", §11 I-5)
+// ---------------------------------------------------------------------------------------------
+//
+// A client that re-reads a table it already holds should pay for a 304 and not for the metadata
+// document. The one requirement the header must not get wrong is that the tag varies with the
+// `snapshots` query parameter: `all` and `refs` are different representations of the same table, so
+// a tag shared between them would let a cache answer a `refs` request with the `all` document (or
+// the reverse) and never be caught - the response is a 2xx with valid JSON, just the wrong one.
+
+// TestETagTableLoad covers the validator of a table load: the tag on a 200, the 304 of a matching
+// If-None-Match, the tag that must differ between snapshots=all and snapshots=refs, a weak or listed
+// tag, and the tag that changes when the table does.
+func TestETagTableLoad(t *testing.T) {
+	f := newTablesFixture(t)
+	books := tablesNamespaceParam(tablesTestRef, Namespace{"inventory", "books"})
+
+	// load issues one table load, optionally conditional.
+	load := func(t *testing.T, query url.Values, ifNoneMatch string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, tablesLoadTarget(books, "orders", query), nil)
+		req.Header.Set("X-Test-User", "alice")
+		if ifNoneMatch != "" {
+			req.Header.Set("If-None-Match", ifNoneMatch)
+		}
+		rec := httptest.NewRecorder()
+		f.router.ServeHTTP(rec, req)
+		return rec
+	}
+	// etagOf loads the table and returns its ETag, asserting the 200 it came with.
+	etagOf := func(t *testing.T, query url.Values) string {
+		t.Helper()
+		rec := load(t, query, "")
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		etag := rec.Header().Get("ETag")
+		require.NotEmpty(t, etag, "a load returns an entity tag")
+		require.True(t, strings.HasPrefix(etag, `"`) && strings.HasSuffix(etag, `"`),
+			"an ETag header value is a quoted string, got %q", etag)
+		return etag
+	}
+
+	allTag := etagOf(t, nil)
+	refsTag := etagOf(t, url.Values{"snapshots": {SnapshotsRefs}})
+
+	t.Run("a matching If-None-Match is 304 with no body", func(t *testing.T) {
+		rec := load(t, nil, allTag)
+		require.Equal(t, http.StatusNotModified, rec.Code, "body: %s", rec.Body.String())
+		require.Empty(t, rec.Body.String(), "a 304 carries no body")
+		require.Equal(t, allTag, rec.Header().Get("ETag"), "the validator is repeated on the 304")
+	})
+
+	t.Run("absent and snapshots=all are the same representation", func(t *testing.T) {
+		require.Equal(t, allTag, etagOf(t, url.Values{"snapshots": {SnapshotsAll}}),
+			"the default and the explicit value select the same document, so they share a tag")
+	})
+
+	t.Run("snapshots=refs has its own tag and refuses the all tag", func(t *testing.T) {
+		require.NotEqual(t, allTag, refsTag,
+			"all and refs are different representations: a shared tag would serve the wrong one")
+
+		rec := load(t, url.Values{"snapshots": {SnapshotsRefs}}, allTag)
+		require.Equal(t, http.StatusOK, rec.Code,
+			"the tag of another representation must not match, body: %s", rec.Body.String())
+		require.Equal(t, refsTag, rec.Header().Get("ETag"))
+		require.NotEmpty(t, rec.Body.String())
+
+		refsMatch := load(t, url.Values{"snapshots": {SnapshotsRefs}}, refsTag)
+		require.Equal(t, http.StatusNotModified, refsMatch.Code, "body: %s", refsMatch.Body.String())
+	})
+
+	t.Run("a weak tag, a tag list and * are honoured", func(t *testing.T) {
+		for name, header := range map[string]string{
+			"weak":      `W/` + allTag,
+			"in a list": `"not-the-tag", ` + allTag,
+			"star":      `*`,
+		} {
+			t.Run(name, func(t *testing.T) {
+				rec := load(t, nil, header)
+				require.Equal(t, http.StatusNotModified, rec.Code, "body: %s", rec.Body.String())
+			})
+		}
+
+		rec := load(t, nil, `"not-the-tag"`)
+		require.Equal(t, http.StatusOK, rec.Code, "an unrelated tag is a full response")
+	})
+
+	t.Run("a client that sends no header is unaffected", func(t *testing.T) {
+		rec := load(t, nil, "")
+		require.Equal(t, http.StatusOK, rec.Code)
+		require.NotEmpty(t, rec.Body.String(), "no conditional request, no empty response")
+	})
+
+	t.Run("the tag changes when the table does", func(t *testing.T) {
+		// A commit stages a new metadata.json, i.e. a different document for the same table.
+		require.Equal(t, http.StatusOK, f.commitTable(t, books, "orders", "carol",
+			commitTableBody(`[]`, setPropertiesUpdate("etag-team"))).Code)
+
+		rec := load(t, nil, allTag)
+		require.Equal(t, http.StatusOK, rec.Code,
+			"the old tag must not match the committed table, body: %s", rec.Body.String())
+		require.NotEqual(t, allTag, rec.Header().Get("ETag"), "the new representation has a new tag")
 	})
 }
