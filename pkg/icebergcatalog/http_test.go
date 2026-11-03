@@ -603,3 +603,31 @@ func TestRoutesBuilderMountsDataPlaneServices(t *testing.T) {
 		requireMethodNotAllowed(t, do(t, mux, http.MethodPost, dataPlaneCredentialsPath, testAccessKeyID, testSecretAccessKey))
 	})
 }
+
+// registerPath is the register operation as a client addresses it (spec: registerTable). The
+// namespace segment carries the repository and the ref, as every catalog namespace does (§5).
+const registerPath = APIBasePath + "/v1/" + CatalogPrefix + "/namespaces/repo%1Fmain%1Fns/register"
+
+// TestRoutesBuilderMountsRegister is the wiring test of the register operation (register.go): it is
+// contributed to the route table by RoutesBuilder - so it is mounted and advertised in
+// GET /v1/config - and it is its own service, whose route table cannot be mounted without also
+// appearing in the endpoint list.
+func TestRoutesBuilderMountsRegister(t *testing.T) {
+	// A real catalog, so deps.Catalog is the shape the server hands a service (§4.1). Nothing in
+	// this test reaches the catalog: mounting and advertisement are decided at startup.
+	fixture := newStoreFixture(t)
+
+	useConfig(t, "iceberg:\n  enabled: true\n")
+	deps := newServerDeps(t)
+	deps.Catalog = fixture.catalog
+	deps.BlockAdapter = fixture.catalog.BlockAdapter
+	mux := coreRouter()
+	require.NoError(t, RoutesBuilder(t.Context(), deps, mux))
+
+	require.Contains(t, mountedEndpoints(t, mux), registerTableEndpoint,
+		"register is advertised because it is mounted (§2.1)")
+
+	// Mounted, not merely advertised: the path is served, and only not with GET, which chi answers
+	// 405 for. An operation that is missing from the route table answers 404 instead.
+	requireMethodNotAllowed(t, do(t, mux, http.MethodGet, registerPath, testAccessKeyID, testSecretAccessKey))
+}

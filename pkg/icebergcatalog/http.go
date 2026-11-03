@@ -129,6 +129,9 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 			// The table reads of I1-9, the staged create of I2-4, and the drop and metrics sink
 			// of I2-5.
 			NewTableService(store, authorizer, deps.Catalog, cfg),
+			// Register (register.go): adopting a metadata.json written outside the catalog. It is its
+			// own service, so its endpoint is advertised exactly when it is mounted.
+			NewRegisterService(store, authorizer, deps.Catalog, cfg),
 			// The two data-plane services of §8. Each is enabled only by what it needs - remote
 			// signing by an S3 blockstore whose pre-signer is available, credential vending by an
 			// S3 blockstore plus a configured blockstore.s3.credentials_vending.role_arn - and a
