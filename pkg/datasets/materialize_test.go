@@ -4,6 +4,8 @@ package datasets
 // the address conversion, and the k-way merge that WriteMetaRangeByIterator requires.
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -11,6 +13,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/block/mem"
 	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/graveler"
+	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 )
 
 // mergedItems opens the item streams of def the way Publish does and returns the merged
@@ -501,4 +504,654 @@ func TestConvertEntryAddress(t *testing.T) {
 			require.Equal(t, "etag", entry.ETag, "conversion must not touch the other entry fields")
 		})
 	}
+}
+
+// Iceberg table and namespace items (ICEBERG_CATALOG_PLAN.md §6.1, §6.3, §9).
+//
+// The fixture below writes the entries the Iceberg catalog's own write path stages on a branch
+// (pkg/icebergcatalog store.go and files.go): namespace markers, one table pointer per table, and
+// one entry per staged file. Materialisation copies exactly those entries, so the assertions are
+// about placement, metadata and addresses - and about the fact that the objects themselves are
+// never copied (goal G3).
+
+// withIcebergEnabled pins the §9 gate for the duration of a test, the way a process configured with
+// iceberg.enabled: true would see it.
+func withIcebergEnabled(t *testing.T) {
+	t.Helper()
+	previous := IcebergEnabled
+	IcebergEnabled = func() bool { return true }
+	t.Cleanup(func() { IcebergEnabled = previous })
+}
+
+// icebergTestFile is one object staged under _lakefs_iceberg/files/<uuid>/: a metadata file, a
+// manifest list, a manifest or a data file.
+type icebergTestFile struct {
+	// path is the path relative to the table root, for example "data/part-0.parquet" or
+	// "metadata/v1.json". §6.3 gives it the same shape under the reserved prefix.
+	path    string
+	content []byte
+}
+
+// icebergTestTable is one table of a source repository, as the catalog would have written it.
+type icebergTestTable struct {
+	// namespace holds the namespace levels, outermost first.
+	namespace []string
+	name      string
+	// physicalRoot is the table's physical directory inside the source storage namespace: the
+	// root the client wrote to, which the catalog gives every table its own of (Q-I5).
+	physicalRoot string
+	// tableUUID is the table identity, the path component of every staged file (§6.3).
+	tableUUID string
+	files     []icebergTestFile
+	// metadataDocument, when set, is written at <physicalRoot>/metadata/v1.json and named by the
+	// pointer. A test that reads the table back through the catalog needs it; the placement tests
+	// only need the entries.
+	metadataDocument []byte
+}
+
+// metadataLocation is the physical URI of the table's current metadata.json: the value the pointer
+// carries, and the one the Iceberg metadata inside it keeps naming (§6.1, §9).
+func (f *datasetFixture) metadataLocation(t *testing.T, repo string, tbl icebergTestTable) string {
+	t.Helper()
+	rec := f.repositoryRecord(t, repo)
+	return rec.StorageNamespace.String() + "/" + tbl.physicalRoot + "/metadata/v1.json"
+}
+
+// stageIcebergTable stages the entries of one table on branch: the markers of its namespace, its
+// pointer and its files. Nothing is committed, so a caller can stage several tables and commit once
+// - which is how a real branch ends up holding a whole warehouse.
+func (f *datasetFixture) stageIcebergTable(t *testing.T, repo, branch string, tbl icebergTestTable) {
+	t.Helper()
+	rec := f.repositoryRecord(t, repo)
+
+	// One marker per namespace level, so the dataset can list the namespace afterwards.
+	for i := 1; i <= len(tbl.namespace); i++ {
+		markerPath := icebergNamespaceMarkerKey(strings.Join(tbl.namespace[:i], "/"))
+		require.NoError(t, f.cat.CreateEntry(f.ctx, repo, branch, catalog.DBEntry{
+			Path:            markerPath,
+			PhysicalAddress: markerPath,
+			AddressType:     catalog.AddressTypeRelative,
+			CreationDate:    testTime(),
+			Metadata:        catalog.Metadata{"owner": "data-platform"},
+		}), "stage namespace marker %s", markerPath)
+	}
+
+	// The metadata document lives at the table's physical root, where the client wrote it. The
+	// pointer names it by absolute URI and never by entry address (pkg/icebergcatalog store.go).
+	metadataLocation := f.metadataLocation(t, repo, tbl)
+	if tbl.metadataDocument != nil {
+		f.putObject(t, repo, tbl.physicalRoot+"/metadata/v1.json", tbl.metadataDocument)
+	}
+
+	pointerPath := icebergTablePointerKey(strings.Join(tbl.namespace, "/") + "/" + tbl.name)
+	require.NoError(t, f.cat.CreateEntry(f.ctx, repo, branch, catalog.DBEntry{
+		Path:            pointerPath,
+		PhysicalAddress: pointerPath,
+		AddressType:     catalog.AddressTypeRelative,
+		CreationDate:    testTime(),
+		Metadata: catalog.Metadata{
+			icebergcatalog.MetadataLocationKey: metadataLocation,
+			icebergcatalog.TableUUIDKey:        tbl.tableUUID,
+			icebergcatalog.FormatVersionKey:    "2",
+		},
+	}), "stage table pointer %s", pointerPath)
+
+	// Table files are staged with the full physical address the client wrote (§6.3), so the
+	// dataset copies that address and never touches the object.
+	for _, file := range tbl.files {
+		key := icebergFilesPrefix(tbl.tableUUID) + file.path
+		f.putObject(t, repo, key, file.content)
+		qk, err := f.cat.BlockAdapter.ResolveNamespace(rec.StorageID.String(), rec.StorageNamespace.String(), key, block.IdentifierTypeRelative)
+		require.NoError(t, err, "resolve %s", key)
+		require.NoError(t, f.cat.CreateEntry(f.ctx, repo, branch, catalog.DBEntry{
+			Path:            key,
+			PhysicalAddress: qk.Format(),
+			AddressType:     catalog.AddressTypeFull,
+			CreationDate:    testTime(),
+			Size:            int64(len(file.content)),
+			Checksum:        etagOf(file.content),
+		}), "stage table file %s", key)
+	}
+}
+
+// commitIcebergTables stages tables and commits them, returning the commit their dataset items pin.
+func (f *datasetFixture) commitIcebergTables(t *testing.T, repo, branch string, tables ...icebergTestTable) graveler.CommitID {
+	t.Helper()
+	for _, tbl := range tables {
+		f.stageIcebergTable(t, repo, branch, tbl)
+	}
+	log, err := f.cat.Commit(f.ctx, repo, branch, "commit "+repo+"/"+branch, "tester", nil, nil, nil, false)
+	require.NoError(t, err, "commit %s/%s", repo, branch)
+	return graveler.CommitID(log.Reference)
+}
+
+// testOrdersUUID is the table uuid of the standard fixture table.
+const testOrdersUUID = "11111111-2222-3333-4444-555555555555"
+
+// testOrdersTable is the standard fixture table: namespace analytics, name orders, four staged
+// files - the ones §6.3 stages for a snapshot.
+func testOrdersTable() icebergTestTable {
+	return icebergTestTable{
+		namespace:    []string{"analytics"},
+		name:         "orders",
+		physicalRoot: "_iceberg/" + testOrdersUUID,
+		tableUUID:    testOrdersUUID,
+		files: []icebergTestFile{
+			{path: "metadata/v1.json", content: []byte(`{"format-version":2}`)},
+			{path: "metadata/snap-1.avro", content: []byte("manifest-list")},
+			{path: "metadata/manifest-1.avro", content: []byte("manifest")},
+			{path: "data/part-0.parquet", content: []byte("parquet-bytes")},
+		},
+	}
+}
+
+// TestPublishTableItem is the §9 payoff: a table item materialises the pointer of the table at the
+// pinned commit and every _lakefs_iceberg/files/<uuid>/... entry the snapshot staged, at the same
+// keys, so the absolute paths inside the Iceberg metadata stay valid. The objects themselves are
+// shared with the source repository - the dataset entry keeps the source's full physical address,
+// which is what makes the copy zero-cost (goal G3).
+func TestPublishTableItem(t *testing.T) {
+	const (
+		dataset = "analytics-tables"
+		source  = "lakehouse-orders"
+	)
+	withIcebergEnabled(t)
+
+	f := newDatasetFixture(t)
+	f.createRepository(t, source, "main", false)
+	f.createRepository(t, dataset, DefaultBranch, true)
+
+	table := testOrdersTable()
+	commit := f.commitIcebergTables(t, source, "main", table)
+
+	def := resolvedDefinition(t, f, Definition{
+		FormatVersion: FormatVersion,
+		Data: []DataItem{{
+			Target:     "analytics/orders",
+			Repository: source,
+			Ref:        SourceRef{Type: RefTypeCommit, ID: commit.String()},
+			Type:       ItemTypeTable,
+			Table:      &TableSrc{Namespace: "analytics", Name: "orders"},
+		}},
+	})
+
+	result := publish(t, f, PublishRequest{
+		Dataset:    dataset,
+		Version:    1,
+		Definition: def,
+		Message:    "publish a table",
+		Publisher:  "tester",
+	})
+	require.Equal(t, VersionTag(1), result.Tag)
+
+	// The reserved layout of the source is reproduced verbatim, next to the synthetic definition
+	// entry and nothing else: exactly the pointer and the table's staged files - the two things
+	// §9 lists. The namespace marker is not copied by a table item, so a dataset of sibling tables
+	// cannot produce it twice (see the sibling-tables test).
+	require.Equal(t, []string{
+		DefinitionPath,
+		icebergFilesPrefix(testOrdersUUID) + "data/part-0.parquet",
+		icebergFilesPrefix(testOrdersUUID) + "metadata/manifest-1.avro",
+		icebergFilesPrefix(testOrdersUUID) + "metadata/snap-1.avro",
+		icebergFilesPrefix(testOrdersUUID) + "metadata/v1.json",
+		"_lakefs_iceberg/tables/analytics/orders/.pointer",
+	}, f.listPaths(t, dataset, VersionTag(1)))
+
+	// The pointer is what the catalog reads: it must decode as a pointer of the same table, with
+	// the metadata location untouched (the URI is absolute, §6.1).
+	pointer := f.datasetEntry(t, dataset, VersionTag(1), icebergTablePointerKey("analytics/orders"))
+	decoded, err := icebergcatalog.DecodeTablePointer(pointer.Metadata)
+	require.NoError(t, err, "the copied pointer must decode like the catalog wrote it")
+	require.Equal(t, f.metadataLocation(t, source, table), decoded.MetadataLocation)
+	require.Equal(t, table.tableUUID, decoded.TableUUID)
+	require.Equal(t, 2, decoded.FormatVersion)
+
+	// Every copied file keeps the source's full physical address, so the dataset serves the very
+	// bytes the client wrote without copying an object.
+	for _, file := range table.files {
+		key := icebergFilesPrefix(table.tableUUID) + file.path
+		entry := f.datasetEntry(t, dataset, VersionTag(1), key)
+		require.Equal(t, catalog.AddressTypeFull, catalog.AddressType(entry.AddressType), "%s keeps a full address", key)
+		require.Equal(t, "mem://"+source+"-ns/"+key, entry.PhysicalAddress,
+			"%s points into the SOURCE namespace", key)
+		require.Equal(t, file.content, f.readDatasetObject(t, dataset, VersionTag(1), key))
+	}
+
+	// The stats count what was materialised: the pointer and the four files.
+	require.Equal(t, int64(5), result.Stats.Objects)
+	require.Len(t, result.Stats.Items, 1)
+	require.Equal(t, "analytics/orders", result.Stats.Items[0].Target)
+}
+
+// TestPublishSiblingTableItems is the regression for the marker-ownership rule of
+// openIcebergItem: two tables of one namespace are a valid definition (they do not overlap,
+// §5.2 rule 3), and both of their namespaces' markers would be the same key. Because a table item
+// does not copy markers, the publish succeeds and both tables are materialised.
+func TestPublishSiblingTableItems(t *testing.T) {
+	const (
+		dataset = "sibling-tables"
+		source  = "lakehouse-siblings"
+	)
+	withIcebergEnabled(t)
+
+	f := newDatasetFixture(t)
+	f.createRepository(t, source, "main", false)
+	f.createRepository(t, dataset, DefaultBranch, true)
+
+	orders := testOrdersTable()
+	customersUUID := "22222222-3333-4444-5555-666666666666"
+	customers := icebergTestTable{
+		namespace:    []string{"analytics"},
+		name:         "customers",
+		physicalRoot: "_iceberg/" + customersUUID,
+		tableUUID:    customersUUID,
+		files: []icebergTestFile{
+			{path: "data/part-0.parquet", content: []byte("customers-parquet")},
+		},
+	}
+	commit := f.commitIcebergTables(t, source, "main", orders, customers)
+
+	def := resolvedDefinition(t, f, Definition{
+		FormatVersion: FormatVersion,
+		Data: []DataItem{
+			{
+				Target:     "analytics/orders",
+				Repository: source,
+				Ref:        SourceRef{Type: RefTypeCommit, ID: commit.String()},
+				Type:       ItemTypeTable,
+				Table:      &TableSrc{Namespace: "analytics", Name: "orders"},
+			},
+			{
+				Target:     "analytics/customers",
+				Repository: source,
+				Ref:        SourceRef{Type: RefTypeCommit, ID: commit.String()},
+				Type:       ItemTypeTable,
+				Table:      &TableSrc{Namespace: "analytics", Name: "customers"},
+			},
+		},
+	})
+	result := publish(t, f, PublishRequest{
+		Dataset:    dataset,
+		Version:    1,
+		Definition: def,
+		Message:    "two tables of one namespace",
+		Publisher:  "tester",
+	})
+	require.Len(t, result.Stats.Items, 2)
+
+	require.Equal(t, []string{
+		DefinitionPath,
+		icebergFilesPrefix(testOrdersUUID) + "data/part-0.parquet",
+		icebergFilesPrefix(testOrdersUUID) + "metadata/manifest-1.avro",
+		icebergFilesPrefix(testOrdersUUID) + "metadata/snap-1.avro",
+		icebergFilesPrefix(testOrdersUUID) + "metadata/v1.json",
+		icebergFilesPrefix(customersUUID) + "data/part-0.parquet",
+		"_lakefs_iceberg/tables/analytics/customers/.pointer",
+		"_lakefs_iceberg/tables/analytics/orders/.pointer",
+	}, f.listPaths(t, dataset, VersionTag(1)))
+}
+
+// TestPublishNamespaceItem pins the namespace item of §9: the marker, every marker below it, every
+// table pointer below it, and the files of every one of those tables.
+func TestPublishNamespaceItem(t *testing.T) {
+	const (
+		dataset = "analytics-warehouse"
+		source  = "lakehouse-warehouse"
+	)
+	withIcebergEnabled(t)
+
+	f := newDatasetFixture(t)
+	f.createRepository(t, source, "main", false)
+	f.createRepository(t, dataset, DefaultBranch, true)
+
+	orders := testOrdersTable()
+	nestedUUID := "99999999-8888-7777-6666-555555555555"
+	nested := icebergTestTable{
+		namespace:    []string{"analytics", "books"},
+		name:         "titles",
+		physicalRoot: "_iceberg/" + nestedUUID,
+		tableUUID:    nestedUUID,
+		files: []icebergTestFile{
+			{path: "data/part-0.parquet", content: []byte("titles-parquet")},
+		},
+	}
+	// "sales" is a sibling namespace and must not be dragged in by the analytics item.
+	other := icebergTestTable{
+		namespace:    []string{"sales"},
+		name:         "invoices",
+		physicalRoot: "_iceberg/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		tableUUID:    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+	}
+	commit := f.commitIcebergTables(t, source, "main", orders, nested, other)
+
+	def := resolvedDefinition(t, f, Definition{
+		FormatVersion: FormatVersion,
+		Data: []DataItem{{
+			Target:     "analytics",
+			Repository: source,
+			Ref:        SourceRef{Type: RefTypeCommit, ID: commit.String()},
+			Type:       ItemTypeNamespace,
+			Namespace:  ptr("analytics"),
+		}},
+	})
+	publish(t, f, PublishRequest{
+		Dataset:    dataset,
+		Version:    1,
+		Definition: def,
+		Message:    "publish a namespace",
+		Publisher:  "tester",
+	})
+
+	require.Equal(t, []string{
+		DefinitionPath,
+		"_lakefs_iceberg/files/11111111-2222-3333-4444-555555555555/data/part-0.parquet",
+		"_lakefs_iceberg/files/11111111-2222-3333-4444-555555555555/metadata/manifest-1.avro",
+		"_lakefs_iceberg/files/11111111-2222-3333-4444-555555555555/metadata/snap-1.avro",
+		"_lakefs_iceberg/files/11111111-2222-3333-4444-555555555555/metadata/v1.json",
+		"_lakefs_iceberg/files/99999999-8888-7777-6666-555555555555/data/part-0.parquet",
+		"_lakefs_iceberg/ns/analytics/.namespace",
+		"_lakefs_iceberg/ns/analytics/books/.namespace",
+		"_lakefs_iceberg/tables/analytics/books/titles/.pointer",
+		"_lakefs_iceberg/tables/analytics/orders/.pointer",
+	}, f.listPaths(t, dataset, VersionTag(1)), "the whole analytics subtree, and only it")
+
+	// A namespace item owns the markers, so the dataset answers the catalog's namespace reads for
+	// the namespace and for every namespace below it.
+	store := icebergcatalog.NewStore(f.cat, f.cat.BlockAdapter)
+	for _, namespace := range []icebergcatalog.Namespace{{"analytics"}, {"analytics", "books"}} {
+		marker, err := store.GetNamespace(f.ctx, icebergcatalog.Address{
+			Repo:      dataset,
+			Ref:       VersionTag(1),
+			Namespace: namespace,
+		})
+		require.NoError(t, err, "the dataset must answer the catalog's namespace read for %v", namespace)
+		require.Equal(t, "data-platform", marker.Properties["owner"])
+	}
+}
+
+// TestPublishTableItemMissingSource pins the answer for a table that does not exist at the pinned
+// commit: it is a definition problem naming the item (like a missing object key, §5.2 rule 5), and
+// the publish writes nothing at all.
+func TestPublishTableItemMissingSource(t *testing.T) {
+	const (
+		dataset = "missing-table"
+		source  = "lakehouse-missing"
+	)
+	withIcebergEnabled(t)
+
+	f := newDatasetFixture(t)
+	f.createRepository(t, source, "main", false)
+	// A table in another namespace exists, so the fixture is a real warehouse and only the pinned
+	// address is wrong.
+	commit := f.commitIcebergTables(t, source, "main", testOrdersTable())
+	f.createRepository(t, dataset, DefaultBranch, true)
+	headBefore, err := f.cat.GetBranchReference(f.ctx, dataset, DefaultBranch)
+	require.NoError(t, err)
+
+	def := resolvedDefinition(t, f, Definition{
+		FormatVersion: FormatVersion,
+		Data: []DataItem{{
+			Target:     "analytics/customers",
+			Repository: source,
+			Ref:        SourceRef{Type: RefTypeCommit, ID: commit.String()},
+			Type:       ItemTypeTable,
+			Table:      &TableSrc{Namespace: "analytics", Name: "customers"},
+		}},
+	})
+	_, err = (&Materializer{Catalog: f.cat}).Publish(f.ctx, PublishRequest{
+		Dataset:    dataset,
+		Version:    1,
+		Definition: def,
+		Message:    "must be rejected",
+		Publisher:  "tester",
+	})
+	var validation *ValidationError
+	require.ErrorAs(t, err, &validation, "a missing table is a definition problem, not a server error")
+	require.Len(t, validation.Problems, 1)
+	require.Equal(t, "data[0].table", validation.Problems[0].Path)
+	require.Contains(t, validation.Problems[0].Message, "analytics.customers")
+
+	_, err = f.cat.GetTag(f.ctx, dataset, VersionTag(1))
+	require.Error(t, err, "a rejected publish creates no version tag")
+	headAfter, err := f.cat.GetBranchReference(f.ctx, dataset, DefaultBranch)
+	require.NoError(t, err)
+	require.Equal(t, headBefore, headAfter, "a rejected publish commits nothing")
+}
+
+// TestPublishTableItemCorruptPointer pins that a pointer without a table uuid fails the publish
+// instead of silently publishing a table without its files: the uuid is what names the staged-file
+// prefix (§6.3), so a table without one cannot be materialised.
+func TestPublishTableItemCorruptPointer(t *testing.T) {
+	const (
+		dataset = "corrupt-pointer"
+		source  = "lakehouse-corrupt"
+	)
+	withIcebergEnabled(t)
+
+	f := newDatasetFixture(t)
+	f.createRepository(t, source, "main", false)
+	f.createRepository(t, dataset, DefaultBranch, true)
+
+	pointerPath := icebergTablePointerKey("analytics/orders")
+	require.NoError(t, f.cat.CreateEntry(f.ctx, source, "main", catalog.DBEntry{
+		Path:            pointerPath,
+		PhysicalAddress: pointerPath,
+		AddressType:     catalog.AddressTypeRelative,
+		CreationDate:    testTime(),
+		Metadata:        catalog.Metadata{icebergcatalog.MetadataLocationKey: "mem://lakehouse-corrupt-ns/x.json"},
+	}))
+	log, err := f.cat.Commit(f.ctx, source, "main", "pointer without a uuid", "tester", nil, nil, nil, false)
+	require.NoError(t, err)
+
+	def := resolvedDefinition(t, f, Definition{
+		FormatVersion: FormatVersion,
+		Data: []DataItem{{
+			Target:     "analytics/orders",
+			Repository: source,
+			Ref:        SourceRef{Type: RefTypeCommit, ID: graveler.CommitID(log.Reference).String()},
+			Type:       ItemTypeTable,
+			Table:      &TableSrc{Namespace: "analytics", Name: "orders"},
+		}},
+	})
+	_, err = (&Materializer{Catalog: f.cat}).Publish(f.ctx, PublishRequest{
+		Dataset:    dataset,
+		Version:    1,
+		Definition: def,
+		Message:    "must be rejected",
+		Publisher:  "tester",
+	})
+	require.ErrorIs(t, err, ErrInvalidSourceEntry)
+	require.Contains(t, err.Error(), icebergcatalog.TableUUIDKey)
+}
+
+// TestOpenItemsTableItemRequiresIceberg pins the gate at the materialisation boundary, for a caller
+// that skipped validation: with the catalog disabled a table item cannot be opened at all, which is
+// the same answer the definition gets from Validate (§10.4).
+func TestOpenItemsTableItemRequiresIceberg(t *testing.T) {
+	require.False(t, IcebergEnabled(), "the fixture must run with the catalog disabled")
+	f := newDatasetFixture(t)
+	f.createRepository(t, "src-no-iceberg", "main", false)
+
+	def := Definition{FormatVersion: FormatVersion, Data: []DataItem{{
+		Target:     "analytics/orders",
+		Repository: "src-no-iceberg",
+		Ref:        SourceRef{Type: RefTypeCommit, ID: "abc"},
+		Type:       ItemTypeTable,
+		Table:      &TableSrc{Namespace: "analytics", Name: "orders"},
+	}}}
+	items, err := (&Materializer{Catalog: f.cat}).openItems(f.ctx, def)
+	require.Nil(t, items)
+	require.ErrorIs(t, err, ErrUnsupportedItemType)
+}
+
+// TestOpenItemsTableItemRejectsForeignTarget pins the primitive's own guard for the target rule of
+// §9: the keys a reserved item produces are fixed by the layout, so a definition whose target
+// disagrees cannot be honoured and must not be guessed at. Validation rejects it first; this covers
+// a caller that skipped validation.
+func TestOpenItemsTableItemRejectsForeignTarget(t *testing.T) {
+	withIcebergEnabled(t)
+	f := newDatasetFixture(t)
+	f.createRepository(t, "src-foreign-target", "main", false)
+	commit := f.commitIcebergTables(t, "src-foreign-target", "main", testOrdersTable())
+
+	def := Definition{FormatVersion: FormatVersion, Data: []DataItem{{
+		Target:     "elsewhere",
+		Repository: "src-foreign-target",
+		Ref:        SourceRef{Type: RefTypeCommit, ID: commit.String()},
+		Type:       ItemTypeTable,
+		Table:      &TableSrc{Namespace: "analytics", Name: "orders"},
+	}}}
+	items, err := (&Materializer{Catalog: f.cat}).openItems(f.ctx, def)
+	require.Nil(t, items)
+	var validation *ValidationError
+	require.ErrorAs(t, err, &validation)
+	require.Equal(t, []string{"data[0].target"}, problemPaths(validation.Problems))
+}
+
+// TestTableItemConflictingItemsFailTheMerge pins that two items claiming the same table fail the
+// publish through the §6.4 merge rather than producing a metarange with two values for one key.
+// Validation rejects the overlap first (§5.2 rule 3); this drives the primitive directly.
+func TestTableItemConflictingItemsFailTheMerge(t *testing.T) {
+	withIcebergEnabled(t)
+	f := newDatasetFixture(t)
+	f.createRepository(t, "src-conflict", "main", false)
+	commit := f.commitIcebergTables(t, "src-conflict", "main", testOrdersTable())
+
+	tableItem := DataItem{
+		Target:     "analytics/orders",
+		Repository: "src-conflict",
+		Ref:        SourceRef{Type: RefTypeCommit, ID: commit.String()},
+		Type:       ItemTypeTable,
+		Table:      &TableSrc{Namespace: "analytics", Name: "orders"},
+	}
+	namespaceItem := DataItem{
+		Target:     "analytics",
+		Repository: "src-conflict",
+		Ref:        SourceRef{Type: RefTypeCommit, ID: commit.String()},
+		Type:       ItemTypeNamespace,
+		Namespace:  ptr("analytics"),
+	}
+	// The namespace item already covers the table, so the two together materialise its keys twice.
+	def := Definition{FormatVersion: FormatVersion, Data: []DataItem{tableItem, namespaceItem}}
+	require.Error(t, Validate(&def, ValidateOptions{}), "validation rejects the overlap first")
+
+	merged, _ := mergedItems(t, f, def)
+	_, err := drainKeys(t, merged)
+	require.ErrorIs(t, err, ErrDuplicateKey)
+}
+
+// TestRecordsIterator pins the iterator the reserved items are built on: sorted output, and a SeekGE
+// that positions on the first key >= the target, which is what the metarange writer's seek contract
+// needs.
+func TestRecordsIterator(t *testing.T) {
+	makeRecord := func(key string) *graveler.ValueRecord {
+		return &graveler.ValueRecord{Key: graveler.Key(key), Value: &graveler.Value{Data: []byte(key)}}
+	}
+	records := []*graveler.ValueRecord{
+		makeRecord("b"),
+		makeRecord("a"),
+		makeRecord("c"),
+	}
+	it := newRecordsIterator(records)
+	keys, err := drainKeys(t, it)
+	require.NoError(t, err)
+	require.Equal(t, []string{"a", "b", "c"}, keys, "records are sorted on construction")
+
+	for _, tc := range []struct {
+		seek   string
+		expect []string
+	}{
+		{seek: "", expect: []string{"a", "b", "c"}},
+		{seek: "a", expect: []string{"a", "b", "c"}},
+		{seek: "aa", expect: []string{"b", "c"}},
+		{seek: "c", expect: []string{"c"}},
+		{seek: "d", expect: []string{}},
+	} {
+		it := newRecordsIterator(records)
+		it.SeekGE(graveler.Key(tc.seek))
+		keys, err := drainKeys(t, it)
+		require.NoError(t, err)
+		require.Equal(t, tc.expect, keys, "seek %q", tc.seek)
+	}
+}
+
+// icebergMetadataDocument renders a v2 table metadata document at location, in the shape the
+// Iceberg spec defines ("Table Metadata" in
+// https://iceberg.apache.org/spec/#table-metadata) and iceberg-go parses.
+func icebergMetadataDocument(tableUUID, location string) []byte {
+	return []byte(fmt.Sprintf(`{
+		"format-version": 2,
+		"table-uuid": %q,
+		"location": %q,
+		"last-sequence-number": 1,
+		"last-updated-ms": 1700000000000,
+		"last-column-id": 1,
+		"current-schema-id": 0,
+		"schemas": [{"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]}],
+		"default-spec-id": 0,
+		"partition-specs": [{"spec-id": 0, "fields": []}],
+		"last-partition-id": 999,
+		"default-sort-order-id": 0,
+		"sort-orders": [{"order-id": 0, "fields": []}],
+		"properties": {},
+		"current-snapshot-id": -1,
+		"snapshots": [],
+		"snapshot-log": [],
+		"metadata-log": []
+	}`, tableUUID, location))
+}
+
+// TestPublishedTableReadableThroughCatalog is the §9 read path end to end: after a table item is
+// published, the *catalog's own reader* finds the table in the dataset repository at the version
+// tag and loads its metadata. Nothing in this test recomputes the reserved keys, so it is what
+// proves the placement - not just the copy - is the one pkg/icebergcatalog addresses.
+func TestPublishedTableReadableThroughCatalog(t *testing.T) {
+	const (
+		dataset = "catalog-readable"
+		source  = "lakehouse-readable"
+	)
+	withIcebergEnabled(t)
+
+	f := newDatasetFixture(t)
+	f.createRepository(t, source, "main", false)
+	f.createRepository(t, dataset, DefaultBranch, true)
+
+	table := testOrdersTable()
+	table.metadataDocument = icebergMetadataDocument(table.tableUUID, "mem://"+source+"-ns/"+table.physicalRoot)
+	commit := f.commitIcebergTables(t, source, "main", table)
+
+	def := resolvedDefinition(t, f, Definition{
+		FormatVersion: FormatVersion,
+		Data: []DataItem{{
+			Target:     "analytics/orders",
+			Repository: source,
+			Ref:        SourceRef{Type: RefTypeCommit, ID: commit.String()},
+			Type:       ItemTypeTable,
+			Table:      &TableSrc{Namespace: "analytics", Name: "orders"},
+		}},
+	})
+	publish(t, f, PublishRequest{
+		Dataset:    dataset,
+		Version:    1,
+		Definition: def,
+		Message:    "publish a table",
+		Publisher:  "tester",
+	})
+
+	store := icebergcatalog.NewStore(f.cat, f.cat.BlockAdapter)
+	addr := icebergcatalog.Address{
+		Repo:      dataset,
+		Ref:       VersionTag(1),
+		Namespace: icebergcatalog.Namespace{"analytics"},
+		Table:     "orders",
+	}
+
+	// The table loads: pointer, metadata location and the metadata document itself, which the
+	// catalog reads from the source namespace through the pointer's absolute URI.
+	loaded, err := store.GetTable(f.ctx, addr)
+	require.NoError(t, err, "the dataset must answer the catalog's table read")
+	require.Equal(t, f.metadataLocation(t, source, table), loaded.Pointer.MetadataLocation)
+	require.Equal(t, table.tableUUID, loaded.Pointer.TableUUID)
+	require.Equal(t, table.metadataDocument, loaded.MetadataJSON,
+		"the metadata document is read from where the pointer names it, unmodified")
 }

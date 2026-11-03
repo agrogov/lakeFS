@@ -3,6 +3,10 @@ package datasets
 import (
 	"fmt"
 	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/spf13/viper"
 )
 
 // Problem is a single validation finding. It is rendered as one entry of the
@@ -54,6 +58,27 @@ func (e *ValidationError) Error() string {
 // Structural validation in this package never inspects metadata values: it only
 // calls the hook when one is supplied.
 type MetadataValidator func(def *Definition) []Problem
+
+// IcebergEnabledKey is the lakeFS setting that mounts the Iceberg REST catalog. It is
+// the key pkg/icebergcatalog reads as icebergcatalog.ConfigKey + ".enabled"; the
+// datasets section has no switch of its own, because a table or namespace item can only
+// be materialised - and the dataset it produces only read back through /iceberg/api -
+// when that catalog is served (ICEBERG_CATALOG_PLAN.md §9).
+const IcebergEnabledKey = "iceberg.enabled"
+
+// IcebergEnabled reports whether the reserved Iceberg item types (table, namespace) are
+// accepted (§1.2, ICEBERG_CATALOG_PLAN.md §9).
+//
+// It is the single gate every validation entry point goes through: while iceberg.enabled is
+// false a table or namespace item keeps answering with the 501 of §10.4, because nothing
+// could materialise it and the resulting dataset could not be read through a catalog.
+//
+// It is a variable so that a caller holding an already-loaded catalog configuration, and a
+// test, can pin the answer instead of mutating the process-wide viper instance. It is the
+// only configuration read in this file: the rest of the package stays pure data code.
+var IcebergEnabled = func() bool {
+	return viper.GetBool(IcebergEnabledKey)
+}
 
 // ValidateOptions tunes Validate and ValidateEnvelope. The zero value is usable
 // and means DefaultMaxItems with free-form metadata (no key validation).
@@ -226,10 +251,17 @@ func validateItems(d *Definition) []Problem {
 				problems = append(problems, wildcardProblems(itemPath(i, "prefix.path"), item.Prefix.Path)...)
 			}
 		case ItemTypeTable, ItemTypeNamespace:
-			problems = append(problems, Problem{
-				Path:    itemPath(i, "type"),
-				Message: fmt.Sprintf("item type %q is not supported (501)", item.Type),
-			})
+			// ICEBERG_CATALOG_PLAN.md §9: the reserved types are accepted only when the catalog
+			// that materialises and serves them is enabled. "(501)" is what the service turns
+			// into ErrUnsupported (§10.4), so the disabled answer is unchanged.
+			if !IcebergEnabled() {
+				problems = append(problems, Problem{
+					Path:    itemPath(i, "type"),
+					Message: fmt.Sprintf("item type %q is not supported (501)", item.Type),
+				})
+				break
+			}
+			problems = append(problems, icebergItemProblems(i, item)...)
 		default:
 			problems = append(problems, Problem{
 				Path:    itemPath(i, "type"),
@@ -248,6 +280,168 @@ func validateItems(d *Definition) []Problem {
 func wildcardProblems(path, value string) []Problem {
 	if strings.ContainsAny(value, "*?") {
 		return []Problem{{Path: path, Message: `must not contain the wildcard characters "*" or "?"`}}
+	}
+	return nil
+}
+
+// icebergNamespaceSeparator is the character a definition document uses to join the levels of a
+// multi-level Iceberg namespace. It is not the catalog's wire separator - that is 0x1F, see
+// pkg/icebergcatalog NamespaceSeparator, because a URL-encoded control byte cannot collide with
+// a namespace name - but the dotted notation lakeFS uses for a namespace outside a URL
+// (Namespace.Dotted, the form a catalog ARN carries and the form diff.go compares). A
+// definition is JSON, not a URL, and it has one string field for the namespace, so it follows
+// the dotted form.
+const icebergNamespaceSeparator = "."
+
+// icebergNamespaceSeparatorByte is the catalog's own separator, spelled here so that a submitted
+// namespace carrying it is rejected: it would be one namespace level on the wire and a literal
+// control byte in a lakeFS key.
+const icebergNamespaceSeparatorByte = "\x1f"
+
+// icebergMaxNamespacePathLength is the exclusive upper bound of a namespace path in characters,
+// the lakeFS rule the catalog enforces (pkg/icebergcatalog MaxNamespacePathLength): a namespace
+// that fails it cannot be addressed through /iceberg/api, so a definition cannot use it either.
+const icebergMaxNamespacePathLength = 255
+
+// icebergAddress is the catalog address a table or namespace item materialises (§9).
+//
+// The reserved Iceberg layout is repository-wide: a table lives at
+// _lakefs_iceberg/tables/<namespace levels>/<table>/.pointer and its files at
+// _lakefs_iceberg/files/<table-uuid>/..., so a dataset that copies those keys unchanged answers
+// /iceberg/api at <dataset>.<ref>.<namespace>.<table>. The address is therefore derived from the
+// item's source descriptor alone (the namespace and name it names), never from a free-form
+// target.
+type icebergAddress struct {
+	// path is the catalog path of the item: "<namespace levels>/<table>" for a table item and
+	// "<namespace levels>" for a namespace item. It is also the item's required Target, which
+	// is what keeps the §5.2 rule-3 overlap check meaningful for these items: two items overlap
+	// exactly when one would materialise the other's keys.
+	path string
+
+	// namespace holds the namespace levels, outermost first. A namespace item materialises this
+	// namespace and every namespace below it; a table item materialises the table in it.
+	namespace []string
+
+	// table is the table name of a table item; empty for a namespace item.
+	table string
+}
+
+// icebergItemProblems validates the shape of a table or namespace item once the catalog is
+// enabled (§9): the source descriptor must name a usable namespace and, for a table, a usable
+// name, and the target must be the catalog path the item materialises at.
+func icebergItemProblems(i int, item *DataItem) []Problem {
+	_, problems := icebergItemAddress(i, item)
+	return problems
+}
+
+// icebergItemAddress derives the catalog address of a table or namespace item and reports every
+// problem that prevents it.
+//
+// A missing source descriptor is not reported here: validateSourceDescriptors owns that answer,
+// so it is reported exactly once. The address is returned only when there is no problem with it,
+// which lets a caller use path without re-checking.
+//
+// The target rule is the interesting one. The keys a reserved item produces are fixed by the
+// catalog layout, so a target that disagrees with the catalog path could not be honoured;
+// silently ignoring it would make the definition say one thing and the dataset do another, and
+// would also let two items collide in the key space while passing the §5.2 rule-3 check. The
+// target is therefore required to be exactly the catalog path.
+func icebergItemAddress(i int, item *DataItem) (icebergAddress, []Problem) {
+	var addr icebergAddress
+	switch item.Type {
+	case ItemTypeTable:
+		if item.Table == nil {
+			return icebergAddress{}, nil
+		}
+		levels, levelProblems := icebergNamespaceLevels(itemPath(i, "table.namespace"), item.Table.Namespace)
+		if len(levelProblems) > 0 {
+			return icebergAddress{}, levelProblems
+		}
+		if item.Table.Name == "" {
+			return icebergAddress{}, []Problem{{Path: itemPath(i, "table.name"), Message: "required"}}
+		}
+		if p := icebergSegmentProblem(itemPath(i, "table.name"), item.Table.Name); p != nil {
+			return icebergAddress{}, []Problem{*p}
+		}
+		addr.namespace = levels
+		addr.table = item.Table.Name
+		addr.path = strings.Join(levels, "/") + "/" + item.Table.Name
+	case ItemTypeNamespace:
+		if item.Namespace == nil {
+			return icebergAddress{}, nil
+		}
+		levels, levelProblems := icebergNamespaceLevels(itemPath(i, "namespace"), *item.Namespace)
+		if len(levelProblems) > 0 {
+			return icebergAddress{}, levelProblems
+		}
+		addr.namespace = levels
+		addr.path = strings.Join(levels, "/")
+	default:
+		return icebergAddress{}, nil
+	}
+	if item.Target != addr.path {
+		return icebergAddress{}, []Problem{{
+			Path:    itemPath(i, "target"),
+			Message: fmt.Sprintf("must be %q, the catalog path this item materialises at", addr.path),
+		}}
+	}
+	return addr, nil
+}
+
+// icebergNamespaceLevels splits a dotted namespace into its levels and validates each one. Every
+// problem names path, the field the namespace came from ("data[2].table.namespace" or
+// "data[2].namespace").
+func icebergNamespaceLevels(path, namespace string) ([]string, []Problem) {
+	if namespace == "" {
+		return nil, []Problem{{Path: path, Message: "required"}}
+	}
+	if n := utf8.RuneCountInString(namespace); n >= icebergMaxNamespacePathLength {
+		return nil, []Problem{{Path: path, Message: fmt.Sprintf(
+			"must be shorter than %d characters, got %d", icebergMaxNamespacePathLength, n)}}
+	}
+	levels := strings.Split(namespace, icebergNamespaceSeparator)
+	for _, level := range levels {
+		if level == "" {
+			return nil, []Problem{{Path: path, Message: "must not contain an empty namespace level"}}
+		}
+		if p := icebergSegmentProblem(path, level); p != nil {
+			return nil, []Problem{*p}
+		}
+		for _, r := range level {
+			if !icebergNamespaceRune(r) {
+				return nil, []Problem{{Path: path, Message: fmt.Sprintf(
+					"namespace level %q contains %q; only letters, digits, underscores and hyphens are allowed",
+					level, r)}}
+			}
+		}
+	}
+	return levels, nil
+}
+
+// icebergNamespaceRune reports whether r may appear in one level of a namespace. Dots are absent
+// on purpose: they separate levels, so a level cannot contain one. The set is the catalog's own
+// (pkg/icebergcatalog validNamespaceRune, minus dots), because a level the catalog cannot address
+// would make the table unreachable through /iceberg/api.
+func icebergNamespaceRune(r rune) bool {
+	if r == utf8.RuneError {
+		return false
+	}
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-'
+}
+
+// icebergSegmentProblem rejects a value that cannot be one component of the reserved
+// _lakefs_iceberg/ layout: a path or namespace separator would let an item reach keys outside
+// the table it names, so this is a security rule as much as a shape rule. It mirrors
+// pkg/icebergcatalog validateLayoutSegment, which the catalog applies when it builds the same
+// key, and it is applied to table names too - a table name is a path component there.
+func icebergSegmentProblem(path, segment string) *Problem {
+	switch {
+	case segment == "." || segment == "..":
+		return &Problem{Path: path, Message: fmt.Sprintf("%q is reserved as a path component", segment)}
+	case strings.ContainsAny(segment, `/\`):
+		return &Problem{Path: path, Message: "must not contain a path separator"}
+	case strings.Contains(segment, icebergNamespaceSeparatorByte):
+		return &Problem{Path: path, Message: "must not contain the iceberg namespace separator"}
 	}
 	return nil
 }

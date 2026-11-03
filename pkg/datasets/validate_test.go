@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 )
 
 // validDefinition is the smallest definition that passes Validate.
@@ -504,4 +505,281 @@ func TestValidateNormalisesBeforeChecking(t *testing.T) {
 	}
 	require.NoError(t, Validate(def, ValidateOptions{}))
 	require.Equal(t, []DataItem{objectItem("a", "g"), objectItem("b", "f")}, def.Data)
+}
+
+// Iceberg table and namespace items (ICEBERG_CATALOG_PLAN.md §9).
+//
+// The reserved item types are accepted only while the Iceberg REST catalog is enabled: without it
+// nothing could materialise a table, and the dataset could not be read back through
+// /iceberg/api. These tests pin both halves - the disabled answer that keeps the 501 of §10.4,
+// and the enabled shape rules.
+
+// TestIcebergEnabledReadsTheCatalogSwitch pins that the gate is the catalog's own setting. The
+// key is written as a literal in validate.go (this package must not depend on the catalog just to
+// spell a configuration key), so this assertion is what keeps the two spellings in step.
+func TestIcebergEnabledReadsTheCatalogSwitch(t *testing.T) {
+	require.Equal(t, "iceberg.enabled", IcebergEnabledKey)
+	require.Equal(t, icebergcatalog.ConfigKey+".enabled", IcebergEnabledKey,
+		"the datasets gate must read the setting pkg/icebergcatalog reads")
+
+	// The default reads the process configuration. viper has no iceberg section here, so the
+	// answer is the disabled one: the zero-configuration behaviour of §10.4.
+	require.False(t, IcebergEnabled(), "an unconfigured process has no iceberg catalog")
+}
+
+// TestValidateIcebergItemTypesDisabled pins the answer every build without the catalog gives:
+// the reserved types are one problem at data[i].type, whose message carries the "(501)" the
+// service maps to ErrUnsupported (§10.4), and no other problem is reported about them.
+func TestValidateIcebergItemTypesDisabled(t *testing.T) {
+	require.False(t, IcebergEnabled(), "the fixture must run with the catalog disabled")
+
+	for _, item := range []DataItem{
+		{
+			Target: "t", Repository: "r", Ref: SourceRef{Type: RefTypeCommit, ID: "c"},
+			Type: ItemTypeTable, Table: &TableSrc{Namespace: "ns", Name: "t"},
+		},
+		{
+			Target: "t", Repository: "r", Ref: SourceRef{Type: RefTypeCommit, ID: "c"},
+			Type: ItemTypeNamespace, Namespace: ptr("ns"),
+		},
+	} {
+		t.Run(string(item.Type), func(t *testing.T) {
+			def := &Definition{FormatVersion: FormatVersion, Data: []DataItem{item}}
+			err := Validate(def, ValidateOptions{})
+			var verr *ValidationError
+			require.ErrorAs(t, err, &verr)
+			require.Equal(t, []string{"data[0].type"}, problemPaths(verr.Problems))
+			require.Contains(t, verr.Problems[0].Message, "(501)",
+				"the service turns this into the 501 of §10.4")
+		})
+	}
+}
+
+// TestValidateTableItemEnabled covers the shape §9 gives a table item: the namespace and the name
+// must be usable as catalog path components, and the target must be the catalog path the item
+// materialises at - <namespace levels>/<table> - because the keys a table item produces are fixed
+// by the reserved layout, not by the definition.
+func TestValidateTableItemEnabled(t *testing.T) {
+	withIcebergEnabled(t)
+
+	tableItem := func(target string, table *TableSrc) DataItem {
+		return DataItem{
+			Target: target, Repository: "src", Ref: SourceRef{Type: RefTypeCommit, ID: "abc"},
+			Type: ItemTypeTable, Table: table,
+		}
+	}
+
+	t.Run("accepted", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			item  DataItem
+			paths []string
+		}{
+			{
+				name: "single level namespace",
+				item: tableItem("analytics/orders", &TableSrc{Namespace: "analytics", Name: "orders"}),
+			},
+			{
+				name: "multi level namespace",
+				item: tableItem("inventory/books/orders", &TableSrc{Namespace: "inventory.books", Name: "orders"}),
+			},
+			{
+				name:  "target is normalised first",
+				item:  tableItem("/analytics/orders/", &TableSrc{Namespace: "analytics", Name: "orders"}),
+				paths: nil,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				def := &Definition{FormatVersion: FormatVersion, Data: []DataItem{tc.item}}
+				require.Equal(t, tc.paths, validatePaths(t, def, ValidateOptions{}))
+			})
+		}
+	})
+
+	t.Run("rejected", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			item  DataItem
+			paths []string
+		}{
+			{
+				name:  "target is not the catalog path",
+				item:  tableItem("orders", &TableSrc{Namespace: "analytics", Name: "orders"}),
+				paths: []string{"data[0].target"},
+			},
+			{
+				name:  "namespace descriptor is missing",
+				item:  tableItem("analytics", &TableSrc{Name: "orders"}),
+				paths: []string{"data[0].table.namespace"},
+			},
+			{
+				name:  "namespace name is missing",
+				item:  tableItem("analytics/", &TableSrc{Namespace: "analytics"}),
+				paths: []string{"data[0].table.name"},
+			},
+			{
+				name:  "table name may not contain a path separator",
+				item:  tableItem("analytics/a/b", &TableSrc{Namespace: "analytics", Name: "a/b"}),
+				paths: []string{"data[0].table.name"},
+			},
+			{
+				name:  "namespace level may not escape the reserved layout",
+				item:  tableItem("a/b/orders", &TableSrc{Namespace: "a/b", Name: "orders"}),
+				paths: []string{"data[0].table.namespace"},
+			},
+			{
+				name:  "dot-only namespace level is reserved",
+				item:  tableItem("x/orders", &TableSrc{Namespace: "..", Name: "orders"}),
+				paths: []string{"data[0].table.namespace"},
+			},
+			{
+				name:  "empty namespace level",
+				item:  tableItem("analytics//orders", &TableSrc{Namespace: "analytics..sub", Name: "orders"}),
+				paths: []string{"data[0].table.namespace"},
+			},
+			{
+				name:  "namespace level with a character the catalog cannot address",
+				item:  tableItem("analytic space/orders", &TableSrc{Namespace: "analytic space", Name: "orders"}),
+				paths: []string{"data[0].table.namespace"},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				def := &Definition{FormatVersion: FormatVersion, Data: []DataItem{tc.item}}
+				require.Equal(t, tc.paths, validatePaths(t, def, ValidateOptions{}))
+			})
+		}
+	})
+}
+
+// TestValidateNamespaceItemEnabled covers the namespace item of §9: it materialises the namespace
+// subtree, so its target is the namespace path and its name is validated like a table's.
+func TestValidateNamespaceItemEnabled(t *testing.T) {
+	withIcebergEnabled(t)
+
+	namespaceItem := func(target, namespace string) DataItem {
+		return DataItem{
+			Target: target, Repository: "src", Ref: SourceRef{Type: RefTypeCommit, ID: "abc"},
+			Type: ItemTypeNamespace, Namespace: ptr(namespace),
+		}
+	}
+
+	require.Nil(t, validatePaths(t, &Definition{FormatVersion: FormatVersion, Data: []DataItem{
+		namespaceItem("analytics", "analytics"),
+	}}, ValidateOptions{}))
+
+	require.Nil(t, validatePaths(t, &Definition{FormatVersion: FormatVersion, Data: []DataItem{
+		namespaceItem("inventory/books", "inventory.books"),
+	}}, ValidateOptions{}))
+
+	for _, tc := range []struct {
+		name string
+		item DataItem
+		want []string
+	}{
+		{
+			name: "target is not the namespace path",
+			item: namespaceItem("data", "analytics"),
+			want: []string{"data[0].target"},
+		},
+		{
+			name: "namespace is missing",
+			item: namespaceItem("analytics", ""),
+			want: []string{"data[0].namespace"},
+		},
+		{
+			name: "namespace may not escape the reserved layout",
+			item: namespaceItem("x", "a/../b"),
+			want: []string{"data[0].namespace"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			def := &Definition{FormatVersion: FormatVersion, Data: []DataItem{tc.item}}
+			require.Equal(t, tc.want, validatePaths(t, def, ValidateOptions{}))
+		})
+	}
+}
+
+// TestValidateIcebergItemsOverlap pins why the target of a reserved item is its catalog path: the
+// §5.2 rule-3 check then answers exactly the "this would be materialised twice" question. A
+// namespace item already copies every table below it, so attaching such a table as well is an
+// overlap; two tables of one namespace are not.
+func TestValidateIcebergItemsOverlap(t *testing.T) {
+	withIcebergEnabled(t)
+
+	tableItem := func(target, namespace, name string) DataItem {
+		return DataItem{
+			Target: target, Repository: "src",
+			Ref:  SourceRef{Type: RefTypeCommit, ID: "abc"},
+			Type: ItemTypeTable, Table: &TableSrc{Namespace: namespace, Name: name},
+		}
+	}
+	namespaceItem := func(target, namespace string) DataItem {
+		return DataItem{
+			Target: target, Repository: "src",
+			Ref:  SourceRef{Type: RefTypeCommit, ID: "abc"},
+			Type: ItemTypeNamespace, Namespace: ptr(namespace),
+		}
+	}
+
+	t.Run("a namespace item covers its own tables", func(t *testing.T) {
+		def := &Definition{FormatVersion: FormatVersion, Data: []DataItem{
+			tableItem("analytics/orders", "analytics", "orders"),
+			namespaceItem("analytics", "analytics"),
+		}}
+		// Canonical order is "analytics" (the namespace item) first, then the table it covers.
+		require.Equal(t, []string{"data[1].target"}, validatePaths(t, def, ValidateOptions{}))
+	})
+
+	t.Run("two tables of one namespace", func(t *testing.T) {
+		def := &Definition{FormatVersion: FormatVersion, Data: []DataItem{
+			tableItem("analytics/orders", "analytics", "orders"),
+			tableItem("analytics/customers", "analytics", "customers"),
+		}}
+		require.Nil(t, validatePaths(t, def, ValidateOptions{}), "sibling tables do not overlap")
+	})
+
+	t.Run("a namespace subtree and a nested namespace", func(t *testing.T) {
+		def := &Definition{FormatVersion: FormatVersion, Data: []DataItem{
+			namespaceItem("inventory", "inventory"),
+			namespaceItem("inventory/books", "inventory.books"),
+		}}
+		require.Equal(t, []string{"data[1].target"}, validatePaths(t, def, ValidateOptions{}))
+	})
+
+	t.Run("sibling namespaces", func(t *testing.T) {
+		def := &Definition{FormatVersion: FormatVersion, Data: []DataItem{
+			namespaceItem("inventory", "inventory"),
+			namespaceItem("sales", "sales"),
+		}}
+		require.Nil(t, validatePaths(t, def, ValidateOptions{}))
+	})
+
+	t.Run("a table and an object item elsewhere", func(t *testing.T) {
+		def := &Definition{FormatVersion: FormatVersion, Data: []DataItem{
+			tableItem("analytics/orders", "analytics", "orders"),
+			objectItem("customers", "data/customers.csv"),
+		}}
+		require.Nil(t, validatePaths(t, def, ValidateOptions{}))
+	})
+}
+
+// TestValidateIcebergItemReportsEveryProblem locks the multi-error contract for a reserved item:
+// the shape problems are reported together with the target problem, and the target is derived from
+// the descriptor only when the descriptor is sound.
+func TestValidateIcebergItemReportsEveryProblem(t *testing.T) {
+	withIcebergEnabled(t)
+
+	def := &Definition{FormatVersion: FormatVersion, Data: []DataItem{{
+		Target: "wrong", Repository: "src", Ref: SourceRef{Type: RefTypeCommit, ID: "abc"},
+		Type: ItemTypeTable, Table: &TableSrc{Namespace: "analytics", Name: "a/b"},
+	}}}
+	require.Equal(t, []string{"data[0].table.name"}, validatePaths(t, def, ValidateOptions{}))
+
+	def.Data[0].Table.Name = "orders"
+	require.Equal(t, []string{"data[0].target"}, validatePaths(t, def, ValidateOptions{}))
+	// The message names the target the item needs, so a client can fix the document.
+	err := Validate(def, ValidateOptions{})
+	var verr *ValidationError
+	require.ErrorAs(t, err, &verr)
+	require.Contains(t, verr.Problems[0].Message, `"analytics/orders"`)
 }

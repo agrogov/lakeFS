@@ -25,13 +25,16 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/graveler"
+	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -88,7 +91,8 @@ var (
 	ErrSourceKeyNotFound = errors.New("source object not found at the committed ref")
 
 	// ErrUnsupportedItemType reports a data item type that materialisation cannot
-	// map (table and namespace items are reserved, §1.2).
+	// map (a type this build knows nothing about; table and namespace items are
+	// served when the Iceberg catalog is enabled, §9).
 	ErrUnsupportedItemType = errors.New("unsupported data item type")
 
 	// ErrInvalidPublishRequest reports a request that the service should never send:
@@ -610,6 +614,11 @@ func (m *Materializer) openItem(ctx context.Context, index int, item *DataItem) 
 				ErrInvalidPublishRequest, itemPath(index, "prefix"), item.Type)
 		}
 		stream.sourceKey = item.Prefix.Path
+	case ItemTypeTable, ItemTypeNamespace:
+		// §9: the item copies the source repository's Iceberg catalog entries for the table or
+		// the namespace subtree. No key range of the source maps onto it, so it has neither a
+		// source prefix nor a target prefix: its keys are the catalog's own (reserved) keys.
+		stream.reserved = true
 	default:
 		return nil, fmt.Errorf("%s: %w: %q", itemPath(index, "type"), ErrUnsupportedItemType, item.Type)
 	}
@@ -625,7 +634,12 @@ func (m *Materializer) openItem(ctx context.Context, index int, item *DataItem) 
 	}
 	stream.repository = repo
 
-	src, err := m.openSource(ctx, stream)
+	var src graveler.ValueIterator
+	if stream.reserved {
+		src, err = m.openIcebergItem(ctx, index, item, stream)
+	} else {
+		src, err = m.openSource(ctx, stream)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -670,20 +684,359 @@ func (m *Materializer) openSource(ctx context.Context, stream *itemStream) (grav
 		return &singleRecordIterator{key: graveler.Key(stream.sourceKey), value: value}, nil
 	}
 
+	it, err := m.listSourcePrefix(ctx, stream, stream.sourceKey)
+	if err != nil {
+		return nil, err
+	}
+	return it, nil
+}
+
+// listSourcePrefix opens the iterator over every key of the source repository starting at prefix,
+// bounded to that prefix and authorized like any other source read (SEC-3). It is the prefix form
+// of §6.3, shared by prefix items and by the reserved Iceberg keys a table item copies.
+func (m *Materializer) listSourcePrefix(ctx context.Context, stream *itemStream, prefix string) (graveler.ValueIterator, error) {
+	reader := sourceReaderFrom(ctx)
+	if reader == nil && m.RequireSourceAuthz {
+		return nil, ErrSourceAuthzMissing
+	}
 	it, err := m.Catalog.Store.List(ctx, stream.repository, graveler.Ref(stream.commitID), m.BatchSize)
 	if err != nil {
 		return nil, fmt.Errorf("datasets: list %q at %s/%s: %w",
-			stream.sourceKey, stream.repository.RepositoryID, stream.commitID, err)
+			prefix, stream.repository.RepositoryID, stream.commitID, err)
 	}
-	if stream.sourceKey != "" {
+	if prefix != "" {
 		// An empty prefix is the whole repository (§5.2), which is where List starts.
-		it.SeekGE(graveler.Key(stream.sourceKey))
+		it.SeekGE(graveler.Key(prefix))
 	}
-	var src graveler.ValueIterator = &prefixIterator{it: it, prefix: stream.sourceKey}
+	var src graveler.ValueIterator = &prefixIterator{it: it, prefix: prefix}
 	if reader != nil {
 		src = &authorizedIterator{ValueIterator: src, ctx: ctx, reader: reader, stream: stream}
 	}
 	return src, nil
+}
+
+// Iceberg table and namespace items (ICEBERG_CATALOG_PLAN.md §6.1, §6.3, §9).
+//
+// A table is stored on the source branch as an ordinary lakeFS entry tree under the reserved
+// _lakefs_iceberg/ prefix:
+//
+//	_lakefs_iceberg/ns/<ns…>/.namespace                  namespace marker (user metadata = properties)
+//	_lakefs_iceberg/tables/<ns…>/<table>/.pointer        table pointer (user metadata: metadata
+//	                                                     location, table uuid, format version)
+//	_lakefs_iceberg/files/<table-uuid>/<relative path>   one entry per metadata, manifest-list,
+//	                                                     manifest and data file (§6.3)
+//
+// The pointer names its current metadata.json by *absolute* physical URI, and every manifest and
+// data file the metadata reaches is named the same way, which is why a table could not be moved
+// into a dataset by copying its files to a new location (DATASETS_DESIGN.md §7.4). §9's answer is
+// the one implemented here: the entries are copied, the objects they name are not. The physical
+// objects stay where the client wrote them - a dataset and its sources share a storage ID (§5.2
+// rule 4), so the dataset reads them through the same block adapter - and the datasets pin branch
+// of the source repository keeps them out of garbage collection.
+//
+// Because the reserved keys are copied unchanged, the dataset repository is itself a catalog
+// workspace: /iceberg/api with repo = the dataset repository, ref = the version tag, answers
+// <dataset>.<ref>.<namespace>.<table> with no further mapping. Item targets are therefore required
+// to be the catalog path (validate.go, icebergItemAddress).
+//
+// A marker or a pointer is a metadata-only entry: its content is its user metadata and its address
+// is its own key, with no object behind it (pkg/icebergcatalog store.go). The §6.3 conversion below
+// still applies to it - the entries are copied the same way as a prefix item's - so its full
+// address names a key no object was ever written at. Nothing reads it; the fields a reader uses are
+// the key and the user metadata.
+
+// icebergTablePointerKey is the reserved key of a table pointer, the sibling of
+// pkg/icebergcatalog tablePointerPath for a path that is already joined.
+func icebergTablePointerKey(path string) string {
+	return icebergcatalog.ReservedPrefix + "/" + icebergcatalog.TablesDirectory + "/" + path + "/" + icebergcatalog.TablePointerName
+}
+
+// icebergTablesPrefix is the key prefix of every table pointer at or below path, so a namespace
+// item sees the tables of its whole subtree.
+func icebergTablesPrefix(path string) string {
+	return icebergcatalog.ReservedPrefix + "/" + icebergcatalog.TablesDirectory + "/" + path + "/"
+}
+
+// icebergNamespaceMarkerKey is the reserved key of one namespace marker.
+func icebergNamespaceMarkerKey(path string) string {
+	return icebergcatalog.ReservedPrefix + "/" + icebergcatalog.NamespaceDirectory + "/" + path + "/" + icebergcatalog.NamespaceMarkerName
+}
+
+// icebergNamespacesPrefix is the key prefix of every namespace marker at or below path.
+func icebergNamespacesPrefix(path string) string {
+	return icebergcatalog.ReservedPrefix + "/" + icebergcatalog.NamespaceDirectory + "/" + path + "/"
+}
+
+// icebergFilesPrefix is the key prefix of the staged files of one table (§6.3). The table uuid is
+// what makes the path stable across branches, so it is also what lets materialisation find every
+// file the pinned snapshot reaches without reading a single manifest.
+func icebergFilesPrefix(tableUUID string) string {
+	return icebergcatalog.ReservedPrefix + "/" + icebergcatalog.FilesDirectory + "/" + tableUUID + "/"
+}
+
+// openIcebergItem opens the iterator of a table or namespace item (§9).
+//
+// A table item contributes exactly what §9 lists: the table pointer and every entry under
+// _lakefs_iceberg/files/<table-uuid>/, the tree §6.3 stages for the snapshot the pointer names. A
+// namespace item contributes the markers and table pointers of the namespace *subtree* below it,
+// and the files of every table in it.
+//
+// Which item owns a key is deliberate, because the k-way merge of §6.4 refuses to produce one key
+// twice and two items cannot coordinate. A namespace marker therefore belongs to the namespace
+// item that covers it, never to a table item: two table items of one namespace both need that
+// namespace's marker, so a marker copied by table items would make a dataset of two sibling tables
+// unpublishable. The consequences are worth stating plainly:
+//
+//   - a dataset of table items alone exposes its tables but no namespace markers, so listing its
+//     namespaces finds nothing; attach a namespace item when the namespace itself is wanted;
+//   - a namespace item's markers stop at its own subtree - its ancestors' markers are left to a
+//     namespace item that covers them - which keeps sibling sub-namespaces from colliding;
+//   - a namespace item and a table item inside it cannot both be attached (§5.2 rule 3), because
+//     the namespace item already copies that table;
+//   - an item that already covers the reserved keys some other way - a prefix item with the root
+//     target over a source that holds a catalog - still collides, and the §6.4 merge refuses the
+//     publish rather than writing one key twice.
+//
+// Everything is read at the pinned commit, and every read goes through the caller's per-object
+// source authorization (SEC-3) exactly like a prefix item's. A table or namespace that does not
+// exist at that commit is a *ValidationError naming the item, not a server error: the client
+// pinned the wrong ref or mistyped a name (§5.2 rule 5).
+func (m *Materializer) openIcebergItem(ctx context.Context, index int, item *DataItem, stream *itemStream) (graveler.ValueIterator, error) {
+	if !IcebergEnabled() {
+		return nil, fmt.Errorf("%w: %s: item type %q requires the iceberg catalog to be enabled",
+			ErrUnsupportedItemType, itemPath(index, "type"), item.Type)
+	}
+	addr, problems := icebergItemAddress(index, item)
+	if len(problems) > 0 {
+		return nil, &ValidationError{Problems: problems}
+	}
+	if addr.path == "" {
+		return nil, fmt.Errorf("%w: %s: item type %q has no source descriptor",
+			ErrInvalidPublishRequest, itemPath(index, ""), item.Type)
+	}
+
+	reader := sourceReaderFrom(ctx)
+	if reader == nil && m.RequireSourceAuthz {
+		return nil, ErrSourceAuthzMissing
+	}
+
+	var (
+		records      []*graveler.ValueRecord
+		filePrefixes []string
+		err          error
+	)
+	switch item.Type {
+	case ItemTypeTable:
+		records, filePrefixes, err = m.collectTable(ctx, stream, reader, addr)
+	case ItemTypeNamespace:
+		records, filePrefixes, err = m.collectNamespace(ctx, stream, reader, addr)
+	default:
+		err = fmt.Errorf("%w: %q", ErrUnsupportedItemType, item.Type)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return m.newIcebergItemIterator(ctx, stream, records, filePrefixes)
+}
+
+// collectTable gathers what a table item copies: the table pointer and the prefix of the table's
+// staged files. The marker of the table's namespace is deliberately not among them (see
+// openIcebergItem).
+func (m *Materializer) collectTable(ctx context.Context, stream *itemStream, reader *SourceReader, addr icebergAddress) ([]*graveler.ValueRecord, []string, error) {
+	pointerKey := icebergTablePointerKey(addr.path)
+	pointer, err := m.getSourceCatalogEntry(ctx, stream, reader, pointerKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	if pointer == nil {
+		return nil, nil, missingIcebergSource(stream, "table", strings.Join(addr.namespace, ".")+"."+addr.table)
+	}
+	tableUUID, err := icebergEntryTableUUID(pointer.entry)
+	if err != nil {
+		return nil, nil, fmt.Errorf("datasets: %s: %w", itemPath(stream.index, ""), err)
+	}
+	return []*graveler.ValueRecord{pointer.record}, []string{icebergFilesPrefix(tableUUID)}, nil
+}
+
+// collectNamespace gathers what a namespace item copies: the markers and table pointers of the
+// whole namespace subtree, and the files of every table in it.
+func (m *Materializer) collectNamespace(ctx context.Context, stream *itemStream, reader *SourceReader, addr icebergAddress) ([]*graveler.ValueRecord, []string, error) {
+	marker, err := m.getSourceCatalogEntry(ctx, stream, reader, icebergNamespaceMarkerKey(addr.path))
+	if err != nil {
+		return nil, nil, err
+	}
+	if marker == nil {
+		return nil, nil, missingIcebergSource(stream, "namespace", strings.Join(addr.namespace, "."))
+	}
+
+	// The subtree listings include the marker read above and every nested marker and pointer, so
+	// the item's answer is independent of how deep the warehouse is.
+	markers, err := m.collectSourcePrefix(ctx, stream, icebergNamespacesPrefix(addr.path))
+	if err != nil {
+		return nil, nil, err
+	}
+	pointers, err := m.collectSourcePrefix(ctx, stream, icebergTablesPrefix(addr.path))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	records := make([]*graveler.ValueRecord, 0, len(markers)+len(pointers))
+	records = append(records, markers...)
+	records = append(records, pointers...)
+
+	// One file prefix per distinct table uuid: the UUID is the table identity, so a table whose
+	// pointer moved within the subtree still contributes its files once.
+	seen := make(map[string]struct{}, len(pointers))
+	uuids := make([]string, 0, len(pointers))
+	for _, pointer := range pointers {
+		entry, err := catalog.ValueToEntry(pointer.Value)
+		if err != nil || entry == nil {
+			return nil, nil, fmt.Errorf("%w: %s: source entry %q has no value",
+				ErrInvalidSourceEntry, itemPath(stream.index, ""), pointer.Key)
+		}
+		tableUUID, err := icebergEntryTableUUID(entry)
+		if err != nil {
+			return nil, nil, fmt.Errorf("datasets: %s: pointer %q: %w", itemPath(stream.index, ""), pointer.Key, err)
+		}
+		if _, ok := seen[tableUUID]; ok {
+			continue
+		}
+		seen[tableUUID] = struct{}{}
+		uuids = append(uuids, tableUUID)
+	}
+	sort.Strings(uuids)
+	filePrefixes := make([]string, len(uuids))
+	for i, tableUUID := range uuids {
+		filePrefixes[i] = icebergFilesPrefix(tableUUID)
+	}
+	return records, filePrefixes, nil
+}
+
+// newIcebergItemIterator turns the collected records and the staged-file prefixes of a reserved
+// item into the item's iterator.
+//
+// The records are metadata-only entries whose keys are already dataset keys, so they are merged
+// with the file listings (which are ordered by the KV) by the same §6.4 merge every other item
+// uses. That merge is what turns two items claiming one table into ErrDuplicateKey instead of a
+// metarange with two values for one key, and it lets the metarange writer seek in this item like
+// in any other.
+func (m *Materializer) newIcebergItemIterator(ctx context.Context, stream *itemStream, records []*graveler.ValueRecord, filePrefixes []string) (graveler.ValueIterator, error) {
+	streams := make([]graveler.ValueIterator, 0, len(filePrefixes)+1)
+	if len(records) > 0 {
+		streams = append(streams, newRecordsIterator(records))
+	}
+	for _, prefix := range filePrefixes {
+		it, err := m.listSourcePrefix(ctx, stream, prefix)
+		if err != nil {
+			for _, opened := range streams {
+				opened.Close()
+			}
+			return nil, err
+		}
+		streams = append(streams, it)
+	}
+	switch len(streams) {
+	case 0:
+		return newRecordsIterator(nil), nil
+	case 1:
+		return streams[0], nil
+	default:
+		return newMergeIterator(streams), nil
+	}
+}
+
+// sourceCatalogEntry is one catalog entry read from a source repository at the pinned commit: the
+// raw record the dataset entry is built from, and the decoded entry the caller inspects.
+type sourceCatalogEntry struct {
+	record *graveler.ValueRecord
+	entry  *catalog.Entry
+}
+
+// getSourceCatalogEntry reads one source key at the pinned commit and returns nil (no error) when
+// the key does not exist, so each item decides what a missing key means for it. The read is
+// authorized like any other source read (SEC-3).
+func (m *Materializer) getSourceCatalogEntry(ctx context.Context, stream *itemStream, reader *SourceReader, key string) (*sourceCatalogEntry, error) {
+	if reader != nil {
+		if err := checkSourceObject(ctx, reader, stream, key); err != nil {
+			return nil, err
+		}
+	}
+	value, err := m.Catalog.Store.Get(ctx, stream.repository, graveler.Ref(stream.commitID), graveler.Key(key))
+	switch {
+	case errors.Is(err, graveler.ErrNotFound):
+		return nil, nil
+	case err != nil:
+		return nil, fmt.Errorf("datasets: %s: get source entry %q at %s/%s: %w",
+			itemPath(stream.index, ""), key, stream.repository.RepositoryID, stream.commitID, err)
+	}
+	entry, err := catalog.ValueToEntry(value)
+	if err != nil {
+		return nil, fmt.Errorf("datasets: %s: decode source entry %q: %w", itemPath(stream.index, ""), key, err)
+	}
+	if entry == nil {
+		return nil, fmt.Errorf("%w: %s: source entry %q has no value",
+			ErrInvalidSourceEntry, itemPath(stream.index, ""), key)
+	}
+	return &sourceCatalogEntry{
+		record: &graveler.ValueRecord{Key: graveler.Key(key), Value: value},
+		entry:  entry,
+	}, nil
+}
+
+// collectSourcePrefix drains every entry of one source key prefix into memory. A reserved item
+// needs the full set before it can open its iterators - the table pointers are what name the file
+// prefixes - and what it holds is catalog metadata: one small entry per namespace or table, never
+// an object.
+func (m *Materializer) collectSourcePrefix(ctx context.Context, stream *itemStream, prefix string) ([]*graveler.ValueRecord, error) {
+	it, err := m.listSourcePrefix(ctx, stream, prefix)
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+
+	var records []*graveler.ValueRecord
+	for it.Next() {
+		record := it.Value()
+		if record == nil {
+			return nil, fmt.Errorf("%w: %s: source iterator returned no value",
+				ErrInvalidSourceEntry, itemPath(stream.index, ""))
+		}
+		records = append(records, &graveler.ValueRecord{
+			Key:   append(graveler.Key(nil), record.Key...),
+			Value: record.Value,
+		})
+	}
+	if err := it.Err(); err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+// icebergEntryTableUUID decodes the table uuid of a pointer entry and returns it in canonical form,
+// so it can be used as one path component of the staged-file prefix. A pointer without a uuid is a
+// corrupted source entry (§6.1 lists it as a required field of the pointer).
+func icebergEntryTableUUID(entry *catalog.Entry) (string, error) {
+	raw := entry.Metadata[icebergcatalog.TableUUIDKey]
+	if raw == "" {
+		return "", fmt.Errorf("%w: table pointer has no %q", ErrInvalidSourceEntry, icebergcatalog.TableUUIDKey)
+	}
+	parsed, err := uuid.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("%w: table pointer %q is not a UUID: %w", ErrInvalidSourceEntry, icebergcatalog.TableUUIDKey, err)
+	}
+	return parsed.String(), nil
+}
+
+// missingIcebergSource is the *ValidationError of an item whose table or namespace does not exist at
+// the pinned commit. Like the missing source key of an object item (§5.2 rule 5) it is a definition
+// problem - the client pinned the wrong ref or mistyped a name - so it names the item and the
+// address that was looked for.
+func missingIcebergSource(stream *itemStream, field, name string) error {
+	return &ValidationError{Problems: []Problem{{
+		Path: itemPath(stream.index, field),
+		Message: fmt.Sprintf("%s %q not found in %s at commit %s",
+			field, name, stream.repository.RepositoryID, stream.commitID),
+	}}}
 }
 
 // ErrSourceAuthzMissing reports a source read attempted without the caller's authorization
@@ -841,6 +1194,12 @@ type itemStream struct {
 	// object reports whether the item maps exactly one key.
 	object bool
 
+	// reserved reports that the item materialises the source repository's Iceberg catalog entries
+	// (§9) rather than a key range: a table item or a namespace item. Its dataset keys are the
+	// source keys unchanged, because the reserved _lakefs_iceberg/ layout is repository-wide and a
+	// dataset has to answer /iceberg/api at the same address the source did.
+	reserved bool
+
 	repository *graveler.RepositoryRecord
 	commitID   graveler.CommitID
 }
@@ -849,7 +1208,14 @@ type itemStream struct {
 // replaces the source prefix with the target; for an object item the single source key
 // becomes the target. The mapping is monotone in the source key, which is what makes
 // each item's stream sorted and the k-way merge of §6.4 valid.
+//
+// A reserved item (table, namespace) is the identity map: the keys it copies are the catalog's
+// own reserved keys, and §9 keeps them so that the layout tree of an Iceberg metadata document,
+// which names this table's files by absolute path, still describes the dataset.
 func (s *itemStream) datasetKey(sourceKey string) string {
+	if s.reserved {
+		return sourceKey
+	}
 	if s.object {
 		return s.target
 	}
@@ -880,6 +1246,10 @@ func (s *itemStream) datasetKey(sourceKey string) string {
 //     that is be the reserved _dataset directory itself, which validation rejects as a target.
 func (s *itemStream) reservedSourceKey() (string, bool) {
 	switch {
+	case s.reserved:
+		// A reserved item copies only keys under _lakefs_iceberg/, which cannot be the reserved
+		// _dataset/ definition path.
+		return "", false
 	case s.object:
 		return s.sourceKey, s.target == DefinitionPath
 	case s.target == RootTarget:
@@ -894,6 +1264,9 @@ func (s *itemStream) reservedSourceKey() (string, bool) {
 // start of the span, so the merge — which owns the final ordering — never misses an
 // entry. Over-seeking would silently drop data.
 func (s *itemStream) sourceSeekKey(datasetKey string) string {
+	if s.reserved {
+		return datasetKey
+	}
 	if s.object {
 		return s.sourceKey
 	}
@@ -1063,6 +1436,60 @@ func (it *singleRecordIterator) Err() error { return nil }
 func (it *singleRecordIterator) Close() {}
 
 var _ graveler.ValueIterator = (*singleRecordIterator)(nil)
+
+// recordsIterator is a graveler.ValueIterator over records already read from a source: the markers
+// and table pointers a reserved item copies (§9). They are sorted by key on construction, because
+// the merge of §6.4 requires every stream to be sorted, and SeekGE is a binary search over them.
+//
+// What it holds is catalog metadata - one small entry per namespace or table - so keeping it in
+// memory is bounded by the number of namespaces and tables, not by the size of the data.
+type recordsIterator struct {
+	records []*graveler.ValueRecord // sorted by Key
+	pos     int
+	current *graveler.ValueRecord
+}
+
+// newRecordsIterator returns an iterator over records, sorting them in place. A nil slice is a
+// valid, empty iterator.
+func newRecordsIterator(records []*graveler.ValueRecord) *recordsIterator {
+	sort.SliceStable(records, func(i, j int) bool {
+		return bytes.Compare(records[i].Key, records[j].Key) < 0
+	})
+	return &recordsIterator{records: records, pos: -1}
+}
+
+// Next implements graveler.ValueIterator.
+func (it *recordsIterator) Next() bool {
+	if it.pos < len(it.records) {
+		it.pos++
+	}
+	if it.pos >= len(it.records) {
+		it.current = nil
+		return false
+	}
+	it.current = it.records[it.pos]
+	return true
+}
+
+// SeekGE implements graveler.ValueIterator: the next Next returns the first record whose key is
+// >= id.
+func (it *recordsIterator) SeekGE(id graveler.Key) {
+	it.pos = sort.Search(len(it.records), func(i int) bool {
+		return bytes.Compare(it.records[i].Key, id) >= 0
+	}) - 1
+	it.current = nil
+}
+
+// Value implements graveler.ValueIterator.
+func (it *recordsIterator) Value() *graveler.ValueRecord { return it.current }
+
+// Err implements graveler.ValueIterator.
+func (it *recordsIterator) Err() error { return nil }
+
+// Close implements graveler.ValueIterator.
+func (it *recordsIterator) Close() {}
+
+var _ graveler.ValueIterator = (*recordsIterator)(nil)
 
 // prefixIterator bounds a Store.List iterator to its prefix. Everything the source
 // repository holds under the prefix belongs to the item; the first key outside it ends
