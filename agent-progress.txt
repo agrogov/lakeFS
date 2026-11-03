@@ -179,3 +179,44 @@ TestPublishNamespaceItem read the published version back with `icebergcatalog.St
 Follow-ups handed to I6-2: api/datasets.yml + pkg/datasets/apigen still say table/namespace are
 "answered with 501"; authz SourceObjectArn still checks the whole repository for a table item; and
 the docs need the target-equals-catalog-path rule plus the marker-ownership note.
+
+## I6-2 (datasets authz + docs for table items) — done, commit a3c953e63
+
+`SourceReadNode` now special-cases a `table` item: `catalog:ReadTable` + `catalog:ReadTableData`
+on `CatalogTableArn(repo, ns, table)` — the pair `/iceberg/api` itself checks — instead of the
+`fs:ListObjects`/`fs:ReadObject` pair. A new `SourceTableArn(item) (string, bool)` is the only
+builder of that ARN; it answers `false` for a missing or empty descriptor, so the node falls back
+to the whole-repository object glob (fail closed). A `namespace` item keeps that fallback: it
+covers every table below it, so no single catalog ARN describes it. `fs:ReadRepository` is still
+checked first by `CheckSourceRepositories`, and `SourceReader.CheckObject` still authorizes each
+entry the materialiser reads, so the catalog pair is not a replacement for SEC-3. `itemSourcePath`
+now names reserved items (`<ns>.<table>`, `<ns>`), so a 403 names the catalog object.
+
+Validation: `go test ./pkg/datasets/... && make validate-api` → ok 61.271s, exit 0.
+`golangci-lint run ./pkg/datasets/...` → the same 7 pre-existing findings as I6-1, none on a
+changed line. Independent review/QA gates unavailable (no subagent): replaced by a documented
+self-review of the full staged diff plus a re-run of the validation after the last edit.
+
+### Scope deviations, both recorded in tasks.json
+
+1. `pkg/datasets/apigen/datasets.gen.go` is in the commit. `api/datasets.yml` generates *that*
+   file (`pkg/datasets/http.go` go:generate), not `pkg/api/apigen/lakefs.gen.go`, and
+   `make validate-api` checks it. `lakefs.gen.go` is also committed, but its only change is the
+   embedded spec's gzip bytes (decoded JSON byte-identical) — a go 1.26.4 toolchain artifact under
+   the pinned generator. The ledger's `files_expected` swapped the two.
+2. `pkg/datasets/handlers.go` + `pkg/datasets/http_api_test.go`. Review found
+   `dataItemFromAPI`/`dataItemToAPI` never carried `apigen.DataItem.Table`: a table item posted to
+   `POST /api/v1/datasets` lost its descriptor and failed validation, so the table items this task
+   documents were unusable through the REST API (and I6-3's esti test cannot pass without the fix).
+   Both directions now map `TableSrc` ↔ `apigen.TableSource{Namespace,Name}`; pinned by
+   `TestDataItemReservedAPIRoundTrip`.
+
+### Follow-ups handed on
+
+1. `pkg/datasets/definition.go` still documents `ItemTypeTable`/`ItemTypeNamespace`/`TableSrc` as
+   rejected with 501. Outside I6-1's and I6-2's `files_expected`; the prose is now wrong.
+2. `pkg/api/apigen/lakefs.gen.go` is out of sync with HEAD's committed blob under go 1.26.4 (gzip
+   only). Any task that runs `make validate-api` must commit the regenerated file or the check
+   fails on an unrelated diff.
+3. I6-3 (esti) is now unblocked: the table descriptor survives the wire, so a definition posted to
+   the control plane can be published and read back through `/iceberg/api`.

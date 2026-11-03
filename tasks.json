@@ -682,17 +682,25 @@
       "title": "datasets authz for table sources, plus api/datasets.yml, docs and DATASETS_DESIGN updates",
       "scope": "Extend pkg/datasets SourceObjectArn/authz for table items: check catalog:ReadTable and catalog:ReadTableData on CatalogTableArn for the source ref. Document table and namespace items in api/datasets.yml (regenerate with make gen-api) and docs/datasets.md, and update DATASETS_DESIGN.md §1.2, §3 (parity row), §7.4, §17 and Q4 to point at the landed catalog.",
       "refs": ["§9 changes", "§3 design refs"],
-      "status": "backlog",
+      "status": "done",
       "depends_on": ["I6-1"],
       "files_expected": ["pkg/datasets/authz.go", "pkg/datasets/authz_test.go", "api/datasets.yml", "pkg/api/apigen/lakefs.gen.go", "docs/datasets.md", "DATASETS_DESIGN.md"],
       "validation": "go test ./pkg/datasets/... && make validate-api",
-      "validation_result": null,
+      "validation_result": {"status": "pass", "command": "go test ./pkg/datasets/... && make validate-api", "details": "go test ./pkg/datasets/... -> ok 61.271s (apigen: no test files); make validate-api -> exit 0 (gen-api regenerates and all four generated files are clean: pkg/api/apigen/lakefs.gen.go, pkg/auth/client.gen.go, pkg/authentication/apiclient/client.gen.go, pkg/datasets/apigen/datasets.gen.go); go tool golangci-lint run ./pkg/datasets/... -> the same 7 pre-existing findings recorded by I6-1 (service.go:1793, handlers.go:616/617/635, store.go:1527, metadata_validate.go:373, proposals.go:621), none on a changed line"},
       "autocommit": true,
       "commit_message": "I6-2: authorize table sources and document table items",
-      "commit": {"sha": null, "at": null},
+      "commit": {"sha": "a3c953e630789b70e92233a22036c3a96b4abe61", "at": "2026-11-03T11:48:14+01:00"},
       "notes": [
         "pkg/api/apigen/lakefs.gen.go is generated: commit it together with api/datasets.yml only.",
-        "A dataset table item is read-only at the destination through the existing immutability deny."
+        "A dataset table item is read-only at the destination through the existing immutability deny.",
+        "SourceReadNode(table item) = And[catalog:ReadTable, catalog:ReadTableData] on CatalogTableArn(repo, ns, table) - the pair /iceberg/api itself checks (ICEBERG_CATALOG_PLAN.md §7.2). The fs:ListObjects/fs:ReadObject pair is gone for table items because the catalog does not require it; fs:ReadRepository is still checked first by CheckSourceRepositories and SourceReader.CheckObject still authorizes every entry the materialiser reads.",
+        "New SourceTableArn(item) (catalog ARN + ok) is the single builder of that ARN; it reports ok=false for a missing/empty descriptor, so SourceReadNode falls back to the whole-repository object glob (fail closed). A namespace item keeps that fallback: it covers every table below it, so no single catalog ARN describes it.",
+        "itemSourcePath now names a table as <ns>.<table> and a namespace as <ns>, so a 403 names the catalog object instead of an empty path (TestSourceItemNameReserved).",
+        "The ARN uses the definition's dotted namespace unchanged: validate.icebergNamespaceSeparator is '.', which is also Namespace.Dotted(), the form icebergcatalog builds its ARNs from - no conversion; pinned by TestSourceReadNode/TestSourceTableArn.",
+        "SCOPE DEVIATION, recorded deliberately: pkg/datasets/apigen/datasets.gen.go is also in the commit. api/datasets.yml is the input of that file (pkg/datasets/http.go go:generate), not of pkg/api/apigen, and make validate-api fails unless it is regenerated and committed with it. The ledger named lakefs.gen.go instead; lakefs.gen.go changes only in the embedded spec's gzip bytes (decoded JSON byte-identical), a toolchain artifact of go 1.26.4 under the pinned generator.",
+        "SCOPE DEVIATION, recorded deliberately: pkg/datasets/handlers.go + pkg/datasets/http_api_test.go. dataItemFromAPI/dataItemToAPI never carried apigen.DataItem.Table, so a table item posted to POST /api/v1/datasets lost its descriptor and failed validation - the documented table items were unusable through the REST API (and I6-3's esti test cannot pass without this). Both directions now map TableSrc <-> apigen.TableSource{Namespace,Name}; pinned by TestDataItemReservedAPIRoundTrip.",
+        "Follow-up for the board: the comments on ItemTypeTable/ItemTypeNamespace/TableSrc in pkg/datasets/definition.go still say the types are rejected with 501; definition.go was outside files_expected for I6-1 and I6-2 and was not touched.",
+        "Independent review/QA gates were not available in this session (no subagent); a documented self-review replaced them: full staged diff read, gofmt/go vet clean, golangci-lint findings compared against I6-1's baseline, and the validation command re-run after the last edit."
       ]
     },
     {
