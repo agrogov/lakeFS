@@ -136,7 +136,7 @@ bigger surface than datasets.
 | Catalog write / commit | `pkg/catalog/catalog.go:1201` `CreateEntry(…, opts ...graveler.SetOptionsFunc)`, `:1361` `Commit` | Options are passed through |
 | Address types | `pkg/block/adapter.go:30-54` (`IdentifierTypeRelative` / `Full`), `pkg/catalog/catalog.go:1156-1176` | Lets entries point at existing physical objects |
 | Datasets reserved item types | `pkg/datasets/definition.go:89-90` (`ItemTypeTable`, `ItemTypeNamespace`), `:103-113` (`TableSrc`, `NsSrc`) | |
-| Datasets 501 rejection | `pkg/datasets/validate.go:222-225` | Remove in phase I-6 |
+| Datasets 501 rejection | `pkg/datasets/validate.go:222-225` | Resolved in phase I-6 (I6-1): `table`/`namespace` items are accepted when `iceberg.enabled` |
 | Design refs | `DATASETS_DESIGN.md:26-27, 51, 81, 587-593, 1107, 1127` | Update when this lands |
 
 ---
@@ -351,10 +351,15 @@ Changes:
 
 ## 9. Datasets integration (phase I-6)
 
+**Status: landed.** `table` and `namespace` items are accepted when `iceberg.enabled`, materialised from the
+pointer and the staged file entries, authorized at the source, and read back through the catalog at
+`<dataset>.<ref>.<namespace>.<table>`; they are no longer rejected. The design notes below are what the
+implementation follows.
+
 Because table files are lakeFS entries with **full physical addresses** (§6.3), a datasets `table` item materialises
 the same way as a `prefix` item. It copies:
 - the pointer entry;
-- the `_lakefs_iceberg/files/<uuid>/…` entries reachable from the pinned snapshot.
+- the `_lakefs_iceberg/files/<uuid>/…` entries present at the source ref.
 
 The absolute paths inside metadata stay valid because:
 - the physical objects are shared;
@@ -362,16 +367,15 @@ The absolute paths inside metadata stay valid because:
 
 This removes the portability problem in DATASETS_DESIGN.md §7.4.
 
-Changes:
-- `pkg/datasets/validate.go:222-225`: accept `table` and `namespace` when `iceberg.enabled`.
-- `pkg/datasets/materialize.go`: add an item opener that resolves the table at the source ref and iterates its file
-  entries plus the pointer.
+Landed as:
+- `pkg/datasets/validate.go`: `table` and `namespace` are accepted when `iceberg.enabled`.
+- `pkg/datasets/materialize.go`: an item opener resolves the table at the source ref and iterates its file entries
+  plus the pointer.
 - The datasets read path: `catalog.<ds>.<ref>.<ns>.<table>` is just `/iceberg/api` with repo = the dataset repo. It is
   read-only because of the immutability deny (§7.2).
-- `pkg/datasets/authz.go` `SourceObjectArn`: for table items, check `catalog:ReadTable` and `catalog:ReadTableData` on
+- `pkg/datasets/authz.go` `SourceObjectArn`: for table items, checks `catalog:ReadTable` and `catalog:ReadTableData` on
   `CatalogTableArn`.
-- `api/datasets.yml` and `docs/datasets.md`: document table and namespace items. Update DATASETS_DESIGN.md §1.2, §3,
-  §7.4, §17 and Q4.
+- `api/datasets.yml` and `docs/datasets.md` document table and namespace items.
 
 ---
 
@@ -384,6 +388,7 @@ iceberg:
   token_ttl: 1h
   max_request_body: 8MiB
   uncommitted_gc_grace: 24h      # §6.3
+  max_staged_files: 50000        # §6.3, spike S-I2
   ignore_compaction_commits: true # phase I-5
 ```
 
@@ -583,7 +588,7 @@ Open items this spike handed on, and where they stand:
 
 | Item | Owner |
 |---|---|
-| Confirm against a real GC run (append → commit → GC → table still readable; stage → wait → GC → files gone) | I3-3 esti — **not yet written** |
+| Confirm against a real GC run (append → commit → GC → table still readable; stage → wait → GC → files gone) | I3-3: `esti/iceberg_test.go` covers append → commit → GC prepare → still readable, and `gc_test.go` covers stage → grace → report; the external Spark sweep itself is not run in-repo |
 | Decide whether `_iceberg/` may be excluded from the committed-GC sweep; the §13 fallback needs it | §13 / Q-I10 — open |
 | Replace the 1 ms-RTT emulation with real `kv/postgres` numbers | I3-1 — optional, not done |
 | Whether the 3 ms batching floor can be avoided with a bulk staging primitive (2.3 s → ≈0.3 s) | future graveler work, out of scope for v1 |
@@ -654,16 +659,17 @@ public documentation states as behaviour, and it is the honest list of what is a
 |---|---|
 | Read path: `GET /v1/config`, namespace and table reads on any ref, `relative_to` in both forms | **landed** |
 | Write path: namespace create/update/drop, table create, drop, metrics, commit (§6.2) | **landed** |
+| Commit over HTTP: `POST …/tables/{table}`, staged, CAS, `400` above `iceberg.max_staged_files` | **landed** |
 | `register` (§I-2) | not served, not advertised |
-| §6.3 file registration as lakeFS entries | code and tests in `pkg/icebergcatalog/files.go`, **not called by the commit path** |
-| §6.3 uncommitted-GC grace and the `_lakefs_iceberg/` deny | predicate and policy builder landed and tested in `gc.go`; **not yet hooked into `pkg/catalog` / bootstrap** |
-| §8 remote signing and vended credentials | implemented in `sign.go` / `creds.go`, **services not mounted**, so not advertised |
-| §7.1 OAuth token endpoint | implemented in `oauth.go` / `auth.go`, **not wired** into the mounted middleware (which still serves Basic and JWT) |
+| §6.3 file registration as lakeFS entries | **landed and called by the commit path** (`files.go`, step 5), capped by `iceberg.max_staged_files` |
+| §6.3 uncommitted-GC grace and the `_lakefs_iceberg/` deny | **landed and wired**: `Bootstrap` installs the grace via `catalog.SetUncommittedGCProtector` and attaches `iceberg-reserved-prefix-protect` |
+| §8 remote signing and vended credentials | **services mounted and advertised** when the blockstore supports them; the table load still returns an empty `config` |
+| §7.1 OAuth token endpoint | **landed**: the catalog's own auth middleware serves `POST /v1/oauth/tokens` (form `client_id`/`client_secret` or HTTP Basic) |
 | §7.2 `catalog:ReadTableData` / `catalog:WriteTableData` and the `CatalogRead` grant | **landed** |
 | §6.4 compaction auto-resolve | decision logic landed (`ResolvePointerConflict`), merge wiring pending |
-| I-5 ETag / `If-None-Match` | not implemented |
-| §9 datasets `table` / `namespace` items | not implemented; they still answer 501 |
-| §12 conformance and esti | iceberg-go external suite and the documented RCK invocation landed; esti suites not yet written |
+| I-5 ETag / `If-None-Match` | **landed** on table load, varying with `snapshots`; no tag on `HEAD` |
+| §9 datasets `table` / `namespace` items | **landed**: accepted when `iceberg.enabled`, materialised, authorized at the source, readable through the catalog |
+| §12 conformance and esti | iceberg-go external suite and the documented RCK invocation landed; esti suites written, but the read path skips without `register` and no green conformance run is recorded |
 
 The user-facing summary of this table lives in [`docs/iceberg.md`](docs/iceberg.md), including the
 uncommitted-GC window and the RBAC note for policies written before the data-plane actions existed.

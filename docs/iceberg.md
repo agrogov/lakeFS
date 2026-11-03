@@ -19,7 +19,11 @@ The catalog is mounted by the hook that also serves the datasets control plane
 
 The companion design document is [`ICEBERG_CATALOG_PLAN.md`](../ICEBERG_CATALOG_PLAN.md); the datasets
 integration it unblocks is in [`DATASETS_DESIGN.md`](../DATASETS_DESIGN.md) and
-[`datasets.md`](datasets.md).
+[`datasets.md`](datasets.md). That integration is in place: a datasets `table` item copies a table's
+pointer and its `_lakefs_iceberg/files/<table-uuid>/` entries at the source ref, a `namespace` item
+copies a namespace subtree's markers, pointers and file entries, and both are accepted when
+`iceberg.enabled` is true — so a published dataset repository is read as a table at
+`<dataset>.<ref>.<namespace>.<table>`.
 
 ## Enabling the catalog
 
@@ -32,17 +36,19 @@ disabled, not receive the lakeFS UI or a gateway error.
 iceberg:
   enabled: true
   prefix: lakefs                   # the only accepted value; see "Addressing"
-  token_ttl: 1h                    # lifetime of a client-credentials token (see "Current limitations")
+  token_ttl: 1h                    # lifetime of a client-credentials token
   max_request_body: 8388608        # 8 MiB; larger bodies are 413
   uncommitted_gc_grace: 24h        # see "Garbage collection"
+  max_staged_files: 50000          # cap on the table files one commit may stage; see "Garbage collection"
   ignore_compaction_commits: true   # see "Merge"
 ```
 
 Every key also has an environment variable (`LAKEFS_ICEBERG_ENABLED`, `LAKEFS_ICEBERG_TOKEN_TTL`,
 `LAKEFS_ICEBERG_MAX_REQUEST_BODY`, `LAKEFS_ICEBERG_UNCOMMITTED_GC_GRACE`,
-`LAKEFS_ICEBERG_IGNORE_COMPACTION_COMMITS`). An invalid `iceberg:` section fails startup: a prefix other
-than `lakefs`, a non-positive `token_ttl`, a negative `max_request_body` or a negative
-`uncommitted_gc_grace` are all configuration errors rather than settings that silently do nothing. The
+`LAKEFS_ICEBERG_MAX_STAGED_FILES`, `LAKEFS_ICEBERG_IGNORE_COMPACTION_COMMITS`). An invalid `iceberg:`
+section fails startup: a prefix other than `lakefs`, a non-positive `token_ttl`, a negative
+`max_request_body`, a negative `uncommitted_gc_grace` or a negative `max_staged_files` are all
+configuration errors rather than settings that silently do nothing. The
 section is absorbed by the core configuration (`pkg/config/oss_config.go`) so that
 `viper.UnmarshalExact` accepts it, and is read by `pkg/icebergcatalog` — never by the core unmarshal.
 
@@ -182,9 +188,14 @@ change in lakeFS.
   the current table metadata; a requirement that does not hold is `409 CommitFailedException` and the
   client refreshes and retries. The pointer is then swapped with a condition on the previous
   `metadata.json` location, so exactly one of two concurrent commits wins; the loser gets `409` too.
-  Anything that fails after the new `metadata.json` is written is `500 CommitStateUnknownException`,
-  never `409`: the commit may well have landed, so the client must re-read the table instead of
-  assuming failure.
+  Anything that fails after the new `metadata.json` is written — other than a staging refusal that is
+  the client's own `400` — is `500 CommitStateUnknownException`, never `409`: the commit may well have
+  landed, so the client must re-read the table instead of assuming failure.
+- **The commit stages the files it added.** Each new metadata, manifest-list, manifest and data file
+  becomes a lakeFS entry under `_lakefs_iceberg/files/<table-uuid>/…` (see
+  [Garbage collection](#garbage-collection)). A commit that names a file outside the table's area, or
+  that would stage more than `iceberg.max_staged_files` files (default 50 000), is refused with `400`
+  before anything is staged — that refusal is the client's, not an unknown outcome.
 - `set-location` is refused with `400`. A table's location is fixed at creation, which is what allows
   the catalog to keep its files in one place across branches.
 
@@ -199,6 +210,8 @@ _lakefs_iceberg/                              on the branch: ordinary lakeFS ent
                                                   iceberg.metadata-location = physical URI
                                                   iceberg.table-uuid
                                                   iceberg.format-version
+  files/<table-uuid>/<relative path>           one entry per table file the commit staged
+                                                  (metadata, manifest-list, manifest, data)
 
 <storage_namespace>/_iceberg/<table-uuid>/     in object storage: the files themselves
   metadata/…
@@ -257,9 +270,12 @@ policies already cover them: the `CatalogRead` policy set includes `catalog:Read
 > lakeFS Iceberg documentation carries for its own upgrade.
 
 Authentication accepts an `Authorization: Bearer <lakefs-jwt>` header and HTTP Basic
-(access key id + secret). A `401` carries no detail about *why* the credential was rejected, and
-authentication runs before any request or body validation, so an unauthenticated caller cannot learn
-whether its request was well-formed. Bodies larger than `iceberg.max_request_body` are `413`.
+(access key id + secret), and the catalog serves `POST /v1/oauth/tokens` itself (`client_credentials`,
+with the access key pair as form `client_id`/`client_secret` or as HTTP Basic) so a client configured
+with an access key pair can obtain a JWT. A `401` carries no detail about *why* the credential was
+rejected, and authentication runs before any request or body validation, so an unauthenticated caller
+cannot learn whether its request was well-formed. Bodies larger than `iceberg.max_request_body` are
+`413`.
 
 Every mutating operation honours `Idempotency-Key`: the final response (including a stored `409`) is
 replayed for the same key while the advertised `idempotency-key-lifetime` (30 minutes) has not elapsed.
@@ -267,28 +283,33 @@ replayed for the same key while the advertised `idempotency-key-lifetime` (30 mi
 ## Data-plane access
 
 Iceberg clients write data files themselves, so the catalog has to answer what credentials a client uses
-for those reads and writes. This build implements the mode that always works and shapes the other two:
+for those reads and writes. This build serves all three modes, the last two gated by how the server is
+set up:
 
 | Mode | Status | How |
 |---|---|---|
 | Client's own storage credentials (**default**) | available | The client is configured with S3 credentials for the storage namespace, or writes through the lakeFS S3 gateway. The catalog returns `config` empty, so a client falls back to its own `FileIO`. |
-| Remote signing | not advertised in this build | The signing endpoint (`POST …/tables/{t}/sign`) and the `s3.remote-signing-enabled` property exist in `pkg/icebergcatalog/sign.go`, but the service is not yet mounted, so the catalog advertises no signing endpoint and requests carrying `X-Iceberg-Access-Delegation: remote-signing` are answered normally with an empty `config`. |
-| STS vended credentials | not advertised in this build | `blockstore.s3.credentials_vending.{role_arn, session_duration, external_id, endpoint}` is parsed and validated (`session_duration` defaults to 1h and must be between 15m and 12h) and `pkg/icebergcatalog/creds.go` implements the vending endpoint scoped to the table prefix, but the service is not yet mounted. |
+| Remote signing | served when the blockstore can sign | `POST …/tables/{t}/sign` is mounted and advertised in `GET /v1/config` when the blockstore is S3 and its pre-signer is available (`pkg/icebergcatalog/sign.go`); the endpoint honours `X-Iceberg-Access-Delegation: remote-signing` and requires `catalog:ReadTableData` / `catalog:WriteTableData` on the table. |
+| STS vended credentials | served when configured | `blockstore.s3.credentials_vending.{role_arn, session_duration, external_id, endpoint}` is parsed and validated (`session_duration` defaults to 1h and must be between 15m and 12h); `GET …/tables/{t}/credentials` (`pkg/icebergcatalog/creds.go`) is mounted and advertised when the blockstore is S3 and `role_arn` is set, and vends a read session scoped to the table prefix. |
 
-The delegation header is always safe to send: a client that asks for `vended-credentials` or
-`remote-signing` and does not receive `storage-credentials` or a signing config falls back to its own
-credentials, which is what makes landing these modes later a non-breaking change.
+A table load still returns an empty `config`: it carries no `storage-credentials` and does not set
+`s3.remote-signing-enabled`, so a standard client is not pointed at either endpoint and keeps its own
+`FileIO` unless it calls `/credentials` or `/sign` directly. The delegation header is always safe to
+send: a client that asks for `vended-credentials` or `remote-signing` and does not receive
+`storage-credentials` falls back to its own credentials, which is what makes advertising either
+mechanism in the load response a non-breaking addition later.
 
 ## Garbage collection
 
 Table files live inside the repository's storage namespace and are written by the *client*, so they are
 not lakeFS entries until the catalog stages them. Two consequences and two controls:
 
-1. **Staged entries.** The commit path is meant to register one entry per new metadata,
-   manifest-list, manifest and data file under `_lakefs_iceberg/files/<table-uuid>/…`, pointing at the
-   physical object with a full address. With entries in place, the GC sees every file, `lakectl diff`
-   shows file-level changes, and a merge carries them. (The registration is written and tested; the
-   commit path does not call it yet — see [Current limitations](#current-limitations).)
+1. **Staged entries.** The commit path registers one entry per new metadata, manifest-list, manifest
+   and data file under `_lakefs_iceberg/files/<table-uuid>/…`, pointing at the physical object with a
+   full address (step 5 of the commit, `pkg/icebergcatalog/files.go`). The GC therefore sees every
+   file, `lakectl diff` shows file-level changes, and a merge carries them. `iceberg.max_staged_files`
+   (default 50 000) caps one commit's staging: a larger commit is refused with `400` before any entry
+   is written, instead of being registered partially.
 2. **An uncommitted-GC grace window**, `iceberg.uncommitted_gc_grace` (default 24h). The uncommitted GC
    lists staged entries, so a staged table file is collectable exactly like any other uncommitted
    lakeFS write. The grace keeps an entry under `_iceberg/` out of the report while it is younger than
@@ -314,11 +335,14 @@ The residual window, stated plainly, because a grace period is a mitigation and 
 - **Clock skew never deletes.** A file whose recorded modification time is in the future is protected,
   so a client with a fast clock delays collection instead of causing it.
 
-The predicate (`icebergcatalog.UncommittedGCProtected`) and the installation-wide deny policy that
-reserves `_lakefs_iceberg/` against `fs:WriteObject` / `fs:DeleteObject` are implemented and tested in
-`pkg/icebergcatalog/gc.go`. Hooking the predicate into `pkg/catalog`'s prepare step and attaching the
-policy at bootstrap are the remaining follow-ups; until they land, only the committed-GC rules and the
-"commit promptly" operational rule protect table files.
+The predicate (`icebergcatalog.UncommittedGCProtected`) is installed into `pkg/catalog`'s
+uncommitted-prepare step at startup (`catalog.SetUncommittedGCProtector`, called from
+`icebergcatalog.Bootstrap`), so a protected object never reaches the report the GC job deletes from.
+The same bootstrap creates and attaches the installation-wide deny policy
+(`iceberg-reserved-prefix-protect`) that reserves `_lakefs_iceberg/` against `fs:WriteObject` and
+`fs:DeleteObject`, for the same non-service groups the datasets pin deny covers. Both controls exist
+only on a `lakefs-sso` server with `iceberg.enabled`; a plain `lakefs` server installs no protector and
+keeps its unchanged GC defaults.
 
 ## Merge
 
@@ -348,8 +372,11 @@ only when it is mounted and tested.
 | `GET`, `HEAD`, `POST`, `DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}` | served |
 | `POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics` | served (accepted and discarded) |
 | `POST /v1/{prefix}/namespaces/{namespace}/register` | not served |
-| `GET …/tables/{table}/credentials`, `POST …/tables/{table}/sign` | implemented, not mounted |
+| `GET …/tables/{table}/credentials`, `POST …/tables/{table}/sign` | served and advertised only when supported: S3 blockstore for signing, S3 plus `credentials_vending.role_arn` for vending |
 | `tables/rename`, `transactions/commit`, `views/*`, `plan`, `tasks` | out of scope for v1, never advertised |
+
+`POST /v1/oauth/tokens` is served as well. It is the catalog's authentication endpoint rather than a
+`/v1/{prefix}` operation, so it is not part of the advertised list.
 
 Errors use the protocol's envelope, `{"error": {"message": …, "type": …, "code": …}}`, with the
 `NoSuchNamespaceException`, `NoSuchTableException`, `AlreadyExistsException`,
@@ -364,38 +391,25 @@ whatever the endpoint.
 
 `pageToken` / `pageSize` are honoured on both listings and `next-page-token` is returned; the token is
 opaque to clients. Table load supports the `snapshots` query parameter (`all`, the default, or `refs`,
-which keeps only the snapshots a branch or tag points at). ETags are not returned in this build, so a
-client that sends `If-None-Match` always receives a full response.
+which keeps only the snapshots a branch or tag points at). A table load sets an `ETag` derived from the
+metadata location and the `snapshots` mode, and answers `304 Not Modified` with no body when
+`If-None-Match` matches (the tag is set on the `304` too). A client that sends no `If-None-Match`
+receives the full response; `HEAD` sets no tag.
 
 ## Current limitations
 
 - **`register` is not served.** A table must be created through the catalog; adopting an existing
   `metadata.json` is not available yet, and the operation is therefore not advertised.
-- **The OAuth token endpoint is not wired into the mounted stack.** `POST /v1/oauth/tokens`
-  (client-credentials, `credential=<access_key_id>:<secret_access_key>`) is implemented in
-  `pkg/icebergcatalog/oauth.go`, but the mounted middleware is still the generic lakeFS one, so the
-  endpoint answers `404` and a client that exchanges `credential` for a token cannot connect. Until it
-  is wired, use HTTP Basic (Spark, Trino) or present a lakeFS JWT as the bearer token.
-- **Table files are not yet staged by the commit path.** `pkg/icebergcatalog/files.go` implements the
-  registration of a snapshot's metadata, manifest-list, manifest and data files as lakeFS entries, but
-  the commit path does not call it yet. Until it does, a table's files are not listed by the GC,
-  `lakectl diff` shows only the pointer change, and a merge carries only the pointer — so the GC
-  section above is the behaviour to plan against, not the finished guarantee.
-- **The uncommitted-GC grace is implemented but not hooked into `pkg/catalog`,** and the reserved-prefix
-  deny policy is built but not attached at bootstrap (see [Garbage collection](#garbage-collection)).
-- **Remote signing and vended credentials are implemented but not mounted,** so the only data-plane mode
-  is the client's own credentials (see [Data-plane access](#data-plane-access)).
-- **No ETag / `304 Not Modified`** on table load.
-- **Datasets `table` and `namespace` items still answer `501`.** The catalog is readable at
-  `<dataset>.<ref>.<namespace>.<table>` — a published dataset repository is an ordinary repository —
-  but defining such an item is the follow-up work described in
-  [`../ICEBERG_CATALOG_PLAN.md`](../ICEBERG_CATALOG_PLAN.md) §9.
-- **No system tests yet.** The unit tests cover the identifier parsing, the authz matrix, the CAS race,
-  the requirement and update application, the error mapping and the config. The iceberg-go external
-  conformance suite and the documented Apache REST compatibility kit invocation landed, but no green run
-  against a live catalog is recorded in this branch, and the PyIceberg/DuckDB esti suites are not
-  written — so client coverage is what the unit tests and the negotiation rules above establish, not
-  what a matrix run has proven.
+- **Table load does not advertise the data-plane mechanisms.** `/credentials` and `/sign` are mounted
+  and advertised in `GET /v1/config`, but the `LoadTableResult` still carries an empty `config`, with
+  no `storage-credentials` and no `s3.remote-signing-enabled`. A standard client therefore keeps its own
+  `FileIO` unless it calls an endpoint directly (see [Data-plane access](#data-plane-access)).
+- **System tests are written but not green in this branch.** `esti/iceberg_test.go` covers the
+  PyIceberg/DuckDB read path, append → lakeFS commit → GC prepare → still readable, and branch/merge
+  including the conflict. The read-path test skips because the catalog does not advertise `register`,
+  and no green run against a live deployment is recorded here: the catalogtest run in
+  `pkg/icebergcatalog/conformance/README.md` §3 predates these fixes and failed the I-2 gate, so that
+  gate still has no green evidence.
 - **A compaction commit still conflicts at merge.** The auto-resolve decision is implemented but not
   called by the merge path (see [Merge](#merge)).
 - **Iceberg format v3, views, functions, server-side scan planning and multi-table transactions** are
@@ -404,9 +418,6 @@ client that sends `If-None-Match` always receives a full response.
 
 ### Known design divergences
 
-- **`iceberg.max_staged_files` does not exist yet.** The spike that sized file registration recommended a
-  hard cap (50 000 files per commit) so that a large append fails loudly instead of slowly. It is not
-  implemented, because the commit path that would enforce it is not wired yet.
 - **`iceberg.prefix` is accepted but must equal `lakefs`.** It is a constant of the catalog rather than a
   configurable namespace, and any other value fails startup instead of being silently ignored.
 
@@ -419,11 +430,12 @@ iceberg:
   token_ttl: 1h                     # lifetime of a client-credentials token
   max_request_body: 8388608         # bytes; larger bodies are 413
   uncommitted_gc_grace: 24h         # 0 protects every _iceberg/ object regardless of age
+  max_staged_files: 50000           # cap on the table files one commit may stage
   ignore_compaction_commits: true    # decision logic for compaction-only conflicts (see "Merge")
 
 blockstore:
   s3:
-    credentials_vending:            # parsed and validated; not advertised until mounted
+    credentials_vending:            # parsed and validated; mounted and advertised when role_arn is set
       role_arn: arn:aws:iam::123456789012:role/lakefs-iceberg
       session_duration: 1h          # between 15m and 12h
       external_id: ""               # optional
