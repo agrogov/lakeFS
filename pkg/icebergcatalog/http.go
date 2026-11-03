@@ -129,7 +129,15 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 			// of I2-5.
 			NewTableService(store, authorizer, deps.Catalog, cfg))
 	}
-	handler, err := NewRouter(authMiddleware, cfg, services...)
+	s := newServer(cfg, services...)
+	// Responses to a request that carries an Idempotency-Key are kept in the server's KV. Only
+	// when there is a KV to keep them in does the catalog wrap its mutations and advertise
+	// idempotency-key-lifetime (I5-3): §2.1 requires the advertised window to be real. A
+	// builder handed no KVStore (a minimal test deps) serves the catalog without idempotency.
+	if deps.KVStore != nil {
+		s.idempotency = NewIdempotencyStore(deps.KVStore, DefaultIdempotencyKeyLifetime)
+	}
+	handler, err := newRouter(authMiddleware, cfg, s)
 	if err != nil {
 		return err
 	}
@@ -331,12 +339,20 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 // CatalogConfig is the response of GET /v1/config (spec: components.schemas.CatalogConfig).
 // Endpoints is always sent, even while it is still empty: an absent list means "the default
 // set", which includes table rename and multi-table commit (§2.1), so absence would be a promise
-// this catalog does not keep. idempotency-key-lifetime is omitted until responses are actually
-// stored (I5-3).
+// this catalog does not keep.
+//
+// IdempotencyKeyLifetime is present only when the catalog actually stores responses to a request
+// that carries an Idempotency-Key (I5-3). The spec reads its presence as "this server supports
+// Idempotency-Key semantics" and its value as the window the responses are kept for, so an
+// absent field is the truthful answer for a server with no KV wired, and an empty value is never
+// sent.
 type CatalogConfig struct {
 	Defaults  map[string]string `json:"defaults"`
 	Overrides map[string]string `json:"overrides"`
 	Endpoints []string          `json:"endpoints"`
+
+	// IdempotencyKeyLifetime is an ISO-8601 duration (PT30M), the replay window of I5-3.
+	IdempotencyKeyLifetime string `json:"idempotency-key-lifetime,omitempty"`
 }
 
 // routeSource is a catalog service that contributes operations to the route table: every route it
@@ -371,6 +387,10 @@ type server struct {
 	// endpoints is the explicit list GET /v1/config returns, derived from routes so that it
 	// cannot promise an operation the router does not serve (§2.1).
 	endpoints []string
+	// idempotency stores the final response of a mutating operation by its Idempotency-Key and
+	// replays it (idempotency.go, I5-3). A nil store means the server has no KV to keep them in:
+	// mutating routes are mounted unwrapped and GET /v1/config advertises no lifetime.
+	idempotency *IdempotencyStore
 }
 
 // newServer builds the catalog's HTTP surface and derives its endpoint list from its own route
@@ -412,15 +432,34 @@ func advertisedEndpoints(routes []route) []string {
 }
 
 // mount registers the route table on r, and refuses a route that would advertise a §1.2
-// non-goal.
+// non-goal. A mutating operation is additionally wrapped in the Idempotency-Key middleware of
+// I5-3 when the server has a store, so a retry with the same key replays the stored final
+// response instead of running the operation again. Read operations (GET, HEAD, OPTIONS) are
+// never wrapped: they have no effect to repeat, and the spec defines the key for mutations.
 func (s *server) mount(r chi.Router) error {
 	for _, rt := range s.routes {
 		if err := checkEndpointScope(rt.endpoint); err != nil {
 			return err
 		}
-		r.Method(rt.method, rt.pattern, rt.handler)
+		handler := rt.handler
+		if s.idempotency != nil && isMutatingMethod(rt.method) {
+			handler = s.idempotency.middleware(handler).ServeHTTP
+		}
+		r.Method(rt.method, rt.pattern, handler)
 	}
 	return nil
+}
+
+// isMutatingMethod reports whether a method can change catalog state, i.e. whether an operation
+// served with it is one an Idempotency-Key applies to. OPTIONS is not a catalog operation here
+// (chi answers it separately), and GET and HEAD only read.
+func isMutatingMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
 }
 
 // checkEndpointScope rejects an endpoint that belongs to an operation §1.2 puts out of scope.
@@ -450,11 +489,18 @@ func (s *server) prefix() string {
 // (<repo>.<ref>.<namespace>[.<ns>...].<table>, §5) rather than by a warehouse property a server
 // would have to impose on the client.
 func (s *server) handleConfig(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, CatalogConfig{
+	response := CatalogConfig{
 		Defaults:  map[string]string{},
 		Overrides: map[string]string{"prefix": s.prefix()},
 		Endpoints: s.endpoints,
-	})
+	}
+	// The lifetime is a promise about stored responses (§2.1), so it is sent only when there is
+	// storage behind it. ISO8601Lifetime is empty for a server without an IdempotencyStore, and
+	// omitempty keeps the field out of the body entirely in that case.
+	if s.idempotency != nil {
+		response.IdempotencyKeyLifetime = s.idempotency.ISO8601Lifetime()
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 // writeJSON writes one catalog response body. A response that cannot be marshalled is answered
