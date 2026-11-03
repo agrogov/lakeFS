@@ -530,7 +530,9 @@ set up:
 
 A table load still returns an empty `config`: it carries no `storage-credentials` and does not set
 `s3.remote-signing-enabled`, so a standard client is not pointed at either endpoint and keeps its own
-`FileIO` unless it calls `/credentials` or `/sign` directly. The delegation header is always safe to
+`FileIO` unless it calls `/credentials` or `/sign` directly. **Both served modes are S3 only in this
+build**: an Azure or GCS blockstore gets neither endpoint, and the client's own credentials is the mode
+to use there (see [Not supported in OSS](#not-supported-in-oss)). The delegation header is always safe to
 send: a client that asks for `vended-credentials` or `remote-signing` and does not receive
 `storage-credentials` falls back to its own credentials, which is what makes advertising either
 mechanism in the load response a non-breaking addition later.
@@ -670,6 +672,73 @@ which keeps only the snapshots a branch or tag points at). A table load sets an 
 metadata location and the `snapshots` mode, and answers `304 Not Modified` with no body when
 `If-None-Match` matches (the tag is set on the `304` too). A client that sends no `If-None-Match`
 receives the full response; `HEAD` sets no tag.
+
+## Not supported in OSS
+
+A few capabilities of the lakeFS Enterprise Iceberg catalog are deliberately **not** implemented in
+this open-source build. They are listed here because their absence is a decision, not a gap to work
+around silently — where a request could otherwise look like it was honoured, the catalog refuses it.
+
+### Multi-tenancy
+
+This catalog is **single-tenant**. The tenant a request belongs to is the lakeFS installation it is
+served by, and there is no per-request tenant scope. A request that carries an
+`X-LakeFS-Tenant` header is therefore **not** silently treated as a request for the default tenant:
+that would let a client believe it was scoped to a tenant while it was served as another one. Any
+non-empty value is answered with `501 NotImplementedException`, in the Iceberg error envelope, with
+the message `multi-tenancy is not supported by this catalog`:
+
+```json
+{"error": {"message": "multi-tenancy is not supported by this catalog",
+           "type": "NotImplementedException", "code": 501}}
+```
+
+The check runs in the catalog middleware **before authentication**, so the answer does not depend on
+— or reveal — whether the caller's credential is valid. An absent header, or one whose value is
+empty, is unchanged: the request is authenticated and served exactly as before. The refusal applies
+to both addressing forms and to every endpoint, including `POST /v1/oauth/tokens`; a disabled
+catalog answers the tenant header the same way rather than with its "disabled" message.
+
+### Azure and GCS credential vending
+
+[Vended credentials](#data-plane-access) are **S3 only** in OSS, for both the feature gate and the
+session policy: the catalog vends only when the blockstore is S3 and
+`blockstore.s3.credentials_vending.role_arn` is set, and the session policy it writes is an AWS S3
+policy scoped to the table's prefix. An Azure or GCS deployment has no credential vending — its
+`GET …/tables/{table}/credentials` endpoint is not mounted or advertised, and a request that reaches
+the handler is refused with `501 NotImplementedException`. Nothing is vended for a table whose own
+location is not an S3 URI either.
+
+Use one of these instead:
+
+- **The client's own storage credentials (the default).** Configure the client's `FileIO` with
+  credentials for the storage namespace (Azure or GCS), exactly as for any non-catalog table. The
+  catalog returns an empty `config`, so the client keeps its own credentials anyway.
+- **Remote signing**, where the deployment supports it. `POST …/tables/{t}/sign` lets the server
+  sign the client's data requests with the server's own credentials, so no long-lived client
+  credential is needed. In this OSS build remote signing is likewise **S3 only**: the endpoint is
+  mounted only for an S3 blockstore with a working pre-signer, and an Azure or GCS blockstore gets
+  no signing endpoint. An S3 deployment that is asked to sign an `abfs://` or `gs://` URI refuses
+  it with `400 BadRequestException` naming the scheme, before the pre-signer is called.
+
+### Tables Cleanup
+
+The Enterprise **Tables Cleanup** maintenance job is not part of this build. The open-source
+counterpart is the `lakectl` command
+[`lakectl iceberg cleanup`](iceberg-cleanup.md): it expires snapshots and marks and sweeps orphan
+files natively in Go, stages its changes as ordinary lakeFS entries, and publishes them with a
+`lakectl commit` — so a cleanup is reviewable with `lakectl diff`, atomic per branch, and revertible
+like any other change. See [Iceberg tables cleanup](iceberg-cleanup.md) for the full command,
+including `--dry-run`, `--mark-only` and `--sweep-only`.
+
+### Views
+
+Views **are** served in OSS: the six operations of the REST spec — list, load, exists, create,
+replace and drop — are mounted and advertised, with the same staged-commit, GC and RBAC rules as
+tables (see [Views](#views)). What is not served is `POST /v1/{prefix}/views/rename` and
+`POST …/namespaces/{namespace}/register-view`: neither is implemented or advertised, and a client
+that calls one gets the catalog's `404`. Multi-table transaction commit (`POST
+/v1/transactions/commit`) is likewise out of scope.
 
 ## Current limitations
 

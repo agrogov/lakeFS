@@ -400,6 +400,8 @@ func TestCredentialVending(t *testing.T) {
 		require.True(t, VendedCredentialsSupported(credsTestAdapter()))
 		require.False(t, VendedCredentialsSupported(nil))
 		require.False(t, VendedCredentialsSupported(&signingAdapter{blockstoreType: block.BlockstoreTypeGS}))
+		require.False(t, VendedCredentialsSupported(&signingAdapter{blockstoreType: block.BlockstoreTypeAzure}),
+			"credential vending is S3 only in OSS; Azure has no vending")
 
 		enabled := NewCredentialService(NewStore(nil, credsTestAdapter()), nil,
 			&Config{Prefix: CatalogPrefix, CredentialsVending: credsTestVending()}, &credsFakeSTS{}, nil)
@@ -417,6 +419,37 @@ func TestCredentialVending(t *testing.T) {
 		// No route is mounted, so the request is the router's 404 in the catalog envelope.
 		requireEnvelope(t, getCredentials(t, router, "alice", credsTestRef, ""), http.StatusNotFound, ErrTypeNotFound)
 	})
+}
+
+// TestCredentialVendingNonS3 pins the OSS decision that credential vending is not implemented
+// for non-S3 blockstores. Azure and GCS therefore get no service, no route and no advertisement,
+// and a request that reaches the handler anyway is refused with a 501 that names the S3
+// requirement rather than silently answering "no credentials".
+func TestCredentialVendingNonS3(t *testing.T) {
+	for _, blockstore := range []string{block.BlockstoreTypeAzure, block.BlockstoreTypeGS} {
+		t.Run(blockstore, func(t *testing.T) {
+			adapter := &signingAdapter{blockstoreType: blockstore, preSignSupported: true}
+			require.False(t, VendedCredentialsSupported(adapter),
+				"vending is S3 only, so a %s blockstore must not be vended for", blockstore)
+
+			service := newTestCredentialService(adapter, nil, credsTestVending(), &credsFakeSTS{}, nil)
+			require.False(t, service.Enabled())
+			require.Empty(t, service.Routes(), "a service that cannot vend must not mount its route")
+
+			// The router answer: the endpoint does not exist on this deployment.
+			handler := newTestCredentialRouter(t, service)
+			requireEnvelope(t, getCredentials(t, handler, "alice", credsTestRef, ""),
+				http.StatusNotFound, ErrTypeNotFound)
+
+			// The handler answer, should anything reach it directly: a clear 501, not a 200 with
+			// an empty credential list that would hide the unsupported blockstore.
+			rec := httptest.NewRecorder()
+			service.handleLoadCredentials(rec, httptest.NewRequest(http.MethodGet, credentialsTarget(credsTestRef), nil))
+			apiError := requireEnvelope(t, rec, http.StatusNotImplemented, ErrTypeNotImplemented)
+			require.Equal(t, CredentialVendingUnsupportedMessage, apiError.Message)
+			require.Contains(t, apiError.Message, "S3", "the refusal names the supported blockstore")
+		})
+	}
 }
 
 func TestCredentialVendingWriteSession(t *testing.T) {

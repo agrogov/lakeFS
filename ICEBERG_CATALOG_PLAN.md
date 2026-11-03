@@ -52,6 +52,13 @@ bigger surface than datasets.
 - Functions, server-side scan planning (`/plan`, `/tasks`), `tables/rename`, `views/rename`, `register-view`,
   location change through a *table* commit, Iceberg format v3. Enterprise does not support these either
   ([docs.lakefs.io/iceberg](https://docs.lakefs.io/iceberg/)).
+- **Multi-tenancy.** The catalog is single-tenant: the tenant is the lakeFS installation. A request that
+  carries `X-LakeFS-Tenant` is **not** silently served as the default tenant; any non-empty value is
+  refused with `501 NotImplementedException` (`multi-tenancy is not supported by this catalog`) in the
+  catalog middleware, **before authentication**. An absent or empty header is unchanged (§7.1).
+- **Credential vending for Azure and GCS.** Vending is S3 only in OSS (§8); a non-S3 blockstore gets no
+  `/credentials` endpoint (and no `/sign` endpoint either, because remote signing is S3 only too). Use
+  the client's own storage credentials, or remote signing where the S3 deployment supports it.
 - Views themselves are **served** (list, load, exists, create, replace, drop; see §6.1 and §7.2). They were a
   non-goal of the original v1 scope and are no longer: the state a view needs is the state a table already needs
   (a pointer entry, a metadata document written under the table area, and a staged file entry for that document),
@@ -334,6 +341,16 @@ the docs: "metadata files are treated as ordinary files"
   not reuse it: `NewAuthMiddleware` (`pkg/icebergcatalog/auth.go`) is a drop-in replacement that keeps the bearer/basic
   schemes, serves the token endpoint itself and adds the cookie scheme below.
 - SSO users: they use access keys. There is no browser *login* flow on the catalog mount — no login or callback route.
+- **No multi-tenancy, and the tenant header is refused, not ignored.** The catalog serves one tenant, the
+  lakeFS installation. `X-LakeFS-Tenant` is not a scope hint the server may drop: a client that sends it
+  believes its request is tenant-scoped, so serving it as the default tenant would cross the boundary
+  silently. `rejectTenant` (`pkg/icebergcatalog/http.go`) is the **first** middleware on the router and
+  answers any non-empty value with `501 NotImplementedException` in the catalog envelope and the message
+  `multi-tenancy is not supported by this catalog`; it runs before the authentication middleware, so the
+  answer does not depend on whether the credential is valid (and applies to `POST /v1/oauth/tokens` too,
+  which the auth middleware serves itself). An absent or empty header goes on to authentication unchanged,
+  and a repeated header is refused if any value is non-empty. The disabled-catalog handler applies the
+  same check, so the tenant answer does not change with `iceberg.enabled`.
 - **The web UI's login session cookie, for `GET`/`HEAD` and for four named management operations.** A signed-in
   browser must be able to read and manage the catalog it is already authenticated against (the repository Tables
   tab, §15.4), so the `internal_auth_session` cookie is accepted for reads unconditionally and for exactly four
@@ -386,10 +403,17 @@ Changes:
 
 | Mode | v1? | Notes |
 |---|---|---|
-| None: the client brings its own storage creds | **yes (default)** | Works with Spark (S3FileIO), Trino, PyIceberg and Snowflake external volumes. Simplest. |
-| Remote signing (`POST …/tables/{t}/sign`, `s3.remote-signing-enabled=true`) | phase I-4a | Reuses lakeFS's own blockstore credentials; the server checks the URI is under the table location and checks ReadTableData or WriteTableData. PyIceberg supports it only with FsspecFileIO ([PyIceberg](https://py.iceberg.apache.org/configuration/)). Nessie implements it ([Nessie](https://projectnessie.org/guides/iceberg-rest/)). |
-| STS vended credentials | phase I-4b | Enterprise's approach: config `blockstore.s3.credentials_vending.{role_arn, session_duration (default 1h, min 15m), external_id, endpoint}`, a session policy scoped to the table prefix, best-effort ([docs.lakefs.io/iceberg](https://docs.lakefs.io/iceberg/)). S3 only. |
+| None: the client brings its own storage creds | **yes (default)** | Works with Spark (S3FileIO), Trino, PyIceberg and Snowflake external volumes. Simplest. On Azure/GCS this is the only mode. |
+| Remote signing (`POST …/tables/{t}/sign`, `s3.remote-signing-enabled=true`) | phase I-4a | Reuses lakeFS's own blockstore credentials; the server checks the URI is under the table location and checks ReadTableData or WriteTableData. PyIceberg supports it only with FsspecFileIO ([PyIceberg](https://py.iceberg.apache.org/configuration/)). Nessie implements it ([Nessie](https://projectnessie.org/guides/iceberg-rest/)). **S3 only in OSS**: `RemoteSigningSupported` requires the S3 adapter and its pre-signer, and a non-S3 URI is a 400 naming the scheme. |
+| STS vended credentials | phase I-4b | Enterprise's approach: config `blockstore.s3.credentials_vending.{role_arn, session_duration (default 1h, min 15m), external_id, endpoint}`, a session policy scoped to the table prefix, best-effort ([docs.lakefs.io/iceberg](https://docs.lakefs.io/iceberg/)). **S3 only in OSS**: a non-S3 blockstore (Azure, GCS) is not vended for; the endpoint is not mounted or advertised, and a direct request is a 501 naming the S3 requirement. |
 | Presigned URLs | no | Iceberg clients don't use them. |
+
+**Not supported in OSS (decided).** Multi-tenancy and non-S3 credential vending are not implemented in
+this build, and the user-facing statement lives in the "Not supported in OSS" section of
+[`docs/iceberg.md`](docs/iceberg.md). Nothing is silently approximated: the tenant header is a 501 (§7.1),
+and Azure/GCS credential vending falls back to the client's own credentials (or remote signing where the
+blockstore supports it) because the service is not mounted. `lakectl iceberg cleanup` is the OSS
+counterpart of the Enterprise **Tables Cleanup** job ([`docs/iceberg-cleanup.md`](docs/iceberg-cleanup.md)).
 
 ---
 
@@ -495,7 +519,12 @@ Total ≈ 6–7 weeks. I-1 to I-3 is the usable minimum (≈ 4 weeks).
   - writes into a dataset repo get 403;
   - `_lakefs_iceberg/` cannot be written through `fs:`;
   - oversized bodies get 413;
-  - OAuth with bad creds gets 401 and leaks no detail.
+  - OAuth with bad creds gets 401 and leaks no detail;
+  - a request carrying a non-empty `X-LakeFS-Tenant` gets 501 `NotImplementedException` before
+    authentication (anonymous and authenticated alike), while an absent or empty header is unchanged;
+  - Azure/GCS credential vending and remote signing are not mounted, are not advertised, and a handler
+    reached directly answers 501 naming the S3 requirement; a non-S3 location on an S3 deployment is a
+    400 naming the scheme and never reaches the pre-signer.
 
 ---
 
@@ -729,6 +758,9 @@ of gaps at the end of this section, not unwired work:
 | §6.3 file registration as lakeFS entries | **landed and called by the commit path** (`files.go`, step 5), capped by `iceberg.max_staged_files`; **a create stages the initial `metadata.json`** (`Store.CreateTableWithMetadata`) and **a drop releases the table's file entries** in the same commit that removes the pointer (`releaseTableFiles`) |
 | §6.3 uncommitted-GC grace and the `_lakefs_iceberg/` deny | **landed and wired**: `Bootstrap` installs the grace via `catalog.SetUncommittedGCProtector` and attaches `iceberg-reserved-prefix-protect`. An auth backend that cannot store policies (the **default** auth mode) degrades to a warning and the deny is **not attached** — a real security gap for those deployments |
 | §8 remote signing and vended credentials | **services mounted and advertised** when the blockstore supports them; the table load still returns an empty `config` |
+| §1.2 not supported in OSS: multi-tenancy | **refused, never ignored**: `X-LakeFS-Tenant` with any non-empty value is `501 NotImplementedException` (`multi-tenancy is not supported by this catalog`) before authentication, on both addressing forms and on the token endpoint, and on a disabled catalog too; an absent or empty header is unchanged (`rejectTenant`, `pkg/icebergcatalog/http.go`) |
+| §1.2 not supported in OSS: non-S3 credential vending and remote signing | **not mounted and not advertised** for Azure/GCS (`VendedCredentialsSupported` / `RemoteSigningSupported` require the S3 adapter); a disabled handler answers `501` naming the S3 requirement, and a non-S3 location on an S3 deployment is `400` naming the scheme. The alternative is the client's own credentials (or remote signing where supported) |
+| Enterprise **Tables Cleanup** | **not implemented; OSS has `lakectl iceberg cleanup`** instead: native snapshot expiry plus mark/sweep, staged and published by `lakectl commit` ([`docs/iceberg-cleanup.md`](docs/iceberg-cleanup.md)) |
 | §7.1 OAuth token endpoint | **landed**: the catalog's own auth middleware serves `POST /v1/oauth/tokens` (form `client_id`/`client_secret` or HTTP Basic) |
 | §7.1 cookie reads and UI management (added after the close-out) | **landed**: `NewAuthMiddleware` accepts the web UI's `internal_auth_session` cookie for `GET`/`HEAD` unconditionally, and for exactly four management operations — `POST …/namespaces`, `DELETE …/namespaces/{namespace}`, `POST …/namespaces/{namespace}/tables`, `DELETE …/namespaces/{namespace}/tables/{table}` — only when the request carries `X-Lakefs-Client: lakefs-webui…` (a custom header forces a CORS preflight the catalog does not grant, and the cookie is `SameSite=Lax`). A cookie on any other write — commit (`POST …/tables/{table}`), register, properties, metrics, remote signing, `POST /v1/oauth/tokens` — is `401`, header or not, so committing data and minting a credential are never reachable from a cookie. Bearer and basic are read first and are unchanged; authorisation stays the `catalog:*` checks |
 | Web UI Tables tab (added after the close-out) | **landed**: the repository Tables tab is an explorer and manager of the current ref through `/iceberg/api` (`webui/src/lib/api/iceberg.ts`, `repository/tablesExplorer.tsx`, `tablesDetails.tsx`, `tablesStates.tsx`, `tablesManagement.tsx`). `GET /v1/config` picks the explorer, the Enterprise upsell (`501`; also `404` when the path is not routed at all), the permission state (`403`) or the tab's own sign-in state (`401`, a plain link, never a login redirect). It reads with `GET /v1/config`, the namespace listing, the table listing and the table load, and it manages with the four cookie operations: create namespace, drop empty namespace, create table (name, columns with name/type/required, optional identity partition) and drop table. Drops are confirmed, catalog errors are shown in place, and a `403` disables the management controls |
@@ -754,4 +786,6 @@ of gaps at the end of this section, not unwired work:
 
 The user-facing summary of this table lives in [`docs/iceberg.md`](docs/iceberg.md), including the
 uncommitted-GC window, the RBAC note for policies written before the data-plane actions existed, the
-cookie rule (reads plus the four management operations) and the [Tables tab](docs/iceberg.md#web-ui-the-tables-tab).
+cookie rule (reads plus the four management operations), the [Tables tab](docs/iceberg.md#web-ui-the-tables-tab)
+and the [Not supported in OSS](docs/iceberg.md#not-supported-in-oss) section (multi-tenancy with its 501,
+Azure/GCS credential vending with its alternatives, and `lakectl iceberg cleanup`).

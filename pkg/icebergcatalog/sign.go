@@ -89,6 +89,11 @@ const (
 	// RemoteSigningSupported reports true and the client requested remote signing.
 	RemoteSigningEnabledProperty = "s3.remote-signing-enabled"
 
+	// RemoteSigningUnsupportedMessage is the 501 answer when this deployment cannot sign. Remote
+	// signing is S3 only in OSS (§8), so the message names the requirement: an Azure or GCS
+	// blockstore has no remote signing, and an S3 blockstore needs a working pre-signer.
+	RemoteSigningUnsupportedMessage = "remote signing is not enabled for this catalog: it requires an S3 blockstore with a pre-signer"
+
 	// remoteSigningPattern is the signing route, relative to the catalog mount (APIBasePath).
 	remoteSigningPattern = "/v1/{prefix}/namespaces/{namespace}/tables/{table}/sign"
 
@@ -285,7 +290,7 @@ func delegationRequests(header, mechanism string) bool {
 func (s *remoteSigningService) handleSign(w http.ResponseWriter, r *http.Request) {
 	if !s.Enabled() {
 		writeIcebergError(w, http.StatusNotImplemented, ErrTypeNotImplemented,
-			"remote signing is not enabled for this catalog")
+			RemoteSigningUnsupportedMessage)
 		return
 	}
 	if !s.checkPrefix(w, r) {

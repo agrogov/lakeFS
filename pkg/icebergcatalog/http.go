@@ -39,6 +39,18 @@ const (
 	// DisabledMessage is answered with 501 while iceberg.enabled is false (§10).
 	DisabledMessage = "the Apache Iceberg catalog is disabled on this server"
 
+	// TenantHeader is the header a multi-tenant client sends to scope a request to a tenant.
+	// Multi-tenancy is not implemented in OSS, and the header is not a hint the catalog may
+	// ignore: a client that sends it believes its request is tenant-scoped, so answering as the
+	// default tenant would silently cross that boundary. Every request carrying a non-empty
+	// value is refused with 501 before authentication (see rejectTenant).
+	TenantHeader = "X-LakeFS-Tenant"
+
+	// TenantUnsupportedMessage is the 501 answer to a request that carries TenantHeader. The
+	// wording says what is unsupported and why the request was not served as an unqualified
+	// one, so a client surfaces a reason instead of a bare status code.
+	TenantUnsupportedMessage = "multi-tenancy is not supported by this catalog"
+
 	contentTypeJSON = "application/json"
 )
 
@@ -207,11 +219,14 @@ func MountDisabled(r *chi.Mux) {
 	r.Mount(RelativeToBasePath, disabled)
 }
 
-// DisabledHandler answers every catalog request with 501 and the error envelope.
+// DisabledHandler answers every catalog request with 501 and the error envelope. A request that
+// names a tenant is answered with the tenant refusal rather than the disabled message: the tenant
+// header is not supported in any build, so it is answered the same way whether the catalog is on
+// or off, and never silently ignored.
 func DisabledHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	return rejectTenant(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeIcebergError(w, http.StatusNotImplemented, ErrTypeNotImplemented, DisabledMessage)
-	})
+	}))
 }
 
 // NewRouter builds the catalog sub-router. It is mounted at APIBasePath (and, with a warehouse
@@ -223,6 +238,11 @@ func DisabledHandler() http.Handler {
 // The middleware stack is ordered the way §12 and I1-3 require, and the order is not
 // interchangeable:
 //
+//  0. the tenant-header refusal (rejectTenant): multi-tenancy is not implemented in OSS, and a
+//     request that names a tenant is answered 501 before any authentication work. This runs
+//     first because the answer must not depend on, or reveal, whether the caller's credential is
+//     valid, and because a client that believes it is tenant-scoped must not be served as the
+//     default tenant;
 //  1. authentication (auth.go), which accepts a lakeFS bearer token or HTTP basic, answers
 //     POST /v1/oauth/tokens itself, and whose 401 and 403 answers are rewritten into the
 //     catalog envelope (authenticate);
@@ -251,6 +271,11 @@ func NewRouter(authMiddleware func(http.Handler) http.Handler, cfg *Config, serv
 func newRouter(authMiddleware func(http.Handler) http.Handler, cfg *Config, s *server) (http.Handler, error) {
 	router := chi.NewRouter()
 
+	// The tenant refusal is the first middleware on the chain: it is answered before the
+	// authentication middleware runs, so a tenant-scoped request is refused identically for an
+	// anonymous and an authenticated caller (see the stack order above).
+	router.Use(rejectTenant)
+
 	// Wrap the authentication middleware exactly, not the whole chain: the envelope is for its
 	// rejections only (see authErrorWriter).
 	router.Use(func(next http.Handler) http.Handler {
@@ -271,6 +296,29 @@ func newRouter(authMiddleware func(http.Handler) http.Handler, cfg *Config, s *s
 		return nil, err
 	}
 	return router, nil
+}
+
+// rejectTenant refuses a request that carries the multi-tenant header. Multi-tenancy is not
+// implemented in OSS (see the "Not supported in OSS" section of docs/iceberg.md), and the header
+// must not be silently dropped: a client that sends X-LakeFS-Tenant would otherwise be served as
+// the default tenant while believing its request was scoped to another one. An absent or empty
+// header is unchanged - the request goes on to authentication exactly as before - and an empty
+// value in a repeated header is ignored too, so only a value the client actually named refuses the
+// request.
+//
+// The check deliberately runs before authentication: whether the header is supported is a
+// property of the server, not of the caller, and answering 501 only after a 401 would tell an
+// anonymous client that the header is accepted while telling an authenticated one it is not.
+func rejectTenant(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, tenant := range r.Header.Values(TenantHeader) {
+			if strings.TrimSpace(tenant) != "" {
+				writeIcebergError(w, http.StatusNotImplemented, ErrTypeNotImplemented, TenantUnsupportedMessage)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // authenticate runs the authentication middleware and answers its failures in the catalog's

@@ -435,7 +435,8 @@ func do(t *testing.T, handler http.Handler, method, path, accessKey, secret stri
 // TestRoutesBuilderDisabled pins the effect of iceberg.enabled=false (§10): the prefixes are
 // still claimed, and the answer is the catalog's 501 in its own envelope. It also re-proves the
 // I0-3 mount fix from the catalog's side: the core placeholder must neither panic nor shadow the
-// hook's mount.
+// hook's mount. A request that names a tenant gets the tenant refusal rather than the disabled
+// message: multi-tenancy is unsupported in every build, so the header is never silent.
 func TestRoutesBuilderDisabled(t *testing.T) {
 	useConfig(t, "iceberg:\n  enabled: false\n")
 
@@ -458,6 +459,15 @@ func TestRoutesBuilderDisabled(t *testing.T) {
 	requireEnvelope(t, rec, http.StatusNotImplemented, ErrTypeNotImplemented)
 	rec = do(t, mux, http.MethodGet, "/mds/iceberg/api/v1/config", "", "")
 	require.Equal(t, http.StatusNotImplemented, rec.Code, "the metadata search prefix stays a core 501")
+
+	// A tenant header is answered with the tenant refusal, not DisabledMessage: which error wins
+	// must not depend on whether the catalog happens to be enabled.
+	req := httptest.NewRequest(http.MethodGet, APIBasePath+configPath, nil)
+	req.Header.Set(TenantHeader, "acme")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	apiError := requireEnvelope(t, rec, http.StatusNotImplemented, ErrTypeNotImplemented)
+	require.Equal(t, TenantUnsupportedMessage, apiError.Message)
 }
 
 // TestRoutesBuilderNeedsDeps: an enabled catalog without server dependencies cannot be served,
@@ -519,6 +529,91 @@ func TestRoutesBuilderEnabled(t *testing.T) {
 	t.Run("the core placeholders do not shadow the mounted catalog", func(t *testing.T) {
 		require.NotPanics(t, func() { api.MountNotImplementedServices(mux) })
 		rec := do(t, mux, http.MethodGet, APIBasePath+configPath, testAccessKeyID, testSecretAccessKey)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	})
+}
+
+// TestTenantHeaderNotSupported pins the OSS decision that multi-tenancy is not implemented: a
+// request that names a tenant is answered 501 NotImplementedException in the Iceberg envelope,
+// before any authentication work, so the header is never silently ignored and a tenant-scoped
+// client cannot believe it was served as the tenant it named. An absent or empty header is
+// unchanged: nothing but a non-empty value refuses the request.
+func TestTenantHeaderNotSupported(t *testing.T) {
+	useConfig(t, "iceberg:\n  enabled: true\n")
+
+	deps := newServerDeps(t)
+	mux := coreRouter()
+	require.NoError(t, RoutesBuilder(t.Context(), deps, mux))
+
+	// send serves one request with an optional tenant header. present distinguishes "no header"
+	// from "a header whose value is empty": a client that omits the header and one that sends
+	// it empty must both be served exactly as before.
+	send := func(method, path, accessKey, secret string, tenant *string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, nil)
+		if accessKey != "" {
+			req.SetBasicAuth(accessKey, secret)
+		}
+		if tenant != nil {
+			req.Header.Set(TenantHeader, *tenant)
+		}
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec
+	}
+	tenant := func(value string) *string { return &value }
+
+	t.Run("refuses an anonymous caller in the envelope", func(t *testing.T) {
+		apiError := requireEnvelope(t,
+			send(http.MethodGet, APIBasePath+configPath, "", "", tenant("acme")),
+			http.StatusNotImplemented, ErrTypeNotImplemented)
+		require.Equal(t, TenantUnsupportedMessage, apiError.Message)
+		require.NotContains(t, apiError.Message, ErrAuthenticationRequired.Error(),
+			"the tenant refusal is not an authentication answer")
+	})
+
+	t.Run("refuses an authenticated caller the same way", func(t *testing.T) {
+		apiError := requireEnvelope(t,
+			send(http.MethodGet, APIBasePath+configPath, testAccessKeyID, testSecretAccessKey, tenant("acme")),
+			http.StatusNotImplemented, ErrTypeNotImplemented)
+		require.Equal(t, TenantUnsupportedMessage, apiError.Message)
+	})
+
+	t.Run("refuses the relative_to form too", func(t *testing.T) {
+		requireEnvelope(t,
+			send(http.MethodGet, RelativeToBasePath+"/repo.branch/api"+configPath,
+				testAccessKeyID, testSecretAccessKey, tenant("acme")),
+			http.StatusNotImplemented, ErrTypeNotImplemented)
+	})
+
+	t.Run("runs before the token endpoint is served", func(t *testing.T) {
+		// POST /v1/oauth/tokens is the authentication middleware's own handler, not a route, so
+		// this is the case that proves the tenant check precedes authentication work.
+		requireEnvelope(t,
+			send(http.MethodPost, APIBasePath+"/v1/oauth/tokens", "", "", tenant("acme")),
+			http.StatusNotImplemented, ErrTypeNotImplemented)
+	})
+
+	t.Run("a repeated header with one non-empty value is refused", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, APIBasePath+configPath, nil)
+		req.SetBasicAuth(testAccessKeyID, testSecretAccessKey)
+		req.Header.Add(TenantHeader, "")
+		req.Header.Add(TenantHeader, "acme")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		requireEnvelope(t, rec, http.StatusNotImplemented, ErrTypeNotImplemented)
+	})
+
+	t.Run("an absent header is unchanged", func(t *testing.T) {
+		requireEnvelope(t, send(http.MethodGet, APIBasePath+configPath, "", "", nil),
+			http.StatusUnauthorized, ErrTypeNotAuthorized)
+		rec := send(http.MethodGet, APIBasePath+configPath, testAccessKeyID, testSecretAccessKey, nil)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	})
+
+	t.Run("an empty header is unchanged", func(t *testing.T) {
+		requireEnvelope(t, send(http.MethodGet, APIBasePath+configPath, "", "", tenant("")),
+			http.StatusUnauthorized, ErrTypeNotAuthorized)
+		rec := send(http.MethodGet, APIBasePath+configPath, testAccessKeyID, testSecretAccessKey, tenant(""))
 		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
 	})
 }

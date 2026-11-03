@@ -421,3 +421,54 @@ func TestRemoteSigning(t *testing.T) {
 			"a blockstore without a presigner must not advertise remote signing")
 	})
 }
+
+// TestRemoteSigningNonS3 pins the OSS decision that remote signing is S3 only. An Azure or GCS
+// blockstore gets no service, no route and no advertisement, and a handler that is reached anyway
+// refuses with a 501 that names the S3 requirement. A non-S3 *location* on an S3 deployment is a
+// 400 naming the scheme, refused before the presigner is called - never silently signed.
+func TestRemoteSigningNonS3(t *testing.T) {
+	for _, blockstore := range []string{block.BlockstoreTypeAzure, block.BlockstoreTypeGS} {
+		t.Run(blockstore, func(t *testing.T) {
+			adapter := &signingAdapter{blockstoreType: blockstore, preSignSupported: true}
+			require.False(t, RemoteSigningSupported(adapter),
+				"remote signing is S3 only, so a %s blockstore must not be signed for", blockstore)
+
+			service := newTestSigningService(adapter, nil, signTestLocation, nil)
+			require.False(t, service.Enabled())
+			require.Empty(t, service.Routes(), "a service that cannot sign must not mount its route")
+
+			// The router answer: the endpoint does not exist on this deployment.
+			handler := newTestSigningRouter(t, service)
+			requireEnvelope(t, postSign(t, handler, "alice", signTestRef,
+				signTestLocation+"/data/file.parquet", http.MethodGet, RemoteSigningDelegation),
+				http.StatusNotFound, ErrTypeNotFound)
+
+			// The handler answer, should anything reach it directly: a clear 501 naming S3.
+			rec := httptest.NewRecorder()
+			service.handleSign(rec, httptest.NewRequest(http.MethodPost, signTarget(signTestRef), nil))
+			apiError := requireEnvelope(t, rec, http.StatusNotImplemented, ErrTypeNotImplemented)
+			require.Equal(t, RemoteSigningUnsupportedMessage, apiError.Message)
+			require.Contains(t, apiError.Message, "S3", "the refusal names the supported blockstore")
+		})
+	}
+
+	// An S3 deployment is still asked to sign something outside S3. Both the Azure and the GCS
+	// spelling of that location are a 400 with the scheme in the message, and the presigner is
+	// never called.
+	for _, uri := range []string{
+		"abfs://lakehouse-data/_iceberg/9c12d441-03fe-4693-9a96-a0705ddf69c1/data/file.parquet",
+		"gs://lakehouse-data/_iceberg/9c12d441-03fe-4693-9a96-a0705ddf69c1/data/file.parquet",
+	} {
+		t.Run(uri, func(t *testing.T) {
+			adapter := signingEnabledAdapter()
+			authz := newAuthzUser(t, authzReadStatements())
+			service := newTestSigningService(adapter, authz.authz, signTestLocation, signingMainRefResolver())
+			handler := newTestSigningRouter(t, service)
+
+			rec := postSign(t, handler, "alice", signTestRef, uri, http.MethodGet, RemoteSigningDelegation)
+			apiError := requireEnvelope(t, rec, http.StatusBadRequest, ErrTypeBadRequest)
+			require.Contains(t, apiError.Message, "is not s3", "the refusal names the unsupported location")
+			require.Empty(t, adapter.calls, "a non-S3 location must never reach the presigner")
+		})
+	}
+}
