@@ -174,10 +174,10 @@ func writeCleanupResult(w io.Writer, repository string, config cleanup.Config, r
 
 //nolint:gochecknoinits
 func init() {
-	icebergCmd := &cobra.Command{
-		Use:   "iceberg",
-		Short: "Manage the Iceberg tables in a repository",
-	}
+	// icebergCmd is the shared "lakectl iceberg" parent command, declared next to the other
+	// Iceberg subcommands (iceberg_import.go) and registered with the root command there.
+	// This file only adds its own subcommand to it: creating a second parent here would
+	// register "iceberg" twice and shadow the sibling subcommands.
 	icebergCleanupCmd.Flags().StringVar(&cleanupRepository, "repo", "", "repository to clean up")
 	icebergCleanupCmd.Flags().IntVar(&cleanupMaxSnapshotAgeDays, "max-snapshot-age-days", defaultMaxSnapshotAgeDays,
 		"expire snapshots older than this many days (a table's history.expire.max-snapshot-age-ms overrides it)")
@@ -192,5 +192,4 @@ func init() {
 	_ = icebergCleanupCmd.MarkFlagRequired("repo")
 
 	icebergCmd.AddCommand(icebergCleanupCmd)
-	rootCmd.AddCommand(icebergCmd)
 }
