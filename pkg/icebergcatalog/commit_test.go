@@ -12,15 +12,21 @@ package icebergcatalog
 // source updates_coverage_test.go uses for the I0-1 gate.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/catalog"
@@ -106,16 +112,37 @@ func (a *recordingAdapter) clone() []string {
 	return append([]string(nil), a.puts...)
 }
 
-// failingCatalog is the fixture's catalog with a CreateEntry that always fails, which is how a
-// test forces the pointer swap of a commit to lose its compare-and-swap (or to fail for a reason
-// that is not a precondition failure).
+// failingCatalog is the fixture's catalog with a CreateEntry that fails for the table pointer,
+// which is how a test forces the pointer swap of a commit to lose its compare-and-swap (or to fail
+// for a reason that is not a precondition failure). Every other entry - the table files §6.2
+// step 5 stages, which go through the same CreateEntry - succeeds, so the failure under test is
+// the swap and not the staging that precedes it.
 type failingCatalog struct {
 	Catalog
 	err error
 }
 
-func (c *failingCatalog) CreateEntry(context.Context, string, string, catalog.DBEntry, ...graveler.SetOptionsFunc) error {
-	return c.err
+func (c *failingCatalog) CreateEntry(ctx context.Context, repositoryID, branch string, entry catalog.DBEntry, opts ...graveler.SetOptionsFunc) error {
+	if strings.HasSuffix(entry.Path, "/"+TablePointerName) {
+		return c.err
+	}
+	return c.Catalog.CreateEntry(ctx, repositoryID, branch, entry, opts...)
+}
+
+// stagingFailureCatalog is the fixture's catalog with a CreateEntry that fails for staged table
+// files and succeeds for everything else. It is how a test reaches the one case that is neither a
+// 400 nor a 409: metadata.json is written, some file entries may be staged, and the pointer has
+// not moved, so the client cannot know whether the commit landed (§2.1).
+type stagingFailureCatalog struct {
+	Catalog
+	err error
+}
+
+func (c *stagingFailureCatalog) CreateEntry(ctx context.Context, repositoryID, branch string, entry catalog.DBEntry, opts ...graveler.SetOptionsFunc) error {
+	if strings.Contains(entry.Path, "/"+FilesDirectory+"/") {
+		return c.err
+	}
+	return c.Catalog.CreateEntry(ctx, repositoryID, branch, entry, opts...)
 }
 
 // commitFixture is a storeFixture with a recording block adapter and one table on main, whose
@@ -156,6 +183,13 @@ func newCommitFixture(t *testing.T) *commitFixture {
 	base, err := f.store.GetTable(f.ctx, addr)
 	require.NoError(t, err, "read the base table")
 
+	// The successful cases of TestUpdates add snapshots whose manifest lists the commit path reads
+	// while staging files (§6.2 step 5). Write them, empty, under the table root, so those cases
+	// test the update they are about rather than the registration that follows it.
+	for _, snapshotID := range []string{"5555555555555555555", "6666666666666666666"} {
+		f.writeEmptyManifestList(t, snapshotID)
+	}
+
 	writes.reset()
 	return &commitFixture{
 		storeFixture:  f,
@@ -173,6 +207,20 @@ func (f *commitFixture) commit(t *testing.T, body string) (*CommitResult, error)
 	request, err := DecodeTableCommitRequest([]byte(body))
 	require.NoError(t, err, "decode commit request %s", body)
 	return f.store.Commit(f.ctx, f.addr, request)
+}
+
+// writeEmptyManifestList writes a v2 manifest list with no manifests for snapshotID under the
+// table root and returns its URI: the smallest real object a snapshot can name, so a test of the
+// commit path does not have to model a manifest to exercise file registration.
+func (f *storeFixture) writeEmptyManifestList(t *testing.T, snapshotID string) string {
+	t.Helper()
+	var buffer bytes.Buffer
+	parsedID, err := strconv.ParseInt(snapshotID, 10, 64)
+	require.NoError(t, err, "parse snapshot id %q", snapshotID)
+	sequenceNumber := int64(35)
+	require.NoError(t, iceberg.WriteManifestList(2, &buffer, parsedID, nil, &sequenceNumber, 0, nil),
+		"write an empty manifest list for snapshot %s", snapshotID)
+	return f.putMetadata(t, "_iceberg/"+storeTestUUID+"/metadata/snap-"+snapshotID+".avro", buffer.String())
 }
 
 // mustCommit runs a commit body and requires it to succeed.
@@ -446,6 +494,178 @@ func TestCommit(t *testing.T) {
 			})
 		}
 	})
+}
+
+// TestCommitStagesTableFiles covers §6.2 step 5 wired into the commit path: a commit that adds a
+// snapshot stages the new metadata file and the files that snapshot references as lakeFS entries on
+// the branch, between the metadata write and the pointer swap. It also covers the two refusals that
+// step introduces - a file outside the table's root (§13) and a commit above
+// iceberg.max_staged_files (§10) - and the unknown outcome of a staging failure (§2.1).
+func TestCommitStagesTableFiles(t *testing.T) {
+	// addSnapshotBody is a commit whose only update adds one snapshot naming manifestList.
+	addSnapshotBody := func(snapshotID int64, manifestList string) string {
+		return fmt.Sprintf(`{"requirements":[],"updates":[{"action":"add-snapshot","snapshot":{
+			"snapshot-id":%d,
+			"parent-snapshot-id":3055729675574597004,
+			"sequence-number":35,
+			"timestamp-ms":1602638574000,
+			"manifest-list":%q,
+			"summary":{"operation":"append"}}}]}`, snapshotID, manifestList)
+	}
+
+	t.Run("a commit that adds no snapshot stages only its metadata file", func(t *testing.T) {
+		f := newCommitFixture(t)
+		recorded := &entryRecordingCatalog{Catalog: f.catalog}
+		f.store = NewStore(recorded, f.writes)
+
+		result := f.mustCommit(t, `{"requirements":[],"updates":[{"action":"set-properties",
+			"updates":{"owner":"lakefs"}}]}`)
+
+		// The metadata.json is registered even though no snapshot was added: the pointer names it
+		// from user metadata, not from an entry address, so nothing else would make the committed
+		// GC retain it (§6.3 step 1).
+		staged := fileEntries(recorded.createdEntries())
+		require.Len(t, staged, 1)
+		relative := strings.TrimPrefix(result.Pointer.MetadataLocation, f.tableLocation+"/")
+		want, err := TableFilePath(uuid.MustParse(storeTestUUID), relative)
+		require.NoError(t, err)
+		require.Equal(t, want, staged[0].Path)
+		require.Equal(t, result.Pointer.MetadataLocation, staged[0].PhysicalAddress)
+		require.EqualValues(t, len(result.MetadataJSON), staged[0].Size)
+	})
+
+	t.Run("stages the metadata file and the snapshot's manifest list", func(t *testing.T) {
+		f := newCommitFixture(t)
+		recorded := &entryRecordingCatalog{Catalog: f.catalog}
+		f.store = NewStore(recorded, f.writes)
+		headBefore := f.headRef(t)
+
+		const snapshotID = int64(1234567890123456789)
+		manifestList := f.writeEmptyManifestList(t, strconv.FormatInt(snapshotID, 10))
+		result := f.mustCommit(t, addSnapshotBody(snapshotID, manifestList))
+
+		// The keys are deterministic: the table UUID, then the file's path relative to the table
+		// root (§6.3), so a retried commit overwrites the same entries.
+		tableUUID := uuid.MustParse(storeTestUUID)
+		metadataRelative := strings.TrimPrefix(result.Pointer.MetadataLocation, f.tableLocation+"/")
+		require.True(t, strings.HasPrefix(metadataRelative, MetadataDirectory+"/"),
+			"the metadata file is written under the table root, got %q", metadataRelative)
+		wantMetadataEntry, err := TableFilePath(tableUUID, metadataRelative)
+		require.NoError(t, err)
+		wantManifestListEntry, err := TableFilePath(tableUUID, "metadata/snap-"+strconv.FormatInt(snapshotID, 10)+".avro")
+		require.NoError(t, err)
+
+		staged := fileEntries(recorded.createdEntries())
+		byPath := make(map[string]catalog.DBEntry, len(staged))
+		for _, entry := range staged {
+			byPath[entry.Path] = entry
+		}
+		require.Len(t, staged, 2, "the metadata file and the manifest list, and nothing else")
+		require.Contains(t, byPath, wantMetadataEntry)
+		require.Contains(t, byPath, wantManifestListEntry)
+
+		// Each entry is a full address pointing at the object that was written, not a copy.
+		require.Equal(t, catalog.AddressTypeFull, byPath[wantMetadataEntry].AddressType)
+		require.Equal(t, result.Pointer.MetadataLocation, byPath[wantMetadataEntry].PhysicalAddress)
+		require.EqualValues(t, len(result.MetadataJSON), byPath[wantMetadataEntry].Size)
+		require.Equal(t, catalog.AddressTypeFull, byPath[wantManifestListEntry].AddressType)
+		require.Equal(t, manifestList, byPath[wantManifestListEntry].PhysicalAddress)
+		// The creation date is the snapshot's timestamp, which is what the uncommitted GC ages a
+		// staged entry by (spike S-I2 §5.1 item 3).
+		require.Equal(t, time.UnixMilli(1602638574000).UTC(), byPath[wantManifestListEntry].CreationDate)
+
+		// Staged, not committed: the entry is readable on the branch and the branch head did not move.
+		entry, err := f.entryAt(t, "main", wantManifestListEntry)
+		require.NoError(t, err, "the staged table file must be readable on the branch")
+		require.Equal(t, manifestList, entry.PhysicalAddress)
+		require.Equal(t, headBefore, f.headRef(t), "a catalog commit stages; it never commits lakeFS")
+	})
+
+	t.Run("a file outside the table root is a 400 and stages nothing", func(t *testing.T) {
+		f := newCommitFixture(t)
+		recorded := &entryRecordingCatalog{Catalog: f.catalog}
+		f.store = NewStore(recorded, f.writes)
+		before := f.currentPointer(t)
+
+		_, err := f.commit(t, addSnapshotBody(1234567890123456790,
+			"s3://another-team/secret/metadata/snap-1.avro"))
+		require.Error(t, err)
+
+		var bad *BadRequestError
+		require.ErrorAs(t, err, &bad)
+		require.ErrorIs(t, err, ErrForeignTableFile,
+			"the client can tell a foreign path from a server failure")
+		require.Equal(t, 400, bad.HTTPStatusCode())
+		require.Equal(t, ErrTypeBadRequest, bad.ErrorType())
+		require.NotErrorIs(t, err, ErrCommitStateUnknown)
+		require.NotErrorIs(t, err, ErrCommitFailed)
+
+		// The plan is refused before the first write, so nothing is staged. The metadata file of
+		// step 4 was written; it is unreferenced and GC collects it.
+		require.Empty(t, fileEntries(recorded.createdEntries()), "a refused plan stages nothing")
+		require.Equal(t, before, f.currentPointer(t), "a refused commit must not move the pointer")
+	})
+
+	t.Run("a commit above iceberg.max_staged_files is a 400", func(t *testing.T) {
+		f := newCommitFixture(t)
+		recorded := &entryRecordingCatalog{Catalog: f.catalog}
+		f.store = NewStore(recorded, f.writes, WithMaxStagedFiles(1))
+		before := f.currentPointer(t)
+
+		const snapshotID = int64(1234567890123456791)
+		manifestList := f.writeEmptyManifestList(t, strconv.FormatInt(snapshotID, 10))
+		_, err := f.commit(t, addSnapshotBody(snapshotID, manifestList))
+
+		var limit *TableFileLimitError
+		require.ErrorAs(t, err, &limit)
+		require.ErrorIs(t, err, ErrTooManyTableFiles)
+		require.Equal(t, 1, limit.Max, "the cap is the one the store was built with")
+		require.Equal(t, 400, limit.HTTPStatusCode())
+		var bad *BadRequestError
+		require.ErrorAs(t, err, &bad)
+		require.Equal(t, 400, bad.HTTPStatusCode())
+		require.NotErrorIs(t, err, ErrCommitStateUnknown)
+		require.Empty(t, fileEntries(recorded.createdEntries()))
+		require.Equal(t, before, f.currentPointer(t))
+	})
+
+	t.Run("the default cap is the documented 50000", func(t *testing.T) {
+		f := newCommitFixture(t)
+		require.Equal(t, DefaultMaxStagedFiles, f.store.MaxStagedFiles())
+		require.Equal(t, 50_000, DefaultMaxStagedFiles, "iceberg.max_staged_files defaults to 50000")
+	})
+
+	t.Run("a staging failure is a 500 CommitStateUnknownException", func(t *testing.T) {
+		f := newCommitFixture(t)
+		stagingErr := errors.New("kv unavailable while staging")
+		f.store = NewStore(&stagingFailureCatalog{Catalog: f.catalog, err: stagingErr}, f.writes)
+		before := f.currentPointer(t)
+
+		const snapshotID = int64(1234567890123456792)
+		manifestList := f.writeEmptyManifestList(t, strconv.FormatInt(snapshotID, 10))
+		_, err := f.commit(t, addSnapshotBody(snapshotID, manifestList))
+
+		var unknown *CommitStateUnknownError
+		require.ErrorAs(t, err, &unknown)
+		require.ErrorIs(t, err, stagingErr)
+		require.Equal(t, 500, unknown.HTTPStatusCode())
+		require.Equal(t, ErrorTypeCommitStateUnknown, unknown.ErrorType())
+		require.NotErrorIs(t, err, ErrCommitFailed, "a staging failure is not a conflict")
+		require.Equal(t, before, f.currentPointer(t), "the pointer did not move")
+	})
+}
+
+// fileEntries keeps the entries a catalog was asked to create that are staged table files (§6.3),
+// dropping the pointer writes of the same commit.
+func fileEntries(entries []catalog.DBEntry) []catalog.DBEntry {
+	prefix := ReservedPrefix + "/" + FilesDirectory + "/"
+	files := make([]catalog.DBEntry, 0, len(entries))
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Path, prefix) {
+			files = append(files, entry)
+		}
+	}
+	return files
 }
 
 // TestRequirements is the §12 "requirement application" table: every requirement type of the REST

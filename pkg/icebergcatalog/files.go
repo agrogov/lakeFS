@@ -60,19 +60,30 @@ package icebergcatalog
 // # The foreign-location check is a security control
 //
 // Every path a new snapshot references - its manifest list, every manifest in the list (not only
-// the added ones) and every file those manifests add - must live under
+// the added ones) and every file those manifests add - must live under the table's root, i.e.
+// under the location metadata.json declares:
 //
-//	<storage_namespace>/_iceberg/<table-uuid>/
+//	<storage_namespace>/_iceberg/<table-uuid>/        (the default location, Q-I5)
+//	<storage_namespace>/_iceberg/<client-chosen>/     (a location the create request carried)
 //
-// or the commit is refused with 400 before anything is staged (§13 "Client writes outside the
-// table location"). This is not an optimisation. The catalog reads manifest lists and manifests
-// through the server's block adapter, i.e. with the server's own credentials, so without the check
-// a client could commit a snapshot whose manifest list points at `s3://another-team/secret/...`
-// and make this server read another bucket. It also keeps a table's files in one place, which is
-// what the staging keys, the GC window and the merge semantics of §6.4 assume.
+// and that root must itself be inside <storage_namespace>/_iceberg/, the catalog's table area. A
+// snapshot that references anything else is refused with 400 before anything is staged (§13
+// "Client writes outside the table location"). This is not an optimisation. The catalog reads
+// manifest lists and manifests through the server's block adapter, i.e. with the server's own
+// credentials, so without the check a client could commit a snapshot whose manifest list points at
+// `s3://another-team/secret/...` and make this server read another bucket. It also keeps a table's
+// files in one place, which is what the staging keys, the GC window and the merge semantics of
+// §6.4 assume.
 //
-// Tables created by this catalog always satisfy the check: the default location is
-// <storage_namespace>/_iceberg/<table-uuid> (Q-I5, task I2-4) and set-location is refused
+// The root is the metadata's location and not a value derived from the table UUID, because the
+// create path lets a client choose a location inside the table area (location.go
+// normalizeTableLocation). Deriving the root from the UUID instead would refuse to commit every
+// table whose location is not the default one, even though its files are exactly where the catalog
+// put them.
+//
+// Tables created by this catalog always satisfy the check: the create path places a table inside
+// <storage_namespace>/_iceberg/ - the managed <storage_namespace>/_iceberg/<table-uuid> (Q-I5,
+// task I2-4) unless the request carried a location of its own - and set-location is refused
 // (commit.go §6.2 step 3). A table registered from another catalog may not; such a table can be
 // read, but a commit that adds a snapshot to it is refused until registration supports external
 // locations (out of scope for v1, §13).
@@ -93,27 +104,25 @@ package icebergcatalog
 //     per file (S-I2 §5.1 items 3-4);
 //   - a hard cap on the files of one commit (DefaultMaxStagedFiles) refuses an oversized commit
 //     with 400 instead of silently skipping files, because a skipped file is a GC-deletable file
-//     (S-I2 §5.1 item 4). The cap belongs to config as iceberg.max_staged_files (§10); this file
-//     ships the default and the request can carry the configured value until the knob is added to
-//     Config.
+//     (S-I2 §5.1 item 4). The cap belongs to config as iceberg.max_staged_files (§10) and reaches
+//     this code as StageTableFilesRequest.MaxFiles, which the commit path fills from the Store's
+//     configured cap (store.go WithMaxStagedFiles).
 //
 // # Wiring
 //
 // StageTableFiles is the whole of §6.2 step 5 and nothing else, so the commit path calls it between
-// the metadata write (step 4) and the pointer swap (step 6):
+// the metadata write (step 4) and the pointer swap (step 6), with the cap the Store was built with:
 //
 //	files, err := s.StageTableFiles(ctx, addr, StageTableFilesRequest{
 //	    Base:          base.Metadata,
 //	    Next:          next,
 //	    MetadataFiles: []TableMetadataFile{{Location: location, Size: int64(len(metadataJSON))}},
+//	    MaxFiles:      s.maxStagedFiles,
 //	})
 //
 // and reports a *ForeignTableFileError or a *TableFileLimitError as the 400 it is, and any other
 // failure as CommitStateUnknownError, because it happens after metadata.json was written and before
-// the pointer swap (§6.2 step 6). The call itself belongs to the task that owns commit.go: this file
-// is the staging engine plus its tests, wired in the same shape gc.go has (the predicate and its
-// tests here, the one-line hook in pkg/catalog in a follow-up), because the ledger keeps one task
-// per file.
+// the pointer swap (§6.2 step 6). The call lives in commit.go (Store.Commit).
 //
 // Licensing: this file is a clean-room implementation from the Apache Iceberg table spec
 // (Apache-2.0), https://iceberg.apache.org/spec/ - "Table Metadata", "Snapshots", "Manifests" and
@@ -197,10 +206,10 @@ const (
 )
 
 var (
-	// ErrForeignTableFile is reported by ForeignTableFileError: a snapshot references a file
-	// outside <storage_namespace>/_iceberg/<table-uuid>/. It is a 400 BadRequestException - the
-	// security control of §13, not an optimisation - and it is always raised during planning, so a
-	// refused snapshot stages nothing.
+	// ErrForeignTableFile is reported by ForeignTableFileError: a snapshot references a file that
+	// is not under the table's root. It is a 400 BadRequestException - the security control of
+	// §13, not an optimisation - and it is always raised during planning, so a refused snapshot
+	// stages nothing.
 	ErrForeignTableFile = errors.New("table file outside the table location")
 
 	// ErrTooManyTableFiles is reported by TableFileLimitError: the commit would stage more files
@@ -215,6 +224,12 @@ var (
 	// written and before the pointer swap, the commit path reports it as
 	// CommitStateUnknownException (§6.2 step 6).
 	ErrTableFileRegistration = errors.New("iceberg table file registration failed")
+
+	// ErrTableLocationOutsideArea is attached to a *ForeignTableFileError when the table's own
+	// location is outside <storage_namespace>/_iceberg/. Such a table can be read, but a commit
+	// that would stage its files is refused with 400 (§13: registration of external locations is
+	// out of scope for v1).
+	ErrTableLocationOutsideArea = errors.New("the table location is outside the catalog's table area")
 )
 
 // TableFile is one lakeFS entry to stage: a file of a table snapshot, promoted to an entry under
@@ -283,8 +298,8 @@ type StageTableFilesRequest struct {
 // TableFileSet is the outcome of one file-registration step: the entries the snapshot's files
 // become, in a deterministic order.
 type TableFileSet struct {
-	// TableRoot is the physical root every registered file lives under:
-	// <storage_namespace>/_iceberg/<table-uuid>.
+	// TableRoot is the physical root every registered file lives under: the location metadata.json
+	// declares, <storage_namespace>/_iceberg/<table-uuid> for a table created without one.
 	TableRoot string
 
 	// SnapshotIDs are the snapshots of this commit that were registered, ascending. It is empty
@@ -310,9 +325,10 @@ type TableFileSet struct {
 
 // ForeignTableFileError is a snapshot that references a file outside its table's physical root.
 // It is the §13 security control: the catalog reads manifest lists and manifests with the server's
-// credentials, so a path outside <storage_namespace>/_iceberg/<table-uuid>/ would make it read
-// another bucket, and a staged entry pointing outside the namespace would be invisible to the
-// uncommitted GC (spike S-I2 §4).
+// credentials, so a path outside the table root would make it read another bucket, and a staged
+// entry pointing outside the namespace would be invisible to the uncommitted GC (spike S-I2 §4).
+// It is also how a table whose own location is outside <storage_namespace>/_iceberg/ is refused
+// when a commit would stage its files.
 //
 // It is a 400 BadRequestException. The reference counts even when the file would not have been
 // read: every manifest of the new snapshot's manifest list is checked, not only the added ones.
@@ -323,7 +339,8 @@ type ForeignTableFileError struct {
 	// Location is the path the snapshot referenced, verbatim.
 	Location string
 
-	// Root is the table's physical root, <storage_namespace>/_iceberg/<table-uuid>.
+	// Root is the table's physical root: the location metadata.json declares, or
+	// <storage_namespace>/_iceberg/<table-uuid> for a table created without one.
 	Root string
 
 	// Err is set when the path is under the root but is not a usable entry path - a segmented path
@@ -380,13 +397,14 @@ func (e *TableFileLimitError) HTTPStatusCode() int { return http.StatusBadReques
 // ErrorType is the Iceberg error type of the refusal.
 func (e *TableFileLimitError) ErrorType() string { return ErrTypeBadRequest }
 
-// TableRoot returns the physical root of a table's files (ICEBERG_CATALOG_PLAN.md §6.3, §10
-// iceberg.uncommitted_gc_grace):
+// TableRoot returns the default physical root of a table's files (ICEBERG_CATALOG_PLAN.md §6.3,
+// §10 iceberg.uncommitted_gc_grace):
 //
 //	<storage_namespace>/_iceberg/<table-uuid>
 //
-// It is the location this catalog gives a table by default (Q-I5) and the only location whose
-// files the catalog will register: everything a commit's snapshots reference must be under it.
+// It is the location this catalog gives a table that the create request did not place itself
+// (Q-I5). File registration uses the root the table itself declares (tableRootForMetadata), which
+// is this value for a defaulted table and the client's location for a table created with one.
 // The storage namespace is used without a trailing slash, because that is the form the location of
 // a defaulted table has.
 func TableRoot(storageNamespace string, tableUUID uuid.UUID) (string, error) {
@@ -425,6 +443,46 @@ func TableFilePath(tableUUID uuid.UUID, relativePath string) (string, error) {
 	return key, nil
 }
 
+// tableRootForMetadata resolves the physical root every file of a commit must live under: the
+// table's own location when metadata.json declares one, and the managed
+// <storage_namespace>/_iceberg/<table-uuid> when it does not.
+//
+// The location is checked against the catalog's table area (<storage_namespace>/_iceberg/) rather
+// than trusted, because it comes from a document a client wrote. A table whose location is outside
+// the area - one registered from another catalog, say - is readable, but a commit that would stage
+// its files is refused with a *ForeignTableFileError: registering files under a root the catalog
+// does not own would stage entries pointing outside the repository's storage namespace, which the
+// uncommitted GC cannot see (spike S-I2 §4) and which §13 forbids.
+func tableRootForMetadata(storageNamespace string, meta table.Metadata) (string, error) {
+	defaultRoot, err := TableRoot(storageNamespace, meta.TableUUID())
+	if err != nil {
+		return "", err
+	}
+	location := strings.TrimRight(meta.Location(), "/")
+	if location == "" || location == defaultRoot {
+		return defaultRoot, nil
+	}
+	area := TableAreaLocation(storageNamespace)
+	relative, ok := strings.CutPrefix(location, area)
+	if !ok || relative == "" {
+		return "", &ForeignTableFileError{
+			Kind:     TableFileKindMetadata,
+			Location: location,
+			Root:     strings.TrimRight(area, "/"),
+			Err:      ErrTableLocationOutsideArea,
+		}
+	}
+	if err := validateTableRelativePath(strings.TrimRight(relative, "/")); err != nil {
+		return "", &ForeignTableFileError{
+			Kind:     TableFileKindMetadata,
+			Location: location,
+			Root:     strings.TrimRight(area, "/"),
+			Err:      err,
+		}
+	}
+	return location, nil
+}
+
 // PlanTableFiles collects the entries a commit's new snapshots need, without writing anything: it
 // reads the manifest lists and manifests through the block adapter and returns the plan in a
 // deterministic order.
@@ -449,7 +507,7 @@ func (s *Store) PlanTableFiles(ctx context.Context, addr Address, request StageT
 		return nil, fmt.Errorf("%w: resolve repository %q: %w", ErrTableFileRegistration, addr.Repo, err)
 	}
 	tableUUID := request.Next.TableUUID()
-	root, err := TableRoot(repo.StorageNamespace, tableUUID)
+	root, err := tableRootForMetadata(repo.StorageNamespace, request.Next)
 	if err != nil {
 		return nil, err
 	}

@@ -15,9 +15,13 @@ package icebergcatalog
 //     it and GC them (§6.3);
 //  4. apply the updates with table.UpdateTableMetadata (iceberg-go), then write the result to a
 //     fresh, never-reused <seq>-<uuid>.metadata.json (metadata.go);
-//  5. swap the pointer with a condition on the base metadata-location, so exactly one of two
+//  5. stage the files the commit added as lakeFS entries (§6.3, files.go StageTableFiles): the new
+//     metadata file, the snapshots' manifest lists, the manifests they add and every file those
+//     manifests add. A path outside the table's root, or a commit above iceberg.max_staged_files,
+//     is refused with 400 here, before the pointer moves;
+//  6. swap the pointer with a condition on the base metadata-location, so exactly one of two
 //     concurrent commits wins and the loser's metadata file is left unreferenced for GC;
-//  6. return the new pointer and metadata, i.e. the body of a LoadTableResult (§6.2 step 7).
+//  7. return the new pointer and metadata, i.e. the body of a LoadTableResult (§6.2 step 7).
 //
 // Error classification, in the terms of the REST spec's ErrorModel:
 //
@@ -29,15 +33,21 @@ package icebergcatalog
 //     cause.)
 //   - a requirement that does not hold, and a lost compare-and-swap
 //     (graveler.ErrPreconditionFailed), are 409 CommitFailedException.
+//   - a snapshot that references a file outside the table's root (§13), or a commit that would
+//     stage more files than iceberg.max_staged_files allows (files.go DefaultMaxStagedFiles), is
+//     a 400 BadRequestException: the request cannot be served as sent, and retrying it unchanged
+//     cannot help. Both are detected while planning, so such a commit stages nothing.
 //   - any other failure of the swap happens *after* metadata.json is written and its outcome is
 //     unknown to the client. It is a 500 CommitStateUnknownException and must not be mapped to
 //     409: the commit may well have landed, so the client must re-read the table instead of
-//     assuming failure (§2.1). The orphan metadata file is intentional and GC collects it.
+//     assuming failure (§2.1). The orphan metadata file is intentional and GC collects it. The
+//     same holds for a failure while staging a file: some entries may already be staged (they are
+//     deterministic, so a retry overwrites them) and the pointer has not moved.
 //
-// Everything that fails before the pointer swap is passed through unchanged: a missing table is
-// NoSuchTableException (404) and a corrupt pointer is ErrInvalidPointer. A graveler refusal of the
-// swap itself - a protected branch, a read-only repository - is preserved for errors.Is but is
-// reported as the unknown-outcome error, because it happens after the metadata write.
+// Everything that fails before metadata.json is written is passed through unchanged: a missing
+// table is NoSuchTableException (404) and a corrupt pointer is ErrInvalidPointer. A graveler refusal
+// of the swap itself - a protected branch, a read-only repository - is preserved for errors.Is but
+// is reported as the unknown-outcome error, because it happens after the metadata write.
 //
 // Staging, not committing: the swap writes the branch's staging area through
 // catalog.CreateEntry without Force (I2-1), exactly like every other catalog write. The commit
@@ -206,7 +216,30 @@ func (s *Store) Commit(ctx context.Context, addr Address, request TableCommitReq
 		return nil, err
 	}
 
-	// Step 5: the compare-and-swap of the pointer on the base metadata-location (§6.2 step 6).
+	// Step 5: stage the files of the snapshots this commit added, and the metadata file it wrote
+	// (§6.2 step 5, §6.3). Planning happens first and inside StageTableFiles, so a foreign location
+	// or an oversized commit is refused before a single entry is written; both are the client's
+	// 400. Anything else fails after metadata.json was written and before the pointer swap, so the
+	// outcome is unknown to the client (§6.2 step 6).
+	if _, err := s.StageTableFiles(ctx, addr, StageTableFilesRequest{
+		Base:          base.Metadata,
+		Next:          next,
+		MetadataFiles: []TableMetadataFile{{Location: location, Size: int64(len(metadataJSON))}},
+		MaxFiles:      s.maxStagedFiles,
+	}); err != nil {
+		if isRefusedTableFiles(err) {
+			return nil, &BadRequestError{
+				Message: "the commit's table files cannot be registered",
+				Err:     err,
+			}
+		}
+		// Some of the files may already be staged - the writes are deterministic, so a retry overwrites
+		// the same keys - and the pointer has not moved, so the client cannot know whether the commit
+		// landed. That is exactly what CommitStateUnknownException tells it (§2.1).
+		return nil, &CommitStateUnknownError{MetadataLocation: location, Err: err}
+	}
+
+	// Step 6: the compare-and-swap of the pointer on the base metadata-location (§6.2 step 6).
 	pointer := TablePointer{
 		MetadataLocation: location,
 		TableUUID:        next.TableUUID().String(),
@@ -223,13 +256,22 @@ func (s *Store) Commit(ctx context.Context, addr Address, request TableCommitReq
 		return nil, &CommitStateUnknownError{MetadataLocation: location, Err: err}
 	}
 
-	// Step 6: what a LoadTableResult is made of.
+	// Step 7: what a LoadTableResult is made of.
 	return &CommitResult{
 		Address:      addr,
 		Pointer:      pointer,
 		Metadata:     next,
 		MetadataJSON: metadataJSON,
 	}, nil
+}
+
+// isRefusedTableFiles reports whether an error of file registration is the client's fault: a path
+// outside the table's root (§13) or a commit above the staged-file cap
+// (iceberg.max_staged_files). Both are raised while planning, i.e. before anything is staged, and
+// both are a 400. Every other failure of that step is a server-side or storage failure and is
+// reported as an unknown outcome by the caller.
+func isRefusedTableFiles(err error) bool {
+	return errors.Is(err, ErrForeignTableFile) || errors.Is(err, ErrTooManyTableFiles)
 }
 
 // validateRequirements runs Requirement.Validate for every requirement, against the base table

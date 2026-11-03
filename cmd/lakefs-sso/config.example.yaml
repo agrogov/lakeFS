@@ -190,3 +190,8 @@ sso:
 #   # Resolve a commit that only re-points metadata at compacted data files instead of
 #   # conflicting with a concurrent change (§6.4).
 #   ignore_compaction_commits: true
+#   # Largest number of table files (metadata, manifest-list, manifest, data) one Iceberg commit
+#   # may register on the branch. A larger commit is refused with 400 rather than registered
+#   # partially, because a file that is not an entry can be collected by GC (§6.3). 50000 files
+#   # is roughly six seconds of staging at the default 32 workers.
+#   max_staged_files: 50000

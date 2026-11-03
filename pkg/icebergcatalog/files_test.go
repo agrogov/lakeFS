@@ -722,6 +722,65 @@ func TestForeignLocationRejected(t *testing.T) {
 	})
 }
 
+// TestTableRoot covers where a commit's files must live (ICEBERG_CATALOG_PLAN.md §6.3): the
+// location the table's own metadata.json declares. For a table created without a location that is
+// the managed <storage_namespace>/_iceberg/<table-uuid>; for a table the create request placed
+// inside the table area it is that location, which is why the root is read from the metadata and
+// not derived from the table UUID. A table whose location is outside the table area can be read
+// but not committed: its files are outside the one place the catalog registers and the GC watches.
+func TestTableRoot(t *testing.T) {
+	t.Run("a table created with its own location registers under that location", func(t *testing.T) {
+		f := newFilesFixture(t)
+		customRoot := "mem://" + storeTestRepo + "-ns/_iceberg/team-a/orders"
+
+		// The snapshot's manifest list, written where the client wrote it: under the table's own
+		// location, not under the managed location derived from the table UUID.
+		var buffer bytes.Buffer
+		sequenceNumber := int64(filesTestSequenceNumber)
+		parent := int64(filesTestParentSnapshotID)
+		require.NoError(t, iceberg.WriteManifestList(2, &buffer, filesTestSnapshotID, &parent, &sequenceNumber, 0, nil))
+		manifestList := customRoot + "/" + filesTestManifestListKey
+		f.putMetadata(t, strings.TrimPrefix(manifestList, "mem://"+storeTestRepo+"-ns/"), buffer.String())
+
+		base := filesTestMetadata(t, filesTestMetadataDocument(customRoot, nil, -1))
+		document := filesTestMetadataDocument(customRoot, []string{filesTestSnapshotDocument(manifestList)}, filesTestSnapshotID)
+		next := filesTestMetadata(t, document)
+		metadataLocation := f.putMetadata(t,
+			strings.TrimPrefix(customRoot+"/"+filesTestMetadataKey, "mem://"+storeTestRepo+"-ns/"), document)
+
+		set, err := f.commitFiles(t, base, next, []TableMetadataFile{{Location: metadataLocation, Size: int64(len(document))}})
+		require.NoError(t, err, "a table inside the table area registers its files")
+		require.Equal(t, customRoot, set.TableRoot, "the root is the location metadata.json declares")
+		require.Equal(t, []string{
+			f.entryPath(t, filesTestMetadataKey),
+			f.entryPath(t, filesTestManifestListKey),
+		}, planPaths(set.Files), "the keys stay relative to the table root, under the table UUID")
+	})
+
+	t.Run("a table outside the table area is refused", func(t *testing.T) {
+		f := newFilesFixture(t)
+
+		// A table registered from another catalog may point anywhere; the catalog can read it, but
+		// a commit must not register files the uncommitted GC cannot see (§13, spike S-I2 §4).
+		const outsideRoot = "s3://another-team/books"
+		base := filesTestMetadata(t, filesTestMetadataDocument(outsideRoot, nil, -1))
+		next := filesTestMetadata(t, filesTestMetadataDocument(outsideRoot, nil, -1))
+
+		_, err := f.commitFiles(t, base, next, nil)
+		require.Error(t, err)
+
+		var foreign *ForeignTableFileError
+		require.ErrorAs(t, err, &foreign)
+		require.ErrorIs(t, err, ErrForeignTableFile)
+		require.ErrorIs(t, err, ErrTableLocationOutsideArea)
+		require.ErrorIs(t, err, ErrCommitRejected)
+		require.Equal(t, 400, foreign.HTTPStatusCode())
+		require.Equal(t, outsideRoot, foreign.Location)
+		require.Empty(t, f.created.createdEntries(), "a refused plan stages nothing")
+		require.Empty(t, f.reader.readPaths(), "a table outside the area is never read")
+	})
+}
+
 // planPaths is the entry keys of a plan, in plan order.
 func planPaths(files []TableFile) []string {
 	paths := make([]string, 0, len(files))

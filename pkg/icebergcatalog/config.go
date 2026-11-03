@@ -159,6 +159,14 @@ type Config struct {
 	// IgnoreCompactionCommits enables the compaction auto-resolve of §6.4 (phase I-5).
 	IgnoreCompactionCommits bool `mapstructure:"ignore_compaction_commits"`
 
+	// MaxStagedFiles is the cap on the number of table-file entries one commit may stage,
+	// iceberg.max_staged_files (§10, spike S-I2 §5.1 item 4). A commit that would register more
+	// files than this is refused with 400 instead of staging a subset, because a file left out of
+	// the staging area is a file the committed GC may delete. 50 000 files is about six seconds of
+	// staging at 32 workers (§15.2); a negative value is rejected by Validate, and an absent or
+	// zero value means DefaultMaxStagedFiles.
+	MaxStagedFiles int `mapstructure:"max_staged_files"`
+
 	// CredentialsVending is the vended-credentials setting of §8 (phase I-4). It is populated
 	// from blockstore.s3.credentials_vending, the key the public lakeFS documentation names, and
 	// from iceberg.credentials_vending; see CredentialsVendingConfig.
@@ -193,6 +201,7 @@ func (c *Config) applyViperOverrides() {
 		maxRequestBodyKey          = ConfigKey + ".max_request_body"
 		uncommittedGCGraceKey      = ConfigKey + ".uncommitted_gc_grace"
 		ignoreCompactionCommitsKey = ConfigKey + ".ignore_compaction_commits"
+		maxStagedFilesKey          = ConfigKey + ".max_staged_files"
 	)
 	if viper.IsSet(enabledKey) {
 		c.Enabled = viper.GetBool(enabledKey)
@@ -218,6 +227,9 @@ func (c *Config) applyViperOverrides() {
 		c.IgnoreCompactionCommits = viper.GetBool(ignoreCompactionCommitsKey)
 	} else {
 		c.IgnoreCompactionCommits = DefaultIgnoreCompactionCommits
+	}
+	if viper.IsSet(maxStagedFilesKey) {
+		c.MaxStagedFiles = viper.GetInt(maxStagedFilesKey)
 	}
 }
 
@@ -262,6 +274,20 @@ func (c *Config) IgnoresCompactionCommits() bool {
 	return c.IgnoreCompactionCommits
 }
 
+// StoreOptions returns the Store options this section configures, so that the mount builds the
+// catalog store with the operator's settings rather than with the built-in defaults:
+//
+//	store := NewStore(deps.Catalog, deps.BlockAdapter, cfg.StoreOptions()...)
+//
+// Today that is the staged-file cap of §10 (iceberg.max_staged_files). A nil *Config or a cap left
+// at zero contributes nothing, which leaves DefaultMaxStagedFiles in force.
+func (c *Config) StoreOptions() []StoreOption {
+	if c == nil || c.MaxStagedFiles <= 0 {
+		return nil
+	}
+	return []StoreOption{WithMaxStagedFiles(c.MaxStagedFiles)}
+}
+
 // setDefaults fills every unset field with its documented default. Zero values mean "unset"
 // here: a value that is set but not positive is rejected by Validate instead of defaulted.
 func (c *Config) setDefaults() {
@@ -284,6 +310,12 @@ func (c *Config) setDefaults() {
 	// role_arn" stays visible to Validate instead of becoming a silently ignored 1h.
 	if c.CredentialsVending.Configured() && c.CredentialsVending.SessionDuration == 0 {
 		c.CredentialsVending.SessionDuration = DefaultVendedSessionDuration
+	}
+	// Zero means "unset" here, exactly as for max_request_body: the cap has no second, meaningful
+	// zero value (a cap of zero would refuse every commit), so an explicit 0 is the default rather
+	// than a setting. A negative value is a typo and is rejected by Validate.
+	if c.MaxStagedFiles == 0 {
+		c.MaxStagedFiles = DefaultMaxStagedFiles
 	}
 }
 
@@ -310,6 +342,12 @@ func (c *Config) Validate() error {
 	if c.UncommittedGCGrace < 0 {
 		return fmt.Errorf("%w: uncommitted_gc_grace must be positive, or %s to protect every %s/ object, got %s",
 			ErrInvalidConfig, UncommittedGCGraceProtectAll, DataPrefix, c.UncommittedGCGrace)
+	}
+	// The cap is a refusal, not a silent truncation: a negative value would refuse every commit
+	// that stages a file, so it is a configuration bug rather than a setting.
+	if c.MaxStagedFiles < 0 {
+		return fmt.Errorf("%w: max_staged_files must not be negative, got %d",
+			ErrInvalidConfig, c.MaxStagedFiles)
 	}
 	return c.CredentialsVending.Validate()
 }

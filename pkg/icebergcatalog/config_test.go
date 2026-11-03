@@ -32,12 +32,14 @@ func TestLoadConfigDefaults(t *testing.T) {
 	require.Equal(t, DefaultMaxRequestBody, cfg.MaxRequestBody, "8 MiB by default")
 	require.Equal(t, DefaultUncommittedGCGrace, cfg.UncommittedGCGrace, "24h of grace for client-written files")
 	require.True(t, cfg.IgnoreCompactionCommits)
+	require.Equal(t, DefaultMaxStagedFiles, cfg.MaxStagedFiles, "50000 files per commit by default")
 
 	// The documented defaults of ICEBERG_CATALOG_PLAN.md section 10, spelled out.
 	require.Equal(t, "lakefs", cfg.Prefix)
 	require.Equal(t, time.Hour, cfg.TokenTTL)
 	require.Equal(t, int64(8<<20), cfg.MaxRequestBody)
 	require.Equal(t, 24*time.Hour, cfg.UncommittedGCGrace)
+	require.Equal(t, 50_000, cfg.MaxStagedFiles)
 }
 
 func TestLoadConfigValid(t *testing.T) {
@@ -49,6 +51,7 @@ iceberg:
   max_request_body: 1048576
   uncommitted_gc_grace: 90m
   ignore_compaction_commits: false
+  max_staged_files: 20000
 `)
 
 	cfg, err := LoadConfig()
@@ -59,6 +62,7 @@ iceberg:
 	require.Equal(t, int64(1<<20), cfg.MaxRequestBody)
 	require.Equal(t, 90*time.Minute, cfg.UncommittedGCGrace)
 	require.False(t, cfg.IgnoreCompactionCommits, "an explicit false must not be replaced by the default")
+	require.Equal(t, 20000, cfg.MaxStagedFiles)
 }
 
 // TestLoadConfigIgnoreCompactionCommits pins the one default that is true: the zero value of a
@@ -94,6 +98,7 @@ func TestLoadConfigEnvironmentOverrides(t *testing.T) {
 	t.Setenv("LAKEFS_ICEBERG_MAX_REQUEST_BODY", "1024")
 	t.Setenv("LAKEFS_ICEBERG_UNCOMMITTED_GC_GRACE", "48h")
 	t.Setenv("LAKEFS_ICEBERG_IGNORE_COMPACTION_COMMITS", "false")
+	t.Setenv("LAKEFS_ICEBERG_MAX_STAGED_FILES", "1234")
 	viper.SetEnvPrefix("LAKEFS")
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	viper.AutomaticEnv()
@@ -105,6 +110,7 @@ func TestLoadConfigEnvironmentOverrides(t *testing.T) {
 	require.Equal(t, int64(1024), cfg.MaxRequestBody)
 	require.Equal(t, 48*time.Hour, cfg.UncommittedGCGrace)
 	require.False(t, cfg.IgnoreCompactionCommits)
+	require.Equal(t, 1234, cfg.MaxStagedFiles)
 }
 
 func TestLoadConfigValidationErrors(t *testing.T) {
@@ -142,6 +148,11 @@ func TestLoadConfigValidationErrors(t *testing.T) {
 			name:    "non-positive uncommitted_gc_grace",
 			yaml:    "iceberg:\n  uncommitted_gc_grace: -1h\n",
 			wantErr: "uncommitted_gc_grace must be positive",
+		},
+		{
+			name:    "negative max_staged_files",
+			yaml:    "iceberg:\n  max_staged_files: -5\n",
+			wantErr: "max_staged_files must not be negative",
 		},
 		{
 			name:    "malformed section",
@@ -186,6 +197,7 @@ func TestConfigImplAbsorbsIcebergSection(t *testing.T) {
 iceberg:
   enabled: true
   prefix: lakefs
+  max_staged_files: 123
   some_future_key: 7
 `)
 
@@ -195,6 +207,46 @@ iceberg:
 	section, ok := c.Iceberg["enabled"]
 	require.True(t, ok, "iceberg.enabled should be absorbed into ConfigImpl.Iceberg")
 	require.Equal(t, true, section)
+	staged, ok := c.Iceberg["max_staged_files"]
+	require.True(t, ok, "iceberg.max_staged_files needs no pkg/config field: the section is a map")
+	require.EqualValues(t, 123, staged)
 	_, ok = c.Iceberg["some_future_key"]
 	require.True(t, ok, "the section is kept verbatim, so new keys do not need a pkg/config change")
+}
+
+// TestStoreOptions pins that the configured cap reaches the store that enforces it (§10): the mount
+// builds the store with cfg.StoreOptions(), so iceberg.max_staged_files is the cap a commit is held
+// to and not just a parsed number.
+func TestStoreOptions(t *testing.T) {
+	t.Run("the configured cap is the store's cap", func(t *testing.T) {
+		useConfig(t, "iceberg:\n  max_staged_files: 7\n")
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		store := NewStore(nil, nil, cfg.StoreOptions()...)
+		require.Equal(t, 7, store.MaxStagedFiles())
+	})
+
+	t.Run("without configuration the documented default is enforced", func(t *testing.T) {
+		useConfig(t, "{}\n")
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		store := NewStore(nil, nil, cfg.StoreOptions()...)
+		require.Equal(t, DefaultMaxStagedFiles, store.MaxStagedFiles())
+	})
+
+	t.Run("a nil config contributes nothing", func(t *testing.T) {
+		store := NewStore(nil, nil, (*Config)(nil).StoreOptions()...)
+		require.Equal(t, DefaultMaxStagedFiles, store.MaxStagedFiles())
+	})
+
+	t.Run("an explicit zero is the default, not a cap of zero", func(t *testing.T) {
+		useConfig(t, "iceberg:\n  max_staged_files: 0\n")
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.Equal(t, DefaultMaxStagedFiles, cfg.MaxStagedFiles)
+
+		store := NewStore(nil, nil, WithMaxStagedFiles(0))
+		require.Equal(t, DefaultMaxStagedFiles, store.MaxStagedFiles(),
+			"a cap of zero would refuse every commit, so it cannot be a setting")
+	})
 }

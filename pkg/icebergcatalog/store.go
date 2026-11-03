@@ -203,13 +203,48 @@ type Catalog interface {
 type Store struct {
 	catalog Catalog
 	block   block.Adapter
+
+	// maxStagedFiles is the cap on the number of table-file entries one commit may stage, i.e.
+	// iceberg.max_staged_files (§10). It is enforced by StageTableFiles before anything is
+	// written, and it is a Store field rather than a parameter of Commit because the commit body
+	// is the client's: a client must not be able to raise its own cap.
+	maxStagedFiles int
+}
+
+// StoreOption configures a Store at construction.
+type StoreOption func(*Store)
+
+// WithMaxStagedFiles sets the cap on the table files of one commit, the iceberg.max_staged_files
+// setting (§10, DefaultMaxStagedFiles). The mount passes the configured value:
+//
+//	store := NewStore(deps.Catalog, deps.BlockAdapter, WithMaxStagedFiles(cfg.MaxStagedFiles))
+//
+// A non-positive value is ignored - the default stays in force - because the cap exists to refuse
+// an oversized commit, and a cap of zero would refuse every commit instead of protecting it.
+func WithMaxStagedFiles(maxFiles int) StoreOption {
+	return func(s *Store) {
+		if maxFiles > 0 {
+			s.maxStagedFiles = maxFiles
+		}
+	}
 }
 
 // NewStore returns a catalog store over the given catalog and block adapter. The catalog must be
 // able to read entries on any ref and to stage writes on a branch; *catalog.Catalog does both.
-func NewStore(catalogStore Catalog, blockAdapter block.Adapter) *Store {
-	return &Store{catalog: catalogStore, block: blockAdapter}
+func NewStore(catalogStore Catalog, blockAdapter block.Adapter, opts ...StoreOption) *Store {
+	store := &Store{
+		catalog:        catalogStore,
+		block:          blockAdapter,
+		maxStagedFiles: DefaultMaxStagedFiles,
+	}
+	for _, opt := range opts {
+		opt(store)
+	}
+	return store
 }
+
+// MaxStagedFiles is the cap this store enforces on the table files of one commit.
+func (s *Store) MaxStagedFiles() int { return s.maxStagedFiles }
 
 // GetNamespace reads the _lakefs_iceberg/ns/<ns>/.namespace marker of addr.Namespace on
 // addr.Ref. A missing marker is NoSuchNamespaceException.
