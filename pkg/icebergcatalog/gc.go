@@ -188,31 +188,63 @@ const (
 	// _lakefs_iceberg/tables/<ns>/<table>/.pointer directly and point a table at a foreign
 	// location, bypassing the check-and-put of §6.2 and the location check of I3-1.
 	//
-	// The pattern needs *two* path segments after the prefix ("…/_iceberg/*/*"), and that arity is
-	// load-bearing in both directions:
+	// The pattern needs *two* path segments after the prefix ("…/_lakefs_iceberg/*/*"), and that
+	// arity is load-bearing in both directions:
 	//
-	//   - one segment is not enough on the request side: §7.2 makes every catalog write require
-	//     fs:WriteObject on ObjectArn(repo, "_lakefs_iceberg/*") - a *wildcard* resource, because
-	//     the catalog cannot know the key of the entry it will stage. A deny on
-	//     "…/object/_lakefs_iceberg/*" would match that very request string and, being a deny,
-	//     would win over every grant: no principal could create, update or drop a table anymore.
-	//     With two segments the pattern does not match the wildcard request (the request has no
-	//     "/" after the "*"), so the catalog's own permission request is unaffected.
-	//   - two segments is enough on the deny side: every key the catalog writes has at least three
-	//     segments after the prefix - _lakefs_iceberg/ns/<ns>/.namespace and
+	//   - two segments is the *maximum* that spares the catalog's own permission request. §7.2
+	//     makes every catalog write require fs:WriteObject on ObjectArn(repo, "_lakefs_iceberg/*"),
+	//     a *wildcard* resource, because the catalog cannot know the key of the entry it will
+	//     stage. auth.ArnMatch matches a statement's resource against that very request string
+	//     with pkg/auth/wildcard, where "*" spans "/" and every other byte, so a statement one
+	//     segment coarser ("…/object/_lakefs_iceberg/*") matches the request as well and, being a
+	//     deny, wins over every grant: no principal could create, update or drop a table anymore.
+	//     With two segments the pattern does not match the request (the request has no "/"
+	//     followed by anything after the "*"), so the catalog keeps its own permission.
+	//   - two segments is enough on the deny side, with one to spare: every key the catalog writes
+	//     has at least three segments after the prefix - _lakefs_iceberg/ns/<ns>/.namespace and
 	//     _lakefs_iceberg/tables/<ns>/<table>/.pointer (store.go namespaceMarkerPath /
-	//     tablePointerPath) and _lakefs_iceberg/files/<uuid>/<relative path> (§6.3) - and every
-	//     such key is matched. gc_test.go pins both directions against auth.ArnMatch and against
-	//     the real ACL engine.
+	//     tablePointerPath) and _lakefs_iceberg/files/<uuid>/<relative path> (files.go
+	//     TableFilePath, whose relative path is validated to be non-empty and clean) - and every
+	//     such key is matched. gc_test.go pins that invariant shape by shape, against
+	//     auth.ArnMatch and against the real ACL engine, so a future builder that emitted a
+	//     shallower key fails there instead of shipping a hole.
 	//
-	// Residual risk, stated: a principal can still write a single-segment key such as
-	// "_lakefs_iceberg/foo", or a *variant* key such as "/_lakefs_iceberg/tables/…" (leading
-	// slash) or "_lakefs_iceberg//tables/…", through the object API. None of them forges catalog
-	// state, because object keys are opaque strings and the catalog reads the exact keys its own
-	// builders produce (store.go namespaceMarkerPath / tablePointerPath), never a normalized
-	// form; a variant key is a different object that nothing reads, and the GC collects it. What
-	// the deny has to cover is therefore exactly "the keys the catalog writes", and gc_test.go
-	// asserts that it covers every one of them.
+	// Why the arity is not closed from the other side (the review question). A statement that
+	// denied one-segment keys - "…/object/_lakefs_iceberg/*" - is exactly the statement rejected
+	// above, and this is not a coincidence of the pattern chosen here: the request's second segment
+	// is the single character "*", so *any* pattern that matches every one-segment key also matches
+	// the wildcard request. There is no "deny one-segment keys but not the request" statement in
+	// this policy language; gc_test.go pins both halves of that impossibility. The remaining ways
+	// to close it were considered and rejected:
+	//
+	//   - Move the catalog's write requirement off the reserved area, e.g. to fs:WriteObject on
+	//     the repository ARN or on ObjectArn(repo, "*"), so that the deny can cover every key
+	//     under the prefix. That works for the deny, but it breaks the least-privilege policy
+	//     shape §7.2 documents: "may operate the catalog, may not write data" is expressed as the
+	//     reserved-area wildcard, and after the move such a principal would either be refused or
+	//     have to be granted write access to the repository's whole object space. Trading an
+	//     unreachable object for that regression is a bad trade, and it would also silently
+	//     invalidate every policy already written to the documented shape.
+	//   - Condition the deny so that a catalog request is exempt, e.g. StringNotEquals on a
+	//     "this request comes from the catalog" field. pkg/auth/condition.go fails a condition on a
+	//     field the request does not carry, so the non-exempt side would have to publish such a
+	//     field from pkg/api and pkg/gateway - a change outside this control - and a deny whose
+	//     bypass is a request-context field is a weaker control than a plain deny of the same
+	//     keys. Not worth it for keys nothing reads.
+	//
+	// Residual risk, stated and bounded: what this statement leaves writable through fs: is every
+	// key that is not "_lakefs_iceberg/<segment>/…" - the area name itself ("_lakefs_iceberg"),
+	// the empty segment ("_lakefs_iceberg/"), one-segment keys ("_lakefs_iceberg/foo"), and keys
+	// that do not start with the prefix at all, such as "/_lakefs_iceberg/tables/…" (leading
+	// slash). None of them can forge catalog state, because object keys are opaque strings and the
+	// catalog only ever (a) reads the exact keys its own builders produce - store.go
+	// namespaceMarkerPath / tablePointerPath, files.go TableFilePath, never a normalized form - and
+	// (b) lists under prefixes that have a fixed second segment and end at a segment boundary:
+	// "_lakefs_iceberg/ns/" and "_lakefs_iceberg/tables/<ns>/" (namespaces.go
+	// namespaceEntryPrefix / tableEntriesPrefix, tables.go tableEntryPrefix; the catalog itself has
+	// no listing of the staged-file area). A residual key is a different object that no reader
+	// loads or lists, and the GC collects it; gc_test.go asserts the reader prefixes cannot reach
+	// it, and asserts that every key the catalog writes is denied with a segment to spare.
 	ReservedPrefixObjectResource = "arn:lakefs:fs:::repository/*/object/" + ReservedPrefix + "/*/*"
 )
 

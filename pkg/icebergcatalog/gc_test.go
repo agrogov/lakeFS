@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/model"
@@ -440,8 +441,11 @@ func TestReservedPrefixDenied(t *testing.T) {
 			{"ordinary object in a subdirectory", "exports/2025/report.csv", false},
 			{"look-alike prefix", ReservedPrefix + "x/tables/inventory/books/titles/.pointer", false},
 			{"reserved prefix deeper in the key", "archive/" + ReservedPrefix + "/tables/x/y/.pointer", false},
-			// The single-segment hole documented on ReservedPrefixObjectResource: it cannot name
-			// any key the catalog writes (all have >= 2 segments after the prefix).
+			// Real keys cannot be forged: the deny covers every key shape the catalog writes, and
+			// every shape has a segment to spare (TestReservedPrefixDeniedCatalogKeyShapes). What
+			// remains writable is only the keys with fewer than two segments after the prefix, and
+			// no reader in the catalog can reach one of those - see the residual note on
+			// ReservedPrefixObjectResource.
 			{"single-segment key", ReservedPrefix + "/foo", false},
 			// The shape §7.2 requires for a catalog write: ObjectArn(repo, "_lakefs_iceberg/*").
 			// Denying it would refuse every catalog write to every principal.
@@ -455,22 +459,9 @@ func TestReservedPrefixDenied(t *testing.T) {
 		}
 	})
 
-	t.Run("every key the catalog writes is covered", func(t *testing.T) {
-		marker, err := namespaceMarkerPath(Namespace{"inventory", "books"})
-		require.NoError(t, err)
-		pointer, err := tablePointerPath(authzTableAddress())
-		require.NoError(t, err)
-		stagedFile := ReservedPrefix + "/files/6f1c9f2e/data/part-00000.parquet"
-
-		for _, key := range []string{marker, pointer, stagedFile} {
-			require.True(t, auth.ArnMatch(ReservedPrefixObjectResource, permissions.ObjectArn("lakehouse", key)),
-				"the deny must match the catalog key %q", key)
-			// The arity argument of the pattern: at least two segments after the prefix, so a
-			// narrower pattern would still cover these keys but a single-segment one would not.
-			relative := strings.TrimPrefix(key, ReservedPrefix+"/")
-			require.GreaterOrEqual(t, strings.Count(relative, "/"), 1, "key %q must have >= 2 segments", key)
-		}
-	})
+	// Every key shape the catalog writes is pinned shape by shape, with one segment to spare, by
+	// TestReservedPrefixDeniedCatalogKeyShapes below: that is the guarantee the two-segment
+	// pattern can give (see the arity note on ReservedPrefixObjectResource).
 
 	// The end-to-end half: a principal that may do everything through fs: and catalog: still
 	// cannot put the reserved prefix itself, but keeps every other object write.
@@ -537,6 +528,170 @@ func TestReservedPrefixDenied(t *testing.T) {
 			Action:   permissions.WriteObjectAction,
 			Resource: permissions.ObjectArn(authzRepo, pointer),
 		}), "a direct write to %q through fs: must be denied", pointer)
+	})
+}
+
+// TestReservedPrefixDeniedCatalogKeyShapes pins the deny against the keys the catalog actually
+// writes, and pins what it cannot cover.
+//
+// ReservedPrefixObjectResource is "_lakefs_iceberg/*/*": two or more segments after the prefix. It
+// is the *maximal* deny the policy language allows without denying §7.2's own write request (see
+// the arity note on the constant), so the guarantee this control can give is not "nothing under
+// the prefix is writable" but "every key the catalog writes has a segment to spare". This test is
+// that guarantee, and it is the tripwire for the ways it could stop being true:
+//
+//   - every key shape, built with the production builders and not written out by hand, is denied,
+//     both by auth.ArnMatch and by a decision of the real ACL auth service;
+//   - every shape has at least three segments after the prefix and a known second segment
+//     (ns/, tables/, files/), so the two-segment pattern can never miss one: a future builder
+//     that emitted "_lakefs_iceberg/<shallow key>" fails here, and whoever hits it has to decide
+//     between widening the deny (which means changing the §7.2 request) and not writing that key;
+//   - the shapes that do stay writable are only the "fewer than two segments" ones, and the reader
+//     prefixes cannot reach them: a listing is anchored at a fixed second segment and ends at a
+//     segment boundary, so a residual key is an object nothing loads or lists.
+func TestReservedPrefixDeniedCatalogKeyShapes(t *testing.T) {
+	t.Parallel()
+
+	// The shapes, from the three builders that write the reserved area: the namespace marker, the
+	// table pointer (both at every namespace depth the layout allows) and the staged table file
+	// (whose relative path the builder validates, so <one segment> is the shallowest file entry).
+	type keyShape struct {
+		shape string
+		key   string
+	}
+	var shapes []keyShape
+	add := func(shape, key string, err error) {
+		t.Helper()
+		require.NoErrorf(t, err, "build %s", shape)
+		shapes = append(shapes, keyShape{shape: shape, key: key})
+	}
+	for _, namespace := range []Namespace{{"analytics"}, {"analytics", "books"}, {"a", "b", "c"}} {
+		marker, err := namespaceMarkerPath(namespace)
+		add("namespace marker "+namespace.Dotted(), marker, err)
+		pointer, err := tablePointerPath(Address{Namespace: namespace, Table: "titles"})
+		add("table pointer "+namespace.Dotted(), pointer, err)
+	}
+	tableUUID := uuid.MustParse(storeTestUUID)
+	for _, relative := range []string{
+		"data.parquet",
+		"data/part-00000.parquet",
+		"metadata/00001-6f1c9f2e.metadata.json",
+		"metadata/snap-1-1-abc.avro",
+	} {
+		key, err := TableFilePath(tableUUID, relative)
+		add("staged file "+relative, key, err)
+	}
+	require.Len(t, shapes, 10, "every builder and every depth is listed above")
+
+	// A principal with the widest possible grant: only the deny can refuse these writes.
+	f := newAuthzUser(t, model.Statements{{
+		Effect:   model.StatementEffectAllow,
+		Action:   []string{"fs:*", "catalog:*"},
+		Resource: permissions.All,
+	}})
+	f.attach(t, "alice", ReservedPrefixProtectPolicy(gcNow))
+
+	directories := []string{NamespaceDirectory, TablesDirectory, FilesDirectory}
+	for _, shape := range shapes {
+		t.Run(shape.shape, func(t *testing.T) {
+			require.True(t, strings.HasPrefix(shape.key, ReservedPrefix+"/"),
+				"a catalog key starts with the reserved prefix: %q", shape.key)
+			relative := strings.TrimPrefix(shape.key, ReservedPrefix+"/")
+			require.False(t, strings.HasSuffix(relative, "/"),
+				"a catalog entry key does not end with a separator: %q", shape.key)
+			segments := strings.Split(relative, "/")
+			require.GreaterOrEqual(t, len(segments), 3,
+				"%q must have a segment to spare over the two-segment deny", shape.key)
+			require.Contains(t, directories, segments[0],
+				"%q must sit in ns/, tables/ or files/", shape.key)
+			for _, segment := range segments {
+				require.NotEmpty(t, segment, "%q must not have an empty path segment", shape.key)
+			}
+
+			require.True(t, auth.ArnMatch(ReservedPrefixObjectResource, permissions.ObjectArn(authzRepo, shape.key)),
+				"the deny must match the catalog key %q", shape.key)
+			for _, action := range ReservedPrefixProtectDeniedActions {
+				require.True(t, gcDenied(t, f, "alice", permissions.Permission{
+					Action:   action,
+					Resource: permissions.ObjectArn(authzRepo, shape.key),
+				}), "%s on the catalog key %q must be denied", action, shape.key)
+			}
+		})
+	}
+
+	// What the deny leaves writable, stated rather than discovered: the area name itself, the empty
+	// segment, and one-segment keys - including the directory names, which are the closest a
+	// residual key gets to a key the catalog reads ("_lakefs_iceberg/ns" is not below
+	// "_lakefs_iceberg/ns/").
+	residual := []string{
+		ReservedPrefix,
+		ReservedPrefix + "/",
+		ReservedPrefix + "/foo",
+		ReservedPrefix + "/ns",
+		ReservedPrefix + "/tables",
+		ReservedPrefix + "/files",
+		ReservedPrefix + "/foo.bin",
+	}
+
+	t.Run("the residual is exactly the keys with fewer than two segments", func(t *testing.T) {
+		for _, key := range residual {
+			require.False(t, auth.ArnMatch(ReservedPrefixObjectResource, permissions.ObjectArn(authzRepo, key)),
+				"%q is the documented residual of the two-segment pattern", key)
+			require.False(t, gcDenied(t, f, "alice", permissions.Permission{
+				Action:   permissions.WriteObjectAction,
+				Resource: permissions.ObjectArn(authzRepo, key),
+			}), "%q must stay writable, or the statement would deny the catalog's own request", key)
+			for _, shape := range shapes {
+				require.NotEqual(t, shape.key, key, "a residual key must not be a key the catalog writes")
+			}
+		}
+	})
+
+	t.Run("no reader prefix can reach a residual key", func(t *testing.T) {
+		// The catalog's listing prefixes: the namespace walk and the table lookup, at every depth.
+		// The staged-file area is read by exact key (files.go TableFilePath) and listed only by
+		// pkg/datasets, with the same "<prefix>/<uuid>/" shape. namespaces.go (tableEntriesPrefix)
+		// and tables.go (tableEntryPrefix) build the table prefix twice; both are listed, so a drift
+		// between the two shows up here rather than as a hole in the deny argument.
+		require.Equal(t, tableEntriesPrefix(Namespace{"analytics"}), tableEntryPrefix(Namespace{"analytics"}),
+			"the two table-prefix helpers must agree on the shape the deny is argued against")
+		prefixes := []string{
+			namespaceEntryPrefix(Namespace{}),
+			namespaceEntryPrefix(Namespace{"analytics"}),
+			namespaceEntryPrefix(Namespace{"analytics", "books"}),
+			tableEntriesPrefix(Namespace{"analytics"}),
+			tableEntriesPrefix(Namespace{"analytics", "books"}),
+			tableEntryPrefix(Namespace{"analytics"}),
+		}
+		for _, prefix := range prefixes {
+			require.True(t, strings.HasPrefix(prefix, ReservedPrefix+"/"),
+				"listing prefix %q is inside the reserved area", prefix)
+			require.True(t, strings.HasSuffix(prefix, "/"),
+				"listing prefix %q ends at a segment boundary, so it cannot select a shallow key", prefix)
+			require.GreaterOrEqual(t, len(strings.Split(strings.TrimSuffix(prefix, "/"), "/")), 2,
+				"listing prefix %q is anchored at a directory under the prefix", prefix)
+			for _, key := range residual {
+				require.False(t, strings.HasPrefix(key, prefix),
+					"residual key %q must not be listed under %q", key, prefix)
+			}
+		}
+	})
+
+	t.Run("a one-segment deny would deny the catalog's own request", func(t *testing.T) {
+		// The reason ReservedPrefixObjectResource stops at two segments is not a preference: a
+		// pattern that denies one-segment keys denies the §7.2 request as well, because the
+		// request's second segment is the single character "*".
+		const oneSegmentDeny = "arn:lakefs:fs:::repository/*/object/" + ReservedPrefix + "/*"
+		require.True(t, auth.ArnMatch(oneSegmentDeny, permissions.ObjectArn(authzRepo, ReservedPrefix+"/foo")),
+			"a one-segment deny is what would close the residual")
+		require.True(t, auth.ArnMatch(oneSegmentDeny, authzWriteObjectArn),
+			"and it denies fs:WriteObject on ObjectArn(repo, \"_lakefs_iceberg/*\") too")
+		require.False(t, auth.ArnMatch(ReservedPrefixObjectResource, authzWriteObjectArn),
+			"the shipped two-segment pattern is the deepest one that spares the request")
+		// The same along the other axis: the request is a single-segment key, so no pattern that
+		// covers every one-segment key can avoid it.
+		require.True(t, auth.ArnMatch(oneSegmentDeny, permissions.ObjectArn(authzRepo, ReservedPrefix+"/")),
+			"even the empty second segment is matched by a one-segment pattern")
 	})
 }
 
