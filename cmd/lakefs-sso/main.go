@@ -45,9 +45,10 @@ func main() {
 	lakefsCmd.SetAuthServiceBuilder(buildAuthService)
 	lakefsCmd.SetAuthenticationServiceBuilder(sso.BuildAuthenticationService)
 
-	// Register the sso-migrate and rbac-migrate subcommands.
+	// Register the sso-migrate, rbac-migrate and mds (Metadata Search indexer) subcommands.
 	lakefsCmd.GetRoot().AddCommand(newSSOmigrateCmd())
 	lakefsCmd.GetRoot().AddCommand(newRBACMigrateCmd())
+	lakefsCmd.GetRoot().AddCommand(newMDSCommand())
 
 	// Mount the datasets control plane on /api/v1/datasets (DATASETS_DESIGN.md §4.4). The
 	// builder mounts a 501 handler when datasets.enabled is false.
