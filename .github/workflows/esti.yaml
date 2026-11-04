@@ -397,6 +397,53 @@ jobs:
           go test -count=1 -timeout 30m -tags datasets -v ./esti \
             -system-tests -run TestDatasets
 
+  metadata-search-system-tests:
+    name: Test Metadata Search (SeaweedFS)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check-out code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      # The suite needs an S3 endpoint that does not vend credentials (design §4.6), docker for the
+      # PyIceberg/DuckDB clients and a lakefs-sso it builds itself, so it runs on the runner with no
+      # cloud secrets. See esti/ops/docker-compose-mds.yaml.
+      - name: Start SeaweedFS
+        run: |
+          docker compose -f esti/ops/docker-compose-mds.yaml up -d
+          for _ in $(seq 60); do
+            curl -s -o /dev/null http://127.0.0.1:8333/ && exit 0
+            sleep 1
+          done
+          echo "SeaweedFS S3 did not answer on :8333 within 60s"
+          docker compose -f esti/ops/docker-compose-mds.yaml logs
+          exit 1
+
+      # The backfill is a measurement, not a gate: 10k objects keep the job well inside its timeout
+      # (100k does not fit a 10 minute run).
+      - name: Metadata Search system tests
+        env:
+          LAKEFS_BLOCKSTORE_TYPE: s3
+          LAKEFS_BLOCKSTORE_S3_ENDPOINT: http://127.0.0.1:8333
+          LAKEFS_BLOCKSTORE_S3_CREDENTIALS_ACCESS_KEY_ID: estiaccesskey
+          LAKEFS_BLOCKSTORE_S3_CREDENTIALS_SECRET_ACCESS_KEY: estisecretkey
+          LAKEFS_BLOCKSTORE_S3_FORCE_PATH_STYLE: "true"
+          AWS_REGION: us-east-1
+          ESTI_STORAGE_NAMESPACE: s3://esti-mds-test/${{ github.run_number }}
+          ESTI_MDS_BACKFILL_OBJECTS: "10000"
+        run: |
+          go test -count=1 -timeout 20m -v ./esti \
+            -system-tests -use-local-credentials -run TestMetadataSearch
+
+      - name: SeaweedFS logs
+        if: failure()
+        run: docker compose -f esti/ops/docker-compose-mds.yaml logs
+
   deploy-rclone-export-image:
     name: Build and push rclone export Docker image
     needs: [check-secrets, login-to-amazon-ecr]

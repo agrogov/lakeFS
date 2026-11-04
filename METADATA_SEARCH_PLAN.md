@@ -20,7 +20,15 @@ File ownership rules on top of each task's list:
 |---|---|
 | R10-1 catalog hook (design 5.1–5.4) | **Done**, commit `80f6927e2` |
 | R9-1 tenant header refusal, OSS-only docs | Done, `a27f0edf5` (not part of this feature, listed so it is not redone) |
-| everything below | not started; no Kanban cards yet |
+| R10-2 `/mds/iceberg/api` alias | Done, `d690b14f3` |
+| M1 config, subcommand, health/metrics | Done, `e3e42d240`; config moved into the shared file in `f2b6d1a45` |
+| M2 lakeFS client layer | Done, `b4d01018a` |
+| M3 spike and table writer | Done, `9483ca0e8`; design aligned in `350f764c2` |
+| M4 indexer core | Done, `0f7ac16f4`; defects found by M6 fixed in `e0940e964` and `99b48ebf0` |
+| M5a ref mapper and server wiring | Done, `823cd8542` |
+| M5b bootstrap and deny policy | Done, `4e552e9d9` |
+| M6 esti end to end | Done, `547707a1e`; CI job `metadata-search-system-tests` in `.github/workflows/esti.yaml`. Open: the 100k backfill was not timed (10k: 71s, indexed 2.7s after start), and vended credentials are untested because SeaweedFS does not vend |
+| M7 docs | Done, `68df447e1`. Open: the Spark and Trino snippets were not run |
 
 ## Tasks
 
