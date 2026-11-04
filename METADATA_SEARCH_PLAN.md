@@ -5,9 +5,14 @@ Option B (design section 11) is not scheduled.
 
 ## Branching
 
-1. `feature/iceberg-catalog`: catalog-side tasks only (R10-1 done, R10-2), because this branch owns `pkg/icebergcatalog`.
-2. `feature/metadata-search`, cut from `feature/iceberg-catalog` after R10-2 lands: M1–M7. These two documents move
-   there in the first commit.
+All tasks run as Kanban cards with base `feature/iceberg-catalog` and auto-commit (the path the board already uses).
+No other cards are in flight there, so `pkg/icebergcatalog` ownership is not contended. A split to
+`feature/metadata-search` can be done after M7 if wanted.
+
+File ownership rules on top of each task's list:
+- `cmd/lakefs-sso/main.go` is edited by M1, M5a and M5b only, which run in that order (Kanban links).
+- `go.mod` / `go.sum` are edited by M3 only.
+- `docs/iceberg.md` is edited by R10-2 and M7 only (M7 runs after R10-2 through M6).
 
 ## Status
 
@@ -39,9 +44,8 @@ and its commit message includes the commands it ran and their output summary.
 ### M2 — lakeFS and catalog client layer
 - Files: `pkg/mds/client/lakefs.go` (wraps `apigen.ClientWithResponses`: branches, logCommits, diffRefs with
   `include_right_stats`, listObjects, statObject, getCommit, commit, createTag, getTag, createBranch, deleteBranch,
-  resetBranch, hardResetBranch, findMergeBase, createRepository, getRepository), `pkg/mds/client/iceberg.go`
-  (`rest.NewCatalog` for `<endpoint>/iceberg/relative_to/<repo>.<branch>/api` with basic-auth credentials and
-  `storage` props via `rest.WithAdditionalProps`), tests with `httptest`.
+  resetBranch, hardResetBranch, findMergeBase, createRepository, getRepository), `pkg/mds/client/lakefs_test.go`
+  with `httptest`. No `go.mod` change.
 - Pattern to follow: `pkg/icebergcatalog/cleanup/apiclient.go` (paging, error mapping).
 - Done when: every call is unit-tested against a fake server, including pagination and 404 → typed not-found error.
 
@@ -51,7 +55,9 @@ and its commit message includes the commands it ran and their output summary.
   one transaction, commit, read it back with iceberg-go scan. If MOR position deletes are rejected by the catalog's
   staging (`files.go` walks ADDED manifest entries, so delete files should be staged too), fix that in a separate
   R10-x task on `feature/iceberg-catalog`, not here.
-- Files: `pkg/mds/table/schema.go` (fixed schema, field IDs, properties), `pkg/mds/table/rows.go` (Arrow builder),
+- Files: `pkg/mds/table/catalog.go` (`rest.NewCatalog` for `<endpoint>/iceberg/relative_to/<repo>.<branch>/api`
+  with basic-auth credentials and `storage` props via `rest.WithAdditionalProps`), `go.mod`/`go.sum` if needed,
+  `pkg/mds/table/schema.go` (fixed schema, field IDs, properties), `pkg/mds/table/rows.go` (Arrow builder),
   `pkg/mds/table/writer.go` (`ApplyDelta(ctx, tbl, upserts, deletes, sourceCommit)`, `Rebuild(ctx, tbl, rowsIter, sourceCommit)`,
   `Compact`), tests.
 - Done when: unit tests cover delta, empty delta (property still moves), chunked `IN` (>10k paths), rebuild, compaction,
@@ -60,19 +66,25 @@ and its commit message includes the commands it ran and their output summary.
 ### M4 — indexer core (design 3.2, 3.3, 4.2–4.5, 4.7, 4.8)
 - Files: `pkg/mds/indexer/repo.go` (create `R-metadata`, namespace rules, init commit), `pkg/mds/indexer/branch.go`
   (tick per branch, recovery table of 4.4, backfill 4.5, rewrite 4.7, lifecycle 4.8), `pkg/mds/indexer/changes.go`
-  (diff → change set, rebuild threshold), tests with fakes of the M2 interfaces.
+  (diff → change set, rebuild threshold), `pkg/mds/indexer/maintenance.go` (compaction, tag retention), tests with
+  fakes of the M2/M3 interfaces, and the tick hook-up in `pkg/mds/service.go` (M1's file, free by then).
 - Done when: tests cover each row of the 4.4 recovery table (inject a crash after each step), seed from an
   ancestor tag, full backfill, first-parent merge handling, hard-reset rewrite, branch delete, namespace
   derivation/overlap refusal, `max_commits` bound per tick.
 
-### M5 — ref mapper and server wiring (design 6, 8)
-- Files: `pkg/mds/refmap/refmap.go`, `refmap_test.go`, `pkg/mds/bootstrap.go` (+ test), `cmd/lakefs-sso/main.go`
-  (two lines: `icebergcatalog.MetadataSearchRefMapper = refmap.New` and `AddExtraRoutesBuilder(mds.BootstrapBuilder)`).
-- Do: `MapRef` per design 6 (full ID, short ID, tag, `main~1`, unindexed → `NoSuchTableException`); bootstrap
-  of user/group/policies per design 8, idempotent, degrades on `BasicAuthService` like
-  `icebergcatalog.EnsureReservedPrefixProtectPolicy`.
-- Done when: unit tests for mapper and bootstrap; a resolver-level test in `pkg/icebergcatalog` style shows a tag of `R`
-  loads the `mds-<id>` table of `R-metadata`.
+### M5a — ref mapper and server wiring (design 6)
+- Files: `pkg/mds/refmap/refmap.go`, `pkg/mds/refmap/refmap_test.go`, `cmd/lakefs-sso/main.go`
+  (one line: `icebergcatalog.MetadataSearchRefMapper = refmap.New`).
+- Do: `MapRef` per design 6 (full ID, short ID, tag, `main~1`, unindexed → `NoSuchTableException`).
+- Done when: unit tests for the mapper; a test wiring `NewMetadataSearchResolver` with the mapper shows a tag of `R`
+  resolves to the `mds-<id>` ref of `R-metadata`.
+
+### M5b — bootstrap of principals and deny policy (design 8)
+- Files: `pkg/mds/bootstrap/bootstrap.go`, `pkg/mds/bootstrap/bootstrap_test.go`, `cmd/lakefs-sso/main.go`
+  (one line: `AddExtraRoutesBuilder(bootstrap.RoutesBuilder)`, a builder that mounts no route).
+- Do: user/group/policies per design 8, idempotent, degrades on `BasicAuthService` like
+  `icebergcatalog.EnsureReservedPrefixProtectPolicy`; runs only when `iceberg.metadata_search.enabled`.
+- Done when: unit tests cover create, repair of a drifted policy, idempotent rerun, degraded auth service.
 
 ### M6 — esti end to end (design 9 security tests)
 - Files: `esti/mds_test.go`, `esti/ops/docker-compose-mds.yaml` (or the existing compose plus a service),
@@ -94,7 +106,8 @@ and its commit message includes the commands it ran and their output summary.
   maintenance (`lakectl iceberg cleanup`, GC, tag retention), option B outlook.
 - Done when: every config key and metric in the design appears, and every snippet was run in M6.
 
-Order: R10-2 ‖ M1 → M2 → M3 → M4 → M5 → M6 → M7 (M5's bootstrap part can run in parallel with M3/M4).
+Order (Kanban links): R10-2 and M1 start at once. M2, M3 and M5a wait on M1. M5b waits on M5a. M4 waits on M2
+and M3. M6 waits on M4, M5b and R10-2. M7 waits on M6. At most four cards are ever in progress together.
 
 ## Verification rules (every task)
 
