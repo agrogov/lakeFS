@@ -13,7 +13,10 @@
 //     builders, each of which is disabled unless its config section is enabled, and
 //     installs the Iceberg catalog's process-wide controls (the _lakefs_iceberg/ deny
 //     policy, the uncommitted-GC grace, and the table-pointer merge-conflict hook)
-//     with a third builder that mounts no route.
+//     with a third builder that mounts no route, and creates the Metadata Search
+//     principals and policies (METADATA_SEARCH_DESIGN.md §8) with a fourth builder that
+//     mounts no route either and does nothing unless iceberg.metadata_search.enabled is
+//     true.
 //
 // Merge-friendliness: the upstream cmd/lakefs directory is untouched except for
 // cmd/lakefs/cmd/hooks.go (new file) and 2 lines in cmd/lakefs/cmd/run.go.
@@ -37,6 +40,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/kv/kvparams"
 	logging "github.com/treeverse/lakefs/pkg/logging"
+	"github.com/treeverse/lakefs/pkg/mds/bootstrap"
 	"github.com/treeverse/lakefs/pkg/mds/refmap"
 	"github.com/treeverse/lakefs/pkg/sso"
 )
@@ -72,6 +76,12 @@ func main() {
 	lakefsCmd.AddExtraRoutesBuilder(func(ctx context.Context, deps lakefsCmd.ServerDeps, _ *chi.Mux) error {
 		return icebergcatalog.Bootstrap(ctx, deps, guardGroups())
 	})
+
+	// Create the Metadata Search principals and policies (METADATA_SEARCH_DESIGN.md §8) when
+	// iceberg.metadata_search.enabled is true. The builder mounts no route: it exists so the
+	// mds-indexer user, the MetadataSearchIndexers group and the two policies are in place before the
+	// first indexer request is authorized.
+	lakefsCmd.AddExtraRoutesBuilder(bootstrap.RoutesBuilder)
 
 	// Map the refs of a data repository to the companion repository's refs, so a tag or a commit read
 	// through the virtual table resolves to the snapshot the indexer recorded for it
