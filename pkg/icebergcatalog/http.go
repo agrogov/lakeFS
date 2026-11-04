@@ -153,11 +153,14 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 		}
 		store := NewStore(deps.Catalog, deps.BlockAdapter, storeOptions...)
 		authorizer := NewAuthorizer(deps.AuthService)
+		// The table service hands out the credential service's sessions in its load and create
+		// answers (§8), which is where iceberg-go takes them from; the endpoint only refreshes them.
+		credentials := NewCredentialService(store, authorizer, deps.Catalog, cfg, nil, deps.Logger)
 		services = append(services,
 			NewNamespaceService(store, authorizer, deps.Catalog, cfg),
 			// The table reads of I1-9, the staged create of I2-4, and the drop and metrics sink
 			// of I2-5.
-			NewTableService(store, authorizer, deps.Catalog, cfg),
+			NewTableService(store, authorizer, deps.Catalog, cfg).WithCredentials(credentials),
 			// The view surface: list, load, exists, create, replace and drop (views.go,
 			// views_http.go). It is a service of its own so its six endpoints are advertised
 			// exactly when the routes are mounted, like every other operation.
@@ -171,7 +174,7 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 			// disabled service contributes neither a route nor an endpoint, so GET /v1/config
 			// advertises exactly the data-plane operations that are actually mounted.
 			NewRemoteSigningService(store, authorizer, deps.BlockAdapter, deps.Catalog, cfg),
-			NewCredentialService(store, authorizer, cfg, nil, deps.Logger))
+			credentials)
 	}
 	s := newServer(cfg, services...)
 	// Responses to a request that carries an Idempotency-Key are kept in the server's KV. Only

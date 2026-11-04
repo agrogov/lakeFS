@@ -403,11 +403,11 @@ func TestCredentialVending(t *testing.T) {
 		require.False(t, VendedCredentialsSupported(&signingAdapter{blockstoreType: block.BlockstoreTypeAzure}),
 			"credential vending is S3 only in OSS; Azure has no vending")
 
-		enabled := NewCredentialService(NewStore(nil, credsTestAdapter()), nil,
+		enabled := NewCredentialService(NewStore(nil, credsTestAdapter()), nil, nil,
 			&Config{Prefix: CatalogPrefix, CredentialsVending: credsTestVending()}, &credsFakeSTS{}, nil)
 		require.True(t, enabled.Enabled())
 		require.Len(t, enabled.Routes(), 1)
-		require.Nil(t, NewCredentialService(nil, nil,
+		require.Nil(t, NewCredentialService(nil, nil, nil,
 			&Config{CredentialsVending: credsTestVending()}, &credsFakeSTS{}, nil).Routes(),
 			"a service without a store cannot resolve a table, so it must not advertise")
 	})

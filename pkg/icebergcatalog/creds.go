@@ -75,6 +75,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/block"
+	"github.com/treeverse/lakefs/pkg/graveler"
 	"github.com/treeverse/lakefs/pkg/httputil"
 	"github.com/treeverse/lakefs/pkg/logging"
 )
@@ -226,8 +227,20 @@ type credentialService struct {
 	// repository's table - while the caller was authorized on the data repository (§5.3).
 	scope func(ctx context.Context, addr Address, authorize AuthorizeFunc) (tableDataScope, error)
 
+	// createdScope is the scope of a table a create has just decided, from its repository, UUID
+	// and metadata location: a staged create is not readable, so scope cannot answer for it.
+	createdScope func(ctx context.Context, repository, tableUUID, location string) (tableDataScope, error)
+
 	// authz is the §7.2 authorizer.
 	authz *Authorizer
+
+	// store is the catalog state: the reserved namespaces a write session is never vended for
+	// (§5.4). A nil store reserves nothing.
+	store *Store
+
+	// refs resolves whether a ref is a branch, which decides whether a credentials request may get a
+	// write session (Q-I4). A nil refs treats every ref as read-only, so the session is a read one.
+	refs BranchLister
 
 	// cfg is the vended-credentials setting: role_arn, session_duration, external_id, endpoint.
 	cfg CredentialsVendingConfig
@@ -249,14 +262,15 @@ type credentialService struct {
 	assumer STSAssumer
 }
 
-// NewCredentialService builds the vended-credentials surface for a catalog store. assumer is the
+// NewCredentialService builds the vended-credentials surface for a catalog store. refs resolves
+// branches, so that a credentials request on a branch can get a write session. assumer is the
 // STS client; a nil assumer means "build one from the server's own AWS identity on first use",
 // which is what the production wiring uses (an in-process fake is passed by the tests). logger
 // reports best-effort failures; a nil logger discards them.
 //
 // The service stays disabled - no route, no advertisement - while the configured blockstore is
 // not S3 (§8: vending is S3 only) or no role is configured. cfg may be nil, which disables it.
-func NewCredentialService(store *Store, authz *Authorizer, cfg *Config, assumer STSAssumer, logger logging.Logger) *credentialService {
+func NewCredentialService(store *Store, authz *Authorizer, refs BranchLister, cfg *Config, assumer STSAssumer, logger logging.Logger) *credentialService {
 	if logger == nil {
 		logger = logging.ContextUnavailable()
 	}
@@ -264,6 +278,7 @@ func NewCredentialService(store *Store, authz *Authorizer, cfg *Config, assumer 
 		vending CredentialsVendingConfig
 		adapter block.Adapter
 		scope   func(context.Context, Address, AuthorizeFunc) (tableDataScope, error)
+		created func(context.Context, string, string, string) (tableDataScope, error)
 	)
 	if cfg != nil {
 		vending = cfg.CredentialsVending
@@ -271,19 +286,23 @@ func NewCredentialService(store *Store, authz *Authorizer, cfg *Config, assumer 
 	if store != nil {
 		adapter = store.block
 		scope = newTableScopeResolver(store)
+		created = newCreatedTableScopeResolver(store)
 	}
 	prefix := CatalogPrefix
 	if cfg != nil && cfg.Prefix != "" {
 		prefix = cfg.Prefix
 	}
 	return &credentialService{
-		scope:   scope,
-		authz:   authz,
-		cfg:     vending,
-		logger:  logger,
-		prefix:  prefix,
-		enabled: vending.Configured() && VendedCredentialsSupported(adapter),
-		assumer: assumer,
+		scope:        scope,
+		createdScope: created,
+		authz:        authz,
+		store:        store,
+		refs:         refs,
+		cfg:          vending,
+		logger:       logger,
+		prefix:       prefix,
+		enabled:      vending.Configured() && VendedCredentialsSupported(adapter),
+		assumer:      assumer,
 	}
 }
 
@@ -316,6 +335,10 @@ func (s *credentialService) Routes() []route {
 }
 
 // handleLoadCredentials is GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials.
+//
+// The session is the one TableCredentials picks: a write session on a branch for a caller who may
+// write the table's data, a read session otherwise. iceberg-go refreshes the session of a table it
+// loaded or created through this endpoint, so a writer must get a write session here too.
 //
 // The order is the one remote signing uses: prefix, delegation, identifier, caller,
 // authorization, table resolution, vending. A best-effort vending failure is not an error here:
@@ -351,7 +374,12 @@ func (s *credentialService) handleLoadCredentials(w http.ResponseWriter, r *http
 	if !ok {
 		return
 	}
-	credentials, err := s.Vend(r.Context(), caller, Request{Op: OpReadTableData, Address: addr})
+	isBranch, err := s.refIsBranch(r.Context(), addr)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	credentials, err := s.TableCredentials(r.Context(), caller, addr, isBranch)
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -410,21 +438,136 @@ func (s *credentialService) Vend(ctx context.Context, caller Caller, req Request
 	if err != nil {
 		return nil, err
 	}
-	credentials, err := s.assume(ctx, caller, req.Address, scope, access)
+	return s.vendScope(ctx, caller, req.Address, scope, access), nil
+}
+
+// TableCredentials vends the session a client gets for a table that exists on addr.Ref: a write
+// session when the ref is a branch, the namespace is not reserved (§5.4) and the caller is allowed
+// catalog:WriteTableData, and a read session otherwise. A write denial falls back to the read
+// session; any other failure, and a read denial, is Vend's.
+//
+// The reserved-namespace check is what keeps a write session away from a virtual table: the
+// resolver reads it from the companion repository, and a caller who may write the data repository
+// must not get credentials that write the companion's files.
+func (s *credentialService) TableCredentials(ctx context.Context, caller Caller, addr Address, isBranch bool) ([]StorageCredential, error) {
+	if isBranch && s.writableNamespace(addr) {
+		credentials, err := s.Vend(ctx, caller, Request{Op: OpWriteTableData, Address: addr, RefIsBranch: true})
+		if !isWriteRefusal(err) {
+			return credentials, err
+		}
+	}
+	return s.Vend(ctx, caller, Request{Op: OpReadTableData, Address: addr, RefIsBranch: isBranch})
+}
+
+// VendsFor reports whether a LoadTableResult answered to a client that sent delegation - the raw
+// X-Iceberg-Access-Delegation header - carries storage-credentials: vending is on and the client
+// listed vended-credentials (§2.1: the server must not choose a mechanism the client did not
+// request). The table handlers ask before they resolve anything a session needs.
+func (s *credentialService) VendsFor(delegation string) bool {
+	return s.Enabled() && delegationRequests(delegation, VendedCredentialsDelegation)
+}
+
+// LoadTableCredentials is the storage-credentials member of a LoadTableResult for a table that
+// exists on addr.Ref, or nil when no session could be vended. The load itself was authorized
+// already, so nothing here fails it; a reason not to vend is logged.
+//
+// It is the member iceberg-go needs: the client enters its vended-credentials mode only when the
+// load answer carries storage-credentials, and uses the credentials endpoint only to refresh them.
+func (s *credentialService) LoadTableCredentials(ctx context.Context, caller Caller, addr Address, isBranch bool) []StorageCredential {
+	credentials, err := s.TableCredentials(ctx, caller, addr, isBranch)
+	if err != nil {
+		s.logNotVending(ctx, caller, addr, "table", err)
+		return nil
+	}
+	return credentials
+}
+
+// CreatedTableCredentials is LoadTableCredentials for the answer of a create, whose table may not
+// be readable yet (a staged create writes no pointer). Its scope therefore comes from what the
+// create just decided - the table UUID and the location of its metadata.json - instead of from a
+// read of the table. The create was authorized on a branch, so the session is a write session
+// when the caller is allowed catalog:WriteTableData and a read session otherwise.
+func (s *credentialService) CreatedTableCredentials(ctx context.Context, caller Caller, addr Address, tableUUID, location string) []StorageCredential {
+	if !s.Enabled() || s.createdScope == nil || s.authz == nil {
+		return nil
+	}
+	scope, err := s.createdScope(ctx, addr.Repo, tableUUID, location)
+	if err != nil {
+		s.logNotVending(ctx, caller, addr, "created table", err)
+		return nil
+	}
+	op := OpWriteTableData
+	err = s.authz.Authorize(ctx, caller, Request{Op: op, Address: addr, RefIsBranch: true})
+	if isWriteRefusal(err) {
+		op = OpReadTableData
+		err = s.authz.Authorize(ctx, caller, Request{Op: op, Address: addr, RefIsBranch: true})
+	}
+	if err != nil {
+		s.logNotVending(ctx, caller, addr, "created table", err)
+		return nil
+	}
+	access, _ := dataAccessFor(op)
+	return s.vendScope(ctx, caller, addr, scope, access)
+}
+
+// writableNamespace reports whether a client may write addr's namespace (§5.4). A service built
+// without a store has no resolver, so nothing is reserved.
+func (s *credentialService) writableNamespace(addr Address) bool {
+	return s.store == nil || s.store.RequireWritableNamespace(addr) == nil
+}
+
+// refIsBranch reports whether addr.Ref is a branch, like tableService.isBranchRef: a ref that is
+// not a valid branch is "not a branch", and a missing repository is the error it is.
+func (s *credentialService) refIsBranch(ctx context.Context, addr Address) (bool, error) {
+	if s.refs == nil {
+		return false, nil
+	}
+	_, err := s.refs.GetBranchReference(ctx, addr.Repo, addr.Ref)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, graveler.ErrBranchNotFound), errors.Is(err, graveler.ErrInvalidBranchID):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+// isWriteRefusal reports whether err is the authorizer's refusal of a write session - a denial or
+// the Q-I4 read-only ref - which a caller answers with a read session instead.
+func isWriteRefusal(err error) bool {
+	return errors.Is(err, ErrPermissionDenied) || errors.Is(err, ErrRefReadOnly)
+}
+
+// logNotVending records why a LoadTableResult carries no storage credentials.
+func (s *credentialService) logNotVending(ctx context.Context, caller Caller, addr Address, what string, err error) {
+	s.logger.WithContext(ctx).WithError(err).WithFields(logging.Fields{
+		logging.UserFieldKey: caller.Username,
+		"repository":         addr.Repo,
+		"ref":                addr.Ref,
+		"namespace":          addr.Namespace.Dotted(),
+		"table":              addr.Table,
+	}).Debug("iceberg catalog: no storage credentials for the " + what)
+}
+
+// vendScope runs the STS exchange for an authorized request whose scope is known. Every failure is
+// best effort (§8): it is logged, and the answer is no credentials.
+func (s *credentialService) vendScope(ctx context.Context, caller Caller, addr Address, scope tableDataScope, access dataAccess) []StorageCredential {
+	credentials, err := s.assume(ctx, caller, addr, scope, access)
 	if err != nil {
 		// §8 best effort: the client falls back to its own credentials. The reason stays in the
 		// log, and no part of it - the role, the STS error, the table - reaches the client.
 		s.logger.WithContext(ctx).WithError(err).WithFields(logging.Fields{
 			logging.UserFieldKey: caller.Username,
-			"repository":         req.Address.Repo,
-			"ref":                req.Address.Ref,
-			"namespace":          req.Address.Namespace.Dotted(),
-			"table":              req.Address.Table,
+			"repository":         addr.Repo,
+			"ref":                addr.Ref,
+			"namespace":          addr.Namespace.Dotted(),
+			"table":              addr.Table,
 			"access":             access.String(),
 		}).Warn("iceberg catalog: not vending storage credentials")
-		return nil, nil
+		return nil
 	}
-	return credentials, nil
+	return credentials
 }
 
 // assume runs the STS exchange of one session: the narrow policy, the duration, the optional
@@ -705,6 +848,27 @@ func newTableScopeResolver(store *Store) func(ctx context.Context, addr Address,
 			return tableDataScope{}, err
 		}
 		return tableDataScope{Root: root, Location: table.Metadata.Location()}, nil
+	}
+}
+
+// newCreatedTableScopeResolver builds the scope of a table the create path has just decided: the
+// root of its UUID under the repository's storage namespace, and the location its metadata.json
+// names. Nothing is read from the ref, because a staged create has no pointer there.
+func newCreatedTableScopeResolver(store *Store) func(ctx context.Context, repository, tableUUID, location string) (tableDataScope, error) {
+	return func(ctx context.Context, repository, tableUUID, location string) (tableDataScope, error) {
+		id, err := uuid.Parse(tableUUID)
+		if err != nil {
+			return tableDataScope{}, fmt.Errorf("%w: table uuid %q: %w", ErrInvalidPointer, tableUUID, err)
+		}
+		repo, err := store.catalog.GetRepository(ctx, repository)
+		if err != nil {
+			return tableDataScope{}, fmt.Errorf("resolve repository %q: %w", repository, err)
+		}
+		root, err := TableRoot(repo.StorageNamespace, id)
+		if err != nil {
+			return tableDataScope{}, err
+		}
+		return tableDataScope{Root: root, Location: location}, nil
 	}
 }
 
