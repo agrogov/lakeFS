@@ -18,7 +18,9 @@ package icebergcatalog
 // session cookie (the cookie_auth scheme of api.GenericAuthMiddleware, read here as the same
 // internal_auth_session session carrying the same token). The web UI authenticates by cookie, and
 // the repository Tables tab explores the catalog's own read endpoints through it, so without the
-// cookie a signed-in user's browser could not read the tables it is allowed to read.
+// cookie a signed-in user's browser could not read the tables it is allowed to read. A user signed
+// in through SSO holds oidc_auth_session (or saml_auth_session) instead, and that session is read
+// and verified the way the core API's oidc_auth and saml_auth schemes read it.
 //
 // The cookie is accepted for GET and HEAD, and - since the Tables tab also manages tables - for
 // exactly four state-changing UI operations (cookieUIManagementOperations):
@@ -170,6 +172,11 @@ type catalogAuth struct {
 	// name api.GenericAuthMiddleware uses for the core API's cookie_auth scheme: the cookie the
 	// UI is signed in with is the cookie this middleware verifies.
 	sessionStore sessions.Store
+	// oidcConfig and cookieAuthConfig verify the SSO sessions (oidc_auth_session and
+	// saml_auth_session) exactly as the core API's oidc_auth and saml_auth schemes do: a user
+	// signed in through SSO holds one of those and no internal_auth_session.
+	oidcConfig       *auth.OIDCConfig
+	cookieAuthConfig *auth.CookieAuthConfig
 	// now is the clock the token's issue and expiry times are taken from. It is a field so that a
 	// test can pin it and assert the iat/exp claims exactly.
 	now func() time.Time
@@ -220,13 +227,24 @@ func newCatalogAuth(deps cmdpkg.ServerDeps, cfg *Config) (*catalogAuth, error) {
 	if logger == nil {
 		logger = logging.ContextUnavailable()
 	}
+	// The same configuration cmd/lakefs/cmd/run.go hands api.GenericAuthMiddleware.
+	oidcConfig := &auth.OIDCConfig{}
+	cookieAuthConfig := &auth.CookieAuthConfig{}
+	if deps.Config != nil {
+		if base := deps.Config.AuthConfig().GetBaseAuthConfig(); base != nil {
+			*oidcConfig = auth.OIDCConfig(base.OIDC)
+			*cookieAuthConfig = auth.CookieAuthConfig(base.CookieAuthVerification)
+		}
+	}
 	return &catalogAuth{
-		logger:        logger,
-		authService:   deps.AuthService,
-		authenticator: deps.Authenticator,
-		cfg:           cfg,
-		sessionStore:  sessions.NewCookieStore(deps.AuthService.SecretStore().SharedSecret()),
-		now:           time.Now,
+		logger:           logger,
+		authService:      deps.AuthService,
+		authenticator:    deps.Authenticator,
+		cfg:              cfg,
+		sessionStore:     sessions.NewCookieStore(deps.AuthService.SecretStore().SharedSecret()),
+		oidcConfig:       oidcConfig,
+		cookieAuthConfig: cookieAuthConfig,
+		now:              time.Now,
 	}, nil
 }
 
@@ -375,13 +393,42 @@ func (a *catalogAuth) userFromCookie(r *http.Request) (*model.User, error) {
 		token, _ = session.Values[auth.TokenSessionKeyName].(string)
 	}
 	if token == "" {
-		return nil, nil //nolint:nilnil // no cookie credential: requireUser answers it.
+		return a.userFromSSOSession(r)
 	}
 	user, err := auth.UserByToken(r.Context(), a.authService, token)
 	if err != nil {
 		return nil, fmt.Errorf("%w: session cookie: %w", auth.ErrAuthenticatingRequest, err)
 	}
 	return user, nil
+}
+
+// userFromSSOSession resolves the session an SSO login leaves in the browser: oidc_auth_session
+// (pkg/sso/oidc_provider.go stores the verified ID-token claims there and sets no
+// internal_auth_session) or saml_auth_session. The verification is the core API's oidc_auth and
+// saml_auth schemes' own (auth.UserFromOIDCSession, auth.UserFromSAMLSession), so a user who can
+// browse the repository through SSO reads its tables with the same identity. As for the internal
+// session, an undecodable cookie is no credential and a session without claims is (nil, nil).
+func (a *catalogAuth) userFromSSOSession(r *http.Request) (*model.User, error) {
+	ctx := r.Context()
+	if session, _ := a.sessionStore.Get(r, auth.OIDCAuthSessionName); session != nil {
+		user, err := auth.UserFromOIDCSession(ctx, a.logger, a.authService, session, a.oidcConfig)
+		if err != nil {
+			return nil, fmt.Errorf("%w: oidc session cookie: %w", auth.ErrAuthenticatingRequest, err)
+		}
+		if user != nil {
+			return user, nil
+		}
+	}
+	if session, _ := a.sessionStore.Get(r, auth.SAMLAuthSessionName); session != nil {
+		user, err := auth.UserFromSAMLSession(ctx, a.logger, a.authService, session, a.cookieAuthConfig)
+		if err != nil {
+			return nil, fmt.Errorf("%w: saml session cookie: %w", auth.ErrAuthenticatingRequest, err)
+		}
+		if user != nil {
+			return user, nil
+		}
+	}
+	return nil, nil //nolint:nilnil // no cookie credential: requireUser answers it.
 }
 
 // requestPath is the path of the request relative to the catalog mount, which is the path the
