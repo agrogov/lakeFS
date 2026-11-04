@@ -326,6 +326,11 @@ Metadata Search makes a repository's object metadata queryable with any Iceberg 
 last modified, etag, content type, committer and user metadata, across the commits of a branch. It is
 off by default and, like the rest of the catalog, it is a server setting rather than a client one.
 
+This section covers the catalog half: the virtual table and how it is resolved and authorized. The
+operator and user guide — the server switch, the indexer and its configuration, the credentials it
+needs, engine recipes for both endpoints, column semantics, freshness, limits and maintenance — is
+[`metadata-search.md`](metadata-search.md).
+
 ```
 iceberg:
   enabled: true
