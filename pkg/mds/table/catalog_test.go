@@ -1,6 +1,7 @@
 package table_test
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/apache/iceberg-go"
@@ -146,6 +147,33 @@ func TestCatalogConfigURI(t *testing.T) {
 			require.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// TestNewCatalogConcurrentSharedStorage builds catalogs concurrently from one Storage map, as the
+// indexer does for the branches of a repository. iceberg-go writes the server's config
+// properties into the map it is given, so a shared map crashed the indexer with "concurrent map
+// writes"; the caller's map must also stay unchanged.
+func TestNewCatalogConcurrentSharedStorage(t *testing.T) {
+	env := newTestEnv(t)
+	storage := iceberg.Properties{"s3.region": "us-east-1"}
+
+	const catalogs = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, catalogs)
+	for range catalogs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := table.NewCatalog(t.Context(), env.catalogConfig(storage))
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.Equal(t, iceberg.Properties{"s3.region": "us-east-1"}, storage, "the caller's Storage map is not modified")
 }
 
 // TestCatalogConfigAuthorization: the credentials are sent as HTTP basic, which the catalog accepts

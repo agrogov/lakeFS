@@ -128,9 +128,12 @@ func NewCatalog(ctx context.Context, cfg CatalogConfig) (*rest.Catalog, error) {
 	if err != nil {
 		return nil, err
 	}
+	// iceberg-go keeps the map it is given and writes the server's /v1/config properties into it,
+	// while the indexer builds one catalog per branch concurrently from the same Storage map, so
+	// each catalog gets its own copy (a shared map is a fatal "concurrent map writes").
 	return rest.NewCatalog(ctx, CatalogName, uri,
 		rest.WithHeaders(map[string]string{"Authorization": cfg.Authorization()}),
-		rest.WithAdditionalProps(cfg.Storage),
+		rest.WithAdditionalProps(maps.Clone(cfg.Storage)),
 	)
 }
 

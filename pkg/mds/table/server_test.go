@@ -21,6 +21,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/apache/iceberg-go"
 	icebergcataloggo "github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/rest"
 	icebergio "github.com/apache/iceberg-go/io"
@@ -175,6 +176,18 @@ func newTestEnv(t *testing.T) *testEnv {
 	require.NoError(t, err, "create the system namespace")
 
 	return env
+}
+
+// catalogConfig is the configuration of the fixture's branch with the given storage properties.
+func (e *testEnv) catalogConfig(storage iceberg.Properties) table.CatalogConfig {
+	return table.CatalogConfig{
+		Endpoint:        e.server.URL,
+		Repository:      e.repo,
+		Branch:          testBranch,
+		AccessKeyID:     testAccessKeyID,
+		SecretAccessKey: testSecretAccessKey,
+		Storage:         storage,
+	}
 }
 
 // createTable creates system.object_metadata through the catalog and returns the created table.
