@@ -1,0 +1,38 @@
+# SeaweedFS as the S3-compatible blockstore of the Metadata Search system tests (esti/mds_test.go,
+# METADATA_SEARCH_DESIGN.md §9, task M6).
+#
+# The suite runs its own lakefs-sso and its own `lakefs-sso mds run` on the host, so this file only
+# provides the object store: an S3 endpoint that does not vend credentials, which is the mode the
+# indexer must support with static `storage` keys (§4.6). SeaweedFS is what the M6 recipe uses;
+# MinIO is not (see METADATA_SEARCH_PLAN.md "M6 needs docker (colima) and SeaweedFS").
+#
+# Run the suite against it:
+#
+#   docker compose -f esti/ops/docker-compose-mds.yaml up -d
+#   LAKEFS_BLOCKSTORE_TYPE=s3 \
+#   ESTI_STORAGE_NAMESPACE=s3://esti-mds-test \
+#   LAKEFS_BLOCKSTORE_S3_ENDPOINT=http://127.0.0.1:8333 \
+#   LAKEFS_BLOCKSTORE_S3_CREDENTIALS_ACCESS_KEY_ID=estiaccesskey \
+#   LAKEFS_BLOCKSTORE_S3_CREDENTIALS_SECRET_ACCESS_KEY=estisecretkey \
+#   LAKEFS_BLOCKSTORE_S3_FORCE_PATH_STYLE=true \
+#   AWS_REGION=us-east-1 \
+#   go test -count=1 -v ./esti -run 'TestMetadataSearch' \
+#     --args --system-tests --use-local-credentials
+#
+# The suite creates the bucket if it is missing and removes only its own prefix when it finishes, so
+# one long-lived SeaweedFS is enough for repeated runs. ESTI_ICEBERG_CLIENT_IMAGE may name a prebuilt
+# image with pyiceberg, pyarrow and duckdb (python:3.12-slim installs them when it is unset).
+services:
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    # The S3 gateway listens on 8333 (design §4.6 examples use the same port); the S3 credentials
+    # come from seaweedfs-s3.json, the identity set the test environment also uses.
+    command: ["server", "-s3", "-dir=/data", "-s3.config=/etc/seaweedfs/s3.json"]
+    ports:
+      - "8333:8333"
+    volumes:
+      - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+      - seaweedfs-data:/data
+
+volumes:
+  seaweedfs-data:

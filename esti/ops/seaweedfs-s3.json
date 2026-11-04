@@ -1,0 +1,14 @@
+{
+  "identities": [
+    {
+      "name": "esti",
+      "credentials": [
+        {
+          "accessKey": "estiaccesskey",
+          "secretKey": "estisecretkey"
+        }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}
