@@ -49,7 +49,9 @@ The indexer is a **REST client** of lakeFS (lakeFS API + the Iceberg REST catalo
 ### 3.1 Table `system.object_metadata` (in `R-metadata`)
 
 Iceberg format **v2**, unpartitioned, sort order `path ASC`, `identifier-field-ids = [2]`.
-Field IDs are fixed; schema changes only add optional fields with new IDs.
+Field IDs below are the ones the created table has; schema changes only add optional fields with new IDs.
+The catalog's create path (iceberg-go `NewMetadataWithUUID`) renumbers IDs in pre-order, so the map's key and
+value come right after `user_metadata`. Readers and the writer take IDs from the loaded table, never from constants.
 
 | ID | Column | Iceberg type | Req. | Value |
 |---|---|---|---|---|
@@ -59,10 +61,13 @@ Field IDs are fixed; schema changes only add optional fields with new IDs.
 | 4 | `size_bytes` | long | required | object size |
 | 5 | `last_modified` | timestamptz (µs) | required | object mtime (`DBEntry.CreationDate` / diff `right.mtime`) |
 | 6 | `etag` | string | required | object checksum, content only |
-| 7 | `user_metadata` | map<string,string> (key ID 11, value ID 12, value required) | required | user metadata, empty map when none (never null) |
-| 8 | `committer` | string | optional | committer of `commit_id` |
-| 9 | `content_type` | string | optional | content type |
-| 10 | `creation_date` | timestamptz (µs) | optional | creation time of the commit `commit_id` (not of the object) |
+| 7 | `user_metadata` | map<string,string> (key ID 8, value ID 9, value optional) | required | user metadata, empty map when none (never null); the indexer never writes a null value |
+| 10 | `committer` | string | optional | committer of `commit_id` |
+| 11 | `content_type` | string | optional | content type |
+| 12 | `creation_date` | timestamptz (µs) | optional | creation time of the commit `commit_id` (not of the object) |
+
+The map value is optional because iceberg-go v0.7.0 reads parquet map columns with nullable items; a required
+value makes its own copy-on-write rewrite and compaction fail with "record schema does not match writer's".
 
 User metadata keys are stored as lakeFS stores them. Objects written through the S3 gateway have keys
 `X-Amz-Meta-<lowercased name>` (`pkg/gateway/operations/operation_utils.go`), as upstream documents.
@@ -230,9 +235,10 @@ none of this.)
 
 - **Compaction.** Position deletes accumulate. When the table has more than `compaction.max_delete_files`
   (default 200) delete files, or every `compaction.every_commits` (default 500) commits, the indexer scans the table
-  at the current snapshot and rewrites it with `Transaction.Overwrite` (no filter), same
-  `lakefs.mds.source-commit`, and does a lakeFS commit `mds: compact <R>@<C>` (no new tag; the tag stays on the
-  pre-compaction commit, which has the same rows).
+  at the current snapshot and, in one transaction, removes every data and delete file (`Transaction.ReplaceFiles`)
+  and appends the scanned rows, with the same `lakefs.mds.source-commit`. A plain `Overwrite` is not enough: it
+  rewrites data files but leaves their delete files in place, so deletes would keep accumulating. Then it does a lakeFS commit `mds: compact <R>@<C>` (no new tag; the tag
+  stays on the pre-compaction commit, which has the same rows).
 - **Snapshot expiry and file sweep** are not done by the indexer: run `lakectl iceberg cleanup -r <R>-metadata`
   on a schedule (`cmd/lakectl/cmd/iceberg_cleanup.go`). It honours lakeFS references (branch heads, tags, commits
   retained by GC), so `mds-*` tags keep their snapshots readable.
@@ -412,8 +418,8 @@ service without policies (`BasicAuthService`) logs a warning naming what is not 
 1. Indexer runs as the `lakefs-sso mds run` subcommand only. A goroutine mode is out of scope for A.
 2. `iceberg-go` v0.7.0 writes merge-on-read position deletes (`Transaction.Delete` with `write.delete.mode=merge-on-read`
    on v2), equality deletes (`WriteEqualityDeletes` + `RowDelta`) and copy-on-write (`Overwrite` with filter).
-   Position deletes are chosen because PyIceberg does not read equality deletes. `Overwrite` is used for rebuilds and
-   compaction.
+   Position deletes are chosen because PyIceberg does not read equality deletes. M3's spike confirmed the catalog
+   stages position delete files. `Overwrite` is used for rebuilds; compaction uses `ReplaceFiles` + `Append` (4.9).
 3. Commit/tag mapping: `mds-<commit>` tags in `R-metadata` plus lakeFS commit metadata. No index file, no
    snapshot-summary scan at read time.
 4. Config: top-level `metadata_search` for the indexer, `iceberg.metadata_search.enabled` for the server.
