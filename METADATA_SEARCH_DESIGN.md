@@ -107,6 +107,7 @@ Every snapshot the indexer produces also carries `lakefs.mds.source-commit` in i
 | Read-only flag | **not** set: catalog writes never pass `graveler.WithForce`, so a read-only repository would also block the indexer. User writes are blocked by a deny policy instead (section 8). |
 | Contents | namespace `system`, table `system.object_metadata` (pointer under `_lakefs_iceberg/tables/…`, files under `<ns>/_iceberg/<table-uuid>/`). No other bookkeeping objects. |
 | Commits | one lakeFS commit per indexed commit of `R`, message `mds: index <R>@<commit>`, metadata `lakefs.mds.source-commit=<commit>`, `lakefs.mds.source-repository=<R>`. |
+| Initialisation | the initialisation commit carries message `mds: init` and metadata `lakefs.mds.init=true`. It is the first commit after lakeFS's automatic `Repository created` root that a non-bare `CreateRepository` writes; for a companion repository created bare it is the root itself. A repository whose whole history is that automatic root is initialised by adding the namespace, table and `mds: init` commit on top (section 4.8). |
 | Tags | `mds-<full commit ID of R>` on the lakeFS commit that recorded it (section 6). |
 
 There is no `state.json`: the indexing position of branch `b` is the `lakefs.mds.source-commit` metadata of
@@ -164,7 +165,10 @@ idempotency check (4.4), not from a lease; a second replica only wastes work and
      `assert-table-uuid`. The catalog **stages** the new pointer and the files on `R-metadata@b`
      (`Store.Commit`: "staged on addr.Ref … part of the repository only on an explicit lakeFS commit").
 4. **lakeFS commit** of `R-metadata@b`: `POST /repositories/<R>-metadata/branches/<b>/commits` with the message
-   and metadata of 3.3, `allow_empty=false`.
+   and metadata of 3.3, `allow_empty=false`. The commit is never legitimately empty: step 3 always moves the
+   `lakefs.mds.source-commit` property, even for a change set with no objects. The walk of 4.2 step 5 must
+   therefore drop the recorded position itself even though the log API's `stop_at` is inclusive; applying it
+   again would stage nothing and fail here with `commit: no changes`.
 5. **Tag** `mds-<C>` → the new commit (`createTag`, `force=true`, so a retry after a crash overwrites it).
 
 Step 3 is the atomicity boundary for readers on the branch head (the staged pointer is what the catalog reads on a
@@ -227,8 +231,10 @@ none of this.)
 | matching branch created | 4.5 |
 | matching branch deleted | delete `R-metadata@b` if `delete_branches` (default true). Its tags stay, so commit/tag reads of its history still work. |
 | branch stops matching the config | nothing (left as is) |
-| repository added to config | create `R-metadata` (3.3), create namespace `system` and the table through the catalog on the default branch, lakeFS commit `mds: init` (the **initialisation commit**, metadata `lakefs.mds.init=true`). Then 4.5 for each matching branch. |
-| `R-metadata` exists but was not created by the indexer (no init commit) | refuse that repository, log an error |
+| repository added to config | create `R-metadata` (3.3). lakeFS creates it non-bare, so its default branch starts with the automatic `Repository created` root; create namespace `system` and the table through the catalog on the default branch, then lakeFS commit `mds: init` as the first commit after that root (the **initialisation commit**, metadata `lakefs.mds.init=true`). Then 4.5 for each matching branch. |
+| `R-metadata` exists and its history is only lakeFS's automatic `Repository created` root | complete the initialisation on top: create namespace `system` and the table, then the `mds: init` commit (metadata `lakefs.mds.init=true`). |
+| `R-metadata` exists with the `lakefs.mds.init=true` marker at its root (a bare repository) or at its first commit after the automatic root | accept it as the indexer's; later commits are indexing commits. |
+| `R-metadata` exists with any other history and no init marker at one of the two accepted positions | refuse that repository, log an error. In particular, a foreign commit after the automatic root without the marker is refused. |
 | repository deleted | log, skip. `R-metadata` is left for the admin. |
 
 ### 4.9 Maintenance
@@ -385,7 +391,7 @@ Two principals, as upstream separates indexing from querying:
 
 | Principal | Created by | Permissions |
 |---|---|---|
-| `mds-indexer` (group `MetadataSearchIndexers`, policy `mds-indexer`) | `pkg/mds` bootstrap, an extra routes builder in lakefs-sso that runs when `iceberg.metadata_search.enabled`. It creates user, group and policy idempotently. **Credentials are created by an admin** (`lakectl auth users credentials create --id mds-indexer`) and placed in the indexer config. | On `*` (data repos): `fs:ReadRepository`, `fs:ListObjects`, `fs:ReadObject`, `fs:ListBranches`, `fs:ReadBranch`, `fs:ListCommits`, `fs:ReadCommit`. On `arn:lakefs:fs:::repository/*-metadata` and below: `fs:*`, `catalog:*` on `arn:lakefs:catalog:::*/*-metadata/*`, `fs:CreateRepository` on the same ARN pattern. |
+| `mds-indexer` (group `MetadataSearchIndexers`, policy `mds-indexer`) | `pkg/mds` bootstrap, an extra routes builder in lakefs-sso that runs when `iceberg.metadata_search.enabled`. It creates user, group and policy idempotently. **Credentials are created by an admin** (`lakectl auth users credentials create --id mds-indexer`) and placed in the indexer config. | On `*` (data repos): `fs:ReadRepository`, `fs:ListObjects`, `fs:ReadObject`, `fs:ListBranches`, `fs:ReadBranch`, `fs:ListCommits`, `fs:ReadCommit`. On `arn:lakefs:fs:::repository/*-metadata` and below: `fs:*`, `catalog:*` on `arn:lakefs:catalog:::*/*-metadata/*`, `fs:CreateRepository` on the repository ARN pattern, and `fs:AttachStorageNamespace` on `arn:lakefs:fs:::namespace/*-metadata`. The last two are the pair `CreateRepository` checks. The namespace pattern is the narrowest one that covers the derived namespaces of 3.3 (`<R namespace>-metadata`); an explicit `storage_namespace` that does not itself end in `-metadata` needs an additional grant. |
 | query users | existing users | Through the catalog: only read on `R` (5.2). Engines reading `R-metadata` directly (not through the virtual table) need read on `R-metadata` like any repository. |
 
 Write protection of `R-metadata`: policy `mds-metadata-repo-protect` (Deny `fs:Write*`, `fs:Delete*`,

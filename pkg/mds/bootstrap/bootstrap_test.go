@@ -73,6 +73,11 @@ func TestIndexerPolicyStatements(t *testing.T) {
 			Action:   []string{"fs:CreateRepository"},
 			Resource: "arn:lakefs:fs:::repository/*-metadata",
 		},
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{"fs:AttachStorageNamespace"},
+			Resource: "arn:lakefs:fs:::namespace/*-metadata",
+		},
 	}
 	policy := IndexerPolicy(time.Unix(0, 0))
 	require.Equal(t, IndexerPolicyName, policy.DisplayName)
@@ -214,6 +219,16 @@ func TestEnsurePrincipalsAuthorization(t *testing.T) {
 			name:     "indexer creates the companion repository",
 			username: UserName, action: permissions.CreateRepositoryAction,
 			resource: permissions.RepoArn(metaRepo), want: true,
+		},
+		{
+			name:     "indexer attaches the derived companion storage namespace",
+			username: UserName, action: permissions.AttachStorageNamespaceAction,
+			resource: permissions.StorageNamespace("s3://bucket/" + dataRepo + "-metadata"), want: true,
+		},
+		{
+			name:     "indexer does not attach a data repository storage namespace",
+			username: UserName, action: permissions.AttachStorageNamespaceAction,
+			resource: permissions.StorageNamespace("s3://bucket/" + dataRepo), want: false,
 		},
 		{
 			name:     "indexer does not create a data repository",

@@ -392,6 +392,13 @@ func (x *Indexer) pending(ctx context.Context, repository string, head client.Co
 		}
 	}
 	slices.Reverse(commits)
+	// The lakeFS API's stop_at is inclusive: it returns the stop commit as the last item of the
+	// last page. The oldest commit of a reversed page list is therefore the already-indexed
+	// position, not part of the work. Applying it again would write no table change and make the
+	// lakeFS commit fail with "commit: no changes" (§4.3 steps 3-4, §4.4).
+	if len(commits) > 0 && commits[0].ID == last {
+		commits = commits[1:]
+	}
 	total := len(commits)
 	if len(commits) > limit {
 		commits = commits[:limit]

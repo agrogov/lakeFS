@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/treeverse/lakefs/pkg/graveler"
+	"github.com/treeverse/lakefs/pkg/mds/table"
 )
 
 // TestAPIBaseURL pins the API base URL derivation: the endpoint may be the server root or already
@@ -117,4 +119,73 @@ func TestTagAndMetadataNames(t *testing.T) {
 		MetadataKeySourceCommit:     "abc123",
 		MetadataKeySourceRepository: "repo",
 	}, sourceMetadata("repo", "abc123"))
+}
+
+// TestServerBaseURL pins the catalog endpoint derivation: the catalog lives at the server root,
+// while the API lives under /api/v1. An endpoint given either way has to produce the same root,
+// because IcebergStore appends /iceberg/relative_to/... to it (§4.3 step 3).
+func TestServerBaseURL(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		want     string
+		wantErr  bool
+	}{
+		{endpoint: "http://lakefs:8000", want: "http://lakefs:8000"},
+		{endpoint: "http://lakefs:8000/", want: "http://lakefs:8000"},
+		{endpoint: "http://lakefs:8000/api/v1", want: "http://lakefs:8000"},
+		{endpoint: "http://lakefs:8000/api/v1/", want: "http://lakefs:8000"},
+		{endpoint: "https://lakefs.example.com/lakefs", want: "https://lakefs.example.com/lakefs"},
+		{endpoint: "https://lakefs.example.com/lakefs/api/v1", want: "https://lakefs.example.com/lakefs"},
+		{endpoint: "http://lakefs:8000?x=1#frag", want: "http://lakefs:8000"},
+		{endpoint: "lakefs:8000", wantErr: true},
+		{endpoint: "", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.endpoint, func(t *testing.T) {
+			got, err := serverBaseURL(test.endpoint)
+			if test.wantErr {
+				require.ErrorIs(t, err, ErrNoEndpoint)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, test.want, got)
+		})
+	}
+}
+
+// TestCatalogURLFromEndpoint pins the defect the end-to-end run found: New used to pass the API
+// base to IcebergStore, so the catalog URL became <endpoint>/api/v1/iceberg/... and answered 404.
+// The endpoint with and without /api/v1 must produce the same catalog URL.
+func TestCatalogURLFromEndpoint(t *testing.T) {
+	endpoints := []string{
+		"http://lakefs:8000",
+		"http://lakefs:8000/",
+		"http://lakefs:8000/api/v1",
+		"http://lakefs:8000/api/v1/",
+	}
+	var urls []string
+	for _, endpoint := range endpoints {
+		idx, err := New(Options{Endpoint: endpoint, AccessKeyID: "key", SecretKey: "secret"})
+		require.NoError(t, err)
+		store, ok := idx.tables.(*IcebergStore)
+		require.True(t, ok, "New builds the production IcebergStore")
+		uri, err := table.CatalogConfig{
+			Endpoint:        store.Endpoint,
+			Repository:      "R-metadata",
+			Branch:          "main",
+			AccessKeyID:     "key",
+			SecretAccessKey: "secret",
+		}.URI()
+		require.NoError(t, err)
+		urls = append(urls, uri)
+	}
+	for _, uri := range urls {
+		require.Equal(t, "http://lakefs:8000/iceberg/relative_to/R-metadata.main/api", uri)
+	}
+}
+
+// TestAutomaticCreationCommitMessage pins the one lakeFS constant this package spells out because
+// the indexer is a REST client and does not import pkg/graveler.
+func TestAutomaticCreationCommitMessage(t *testing.T) {
+	require.Equal(t, graveler.FirstCommitMsg, automaticCreationCommitMessage)
 }

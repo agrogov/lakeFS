@@ -142,8 +142,12 @@ func TestCreateMetadataRepository(t *testing.T) {
 
 	initCommit := e.fake.initCommitID()
 	require.NotEmpty(t, initCommit)
-	require.Equal(t, initCommit, e.fake.commits["repo-metadata"][initCommit].ID)
-	require.Empty(t, e.fake.commits["repo-metadata"][initCommit].Parents, "the initialisation commit is the root")
+	init := e.fake.commits["repo-metadata"][initCommit]
+	require.Equal(t, initCommit, init.ID)
+	require.Len(t, init.Parents, 1, "a non-bare repository has its automatic creation root beneath the initialisation")
+	root := e.fake.commits["repo-metadata"][init.Parents[0]]
+	require.Equal(t, "Repository created", root.Message)
+	require.Empty(t, root.Parents, "the automatic creation commit is the root")
 
 	// A second tick finds the repository initialised and writes nothing.
 	before := len(e.fake.madeCommits())
@@ -172,6 +176,29 @@ func TestInterruptedInitialisationIsCompleted(t *testing.T) {
 	require.Equal(t, []string{"a"}, state.paths())
 }
 
+// TestInitialiseOnTheAutomaticCreationCommit pins the non-bare form of §4.8: the indexer's
+// CreateRepository leaves lakeFS's automatic "Repository created" root on the branch, and the
+// initialisation is completed on top of that root instead of being refused as foreign.
+func TestInitialiseOnTheAutomaticCreationCommit(t *testing.T) {
+	e := newEnv(t)
+	e.fake.addRepository("repo-metadata", "s3://bucket/data-metadata", "main")
+	root := e.fake.addCommit("repo-metadata", "main", "created", nil, nil)
+	root.Message = "Repository created"
+	e.fake.setCommit("repo-metadata", root)
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+
+	e.tick()
+
+	require.NoError(t, e.health.repositoryError("repo"))
+	initCommit := e.fake.initCommitID()
+	require.NotEmpty(t, initCommit)
+	init := e.fake.commits["repo-metadata"][initCommit]
+	require.Equal(t, []string{"created"}, init.Parents, "the initialisation commit is the first non-root commit")
+	state, ok := e.fake.tableState("main")
+	require.True(t, ok)
+	require.Equal(t, []string{"a"}, state.paths())
+}
+
 // TestRefuseForeignRepository pins §4.8: a companion repository that was not created by the
 // indexer (it has no initialisation commit) is refused and never written to.
 func TestRefuseForeignRepository(t *testing.T) {
@@ -187,6 +214,24 @@ func TestRefuseForeignRepository(t *testing.T) {
 	require.Empty(t, e.fake.madeCommits(), "nothing is written into a foreign repository")
 	require.Zero(t, e.fake.applyCalls)
 	require.Zero(t, e.fake.rebuildCalls)
+}
+
+// TestRefuseForeignRepositoryAfterAutomaticRoot pins the other half of §4.8's acceptance rule: a
+// non-bare repository whose automatic root is followed by a commit without the initialisation
+// marker is not the indexer's, even though the root itself is the shape lakeFS creates.
+func TestRefuseForeignRepositoryAfterAutomaticRoot(t *testing.T) {
+	e := newEnv(t)
+	e.fake.addRepository("repo-metadata", "s3://bucket/foreign", "main")
+	root := e.fake.addCommit("repo-metadata", "main", "created", nil, nil)
+	root.Message = "Repository created"
+	e.fake.setCommit("repo-metadata", root)
+	e.fake.addCommit("repo-metadata", "main", "foreign", []string{"created"}, nil)
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+
+	e.tick()
+
+	require.ErrorIs(t, e.health.repositoryError("repo"), indexer.ErrForeignRepository)
+	require.Empty(t, e.fake.madeCommits(), "nothing is written into a foreign repository")
 }
 
 // TestDataRepositoryNamedMetadataIsRefused pins the other half of §3.3's naming rule: a configured

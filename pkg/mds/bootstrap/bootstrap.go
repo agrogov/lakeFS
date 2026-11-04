@@ -103,6 +103,14 @@ const (
 	// MetadataCatalogPattern matches every catalog ARN of a companion repository, e.g.
 	// arn:lakefs:catalog:::table/<R>-metadata/system/object_metadata (§8).
 	MetadataCatalogPattern = "arn:lakefs:catalog:::*/*" + icebergcatalog.MetadataRepositorySuffix + "/*"
+
+	// MetadataNamespacePattern matches the storage-namespace ARN of every companion repository whose
+	// namespace is derived by §3.3: <R's namespace>-metadata. CreateRepository checks
+	// fs:AttachStorageNamespace on arn:lakefs:fs:::namespace/<namespace>
+	// (pkg/permissions.StorageNamespace), and "*" spans "/", so this is the narrowest pattern that
+	// covers the derived namespaces. An explicit metadata_search.repositories.<R>.storage_namespace
+	// that does not itself end in -metadata is outside this grant and needs an extra statement.
+	MetadataNamespacePattern = "arn:lakefs:fs:::namespace/*" + icebergcatalog.MetadataRepositorySuffix
 )
 
 // indexerReadActions are the data-repository permissions of §8: what the indexer needs to list a
@@ -159,10 +167,13 @@ var ErrMissingDeps = errors.New("mds bootstrap: metadata search is enabled and t
 //	on repository/*-metadata and below   fs:*
 //	on catalog:::* / *-metadata/*        catalog:*
 //	on repository/*-metadata             fs:CreateRepository
+//	on namespace/*-metadata              fs:AttachStorageNamespace
 //
-// The last statement is subsumed by the fs:* statement above it; it is spelled out because §8
-// names fs:CreateRepository as a separate grant, and keeping it visible makes the policy a reader
-// can check against the design line by line.
+// The fs:CreateRepository and fs:AttachStorageNamespace statements are subsumed by the fs:*
+// statements above them; they are spelled out because §8 names them as separate grants, and
+// keeping them visible makes the policy a reader can check against the design line by line.
+// CreateRepository checks both: fs:CreateRepository on the repository ARN and
+// fs:AttachStorageNamespace on the storage-namespace ARN (pkg/api/controller.go).
 func IndexerPolicy(ts time.Time) *model.Policy {
 	return &model.Policy{
 		CreatedAt:   ts,
@@ -192,6 +203,11 @@ func IndexerPolicy(ts time.Time) *model.Policy {
 				Effect:   model.StatementEffectAllow,
 				Action:   []string{permissions.CreateRepositoryAction},
 				Resource: MetadataRepositoryPattern,
+			},
+			{
+				Effect:   model.StatementEffectAllow,
+				Action:   []string{permissions.AttachStorageNamespaceAction},
+				Resource: MetadataNamespacePattern,
 			},
 		},
 	}

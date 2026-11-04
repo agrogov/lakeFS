@@ -341,6 +341,19 @@ func (f *fake) CreateRepository(_ context.Context, opts client.RepositoryOptions
 		branch = "main"
 	}
 	f.addRepositoryLocked(opts.Name, opts.StorageNamespace, branch)
+	// lakeFS creates a non-bare repository: its default branch starts with the automatic
+	// "Repository created" root commit. The indexer's initialisation commit is the first commit
+	// after it, never the root (design §4.8).
+	root := client.Commit{
+		ID:           fmt.Sprintf("created-%d", f.index),
+		Message:      "Repository created",
+		Committer:    "lakefs",
+		CreationDate: f.now.Add(time.Duration(f.index) * time.Minute),
+	}
+	f.index++
+	f.commits[opts.Name][root.ID] = root
+	f.setObjectsLocked(opts.Name, root.ID, nil)
+	f.branches[opts.Name][branch] = root.ID
 	f.createdRepositories = append(f.createdRepositories, opts)
 	return f.repositories[opts.Name], nil
 }
@@ -463,14 +476,15 @@ func (f *fake) LogCommits(_ context.Context, repository, ref string, opts client
 	}
 	var chain []client.Commit
 	for current := head; current != ""; {
-		if opts.StopAt != "" && current == opts.StopAt {
-			break
-		}
 		commit, ok := f.commits[repository][current]
 		if !ok {
 			break
 		}
 		chain = append(chain, commit)
+		// The lakeFS API's stop_at is inclusive: the stop commit is the last item returned.
+		if opts.StopAt != "" && current == opts.StopAt {
+			break
+		}
 		if len(commit.Parents) == 0 {
 			break
 		}

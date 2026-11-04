@@ -21,6 +21,13 @@ import (
 	"github.com/treeverse/lakefs/pkg/mds/client"
 )
 
+// automaticCreationCommitMessage is the message lakeFS gives the root commit of a non-bare
+// repository (pkg/graveler.FirstCommitMsg). A companion repository is created non-bare, so its
+// default branch starts with this commit and the initialisation commit is the first commit after
+// it. The indexer is a REST client and does not import pkg/graveler, so the string is spelled here;
+// a test pins it to the real constant.
+const automaticCreationCommitMessage = "Repository created"
+
 // ensureMetadataRepository makes sure R-metadata of a configured repository exists, is one this
 // indexer created, and is initialised (§3.3, §4.8). It returns the name of the companion
 // repository and caches its default branch and initialisation commit for the rest of the tick.
@@ -112,7 +119,7 @@ func (x *Indexer) ensureInitialised(ctx context.Context, repository, metadata, d
 	case err != nil:
 		return fmt.Errorf("head of %q@%s: %w", metadata, branch, err)
 	default:
-		state, err = x.verifyInitCommit(ctx, metadata, branch)
+		state, err = x.verifyInitCommit(ctx, repository, metadata, branch)
 	}
 	if err != nil {
 		return err
@@ -121,19 +128,61 @@ func (x *Indexer) ensureInitialised(ctx context.Context, repository, metadata, d
 	return nil
 }
 
-// verifyInitCommit walks the first-parent log of R-metadata to its root: the initialisation commit
-// is the root of the repository (§4.8), so the root's metadata is what tells a companion
-// repository of this indexer from one an operator created.
-func (x *Indexer) verifyInitCommit(ctx context.Context, metadata, branch string) (metadataState, error) {
-	root, err := x.rootCommit(ctx, metadata, branch)
+// verifyInitCommit walks the first-parent log of R-metadata and decides whether the repository is
+// the indexer's (§4.8). The initialisation commit is accepted in exactly two places:
+//
+//   - at the root, for a companion repository that was created bare (the original initialisation);
+//   - as the first commit after lakeFS's automatic "Repository created" root, which is what a
+//     non-bare CreateRepository writes.
+//
+// A repository whose only commit is that automatic root has not been initialised yet: the
+// namespace, the table and the mds: init commit are written on top of it. Any other history
+// without the marker at one of those two positions is not the indexer's and is refused.
+func (x *Indexer) verifyInitCommit(ctx context.Context, repository, metadata, branch string) (metadataState, error) {
+	history, err := x.firstParentHistory(ctx, metadata, branch)
 	if err != nil {
 		return metadataState{}, err
 	}
-	if root.Metadata[MetadataKeyInit] != MetadataKeyInitValue {
-		return metadataState{}, fmt.Errorf("%w: %q has no %s commit",
-			ErrForeignRepository, metadata, MetadataKeyInit)
+	if len(history) == 0 {
+		return metadataState{}, fmt.Errorf("%w: %q@%s", ErrNoCommit, metadata, branch)
 	}
-	return metadataState{defaultBranch: branch, initCommit: root.ID, initialised: true}, nil
+	root := history[len(history)-1]
+	for i, commit := range history {
+		if commit.Metadata[MetadataKeyInit] == MetadataKeyInitValue {
+			if initCommitAccepted(history, i, root) {
+				return metadataState{defaultBranch: branch, initCommit: commit.ID, initialised: true}, nil
+			}
+			return metadataState{}, fmt.Errorf("%w: %q carries %s on a commit that is neither its root nor its first commit after %q",
+				ErrForeignRepository, metadata, MetadataKeyInit, automaticCreationCommitMessage)
+		}
+	}
+	if len(history) == 1 && isAutomaticCreationCommit(root) {
+		x.log.WithFields(logging.Fields{
+			"repository": repository,
+			"metadata":   metadata,
+			"root":       root.ID,
+		}).Info("mds: completing the initialisation of a newly created metadata repository")
+		return x.initialise(ctx, repository, metadata, branch)
+	}
+	return metadataState{}, fmt.Errorf("%w: %q has no %s commit",
+		ErrForeignRepository, metadata, MetadataKeyInit)
+}
+
+// initCommitAccepted reports whether the init marker at index i of a newest-first first-parent
+// history is in one of the two accepted positions of §4.8.
+func initCommitAccepted(history []client.Commit, i int, root client.Commit) bool {
+	if i == len(history)-1 {
+		// The marker is the root: a bare companion repository, the original form.
+		return true
+	}
+	// The marker is the first commit after lakeFS's automatic root of a non-bare repository.
+	return i == len(history)-2 && isAutomaticCreationCommit(root)
+}
+
+// isAutomaticCreationCommit reports whether commit is lakeFS's automatic root commit of a non-bare
+// repository.
+func isAutomaticCreationCommit(commit client.Commit) bool {
+	return len(commit.Parents) == 0 && commit.Message == automaticCreationCommitMessage
 }
 
 // initialise creates the namespace and the table of a fresh R-metadata and writes its
@@ -185,34 +234,25 @@ func (x *Indexer) initCommit(repository string) (string, error) {
 	return state.initCommit, nil
 }
 
-// rootCommit returns the oldest first-parent commit of a branch, stopping early at the first
-// commit that carries the initialisation marker.
-func (x *Indexer) rootCommit(ctx context.Context, repository, branch string) (client.Commit, error) {
-	var root client.Commit
+// firstParentHistory returns the first-parent history of a branch, newest first.
+func (x *Indexer) firstParentHistory(ctx context.Context, repository, branch string) ([]client.Commit, error) {
+	var commits []client.Commit
 	after := ""
 	for {
-		commits, hasMore, err := x.lakeFS.LogCommits(ctx, repository, branch, client.LogCommitsOptions{
+		page, hasMore, err := x.lakeFS.LogCommits(ctx, repository, branch, client.LogCommitsOptions{
 			FirstParent: true,
 			After:       after,
 		})
 		if err != nil {
-			return client.Commit{}, fmt.Errorf("log commits of %q@%s: %w", repository, branch, err)
+			return nil, fmt.Errorf("log commits of %q@%s: %w", repository, branch, err)
 		}
-		for _, commit := range commits {
-			if commit.Metadata[MetadataKeyInit] == MetadataKeyInitValue {
-				return commit, nil
-			}
-			root = commit
-		}
+		commits = append(commits, page...)
 		if !hasMore {
-			if root.ID == "" {
-				return client.Commit{}, fmt.Errorf("%w: %q@%s", ErrNoCommit, repository, branch)
-			}
-			return root, nil
+			return commits, nil
 		}
-		after = lastNameOf(len(commits), func(i int) string { return commits[i].ID })
+		after = lastNameOf(len(page), func(i int) string { return page[i].ID })
 		if after == "" {
-			return client.Commit{}, fmt.Errorf("%w: log commits of %q@%s: more results without a cursor",
+			return nil, fmt.Errorf("%w: log commits of %q@%s: more results without a cursor",
 				client.ErrBadPagination, repository, branch)
 		}
 	}

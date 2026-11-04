@@ -152,8 +152,8 @@ var (
 	// indexer cannot address a table, a commit or an initialisation without one.
 	ErrNoDefaultBranch = errors.New("the companion repository has no default branch")
 
-	// ErrNoCommit is reported by rootCommit for a branch that has no commit at all, which is not
-	// the state of an initialised companion repository.
+	// ErrNoCommit is reported for a branch that has no commit at all, which is not the state of an
+	// initialised companion repository.
 	ErrNoCommit = errors.New("the branch has no commit")
 )
 
@@ -351,6 +351,13 @@ func New(opts Options) (*Indexer, error) {
 		if err != nil {
 			return nil, err
 		}
+		// The catalog lives at the server root, not under the API path: IcebergStore appends
+		// /iceberg/relative_to/<R>-metadata.<branch>/api itself (§4.3 step 3). Using the API base
+		// here would send every catalog request to /api/v1/iceberg/... and get a 404.
+		root, err := serverBaseURL(endpoint)
+		if err != nil {
+			return nil, err
+		}
 		if x.lakeFS == nil {
 			lakeFS, err := newLakeFSClient(base, opts.AccessKeyID, opts.SecretKey)
 			if err != nil {
@@ -360,7 +367,7 @@ func New(opts Options) (*Indexer, error) {
 		}
 		if x.tables == nil {
 			x.tables = &IcebergStore{
-				Endpoint:        base,
+				Endpoint:        root,
 				AccessKeyID:     opts.AccessKeyID,
 				SecretAccessKey: opts.SecretKey,
 				Storage:         iceberg.Properties(opts.Storage),
@@ -558,9 +565,10 @@ func lastNameOf(count int, name func(int) string) string {
 	return name(count - 1)
 }
 
-// apiBaseURL returns the lakeFS API base URL of an endpoint: the endpoint with its path reduced to
-// /api/v1, so that an endpoint that already carries the API path is not doubled.
-func apiBaseURL(endpoint string) (string, error) {
+// serverBaseURL returns the lakeFS server root of an endpoint: the endpoint with a trailing
+// /api/v1 path removed. The API is mounted under it and the catalog at /iceberg directly below it
+// (§4.3 step 3), so both URLs have to come from this one normalisation.
+func serverBaseURL(endpoint string) (string, error) {
 	parsed, err := url.Parse(endpoint)
 	if err != nil {
 		return "", fmt.Errorf("%w: endpoint %q: %w", ErrNoEndpoint, endpoint, err)
@@ -573,7 +581,17 @@ func apiBaseURL(endpoint string) (string, error) {
 	parsed.Path = strings.TrimRight(path, "/")
 	parsed.RawQuery = ""
 	parsed.Fragment = ""
-	return strings.TrimRight(parsed.String(), "/") + apiutil.BaseURL, nil
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+// apiBaseURL returns the lakeFS API base URL of an endpoint: the server root with /api/v1, so that
+// an endpoint that already carries the API path is not doubled.
+func apiBaseURL(endpoint string) (string, error) {
+	root, err := serverBaseURL(endpoint)
+	if err != nil {
+		return "", err
+	}
+	return root + apiutil.BaseURL, nil
 }
 
 // newLakeFSClient builds the typed lakeFS client of pkg/mds/client over the generated client,
