@@ -436,6 +436,8 @@ jobs:
           AWS_REGION: us-east-1
           ESTI_STORAGE_NAMESPACE: s3://esti-mds-test/${{ github.run_number }}
           ESTI_MDS_BACKFILL_OBJECTS: "10000"
+          # The suite starts its own lakefs-sso; TestMain must not wait for one on :8000.
+          ESTI_SETUP_LAKEFS: "false"
         run: |
           go test -count=1 -timeout 20m -v ./esti \
             -system-tests -use-local-credentials -run TestMetadataSearch
