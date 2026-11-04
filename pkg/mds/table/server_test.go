@@ -100,12 +100,39 @@ type testEnv struct {
 	repo   string
 	server *httptest.Server
 	rest   *rest.Catalog
+	// clientConfig is the configuration the client catalog was built with, so that a test can
+	// assert the mode it runs in (vended_test.go asserts that metadata_search.storage is empty).
+	clientConfig table.CatalogConfig
 }
 
-// newTestEnv builds the fixture: a local block adapter rooted in a temporary directory, a mem KV
-// store, a basic auth service with one principal, a catalog, the production catalog routes
-// mounted over a real HTTP server, the companion repository and its system namespace.
+// testEnvOptions are the fixture knobs beyond the local-blockstore default. Every test but the
+// vended-credentials test of vended_test.go uses the defaults.
+type testEnvOptions struct {
+	// viper is set before the lakeFS configuration is built. The vended test uses it for the
+	// blockstore.s3.* keys and for iceberg.credentials_vending.*.
+	viper map[string]any
+	// storageNamespace overrides the companion repository's storage namespace. A nil function
+	// keeps the local adapter's namespace under the fixture's temporary directory.
+	storageNamespace func(root, repo string) string
+	// storage is metadata_search.storage, the client's static IO properties. Nil is the vended
+	// mode of design §4.6: the client has no object-store credentials of its own.
+	storage iceberg.Properties
+	// wrapHandler wraps the catalog's HTTP handler, so a test can observe the requests iceberg-go
+	// sends (the vended test records the data-access delegation header).
+	wrapHandler func(http.Handler) http.Handler
+}
+
+// newTestEnv builds the fixture with the default: a local block adapter rooted in a temporary
+// directory and a client with no static IO properties.
 func newTestEnv(t *testing.T) *testEnv {
+	t.Helper()
+	return newTestEnvWith(t, testEnvOptions{})
+}
+
+// newTestEnvWith builds the fixture: a block adapter, a mem KV store, a basic auth service with one
+// principal, a catalog, the production catalog routes mounted over a real HTTP server, the
+// companion repository and its system namespace.
+func newTestEnvWith(t *testing.T, opts testEnvOptions) *testEnv {
 	t.Helper()
 	ctx := t.Context()
 	registerLocalIO()
@@ -113,6 +140,9 @@ func newTestEnv(t *testing.T) *testEnv {
 	root := t.TempDir()
 	viper.Set(config.BlockstoreTypeKey, block.BlockstoreTypeLocal)
 	viper.Set("blockstore.local.path", root)
+	for key, value := range opts.viper {
+		viper.Set(key, value)
+	}
 	viper.Set("iceberg.enabled", true)
 	viper.Set("iceberg.metadata_search.enabled", true)
 	viper.Set("committed.local_cache.size_bytes", 24*1024*1024)
@@ -145,6 +175,9 @@ func newTestEnv(t *testing.T) *testEnv {
 	env := &testEnv{repo: "data-repo-metadata"}
 
 	storageNamespace := "local://" + filepath.Join(root, "repos", env.repo)
+	if opts.storageNamespace != nil {
+		storageNamespace = opts.storageNamespace(root, env.repo)
+	}
 	_, err = cat.CreateRepository(ctx, env.repo, "", storageNamespace, testBranch, false)
 	require.NoError(t, err, "create the companion repository")
 
@@ -160,16 +193,22 @@ func newTestEnv(t *testing.T) *testEnv {
 		Logger:        logging.FromContext(ctx),
 	}, mux), "mount the Iceberg catalog")
 	api.MountNotImplementedServices(mux)
-	env.server = httptest.NewServer(mux)
+	var handler http.Handler = mux
+	if opts.wrapHandler != nil {
+		handler = opts.wrapHandler(handler)
+	}
+	env.server = httptest.NewServer(handler)
 	t.Cleanup(env.server.Close)
 
-	env.rest, err = table.NewCatalog(ctx, table.CatalogConfig{
+	env.clientConfig = table.CatalogConfig{
 		Endpoint:        env.server.URL,
 		Repository:      env.repo,
 		Branch:          testBranch,
 		AccessKeyID:     testAccessKeyID,
 		SecretAccessKey: testSecretAccessKey,
-	})
+		Storage:         opts.storage,
+	}
+	env.rest, err = table.NewCatalog(ctx, env.clientConfig)
 	require.NoError(t, err, "build the iceberg-go REST catalog")
 
 	err = env.rest.CreateNamespace(ctx, icebergcataloggo.ToIdentifier(table.Namespace), nil)
