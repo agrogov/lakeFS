@@ -175,7 +175,7 @@ Every key, its default and its meaning:
 | `delete_branches` | bool | `true` | Delete `R-metadata@b` when branch `b` of `R` is deleted. Its `mds-*` tags stay. |
 | `tag_retention` | duration | `0s` | Delete `mds-*` tags whose source commit is older than this. `0` keeps them forever. |
 | `compaction.max_delete_files` | int | `200` | Compact a branch's table when it has more delete files than this. `0` disables this trigger. |
-| `compaction.every_commits` | int | `500` | Compact a branch's table after this many indexed commits. `0` disables this trigger. The counter is in memory, so a restart can defer a compaction by up to this many commits. |
+| `compaction.every_commits` | int | `500` | Compact a branch's table after this many indexed commits. `0` disables this trigger. The count is read back from the first-parent commit log of the companion branch, so a restart neither defers nor advances a compaction. |
 | `storage` | map | empty | iceberg-go IO properties used when the catalog does not vend write credentials. See below. |
 | `repositories` | map | — (required) | The data repositories to index, by name. At least one entry. |
 | `repositories.<R>.branches` | list | — (required) | Branch selectors: exact names, or a prefix with a single trailing `*` (`dev-*`). At least one. |
@@ -811,8 +811,8 @@ deleted. Its tags stay, so history that was tagged remains readable; the branch 
 ### Upgrades and restarts
 
 - Restarting the indexer is safe and is part of normal operation; it resumes at the recorded
-  position. A restart can defer a scheduled compaction by up to `every_commits`, because the
-  commit counter is in memory.
+  position. A restart does not defer a scheduled compaction: the `every_commits` count is read
+  back from the companion branch's commit log, not kept in process state.
 - A lakeFS upgrade that changes the catalog or the table schema should be followed by a normal
   indexer tick. The indexer reloads the table before every commit and takes field IDs from the
   loaded table.

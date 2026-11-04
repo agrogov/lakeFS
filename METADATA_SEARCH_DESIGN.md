@@ -38,7 +38,7 @@ exact upstream `commit_id` semantics for objects that existed before the first i
 | `/mds/iceberg/api` alias of the catalog (upstream endpoint) | `pkg/icebergcatalog/http.go` | **New**, small (task R10-2, section 5.5). |
 | `RefMapper` for tags and commits | new `pkg/mds/refmap`, installed from `cmd/lakefs-sso/main.go` | New (section 6). |
 | Indexer (`lakefs-sso mds run`) | new `pkg/mds/...`, registered in `cmd/lakefs-sso/main.go` | New (sections 4, 7). |
-| Bootstrap of indexer principal and `R-metadata` deny policy | new `pkg/mds/bootstrap.go`, extra routes builder in `cmd/lakefs-sso/main.go` | New (section 8). |
+| Bootstrap of indexer principal and `R-metadata` deny policy | new `pkg/mds/bootstrap/bootstrap.go`, extra routes builder in `cmd/lakefs-sso/main.go` | New (section 8). |
 
 The indexer is a **REST client** of lakeFS (lakeFS API + the Iceberg REST catalog). It does not import
 `pkg/catalog` or `pkg/graveler` and does not touch KV or the block adapter. The only server-side code is the
@@ -131,14 +131,32 @@ idempotency check (4.4), not from a lease; a second replica only wastes work and
 
 ### 4.2 Per-branch tick
 
-1. **Recover** (4.4).
+1. **Recover** (4.4). The code reaches this only after it has read the position and the pending list; see
+   "Order in the code" below.
 2. `last` = `lakefs.mds.source-commit` of `R-metadata@b` head commit (none on a branch that was never indexed → 4.5).
-3. `head` = head commit of `R@b`. If `last == head`, done.
+3. `head` = head commit of `R@b`. If `last == head`, there is nothing to apply; the tag repair (4.4, "crashed
+   after 4") and the 4.9 compaction check still run.
 4. If `last` is not an ancestor of `head` (`findMergeBase(R, last, head)` ≠ `last`) → history rewrite (4.7).
 5. `todo` = first-parent commits of `R@b` after `last` up to `head`, **oldest first**, at most `max_commits`
    (`logCommits(R, head, first_parent=true, stop_at=last)` paged, then reversed).
 6. For each commit `C` in `todo`, apply it (4.3). A failure stops this branch for this tick; the next tick resumes at
    the recorded position.
+
+**Order in the code.** `runBranchOnce` (`pkg/mds/indexer/branch.go`) runs these steps as 3, then 2 (loading
+`R-metadata@b` first, and creating it per 4.5 if it does not exist), then 4, 5, then 1, then 6, and
+finally the 4.9 compaction check. Recovery therefore runs *after* the pending list is computed, not
+before it. That is equivalent to the logical order above:
+
+- Recovery's decision compares the staged `lakefs.mds.source-commit` with exactly two values - the recorded
+  position (step 2) and the next commit to apply (step 5, `todo[0]`) - so the list has to exist before the
+  comparison can be made. Recovery adds no API call: it reads the position the tick already has.
+- The position is still read before anything is written, and recovery never moves it backwards. It either
+  finishes the staged commit and advances the position to it, consuming `todo[0]`, or discards the staging
+  and leaves both `last` and `todo` untouched.
+- Because it consumes at most the first element and never appends, the sequence of writes is the same in
+  either order: 4.3 steps 4–5 for the staged commit followed by the remaining commits, or a discarded
+  staging followed by the commits after `last`. Step 5 drops the recorded position itself even though the
+  log API's `stop_at` is inclusive (4.3 step 4), so no commit is applied twice and none is skipped.
 
 ### 4.3 Applying one commit `C` of `R`
 
