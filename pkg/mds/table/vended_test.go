@@ -35,22 +35,19 @@ package table_test
 // the object store knows one identity (estiaccesskey/estisecretkey) and nothing else in the fixture
 // supplies a token.
 //
-// KNOWN PRODUCT GAP (reported, not fixed here: pkg/icebergcatalog is another task's file set). At
-// the time of writing this test fails, and it fails for two reasons that are both server side:
+// Two server-side pieces make this work, and the test fails without either one:
 //
-//  1. iceberg-go v0.7.0 enables its vended-credentials mode only when the loadTable/createTable/
-//     commitTable response carries `storage-credentials` (catalog/rest/rest.go:
+//  1. iceberg-go v0.7.0 enables its vended-credentials mode only when the loadTable/createTable
+//     response carries `storage-credentials` (catalog/rest/rest.go:
 //     `credsVended := len(ret.StorageCredentials) > 0`); it uses the separate
 //     GET .../tables/{table}/credentials endpoint only to refresh an already vended session.
-//     pkg/icebergcatalog's loadTableResult has no storage-credentials member (tables.go), so a
-//     client whose metadata_search.storage is empty gets an IO with no credentials at all and falls
-//     back to the ambient AWS chain - exactly what design §4.6 says must not be needed.
-//  2. The credentials endpoint that does exist always vends a *read* session:
-//     handleLoadCredentials calls Vend with OpReadTableData (creds.go), and no handler calls Vend
-//     with OpWriteTableData. Even without (1), the indexer could not get write credentials for the
-//     Parquet and Avro files of §4.3 step 3.
+//     pkg/icebergcatalog's load and create answers carry the member (tables.go).
+//  2. The session is a write session: the load, the create and the credentials endpoint call Vend
+//     with OpWriteTableData on a branch for a caller allowed catalog:WriteTableData (creds.go
+//     TableCredentials), so the indexer gets write credentials for the Parquet and Avro files of
+//     §4.3 step 3.
 //
-// The client side is not part of the gap: table.NewCatalog already makes iceberg-go send
+// The client side needs nothing: table.NewCatalog already makes iceberg-go send
 // `X-Iceberg-Access-Delegation: vended-credentials` on every request (the session default), which
 // the test asserts, so catalog.go needs no extra header.
 //

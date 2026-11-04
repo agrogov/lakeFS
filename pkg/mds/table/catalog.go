@@ -125,13 +125,12 @@ func (c CatalogConfig) Authorization() string {
 // Vended mode needs no option here and no property in Storage: the client asks for vended
 // credentials itself. iceberg-go's REST session sends `X-Iceberg-Access-Delegation:
 // vended-credentials` on every request as a session default (catalog/rest/rest.go), which
-// vended_test.go asserts at the HTTP boundary. What vended mode does need is on the server: the
-// client uses the session only when the loadTable, createTable or commitTable response carries
-// `storage-credentials` (catalog/rest/rest.go: `credsVended := len(ret.StorageCredentials) > 0`);
-// the separate GET .../tables/{table}/credentials endpoint is only used to refresh a session
-// already in hand.
-// pkg/icebergcatalog answers the table requests without that member, so this repository's indexer
-// cannot yet run on vended credentials alone - see the KNOWN PRODUCT GAP note of vended_test.go.
+// vended_test.go asserts at the HTTP boundary. The client uses the session only when the
+// loadTable or createTable response carries `storage-credentials` (catalog/rest/rest.go:
+// `credsVended := len(ret.StorageCredentials) > 0`); the separate GET .../tables/{table}/credentials
+// endpoint is only used to refresh a session already in hand. pkg/icebergcatalog fills that member
+// with a write session on a branch for a caller allowed catalog:WriteTableData, and the
+// credentials endpoint refreshes the same kind of session.
 //
 // The caller owns the returned catalog and should Close it.
 func NewCatalog(ctx context.Context, cfg CatalogConfig) (*rest.Catalog, error) {
