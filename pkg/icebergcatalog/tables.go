@@ -287,6 +287,17 @@ type tableService struct {
 	// reads itself (the commit of commit_http.go). The router's middleware already bounds every
 	// body, but a service mounted without it must still refuse an unbounded one (§10, §12).
 	maxBody int64
+
+	// creds vends the storage-credentials of a load or a create answer (creds.go). It is nil
+	// unless WithCredentials set it, and a nil or disabled service vends nothing.
+	creds *credentialService
+}
+
+// WithCredentials makes the load and create answers of this service carry the vended session of
+// creds. It returns the service, so the route table (http.go) can wire it in one expression.
+func (s *tableService) WithCredentials(creds *credentialService) *tableService {
+	s.creds = creds
+	return s
 }
 
 // NewTableService builds the table read surface. The prefix is the value of GET /v1/config
@@ -386,12 +397,16 @@ type listTablesResponse struct {
 // it was written (or, in refs mode, only its snapshots field rewritten) instead of being
 // re-encoded from a model that would drop fields this catalog does not interpret.
 //
-// storage-credentials, remote-signing-config and read-restrictions are absent: credential vending
-// and remote signing are phase I-4, and the catalog imposes no read restrictions.
+// storage-credentials is the vended session of §8 (creds.go), present on a load or a create when
+// the catalog vends and the client asked for vended-credentials; a commit answers without it,
+// because the spec's CommitTableResponse has no such member. remote-signing-config and
+// read-restrictions are absent: remote signing is enabled through config (sign.go), and the
+// catalog imposes no read restrictions.
 type loadTableResult struct {
-	MetadataLocation string            `json:"metadata-location"`
-	Metadata         json.RawMessage   `json:"metadata"`
-	Config           map[string]string `json:"config"`
+	MetadataLocation   string              `json:"metadata-location"`
+	Metadata           json.RawMessage     `json:"metadata"`
+	Config             map[string]string   `json:"config"`
+	StorageCredentials []StorageCredential `json:"storage-credentials,omitempty"`
 }
 
 // createTableRequest is CreateTableRequest (spec: components.schemas.CreateTableRequest): the
@@ -550,10 +565,35 @@ func (s *tableService) handleLoadTable(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, loadTableResult{
 		// The physical URI of the pointer's metadata.json, never a lakeFS path: the client reads
 		// it with its own object-store client (§6.1, I1-9 note).
-		MetadataLocation: table.Pointer.MetadataLocation,
-		Metadata:         metadata,
-		Config:           map[string]string{},
+		MetadataLocation:   table.Pointer.MetadataLocation,
+		Metadata:           metadata,
+		Config:             map[string]string{},
+		StorageCredentials: s.loadCredentials(r),
 	})
+}
+
+// loadCredentials is the storage-credentials member of a load answer: the session of the table the
+// request named, a write session when its ref is a branch the caller may write the data of
+// (creds.go TableCredentials). The load was authorized already, so a reason not to vend leaves the
+// member out instead of failing the load.
+func (s *tableService) loadCredentials(r *http.Request) []StorageCredential {
+	if !s.creds.VendsFor(strings.Join(r.Header.Values(AccessDelegationHeader), ",")) {
+		return nil
+	}
+	addr, err := ParseTable(chi.URLParam(r, "namespace"), chi.URLParam(r, "table"))
+	if err != nil {
+		return nil
+	}
+	caller, err := requestCaller(r)
+	if err != nil {
+		return nil
+	}
+	isBranch, err := s.isBranchRef(r.Context(), addr)
+	if err != nil {
+		s.creds.logNotVending(r.Context(), caller, addr, "table", err)
+		return nil
+	}
+	return s.creds.LoadTableCredentials(r.Context(), caller, addr, isBranch)
 }
 
 // handleHeadTable is HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table} (spec: tableExists):
@@ -624,10 +664,16 @@ func (s *tableService) handleCreateTable(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	result, err := s.createTable(r.Context(), addr, request)
+	result, metadata, err := s.createTable(r.Context(), addr, request)
 	if err != nil {
 		s.writeError(w, err)
 		return
+	}
+	if s.creds.VendsFor(strings.Join(r.Header.Values(AccessDelegationHeader), ",")) {
+		// The client writes the table's first data files with this session, so it is scoped from
+		// the table the create just decided rather than from a read a staged create cannot serve.
+		result.StorageCredentials = s.creds.CreatedTableCredentials(r.Context(), caller, addr,
+			metadata.TableUUID().String(), metadata.Location())
 	}
 	writeJSON(w, http.StatusOK, result)
 }
@@ -642,24 +688,26 @@ func (s *tableService) handleCreateTable(w http.ResponseWriter, r *http.Request)
 // therefore costs one collectable object and one collectable entry, and nothing can point a table
 // at the loser's document. Every failure after the metadata write - including one of the file
 // registration of step 4 - answers what this path answered before that step existed.
-func (s *tableService) createTable(ctx context.Context, addr Address, request createTableRequest) (*loadTableResult, error) {
+//
+// The metadata is returned with the answer, so the caller can scope a vended session to the table.
+func (s *tableService) createTable(ctx context.Context, addr Address, request createTableRequest) (*loadTableResult, table.Metadata, error) {
 	if request.Schema == nil {
-		return nil, fmt.Errorf("%w: the request carries no schema", ErrInvalidCreateTable)
+		return nil, nil, fmt.Errorf("%w: the request carries no schema", ErrInvalidCreateTable)
 	}
 	// §6.1: a namespace exists when its marker does, and the spec's createTable answers 404
 	// NoSuchNamespaceException for one that does not. The check is a read on the same ref the
 	// pointer is staged on, so it sees the branch's staging area too.
 	if _, err := s.store.GetNamespace(ctx, addr); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	tableUUID, err := uuid.NewRandom()
 	if err != nil {
-		return nil, fmt.Errorf("generate a table uuid: %w", err)
+		return nil, nil, fmt.Errorf("generate a table uuid: %w", err)
 	}
 	location, err := s.store.TableLocation(ctx, addr.Repo, request.Location, tableUUID.String())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// The unbound spec and order are handed over embedded: NewMetadataWithUUID resolves their
@@ -675,23 +723,23 @@ func (s *tableService) createTable(ctx context.Context, addr Address, request cr
 	}
 	metadata, err := table.NewMetadataWithUUID(request.Schema, spec, order, location, request.Properties, tableUUID)
 	if err != nil {
-		return nil, fmt.Errorf("%w: the schema, partition spec or sort order cannot describe a table: %w",
+		return nil, nil, fmt.Errorf("%w: the schema, partition spec or sort order cannot describe a table: %w",
 			ErrInvalidCreateTable, err)
 	}
 	// Format version 3 is a v1 non-goal (§1.2), exactly as on the commit path.
 	version := metadata.Version()
 	if version != 1 && version != 2 {
-		return nil, fmt.Errorf("%w: format version %d is not supported: this catalog serves format versions 1 and 2",
+		return nil, nil, fmt.Errorf("%w: format version %d is not supported: this catalog serves format versions 1 and 2",
 			ErrInvalidCreateTable, version)
 	}
 
 	metadataLocation, err := NewMetadataFileLocation(location, "", metadata)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	metadataJSON, err := s.store.WriteMetadata(ctx, addr.Repo, metadataLocation, metadata)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	pointer := TablePointer{
 		MetadataLocation: metadataLocation,
@@ -703,7 +751,7 @@ func (s *tableService) createTable(ctx context.Context, addr Address, request cr
 		// pointer is staged with assert-create semantics (§6.2). A duplicate create is
 		// ErrAlreadyExists there, which the HTTP layer answers 409 AlreadyExistsException.
 		if err := s.store.CreateTableWithMetadata(ctx, addr, pointer, metadata, int64(len(metadataJSON))); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -711,7 +759,7 @@ func (s *tableService) createTable(ctx context.Context, addr Address, request cr
 		MetadataLocation: metadataLocation,
 		Metadata:         json.RawMessage(metadataJSON),
 		Config:           map[string]string{},
-	}, nil
+	}, metadata, nil
 }
 
 // handleDropTable is DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table} (spec: dropTable):
@@ -1295,15 +1343,24 @@ func (s *tableService) checkPrefix(w http.ResponseWriter, r *http.Request) bool 
 // in http.go already answered a request without one) and the client IP the auth service evaluates
 // SourceIp conditions with, extracted the same way pkg/datasets does.
 func (s *tableService) caller(w http.ResponseWriter, r *http.Request) (Caller, bool) {
-	user, err := auth.GetUser(r.Context())
+	caller, err := requestCaller(r)
 	if err != nil {
 		writeIcebergError(w, http.StatusUnauthorized, ErrTypeNotAuthorized, authFailureMessage(http.StatusUnauthorized))
 		return Caller{}, false
 	}
+	return caller, true
+}
+
+// requestCaller is the caller of r, or the error of a request without an authenticated user.
+func requestCaller(r *http.Request) (Caller, error) {
+	user, err := auth.GetUser(r.Context())
+	if err != nil {
+		return Caller{}, err
+	}
 	return Caller{
 		Username: user.Username,
 		ClientIP: httputil.ExtractClientIP(r.Header, r.RemoteAddr),
-	}, true
+	}, nil
 }
 
 // writeError maps the typed errors of this package onto the catalog envelope and the statuses of
