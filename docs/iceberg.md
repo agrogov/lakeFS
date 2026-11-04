@@ -15,7 +15,10 @@ The catalog is mounted by the hook that also serves the datasets control plane
 | `/iceberg/api` | The catalog. The repository and ref are the first two namespace levels of every identifier. |
 | `/iceberg/relative_to` | The same catalog with the warehouse carried in the URL: `/iceberg/relative_to/<repo>[.<branch>]/api/…`. |
 
-`/mds/iceberg/api` (metadata search) is not part of this catalog and answers `501` in every build.
+`/mds/iceberg/api` is not a third addressing form: while `iceberg.enabled` and
+`metadata_search.enabled` are true it is the same catalog, mounted a second time at the prefix upstream
+clients use (`/mds/iceberg/api/v1/…`); otherwise it is unclaimed and answers `501`. See
+[Metadata Search](#metadata-search).
 
 The companion design document is [`ICEBERG_CATALOG_PLAN.md`](../ICEBERG_CATALOG_PLAN.md); the datasets
 integration it unblocks is in [`DATASETS_DESIGN.md`](../DATASETS_DESIGN.md) and
@@ -350,6 +353,31 @@ catalog.load_table("system.object_metadata").scan().to_pandas()
 # The /iceberg/api form names all four components.
 catalog.load_table("my-repo.main.system.object_metadata")
 ```
+
+### The upstream endpoint: `/mds/iceberg/api`
+
+Upstream Metadata Search clients point at the catalog at `<lakefs>/mds/iceberg/api`. While
+`iceberg.enabled` and `metadata_search.enabled` are true lakeFS mounts the catalog there as well — the
+**same handler**, the same authentication schemes, the same `lakefs` prefix and the same routes as
+`/iceberg/api` — so an existing upstream configuration works unchanged apart from the host:
+
+```python
+catalog = load_catalog("lakefs", **{
+    "uri": "http://lakefs.example.com:8000/mds/iceberg/api",
+    "credential": "<access_key_id>:<secret_access_key>",
+    "prefix": "lakefs",
+})
+catalog.load_table("my-repo.main.system.object_metadata")
+```
+
+Both endpoints a client negotiates with answer exactly as their `/iceberg/api` counterparts:
+`GET /mds/iceberg/api/v1/config` and `POST /mds/iceberg/api/v1/oauth/tokens`. The alias is a second mount
+of the same catalog, not a second catalog: a token minted at either URL authenticates both.
+
+There is no `relative_to` form under the alias: the repository and ref stay in the identifier, as they do
+under `/iceberg/api`. When the feature is not enabled the catalog does not mount the path at all: the prefix
+stays unclaimed, so the core placeholder answers it with `501` rather than serving a catalog with no metadata
+to search.
 
 ### Refs
 

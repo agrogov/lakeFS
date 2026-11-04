@@ -25,6 +25,13 @@ const (
 	// <RelativeToBasePath>/{repo}[.{branch}]/api/v1/... (§5, §1.1 goal 2).
 	RelativeToBasePath = "/iceberg/relative_to"
 
+	// MetadataSearchBasePath is the upstream Metadata Search endpoint: while
+	// iceberg.metadata_search.enabled is true the same catalog handler is mounted here as well, so
+	// an upstream client configured for <lakefs>/mds/iceberg/api works unchanged apart from the
+	// host (METADATA_SEARCH_DESIGN.md §5.5, task R10-2). The prefix, the authentication schemes and
+	// the routes are the ones of APIBasePath; there is no relative_to alias under this path.
+	MetadataSearchBasePath = "/mds/iceberg/api"
+
 	// relativeToPattern is the route under RelativeToBasePath. chi mounts it as
 	// <RelativeToBasePath>/{warehouse}/api/*, which is also how the warehouse segment survives
 	// as the "warehouse" URL parameter for ident.go to bind (I1-10). Everything after /api is
@@ -203,6 +210,15 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 	})
 	relativeTo.Mount(relativeToPattern, RelativeTo(handler))
 	r.Mount(RelativeToBasePath, relativeTo)
+
+	// The Metadata Search alias (METADATA_SEARCH_DESIGN.md §5.5, R10-2) is mounted only while the
+	// feature is enabled: the upstream endpoint advertises the virtual table's catalog, and a
+	// server that has no metadata to search must not grow a second catalog at this path. When it
+	// is disabled the prefix stays unclaimed, so MountNotImplementedServices keeps answering it
+	// with its placeholder rather than this handler.
+	if cfg.MetadataSearchEnabled() {
+		r.Mount(MetadataSearchBasePath, handler)
+	}
 	return nil
 }
 
@@ -222,7 +238,9 @@ func newAuthMiddleware(deps cmdpkg.ServerDeps, cfg *Config) (func(http.Handler) 
 
 // MountDisabled mounts the catalog's 501 answer at both catalog prefixes. The prefixes are
 // claimed even though the catalog is off: a client that asks for it must be told it is
-// disabled, and the answer is a catalog error like any other (§12).
+// disabled, and the answer is a catalog error like any other (§12). MetadataSearchBasePath is
+// deliberately not claimed here: it is a Metadata Search alias and stays a plain 404 while the
+// feature is off.
 func MountDisabled(r *chi.Mux) {
 	disabled := DisabledHandler()
 	r.Mount(APIBasePath, disabled)
@@ -240,8 +258,9 @@ func DisabledHandler() http.Handler {
 }
 
 // NewRouter builds the catalog sub-router. It is mounted at APIBasePath (and, with a warehouse
-// segment in between, at RelativeToBasePath) by RoutesBuilder, so its routes are relative to
-// that mount point. services are the operation tables of the catalog's own services (namespaces
+// segment in between, at RelativeToBasePath, and - while Metadata Search is enabled - unchanged at
+// MetadataSearchBasePath) by RoutesBuilder, so its routes are relative to that mount point.
+// services are the operation tables of the catalog's own services (namespaces
 // and tables): every operation they carry is mounted and, through the route table, advertised in
 // GET /v1/config.
 //

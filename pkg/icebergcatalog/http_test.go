@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -530,6 +531,111 @@ func TestRoutesBuilderEnabled(t *testing.T) {
 		require.NotPanics(t, func() { api.MountNotImplementedServices(mux) })
 		rec := do(t, mux, http.MethodGet, APIBasePath+configPath, testAccessKeyID, testSecretAccessKey)
 		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	})
+}
+
+// postTokenForm exchanges an access key pair at an explicit token URL. postToken is the same
+// request against the documented /iceberg/api URL; this helper lets the Metadata Search alias be
+// exercised with the identical form (METADATA_SEARCH_DESIGN.md §5.5, R10-2).
+func postTokenForm(t *testing.T, handler http.Handler, path string, form url.Values) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestRoutesBuilderMountsMetadataSearchAlias is the wiring test of METADATA_SEARCH_DESIGN.md §5.5
+// (R10-2): while iceberg.metadata_search.enabled is true the catalog handler is mounted a second
+// time at /mds/iceberg/api, the endpoint upstream Metadata Search clients are configured with. The
+// alias is the same handler behind the same authentication and the same "lakefs" prefix, so both
+// the negotiation endpoint and the OAuth token endpoint answer exactly as they do under
+// /iceberg/api, and there is no relative_to form under the alias. While the feature is disabled the
+// prefix stays unclaimed and answers a plain 404.
+func TestRoutesBuilderMountsMetadataSearchAlias(t *testing.T) {
+	tokenForm := url.Values{
+		"grant_type":    {grantTypeClientCredentials},
+		"client_id":     {testAccessKeyID},
+		"client_secret": {testSecretAccessKey},
+	}
+
+	t.Run("enabled", func(t *testing.T) {
+		useConfig(t, "iceberg:\n  enabled: true\n  metadata_search:\n    enabled: true\n")
+
+		deps := newServerDeps(t)
+		mux := coreRouter()
+		require.NoError(t, RoutesBuilder(t.Context(), deps, mux))
+
+		t.Run("GET /v1/config answers like /iceberg/api", func(t *testing.T) {
+			direct := do(t, mux, http.MethodGet, APIBasePath+configPath, testAccessKeyID, testSecretAccessKey)
+			alias := do(t, mux, http.MethodGet, MetadataSearchBasePath+configPath, testAccessKeyID, testSecretAccessKey)
+			require.Equal(t, http.StatusOK, direct.Code, "body: %s", direct.Body.String())
+			require.Equal(t, http.StatusOK, alias.Code, "body: %s", alias.Body.String())
+			require.JSONEq(t, direct.Body.String(), alias.Body.String())
+
+			var response CatalogConfig
+			require.NoError(t, json.Unmarshal(alias.Body.Bytes(), &response))
+			require.Equal(t, map[string]string{"prefix": CatalogPrefix}, response.Overrides,
+				"the alias keeps the lakefs prefix; it does not add a warehouse to the path")
+		})
+
+		t.Run("POST /v1/oauth/tokens answers like /iceberg/api", func(t *testing.T) {
+			direct := postTokenForm(t, mux, APIBasePath+OAuthTokenPath, tokenForm)
+			alias := postTokenForm(t, mux, MetadataSearchBasePath+OAuthTokenPath, tokenForm)
+			require.Equal(t, http.StatusOK, direct.Code, "body: %s", direct.Body.String())
+			require.Equal(t, http.StatusOK, alias.Code, "body: %s", alias.Body.String())
+
+			var directResponse, aliasResponse OAuthTokenResponse
+			require.NoError(t, json.Unmarshal(direct.Body.Bytes(), &directResponse))
+			require.NoError(t, json.Unmarshal(alias.Body.Bytes(), &aliasResponse))
+			require.NotEmpty(t, aliasResponse.AccessToken)
+			require.Equal(t, directResponse.TokenType, aliasResponse.TokenType)
+			require.Equal(t, directResponse.IssuedTokenType, aliasResponse.IssuedTokenType)
+			require.Equal(t, directResponse.ExpiresIn, aliasResponse.ExpiresIn)
+
+			// The token minted at the alias is an ordinary catalog token: it authenticates the
+			// /iceberg/api mount and the alias itself.
+			require.Equal(t, http.StatusOK,
+				bearerRequest(t, mux, http.MethodGet, APIBasePath+configPath, aliasResponse.AccessToken).Code)
+			require.Equal(t, http.StatusOK,
+				bearerRequest(t, mux, http.MethodGet, MetadataSearchBasePath+configPath, aliasResponse.AccessToken).Code)
+		})
+
+		t.Run("the alias requires authentication", func(t *testing.T) {
+			requireEnvelope(t, do(t, mux, http.MethodGet, MetadataSearchBasePath+configPath, "", ""),
+				http.StatusUnauthorized, ErrTypeNotAuthorized)
+		})
+
+		t.Run("there is no relative_to form under the alias", func(t *testing.T) {
+			rec := do(t, mux, http.MethodGet, MetadataSearchBasePath+"/repo.main/api"+configPath,
+				testAccessKeyID, testSecretAccessKey)
+			require.Equal(t, http.StatusNotFound, rec.Code, "body: %s", rec.Body.String())
+		})
+
+		t.Run("the core placeholder does not shadow the alias", func(t *testing.T) {
+			require.NotPanics(t, func() { api.MountNotImplementedServices(mux) })
+			rec := do(t, mux, http.MethodGet, MetadataSearchBasePath+configPath, testAccessKeyID, testSecretAccessKey)
+			require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		})
+	})
+
+	t.Run("disabled", func(t *testing.T) {
+		useConfig(t, "iceberg:\n  enabled: true\n")
+
+		deps := newServerDeps(t)
+		mux := coreRouter()
+		require.NoError(t, RoutesBuilder(t.Context(), deps, mux))
+
+		t.Run("GET /v1/config is a plain 404", func(t *testing.T) {
+			rec := do(t, mux, http.MethodGet, MetadataSearchBasePath+configPath, testAccessKeyID, testSecretAccessKey)
+			require.Equal(t, http.StatusNotFound, rec.Code, "body: %s", rec.Body.String())
+		})
+
+		t.Run("POST /v1/oauth/tokens is a plain 404", func(t *testing.T) {
+			rec := postTokenForm(t, mux, MetadataSearchBasePath+OAuthTokenPath, tokenForm)
+			require.Equal(t, http.StatusNotFound, rec.Code, "body: %s", rec.Body.String())
+		})
 	})
 }
 
