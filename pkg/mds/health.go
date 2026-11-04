@@ -123,6 +123,23 @@ func (h *Health) SetBranch(repository, branch string, health BranchHealth) {
 	h.repositoryLocked(repository).branches[branch] = health
 }
 
+// SetBranchState records the whole state of one mirrored branch (§9): the commit its table is at,
+// the head the tick saw, how many commits are still to apply, and the error of the attempt.
+//
+// It takes the fields rather than a BranchHealth so that the indexer (pkg/mds/indexer) can report
+// through an interface without importing this package: the indexer is a client of the indexer
+// process, and the dependency runs the other way.
+func (h *Health) SetBranchState(repository, branch, lastIndexed, head string, lagCommits int64, err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.repositoryLocked(repository).branches[branch] = BranchHealth{
+		LastIndexed: lastIndexed,
+		Head:        head,
+		LagCommits:  lagCommits,
+		LastError:   errorString(err),
+	}
+}
+
 // SetBranchError records that indexing one branch failed, leaving the rest of its state as it
 // was.
 func (h *Health) SetBranchError(repository, branch string, err error) {

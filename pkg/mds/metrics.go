@@ -134,6 +134,12 @@ func (Recorder) SetLag(repository, branch string, commits int64) {
 	lagCommits.WithLabelValues(repository, branch).Set(float64(commits))
 }
 
+// ClearLag drops the lag series of a branch (§4.8): the branch is gone, and a gauge that kept its
+// last value would report a lag that no tick can ever clear.
+func (Recorder) ClearLag(repository, branch string) {
+	lagCommits.DeleteLabelValues(repository, branch)
+}
+
 // Error counts one failure at the given stage of the given repository.
 func (Recorder) Error(repository, stage string) {
 	errorsTotal.WithLabelValues(repository, stage).Inc()

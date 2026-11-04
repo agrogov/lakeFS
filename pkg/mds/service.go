@@ -21,6 +21,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/treeverse/lakefs/pkg/httputil"
 	"github.com/treeverse/lakefs/pkg/logging"
+	"github.com/treeverse/lakefs/pkg/mds/indexer"
 )
 
 const (
@@ -73,6 +74,10 @@ func WithTickFunc(tick TickFunc) ServiceOption {
 // NewService returns a Service for the given configuration. A nil logger falls back to the
 // process logger, so a caller in a test or an operator running the command needs no logging
 // setup of its own.
+//
+// The per-tick body starts out as the skeleton no-op of §4.1 and is replaced by Run with the real
+// indexer (see Run) unless WithTickFunc supplied one. Keeping NewService side-effect free is what
+// lets a Service that is only probed - a health check, a unit test - answer without a lakeFS.
 func NewService(cfg *Config, log logging.Logger, opts ...ServiceOption) *Service {
 	if log == nil {
 		log = logging.ContextUnavailable()
@@ -84,9 +89,6 @@ func NewService(cfg *Config, log logging.Logger, opts ...ServiceOption) *Service
 	}
 	for _, opt := range opts {
 		opt(s)
-	}
-	if s.tick == nil {
-		s.tick = s.noopTick
 	}
 	return s
 }
@@ -108,12 +110,20 @@ func (s *Service) Addr() string {
 // Run serves /_health, /metrics and /_pprof/ on the configured listen_address and ticks every
 // period until ctx is cancelled, which is how SIGTERM stops the process (§4.1). It returns nil
 // after a graceful stop and an error when the address cannot be bound or the server fails.
+//
+// It is also where the indexer is installed (§4.1): unless a TickFunc was supplied, Run builds the
+// Metadata Search indexer of pkg/mds/indexer from the configuration and ticks it. The build is
+// part of startup, so a configuration the indexer cannot address fails here instead of on the
+// first tick.
 func (s *Service) Run(ctx context.Context) error {
 	if s.cfg == nil {
 		return ErrNotConfigured
 	}
 	if s.cfg.Period <= 0 {
 		return fmt.Errorf("%w: %s.period must be positive, got %s", ErrInvalidConfig, ConfigKey, s.cfg.Period)
+	}
+	if err := s.installIndexer(); err != nil {
+		return err
 	}
 
 	listener, err := net.Listen("tcp", s.cfg.ListenAddress)
@@ -155,6 +165,11 @@ func (s *Service) Run(ctx context.Context) error {
 }
 
 // tickUntilDone runs the period until ctx is cancelled or the HTTP server stops serving.
+//
+// A tick runs in its own goroutine and the loop keeps waiting on the stop signals: a graceful stop
+// must not wait for a tick that is blocked on a slow or unreachable lakeFS. The tick observes the
+// cancellation of ctx, and the position it had reached is a lakeFS commit, so the next process
+// resumes exactly where this one stopped (§4.4).
 func (s *Service) tickUntilDone(ctx context.Context, serveErr <-chan error) error {
 	ticker := time.NewTicker(s.cfg.Period)
 	defer ticker.Stop()
@@ -168,7 +183,21 @@ func (s *Service) tickUntilDone(ctx context.Context, serveErr <-chan error) erro
 			}
 			return fmt.Errorf("mds: serve HTTP: %w", err)
 		case <-ticker.C:
-			s.tickOnce(ctx)
+			tickDone := make(chan struct{})
+			go func() {
+				defer close(tickDone)
+				s.tickOnce(ctx)
+			}()
+			select {
+			case <-tickDone:
+			case <-ctx.Done():
+				return nil
+			case err := <-serveErr:
+				if err == nil || errors.Is(err, http.ErrServerClosed) {
+					return nil
+				}
+				return fmt.Errorf("mds: serve HTTP: %w", err)
+			}
 		}
 	}
 }
@@ -178,7 +207,11 @@ func (s *Service) tickUntilDone(ctx context.Context, serveErr <-chan error) erro
 // reported.
 func (s *Service) tickOnce(ctx context.Context) {
 	start := time.Now()
-	err := s.tick(ctx)
+	tick := s.tick
+	if tick == nil {
+		tick = s.noopTick
+	}
+	err := tick(ctx)
 	s.metrics.TickDuration(time.Since(start))
 	if ctx.Err() != nil {
 		return
@@ -193,12 +226,65 @@ func (s *Service) tickOnce(ctx context.Context) {
 }
 
 // noopTick is the skeleton's per-tick body: it reports every configured repository healthy and
-// does nothing else. It is replaced with WithTickFunc by the wire-up of the indexer.
+// does nothing else. It runs when no TickFunc was supplied and the Service was never Run, which is
+// the state a unit test or a bare health probe is in.
 func (s *Service) noopTick(context.Context) error {
 	for _, repository := range repositoryNames(s.cfg) {
 		s.health.FinishTick(repository, nil)
 	}
 	return nil
+}
+
+// installIndexer replaces the skeleton tick with the Metadata Search indexer of §4.1, unless a
+// TickFunc was supplied. It is called by Run, so the process the command starts always indexes.
+func (s *Service) installIndexer() error {
+	if s.tick != nil {
+		return nil
+	}
+	idx, err := indexer.New(indexerOptions(s.cfg, s.health, s.metrics, s.log))
+	if err != nil {
+		return fmt.Errorf("%w: cannot start the indexer: %w", ErrInvalidConfig, err)
+	}
+	s.tick = idx.Tick
+	return nil
+}
+
+// indexerOptions maps the metadata_search section of §7 onto the indexer's own configuration. The
+// indexer does not import this package, so this is the one place where the two meet.
+func indexerOptions(cfg *Config, health *Health, metrics Recorder, log logging.Logger) indexer.Options {
+	opts := indexer.Options{
+		Endpoint:         cfg.LakeFSMDSEndpoint,
+		AccessKeyID:      cfg.AccessKeyID,
+		SecretKey:        cfg.SecretKey,
+		Storage:          cfg.Storage,
+		Concurrency:      cfg.Concurrency,
+		MaxCommits:       cfg.MaxCommits,
+		Backfill:         cfg.Backfill,
+		SeedLookback:     cfg.SeedLookback,
+		RebuildThreshold: cfg.RebuildThreshold,
+		DeleteBranches:   cfg.DeleteBranches,
+		TagRetention:     cfg.TagRetention,
+		Compaction: indexer.Compaction{
+			MaxDeleteFiles: cfg.Compaction.MaxDeleteFiles,
+			EveryCommits:   cfg.Compaction.EveryCommits,
+		},
+		Health:  health,
+		Metrics: metrics,
+		Log:     log,
+	}
+	if since, ok := cfg.SinceTime(); ok {
+		opts.Since = &since
+	}
+	opts.Repositories = make([]indexer.Repository, 0, len(cfg.Repositories))
+	for _, name := range cfg.RepositoryNames() {
+		repository := cfg.Repositories[name]
+		opts.Repositories = append(opts.Repositories, indexer.Repository{
+			Name:             name,
+			Branches:         append([]string(nil), repository.Branches...),
+			StorageNamespace: repository.StorageNamespace,
+		})
+	}
+	return opts
 }
 
 // handler builds the HTTP surface of §9: the health report, the Prometheus metrics of the
