@@ -132,8 +132,10 @@ const (
 	// mdsIndexerPeriod (2s), so a minute is many periods. The 100k backfill has its own bound.
 	mdsIndexTimeout = 60 * time.Second
 
-	// mdsBackfillIndexTimeout bounds the wait for the 100k-object backfill.
-	mdsBackfillIndexTimeout = 5 * time.Minute
+	// mdsBackfillIndexTimeout bounds the wait for the 100k-object backfill. The first indexing
+	// writes one row per object and reads every object of the branch, so it is bounded at ten
+	// minutes. (The 10k run indexed 2.7s after the indexer started.)
+	mdsBackfillIndexTimeout = 10 * time.Minute
 
 	// mdsBucketOperationTimeout bounds one bulk bucket operation of the backfill setup (writing
 	// the objects, waiting for the import). It is not a poll bound: the work is proportional to
@@ -168,7 +170,20 @@ const (
 	// mdsBackfillObjectsDefault is the size of the backfill commit the plan asks to time.
 	mdsBackfillObjectsDefault = 100_000
 
-	// mdsBackfillConcurrency is how many objects the backfill writes to the bucket at a time.
+	// mdsBackfillSetupEnv selects how the source commit of the backfill is built. It exists so
+	// the two ways can be measured against each other (see buildBackfillCommit); an unset or
+	// unknown value uses the cheap one.
+	mdsBackfillSetupEnv = "ESTI_MDS_BACKFILL_SETUP"
+
+	// mdsBackfillSetupShared imports one source object into count destinations: one object in
+	// the bucket, many entries in the commit. This is the default.
+	mdsBackfillSetupShared = "shared"
+
+	// mdsBackfillSetupPrefix writes count source objects and imports their prefixes. It is kept
+	// for the comparison run only.
+	mdsBackfillSetupPrefix = "prefix"
+
+	// mdsBackfillConcurrency is how many objects the prefix setup writes to the bucket at a time.
 	mdsBackfillConcurrency = 256
 
 	// mdsBackfillParts is the number of source prefixes the backfill is split into. lakeFS walks
@@ -213,7 +228,9 @@ type mdsEnv struct {
 
 	// backfillObjects and backfillPrefix are the keys writeBackfillObjects wrote, known exactly
 	// without listing. deleteRunPrefix removes them directly: on a single-node object store the
-	// listing of a 100k-key prefix costs far more than the deletion itself.
+	// listing of a 100k-key prefix costs far more than the deletion itself. The shared-object
+	// setup leaves them zero: it writes a single source object, which the ordinary listing sweep
+	// removes.
 	backfillObjects int
 	backfillPrefix  string
 
@@ -500,15 +517,16 @@ func TestMetadataSearchBackfill(t *testing.T) {
 	count := mdsBackfillObjectCount()
 	env := newMDSEnv(t)
 
-	// The objects land in the bucket directly, outside any commit, and are then imported into
-	// one commit of R: that is the shape the backfill indexes (one commit, `count` objects).
-	env.writeBackfillObjects(t, count)
-	// Importing a 100k-object prefix is the setup phase that takes longest after the write, so it
-	// is timed too: the reported backfill number below starts when the indexer starts.
-	importStart := time.Now()
-	head := env.importPrefix(t, count)
-	t.Logf("backfill setup: import took %s", time.Since(importStart).Round(time.Millisecond))
-	t.Logf("backfill: imported %d objects into %s@%s", count, env.repo, head)
+	// Build the source commit before the clock starts: the measurement is the indexer's first
+	// indexing of the branch, not the test's ability to create 100k entries. Both setups below
+	// produce exactly that shape (one commit of R with `count` objects); they differ only in how
+	// many bytes the object store has to write.
+	setupStart := time.Now()
+	head := env.buildBackfillCommit(t, count)
+	setup := time.Since(setupStart)
+
+	t.Logf("MDS BACKFILL SETUP: %d objects committed to %s@%s in %s; the indexing clock below starts when the indexer starts",
+		count, env.repo, head, setup.Round(time.Millisecond))
 
 	start := time.Now()
 	env.startIndexer(t)
@@ -1352,6 +1370,50 @@ func mdsBackfillObjectCount() int {
 	return mdsBackfillObjectsDefault
 }
 
+// buildBackfillCommit creates one commit of the branch with count objects and returns its ID.
+// The object store work is what the two setups trade: the shared setup writes one object and
+// repeats it in the commit, the prefix setup writes every object and imports the prefixes.
+//
+// The shared setup is the default because the prefix setup does not fit the test budget at 100k:
+// measured on the local SeaweedFS recipe, its 100k upload alone took 3m23s and the run was killed by
+// the 10m test timeout while the import was still running. The shared setup committed the same
+// 100k objects in 4m26s (26ms for the one source object, the rest the import). The indexer's timed
+// work is the same either way: it reads the commit's entries, never the object payloads.
+func (e *mdsEnv) buildBackfillCommit(t *testing.T, count int) string {
+	t.Helper()
+	setup := os.Getenv(mdsBackfillSetupEnv)
+	if setup == "" {
+		setup = mdsBackfillSetupShared
+	}
+	if setup == mdsBackfillSetupPrefix {
+		e.writeBackfillObjects(t, count)
+		return e.importPrefix(t, count)
+	}
+	source := e.writeBackfillSource(t)
+	return e.importSharedObject(t, count, source)
+}
+
+// writeBackfillSource writes the one object the shared setup imports count times. The indexer
+// never reads object data, only the entries of the commit, so a commit whose paths all point at
+// the same payload is exactly as large as one with count distinct payloads for the backfill. The
+// test names the sharing in its log; the import below is a normal lakeFS import of object paths.
+func (e *mdsEnv) writeBackfillSource(t *testing.T) string {
+	t.Helper()
+	cl := e.s3Client(t)
+	key := e.importSourcePrefix() + "shared/object.txt"
+	content := []byte("metadata search backfill object\n")
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(e.ctx, mdsRequestTimeout)
+	defer cancel()
+	_, err := cl.PutObject(ctx, e.bucket, key, bytes.NewReader(content), int64(len(content)),
+		minio.PutObjectOptions{ContentType: mdsObjectContentType})
+	require.NoErrorf(t, err, "write the backfill source object s3://%s/%s", e.bucket, key)
+	t.Logf("backfill setup: wrote one source object s3://%s/%s in %s", e.bucket, key,
+		time.Since(start).Round(time.Millisecond))
+	return "s3://" + e.bucket + "/" + key
+}
+
 // writeBackfillObjects writes count small objects straight into the bucket below the repository's
 // storage namespace, outside any commit. The import step is what puts them into one commit; writing
 // them through the API instead would make the setup, not the backfill, the subject of the timing.
@@ -1538,13 +1600,25 @@ func (e *mdsEnv) importSourcePrefix() string {
 	return strings.Trim(e.runPrefix, "/") + "/import-source/"
 }
 
-// importPrefix imports one bucket prefix into a branch and waits for the import to complete,
-// returning the commit it created. The commit is a single commit with every imported object, which
-// is the state the first indexing of a branch rebuilds (§4.5 step 2).
-// importPrefix imports the count objects the backfill wrote into one commit of the branch and
-// waits for the import to complete, returning the commit it created. The commit is a single commit
-// with every imported object, which is the state the first indexing of a branch rebuilds (§4.5
-// step 2).
+// importSharedObject imports one source object into count destinations and returns the commit it
+// created. Importing the same object under different paths is a normal lakeFS object import: the
+// commit has count entries, and the indexer reads those entries, not the payload (§4.3, §4.5 step
+// 2). Setup therefore costs one bucket PUT and no per-object bucket write.
+func (e *mdsEnv) importSharedObject(t *testing.T, count int, source string) string {
+	t.Helper()
+	paths := make([]apigen.ImportLocation, count)
+	for i := range count {
+		paths[i] = apigen.ImportLocation{
+			Type:        "object",
+			Path:        source,
+			Destination: "data/" + mdsBackfillKey("", count, i),
+		}
+	}
+	return e.importLocations(t, paths, fmt.Sprintf("%d object paths of %s", count, source))
+}
+
+// importPrefix imports the count objects the prefix setup wrote into one commit of the branch and
+// returns the commit it created.
 //
 // The objects were written into mdsBackfillParts source prefixes, and the import declares one
 // common_prefix per part: lakeFS walks each source prefix on its own, so the walk runs in the
@@ -1562,39 +1636,61 @@ func (e *mdsEnv) importPrefix(t *testing.T, count int) string {
 			Destination: fmt.Sprintf("data/part-%03d/", part),
 		})
 	}
-	started, err := e.admin.ImportStartWithResponse(e.ctx, e.repo, mdsBranch,
+	return e.importLocations(t, paths, fmt.Sprintf("%d source prefixes below %s", parts, firstSource))
+}
+
+// importLocations starts one import, waits for it to complete and returns its commit. Every wait
+// is bounded by mdsBucketOperationTimeout; a timeout reports the server log tail.
+func (e *mdsEnv) importLocations(t *testing.T, paths []apigen.ImportLocation, description string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(e.ctx, mdsBucketOperationTimeout)
+	defer cancel()
+
+	start := time.Now()
+	started, err := e.admin.ImportStartWithResponse(ctx, e.repo, mdsBranch,
 		apigen.ImportStartJSONRequestBody{
 			Paths:  paths,
-			Commit: apigen.CommitCreation{Message: fmt.Sprintf("mds test: import %d objects", count)},
+			Commit: apigen.CommitCreation{Message: fmt.Sprintf("mds test: import %s", description)},
 		})
-	require.NoErrorf(t, err, "start the import of %d source prefixes below %s", parts, firstSource)
+	if err != nil {
+		t.Fatalf("start the import of %s: %v\nserver log tail:\n%s",
+			description, err, mdsLogTail(e.logPath, mdsLogTailLines))
+	}
 	require.Equalf(t, http.StatusAccepted, started.StatusCode(),
-		"start the import of %d source prefixes below %s: %s", parts, firstSource, started.Body)
-	require.NotNilf(t, started.JSON202, "start the import of %d source prefixes below %s: %s",
-		parts, firstSource, started.Body)
+		"start the import of %s: %s\nserver log tail:\n%s",
+		description, started.Body, mdsLogTail(e.logPath, mdsLogTailLines))
+	require.NotNilf(t, started.JSON202, "start the import of %s: %s", description, started.Body)
 
 	id := started.JSON202.Id
-	deadline := time.Now().Add(mdsBucketOperationTimeout)
 	for {
 		e.exitedWhileRunning(t, e.server, "waiting for the import to complete")
-		status, err := e.admin.ImportStatusWithResponse(e.ctx, e.repo, mdsBranch,
+		status, err := e.admin.ImportStatusWithResponse(ctx, e.repo, mdsBranch,
 			&apigen.ImportStatusParams{Id: id})
-		require.NoErrorf(t, err, "import status %s", id)
-		require.Equalf(t, http.StatusOK, status.StatusCode(), "import status %s: %s", id, status.Body)
+		if err != nil {
+			t.Fatalf("import status %s: %v\nserver log tail:\n%s",
+				id, err, mdsLogTail(e.logPath, mdsLogTailLines))
+		}
+		require.Equalf(t, http.StatusOK, status.StatusCode(),
+			"import status %s: %s\nserver log tail:\n%s",
+			id, status.Body, mdsLogTail(e.logPath, mdsLogTailLines))
 		require.NotNilf(t, status.JSON200, "import status %s: %s", id, status.Body)
 		if status.JSON200.Error != nil {
-			t.Fatalf("import %s failed: %+v", id, status.JSON200.Error)
+			t.Fatalf("import %s failed: %+v\nserver log tail:\n%s",
+				id, status.JSON200.Error, mdsLogTail(e.logPath, mdsLogTailLines))
 		}
 		if status.JSON200.Completed {
 			require.NotNilf(t, status.JSON200.Commit, "import %s completed without a commit", id)
-			t.Logf("backfill setup: imported %d source prefixes below %s into %s@%s",
-				parts, firstSource, e.repo, status.JSON200.Commit.Id)
+			t.Logf("backfill setup: imported %s into %s@%s in %s",
+				description, e.repo, status.JSON200.Commit.Id, time.Since(start).Round(time.Millisecond))
 			return status.JSON200.Commit.Id
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("import %s did not complete within %s", id, mdsBucketOperationTimeout)
+		select {
+		case <-ctx.Done():
+			t.Fatalf("import %s (%s) did not complete within %s: %v\nserver log tail:\n%s",
+				id, description, mdsBucketOperationTimeout, ctx.Err(),
+				mdsLogTail(e.logPath, mdsLogTailLines))
+		case <-time.After(mdsPollInterval):
 		}
-		time.Sleep(mdsPollInterval)
 	}
 }
 
