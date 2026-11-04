@@ -1,0 +1,166 @@
+package table
+
+import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"maps"
+	"net/url"
+	"strings"
+
+	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/catalog/rest"
+	icebergtable "github.com/apache/iceberg-go/table"
+
+	// Blank import: the indexer writes its Parquet, Avro and metadata files through iceberg-go's
+	// IO, and S3 is the backend design §4.6 describes: with vended credentials the catalog hands
+	// the client a session, and without them metadata_search.storage supplies static keys. The
+	// import registers the s3, s3a and s3n schemes in iceberg-go's IO registry; the file and local
+	// schemes are registered by iceberg-go itself and the local block adapter is not part of a
+	// supported Metadata Search deployment (design §4.6: S3, with Azure/GCS out of scope).
+	_ "github.com/apache/iceberg-go/io/gocloud/s3"
+)
+
+const (
+	// CatalogName labels the client side of the catalog. iceberg-go looks its own configuration
+	// file up by catalog name; the name is not part of the address.
+	CatalogName = "lakefs-mds"
+
+	// RelativeToPath is the addressing form the indexer uses (design §4.3 step 3):
+	//
+	//	<lakefs_mds_endpoint>/iceberg/relative_to/<R-metadata>.<branch>/api
+	//
+	// It fixes the repository and the branch in the URL, so the table identifier the writer sends
+	// is the plain <namespace>.<table> of §3.1 rather than an address.
+	RelativeToPath = "/iceberg/relative_to"
+)
+
+// The errors of this package's entry points. They are static so that a caller can match them with
+// errors.Is, and so that a message is never built from a value the caller cannot see.
+var (
+	// ErrInvalidCatalogConfig is wrapped by every validation error of CatalogConfig.
+	ErrInvalidCatalogConfig = errors.New("invalid metadata search catalog configuration")
+
+	// ErrNoCatalog is returned by CreateTable without a catalog: a table cannot be created through
+	// a client that does not exist, and a nil dereference would be the alternative.
+	ErrNoCatalog = errors.New("no catalog")
+)
+
+// CatalogConfig is what the indexer needs to reach the Iceberg REST catalog of one branch of a
+// companion repository (design §4.3 step 3, §4.6).
+type CatalogConfig struct {
+	// Endpoint is the lakeFS base URL (metadata_search.lakefs_mds_endpoint), e.g.
+	// http://lakefs:8000. The API and the catalog both live under it.
+	Endpoint string
+	// Repository is the companion repository R-metadata (§3.3), not the data repository.
+	Repository string
+	// Branch is the branch of R-metadata the writes land on: the branch of the data repository
+	// that is being indexed (§3.3, §4.2).
+	Branch string
+	// AccessKeyID and SecretAccessKey are the credentials of the indexer principal. They are sent
+	// as HTTP basic authentication, which the catalog accepts on every route (design §5,
+	// pkg/icebergcatalog/auth.go), so no OAuth round trip is needed.
+	AccessKeyID     string
+	SecretAccessKey string
+	// Storage is passed to iceberg-go with rest.WithAdditionalProps (§4.6): the IO properties
+	// (s3.endpoint, s3.region, s3.access-key-id, s3.secret-access-key, s3.path-style-access) used
+	// when the catalog does not vend write credentials. Empty means "the catalog vends, or the
+	// client's own environment is enough".
+	Storage iceberg.Properties
+}
+
+// Validate reports whether the configuration can address a catalog.
+func (c CatalogConfig) Validate() error {
+	switch {
+	case strings.TrimSpace(c.Endpoint) == "":
+		return fmt.Errorf("%w: no endpoint", ErrInvalidCatalogConfig)
+	case strings.TrimSpace(c.Repository) == "":
+		return fmt.Errorf("%w: no repository", ErrInvalidCatalogConfig)
+	case strings.TrimSpace(c.Branch) == "":
+		return fmt.Errorf("%w: no branch", ErrInvalidCatalogConfig)
+	case c.AccessKeyID == "" || c.SecretAccessKey == "":
+		return fmt.Errorf("%w: no credentials", ErrInvalidCatalogConfig)
+	}
+	return nil
+}
+
+// URI returns the catalog URI of the configured branch: the relative_to form of design §4.3 step
+// 3, <endpoint>/iceberg/relative_to/<repository>.<branch>/api.
+//
+// The warehouse segment is one URL path segment and a lakeFS branch name may contain "/", so the
+// segment is percent-escaped once; the catalog decodes it before splitting the repository from
+// the ref (pkg/icebergcatalog/ident.go ParseWarehouse).
+func (c CatalogConfig) URI() (string, error) {
+	if err := c.Validate(); err != nil {
+		return "", err
+	}
+	endpoint, err := url.Parse(strings.TrimSpace(c.Endpoint))
+	if err != nil {
+		return "", fmt.Errorf("%w: endpoint %q: %w", ErrInvalidCatalogConfig, c.Endpoint, err)
+	}
+	if endpoint.Scheme == "" || endpoint.Host == "" {
+		return "", fmt.Errorf("%w: endpoint %q is not an absolute URL", ErrInvalidCatalogConfig, c.Endpoint)
+	}
+	warehouse := url.PathEscape(strings.TrimSpace(c.Repository) + "." + strings.TrimSpace(c.Branch))
+	return strings.TrimRight(strings.TrimSpace(c.Endpoint), "/") + RelativeToPath + "/" + warehouse + "/api", nil
+}
+
+// Authorization returns the HTTP basic Authorization header value of the configured credentials.
+func (c CatalogConfig) Authorization() string {
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(c.AccessKeyID+":"+c.SecretAccessKey))
+}
+
+// NewCatalog builds the iceberg-go REST client for one branch of a companion repository (design
+// §4.3 step 3, §4.6): rest.NewCatalog over the relative_to URI, HTTP basic credentials and the
+// static IO properties of metadata_search.storage.
+//
+// The two options are the ones design §4.6 names. rest.WithHeaders carries the basic credentials
+// on every request, including the GET /v1/config the client starts with. rest.WithAdditionalProps
+// carries the storage properties into the table's IO, which is what lets the transaction write
+// Parquet, Avro and metadata files when the catalog does not vend credentials - iceberg-go does
+// not implement S3 remote signing.
+//
+// The caller owns the returned catalog and should Close it.
+func NewCatalog(ctx context.Context, cfg CatalogConfig) (*rest.Catalog, error) {
+	uri, err := cfg.URI()
+	if err != nil {
+		return nil, err
+	}
+	return rest.NewCatalog(ctx, CatalogName, uri,
+		rest.WithHeaders(map[string]string{"Authorization": cfg.Authorization()}),
+		rest.WithAdditionalProps(cfg.Storage),
+	)
+}
+
+// Identifier returns the identifier of system.object_metadata (§3.1).
+func Identifier() icebergtable.Identifier {
+	return catalog.ToIdentifier(Namespace, Name)
+}
+
+// CreateTable creates system.object_metadata in the catalog's current repository and branch with
+// the fixed schema, sort order and properties of §3.1 (design §4.8: an indexer initialises the
+// table when a repository is added to its configuration).
+//
+// extra properties are merged over the defaults of Properties, so a caller can add properties but
+// cannot accidentally drop the merge-on-read modes: they are written last.
+func CreateTable(ctx context.Context, cat catalog.Catalog, repository string, extra iceberg.Properties) (*icebergtable.Table, error) {
+	if cat == nil {
+		return nil, ErrNoCatalog
+	}
+	order, err := SortOrder()
+	if err != nil {
+		return nil, err
+	}
+	props := iceberg.Properties{}
+	maps.Copy(props, extra)
+	// The fixed properties of §3.1 are written last: a caller extends the table, it does not get
+	// to turn the merge-on-read delete mode off by accident.
+	maps.Copy(props, Properties(repository))
+
+	return cat.CreateTable(ctx, Identifier(), Schema(),
+		catalog.WithProperties(props),
+		catalog.WithSortOrder(order),
+	)
+}

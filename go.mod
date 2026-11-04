@@ -69,6 +69,7 @@ require (
 	github.com/Shopify/go-lua v0.0.0-20221004153744-91867de107cf
 	github.com/alitto/pond/v2 v2.5.0
 	github.com/antonmedv/expr v1.15.3
+	github.com/apache/arrow-go/v18 v18.8.0
 	github.com/apache/iceberg-go v0.7.0
 	github.com/aws/aws-sdk-go-v2 v1.45.1
 	github.com/aws/aws-sdk-go-v2/config v1.33.1
@@ -100,6 +101,7 @@ require (
 	github.com/minio/crc64nvme v1.1.1
 	github.com/puzpuzpuz/xsync v1.5.2
 	github.com/tilinna/z85 v1.0.0
+	github.com/twmb/avro v1.8.0
 	go.uber.org/ratelimit v0.3.0
 	gocloud.dev v0.46.0
 )
@@ -148,7 +150,6 @@ require (
 	github.com/alingse/nilnesserr v0.2.0 // indirect
 	github.com/andybalholm/brotli v1.2.3 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
-	github.com/apache/arrow-go/v18 v18.8.0 // indirect
 	github.com/apache/arrow/go/arrow v0.0.0-20200730104253-651201b0f516 // indirect
 	github.com/ashanbrown/forbidigo/v2 v2.3.0 // indirect
 	github.com/ashanbrown/makezero/v2 v2.1.0 // indirect
@@ -352,7 +353,6 @@ require (
 	github.com/timonwong/loggercheck v0.11.0 // indirect
 	github.com/tomarrell/wrapcheck/v2 v2.12.0 // indirect
 	github.com/tommy-muehle/go-mnd/v2 v2.5.1 // indirect
-	github.com/twmb/avro v1.8.0 // indirect
 	github.com/twmb/murmur3 v1.1.8 // indirect
 	github.com/twpayne/go-geom v1.6.1 // indirect
 	github.com/ultraware/funlen v0.2.0 // indirect
