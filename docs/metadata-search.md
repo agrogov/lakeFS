@@ -417,34 +417,52 @@ For `/mds/iceberg/api`, the OAuth token URI is
 ### Spark
 
 PySpark with the Iceberg Spark runtime. The catalog name (`lakefs`) is arbitrary; the URI must not
-include `/v1`.
+include `/v1`. The S3 FileIO properties are only needed when the catalog does not vend
+credentials; omit them when it does.
 
 `/mds/iceberg/api`:
 
 ```properties
+spark.sql.defaultCatalog=lakefs
+spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
 spark.sql.catalog.lakefs=org.apache.iceberg.spark.SparkCatalog
 spark.sql.catalog.lakefs.type=rest
 spark.sql.catalog.lakefs.uri=http://lakefs:8000/mds/iceberg/api
 spark.sql.catalog.lakefs.rest.auth.type=basic
 spark.sql.catalog.lakefs.credential=<access_key_id>:<secret_access_key>
 spark.sql.catalog.lakefs.warehouse=s3://my-bucket
+# When the catalog does not vend credentials, the Iceberg S3FileIO reads the data files:
+spark.sql.catalog.lakefs.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+spark.sql.catalog.lakefs.s3.endpoint=http://seaweedfs:8333
+spark.sql.catalog.lakefs.s3.path-style-access=true
+spark.sql.catalog.lakefs.s3.access-key-id=<key>
+spark.sql.catalog.lakefs.s3.secret-access-key=<secret>
+spark.sql.catalog.lakefs.client.region=us-east-1
 ```
 
 ```sql
 SELECT path, size_bytes, commit_id, user_metadata
-FROM lakefs.`my-repo.main.system`.object_metadata
+FROM lakefs.`my-repo`.`main`.`system`.object_metadata
 WHERE path LIKE 'orders/%';
 ```
 
 `/iceberg/relative_to`:
 
 ```properties
+spark.sql.defaultCatalog=lakefs
+spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
 spark.sql.catalog.lakefs=org.apache.iceberg.spark.SparkCatalog
 spark.sql.catalog.lakefs.type=rest
 spark.sql.catalog.lakefs.uri=http://lakefs:8000/iceberg/relative_to/my-repo.main/api
 spark.sql.catalog.lakefs.rest.auth.type=basic
 spark.sql.catalog.lakefs.credential=<access_key_id>:<secret_access_key>
 spark.sql.catalog.lakefs.warehouse=s3://my-bucket
+spark.sql.catalog.lakefs.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+spark.sql.catalog.lakefs.s3.endpoint=http://seaweedfs:8333
+spark.sql.catalog.lakefs.s3.path-style-access=true
+spark.sql.catalog.lakefs.s3.access-key-id=<key>
+spark.sql.catalog.lakefs.s3.secret-access-key=<secret>
+spark.sql.catalog.lakefs.client.region=us-east-1
 ```
 
 ```sql
@@ -453,15 +471,23 @@ FROM lakefs.system.object_metadata
 WHERE path LIKE 'orders/%';
 ```
 
-The namespace is quoted because it contains dots: in the identifier form the schema is
-`my-repo.main.system`, not `system`.
+There are three namespace levels in the identifier form (`my-repo`, `main`, `system`), so quote
+each level separately, as above. Writing the whole dotted namespace as one backquoted token makes
+it one namespace level, and the catalog rejects it with
+`namespace "my-repo.main.system" must start with a repository and a ref`.
+
+Iceberg 1.8 takes the AWS region from `client.region`; older Spark runtimes take it from
+`s3.region` (or from `AWS_REGION`). Set the key the runtime you use reads.
 
 ### Trino
 
-Trino's Iceberg connector speaks the same REST protocol. Use
-`iceberg.rest-catalog.security=BASIC` with the key pair of a principal that may read `my-repo`;
-`vended-credentials-enabled=false` makes Trino use its own S3 credentials, which is the supported
-mode unless the catalog vends.
+Trino's Iceberg connector speaks the same REST protocol. The snippets below are for Trino 484 and
+later, where the REST catalog security is `OAUTH2`: Trino exchanges the key pair at the catalog's
+OAuth2 token endpoint, and `vended-credentials-enabled=false` makes it use its own S3 credentials,
+which is the supported mode unless the catalog vends. For Trino before 484, use
+`iceberg.rest-catalog.security=BASIC` with `iceberg.rest-catalog.user` and
+`iceberg.rest-catalog.password` instead of the three `oauth2.*` keys, and
+`fs.native-s3.enabled=true` instead of `fs.s3.enabled=true`.
 
 `/mds/iceberg/api`:
 
@@ -469,10 +495,18 @@ mode unless the catalog vends.
 connector.name=iceberg
 iceberg.catalog.type=rest
 iceberg.rest-catalog.uri=http://lakefs:8000/mds/iceberg/api
-iceberg.rest-catalog.security=BASIC
-iceberg.rest-catalog.user=<access_key_id>
-iceberg.rest-catalog.password=<secret_access_key>
+iceberg.rest-catalog.security=OAUTH2
+iceberg.rest-catalog.oauth2.credential=<access_key_id>:<secret_access_key>
+iceberg.rest-catalog.oauth2.server-uri=http://lakefs:8000/mds/iceberg/api/v1/oauth/tokens
 iceberg.rest-catalog.vended-credentials-enabled=false
+iceberg.rest-catalog.nested-namespace-enabled=true
+# Trino reads the files with its own S3 client when the catalog does not vend credentials:
+fs.s3.enabled=true
+s3.endpoint=http://seaweedfs:8333
+s3.region=us-east-1
+s3.aws-access-key=<key>
+s3.aws-secret-key=<secret>
+s3.path-style-access=true
 ```
 
 ```sql
@@ -487,10 +521,16 @@ WHERE path LIKE 'orders/%';
 connector.name=iceberg
 iceberg.catalog.type=rest
 iceberg.rest-catalog.uri=http://lakefs:8000/iceberg/relative_to/my-repo.main/api
-iceberg.rest-catalog.security=BASIC
-iceberg.rest-catalog.user=<access_key_id>
-iceberg.rest-catalog.password=<secret_access_key>
+iceberg.rest-catalog.security=OAUTH2
+iceberg.rest-catalog.oauth2.credential=<access_key_id>:<secret_access_key>
+iceberg.rest-catalog.oauth2.server-uri=http://lakefs:8000/iceberg/api/v1/oauth/tokens
 iceberg.rest-catalog.vended-credentials-enabled=false
+fs.s3.enabled=true
+s3.endpoint=http://seaweedfs:8333
+s3.region=us-east-1
+s3.aws-access-key=<key>
+s3.aws-secret-key=<secret>
+s3.path-style-access=true
 ```
 
 ```sql
@@ -504,9 +544,17 @@ WHERE path LIKE 'orders/%';
 The end-to-end suite [`../esti/mds_test.go`](../esti/mds_test.go) runs the PyIceberg and DuckDB
 snippets above against a real `lakefs-sso` and a real indexer on SeaweedFS: PyIceberg through
 `/mds/iceberg/api` and DuckDB through `/iceberg/relative_to`, including tags, short commit IDs, a
-hard reset and an indexer restart. The Spark and Trino snippets use the same catalog, the same two
-endpoints and the same identifiers, but are not run by the esti suite: treat them as untested
-recipes, and report a divergence rather than working around it.
+hard reset and an indexer restart.
+
+The Spark and Trino snippets are not part of the esti suite; they were run separately against the
+same local recipe (a `lakefs-sso` with both switches on, an indexer with `period: 2s`, and the
+SeaweedFS of `esti/ops/docker-compose-mds.yaml`) with the runnable scripts in
+[`../esti/ops/mds-engines/`](../esti/ops/mds-engines/): Spark 3.5.5 with Iceberg 1.8.1
+(`tabulario/spark-iceberg@sha256:790a72e744e0d09f161e1b4c7c2f79625cc598cf0476da4703e62f1f4e023460`)
+and Trino 484 (`trinodb/trino@sha256:2704eb53935af5e582d63d6033e9bf99d20c325e9b0e30b1016ef59a4773979f`).
+Both `/mds/iceberg/api` and `/iceberg/relative_to` returned the same three rows for the same
+objects, with the same `commit_id`. The scripts' README records the exact commands and the
+environment they expect.
 
 ## Columns and semantics
 
@@ -591,7 +639,7 @@ print(indexed)
 With Spark:
 
 ```sql
-SHOW TBLPROPERTIES lakefs.`my-repo.main.system`.object_metadata;
+SHOW TBLPROPERTIES lakefs.`my-repo`.`main`.`system`.object_metadata;
 ```
 
 Compare it with the head of the branch in lakeFS:
