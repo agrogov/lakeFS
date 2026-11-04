@@ -37,6 +37,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/kv/kvparams"
 	logging "github.com/treeverse/lakefs/pkg/logging"
+	"github.com/treeverse/lakefs/pkg/mds/refmap"
 	"github.com/treeverse/lakefs/pkg/sso"
 )
 
@@ -71,6 +72,11 @@ func main() {
 	lakefsCmd.AddExtraRoutesBuilder(func(ctx context.Context, deps lakefsCmd.ServerDeps, _ *chi.Mux) error {
 		return icebergcatalog.Bootstrap(ctx, deps, guardGroups())
 	})
+
+	// Map the refs of a data repository to the companion repository's refs, so a tag or a commit read
+	// through the virtual table resolves to the snapshot the indexer recorded for it
+	// (METADATA_SEARCH_DESIGN.md §6).
+	icebergcatalog.MetadataSearchRefMapper = refmap.New
 
 	lakefsCmd.Execute()
 }
