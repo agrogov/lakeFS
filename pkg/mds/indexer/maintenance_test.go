@@ -1,13 +1,16 @@
 package indexer_test
 
-// maintenance_test.go covers design §4.9: compaction by delete files and by the commit counter, the
-// lakeFS commit it leaves behind (without a new tag), and tag retention.
+// maintenance_test.go covers design §4.9: compaction by delete files and by the indexed commits
+// since the last compaction, the lakeFS commit it leaves behind (without a new tag), and tag
+// retention. The every_commits count is durable state, so the tests here also restart the indexer
+// over the same lakeFS and expect the same commit to trigger it.
 
 import (
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/mds/client"
 	"github.com/treeverse/lakefs/pkg/mds/indexer"
 )
@@ -69,7 +72,7 @@ func TestCompactionEveryCommits(t *testing.T) {
 	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, nil)
 	e.fake.setDiff("repo", "s2", "s3", []client.Change{added("c", 30)})
 	e.tick()
-	require.Equal(t, 1, e.fake.compactCalls, "the counter restarts after a compaction")
+	require.Equal(t, 1, e.fake.compactCalls, "the count restarts at the compaction commit")
 
 	e.fake.addCommit("repo", "main", "s4", []string{"s3"}, nil)
 	e.fake.setDiff("repo", "s3", "s4", []client.Change{added("d", 40)})
@@ -78,6 +81,91 @@ func TestCompactionEveryCommits(t *testing.T) {
 
 	state, _ := e.fake.tableState("main")
 	require.Equal(t, []string{"a", "b", "c", "d"}, state.paths())
+}
+
+// TestCompactionEveryCommitsSurvivesRestart pins that the every_commits count is durable state and
+// not a tally of the process: a fresh indexer over the same lakeFS keeps counting the commits the
+// previous process indexed, so it compacts at the commit that reaches every_commits and not
+// every_commits commits later.
+func TestCompactionEveryCommitsSurvivesRestart(t *testing.T) {
+	configure := func(opts *indexer.Options) {
+		opts.Compaction = indexer.Compaction{MaxDeleteFiles: 1000, EveryCommits: 3}
+	}
+	e := newEnv(t, configure)
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.tick()
+	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
+	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.tick()
+	require.Zero(t, e.fake.compactCalls, "two of three indexed commits are below every_commits")
+
+	// A restart is a new indexer over the same lakeFS: the two commits the previous process indexed
+	// have to come back from R-metadata, which is what the count is read from.
+	restarted := restart(t, e, configure)
+	require.NoError(t, restarted.Tick(t.Context()))
+	require.Zero(t, e.fake.compactCalls, "a restart does not count more commits than were indexed")
+
+	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, nil)
+	e.fake.setDiff("repo", "s2", "s3", []client.Change{added("c", 30)})
+	require.NoError(t, restarted.Tick(t.Context()))
+
+	require.Equal(t, 1, e.fake.compactCalls, "the third indexed commit triggers it, restart or not")
+	made := e.fake.madeCommits()
+	require.Equal(t, "mds: compact repo@s3", made[len(made)-1].Message,
+		"the compaction happens at the commit that reached every_commits")
+	state, _ := e.fake.tableState("main")
+	require.Equal(t, []string{"a", "b", "c"}, state.paths(), "compaction keeps the rows")
+	require.Equal(t, "s3", state.sourceCommit, "and the position")
+	require.Zero(t, state.deleteFiles)
+
+	// The compaction commit is where the durable count restarts, so neither the next tick nor one
+	// commit after it triggers a second compaction.
+	require.NoError(t, restarted.Tick(t.Context()))
+	require.Equal(t, 1, e.fake.compactCalls, "a compacted branch is quiet until every_commits again")
+	e.fake.addCommit("repo", "main", "s4", []string{"s3"}, nil)
+	e.fake.setDiff("repo", "s3", "s4", []client.Change{added("d", 40)})
+	require.NoError(t, restarted.Tick(t.Context()))
+	require.Equal(t, 1, e.fake.compactCalls, "one indexed commit after the compaction is below it")
+}
+
+// TestCompactionEveryCommitsPagesTheLog pins that the count reads the commit log in pages: three
+// indexed commits do not fit in a page of one.
+func TestCompactionEveryCommitsPagesTheLog(t *testing.T) {
+	e := newEnv(t, func(opts *indexer.Options) {
+		opts.Compaction = indexer.Compaction{MaxDeleteFiles: 1000, EveryCommits: 3}
+	})
+	e.fake.pageSize = 1
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.tick()
+	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
+	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.tick()
+	require.Zero(t, e.fake.compactCalls)
+
+	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, nil)
+	e.fake.setDiff("repo", "s2", "s3", []client.Change{added("c", 30)})
+	e.tick()
+	require.Equal(t, 1, e.fake.compactCalls, "the count crosses the page boundaries")
+}
+
+// restart builds a second indexer over the same fake lakeFS with the same options: what a process
+// restart looks like to §4.9, where no tally of the previous process is left.
+func restart(t *testing.T, e *env, configure ...func(*indexer.Options)) *indexer.Indexer {
+	t.Helper()
+	opts := indexer.Options{
+		LakeFS:       e.fake,
+		Tables:       e.fake,
+		Repositories: []indexer.Repository{{Name: "repo", Branches: []string{"main"}}},
+		Health:       e.health,
+		Metrics:      e.metrics,
+		Log:          logging.ContextUnavailable(),
+	}
+	for _, apply := range configure {
+		apply(&opts)
+	}
+	idx, err := indexer.New(opts)
+	require.NoError(t, err)
+	return idx
 }
 
 // TestTagRetention pins §4.9's tag_retention: mds-* tags whose source commit is older than the

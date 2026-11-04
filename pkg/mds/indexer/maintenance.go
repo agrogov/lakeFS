@@ -20,13 +20,28 @@ import (
 	"github.com/treeverse/lakefs/pkg/mds/client"
 )
 
+// compactMessagePrefix and indexMessagePrefix tell the two kinds of commit of R-metadata apart
+// when the every_commits count is read back from its log: a compaction commit is "mds: compact
+// <R>@<C>" (§4.9) and an indexing commit is "mds: index <R>@<C>" (§4.3 step 4), which are
+// CompactCommitMessage and IndexCommitMessage without their operands.
+const (
+	compactMessagePrefix = "mds: compact "
+	indexMessagePrefix   = "mds: index "
+)
+
 // compactIfNeeded rewrites the branch's table when §4.9's thresholds are crossed: more than
 // compaction.max_delete_files delete files, or compaction.every_commits indexed commits since the
 // last compaction.
 //
-// The commit count is kept in memory, so a restart can defer a compaction by up to every_commits
-// commits; the delete-file trigger is read from the table and is unaffected. Compaction itself is
-// not part of the count: a rewrite adds a snapshot but no indexed commit.
+// Neither trigger is process state, so a restart neither defers nor advances a compaction: the
+// delete files are on the summary of the current snapshot, and the commits are counted from the
+// commit log of R-metadata@b, the durable record of both the indexed commits and the compactions
+// (indexedSinceCompaction). Compaction itself is not part of the count: a rewrite adds a snapshot
+// but no indexed commit, which is what makes the compaction commit the place the count restarts.
+//
+// The delete-file trigger is checked first because it is free - it reads a number the loaded table
+// already carries - so a branch that is compacting for deletes does not pay a log read for the
+// commit count as well (the count is then reported as 0 in the log line).
 //
 // The compaction keeps the position: the rows are the same and the lakefs.mds.source-commit stays
 // the commit the table already records, so the lakeFS commit it produces carries no new tag - the
@@ -37,11 +52,17 @@ func (x *Indexer) compactIfNeeded(ctx context.Context, repository, branch string
 	}
 	deleteFiles := tbl.DeleteFiles()
 	snapshots := tbl.SnapshotCount()
-	indexed := x.maintenanceCommits(repository, branch)
-	switch {
-	case x.compaction.MaxDeleteFiles > 0 && deleteFiles > x.compaction.MaxDeleteFiles:
-	case x.compaction.EveryCommits > 0 && indexed >= x.compaction.EveryCommits:
-	default:
+	due := x.compaction.MaxDeleteFiles > 0 && deleteFiles > x.compaction.MaxDeleteFiles
+	indexed := 0
+	if !due && x.compaction.EveryCommits > 0 {
+		var err error
+		indexed, err = x.indexedSinceCompaction(ctx, repository, branch)
+		if err != nil {
+			return err
+		}
+		due = indexed >= x.compaction.EveryCommits
+	}
+	if !due {
 		return nil
 	}
 
@@ -56,7 +77,6 @@ func (x *Indexer) compactIfNeeded(ctx context.Context, repository, branch string
 	}); err != nil {
 		return fmt.Errorf("commit the compaction of %q@%s: %w", metadata, branch, err)
 	}
-	x.setMaintenanceCommits(repository, branch, 0)
 	x.metrics.Compaction()
 	x.log.WithFields(logging.Fields{
 		"repository":    repository,
@@ -69,27 +89,62 @@ func (x *Indexer) compactIfNeeded(ctx context.Context, repository, branch string
 	return nil
 }
 
-// maintenanceCommits returns how many indexed commits a branch has received since its last
-// compaction.
-func (x *Indexer) maintenanceCommits(repository, branch string) int {
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	return x.maintenance[repository+"@"+branch]
+// indexedSinceCompaction returns how many commits of R the branch has indexed since its last
+// compaction (§4.9). The count is derived from durable state - the first-parent log of
+// R-metadata@b - and not from a tally this process keeps: the log is what a restarted indexer
+// reads, so a restart, or a second replica, counts the same commits and reaches every_commits at
+// the same commit of R. A compaction commit repeats the source commit of the index commit it
+// follows, and is what the walk stops at; an interrupted tick leaves no log entry, so it cannot
+// lose or gain a count.
+//
+// The walk stops at the first compaction commit, after every_commits indexing commits, or at the
+// start of the history - whichever comes first - because the caller only compares the result with
+// every_commits. One page of the log (client.DefaultPageSize) therefore covers the default
+// configuration in a single request.
+func (x *Indexer) indexedSinceCompaction(ctx context.Context, repository, branch string) (int, error) {
+	metadata := metadataRepository(repository)
+	limit := x.compaction.EveryCommits
+	indexed := 0
+	after := ""
+	for indexed < limit {
+		commits, hasMore, err := x.lakeFS.LogCommits(ctx, metadata, branch, client.LogCommitsOptions{
+			FirstParent: true,
+			After:       after,
+		})
+		if err != nil {
+			return 0, fmt.Errorf("log commits of %q@%s for the compaction count: %w", metadata, branch, err)
+		}
+		for _, commit := range commits {
+			switch {
+			case strings.HasPrefix(commit.Message, compactMessagePrefix):
+				return indexed, nil
+			case strings.HasPrefix(commit.Message, indexMessagePrefix):
+				indexed++
+			}
+			if indexed >= limit {
+				return indexed, nil
+			}
+		}
+		if !hasMore || len(commits) == 0 {
+			return indexed, nil
+		}
+		after = lastNameOf(len(commits), func(i int) string { return commits[i].ID })
+		if after == "" {
+			return 0, fmt.Errorf("%w: log commits of %q@%s: more results without a cursor",
+				client.ErrBadPagination, metadata, branch)
+		}
+	}
+	return indexed, nil
 }
 
-// addMaintenanceCommit counts one indexed commit towards the every_commits trigger of §4.9.
+// addMaintenanceCommit is the branch tick's report that one commit of R was just indexed (§4.3
+// step 4). §4.9's every_commits trigger no longer counts these in memory: it reads them back from
+// the commit log (indexedSinceCompaction), which is what makes the count survive a restart. The
+// tally is therefore write-only and the call site in the branch tick is what removes it.
 func (x *Indexer) addMaintenanceCommit(repository, branch string) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	key := repository + "@" + branch
-	x.maintenance[key]++
-}
-
-// setMaintenanceCommits resets the commit counter of a branch after a compaction.
-func (x *Indexer) setMaintenanceCommits(repository, branch string, value int) {
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	x.maintenance[repository+"@"+branch] = value
+	x.maintenance[repository+"@"+branch]++
 }
 
 // retireTags deletes the mds-* tags of R-metadata whose source commit is older than tag_retention
