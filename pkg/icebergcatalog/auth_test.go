@@ -17,6 +17,9 @@ import (
 	"github.com/stretchr/testify/require"
 	cmdpkg "github.com/treeverse/lakefs/cmd/lakefs/cmd"
 	"github.com/treeverse/lakefs/pkg/auth"
+	"github.com/treeverse/lakefs/pkg/auth/model"
+	oidcencoding "github.com/treeverse/lakefs/pkg/auth/oidc/encoding"
+	"github.com/treeverse/lakefs/pkg/config"
 )
 
 // authTestRouter is the production stack of http.go - newRouter over newServer, with the
@@ -592,6 +595,82 @@ func TestAuthBearerAndBasicAreUnchangedByTheUIManagementRule(t *testing.T) {
 		req.Header.Set(uiClientHeader, uiClientPrefix+"/1.2.3")
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, req)
+		requireUnauthorized(t, rec)
+	})
+}
+
+// ssoSessionCookie builds the session cookie an SSO login leaves in the browser: pkg/sso's
+// OauthCallback stores the verified ID-token claims under auth.IDTokenClaimsSessionKey in
+// oidc_auth_session (saml_auth_session for SAML, under auth.SAMLTokenClaimsSessionKey) and sets
+// no internal_auth_session.
+func ssoSessionCookie(t *testing.T, deps cmdpkg.ServerDeps, name, key string, claims oidcencoding.Claims) *http.Cookie {
+	t.Helper()
+	store := sessions.NewCookieStore(deps.AuthService.SecretStore().SharedSecret())
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	session, err := store.New(req, name)
+	require.NoError(t, err)
+	session.Values[key] = claims
+	rec := httptest.NewRecorder()
+	require.NoError(t, session.Save(req, rec))
+	cookies := rec.Result().Cookies()
+	require.Len(t, cookies, 1, "the session store wrote exactly one cookie")
+	return cookies[0]
+}
+
+// TestAuthAcceptsSSOSessionCookie: a user signed in through SSO holds oidc_auth_session or
+// saml_auth_session and no internal_auth_session. The catalog verifies those sessions the way the
+// core API's oidc_auth and saml_auth schemes do, including the configured claim validation, so the
+// Tables tab works for SSO users and stays closed to a session the core API would refuse.
+func TestAuthAcceptsSSOSessionCookie(t *testing.T) {
+	const ssoUser = "0b7c1a52-sso-user"
+	cfg := &Config{Prefix: CatalogPrefix, TokenTTL: time.Hour, MaxRequestBody: DefaultMaxRequestBody}
+	deps := newServerDeps(t)
+	lakefsCfg := &config.ConfigImpl{}
+	lakefsCfg.Auth.OIDC.ValidateIDTokenClaims = map[string]string{"tid": "tenant-a"}
+	lakefsCfg.Auth.CookieAuthVerification.ExternalUserIDClaimName = "user_id"
+	deps.Config = lakefsCfg
+	externalID := ssoUser
+	_, err := deps.AuthService.CreateUser(t.Context(), &model.User{Username: ssoUser, ExternalID: &externalID, Source: "oidc"})
+	require.NoError(t, err)
+
+	middleware, err := NewAuthMiddleware(deps, cfg)
+	require.NoError(t, err)
+	router, err := newRouter(middleware, cfg, newServer(cfg))
+	require.NoError(t, err)
+	mux := coreRouter()
+	mux.Mount(APIBasePath, router)
+
+	oidcCookie := func(claims oidcencoding.Claims) *http.Cookie {
+		return ssoSessionCookie(t, deps, auth.OIDCAuthSessionName, auth.IDTokenClaimsSessionKey, claims)
+	}
+
+	t.Run("an OIDC session is accepted on reads", func(t *testing.T) {
+		rec := cookieRequest(t, mux, http.MethodGet, catalogPath(configPath),
+			oidcCookie(oidcencoding.Claims{"sub": ssoUser, "tid": "tenant-a"}))
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	})
+
+	t.Run("a SAML session is accepted on reads", func(t *testing.T) {
+		rec := cookieRequest(t, mux, http.MethodGet, catalogPath(configPath),
+			ssoSessionCookie(t, deps, auth.SAMLAuthSessionName, auth.SAMLTokenClaimsSessionKey,
+				oidcencoding.Claims{"user_id": ssoUser}))
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	})
+
+	t.Run("an OIDC session failing claim validation is refused", func(t *testing.T) {
+		rec := cookieRequest(t, mux, http.MethodGet, catalogPath(configPath),
+			oidcCookie(oidcencoding.Claims{"sub": ssoUser, "tid": "tenant-b"}))
+		requireUnauthorized(t, rec)
+	})
+
+	t.Run("an OIDC session without claims authenticates nothing", func(t *testing.T) {
+		rec := cookieRequest(t, mux, http.MethodGet, catalogPath(configPath), oidcCookie(nil))
+		requireUnauthorized(t, rec)
+	})
+
+	t.Run("an OIDC session does not open writes outside UI management", func(t *testing.T) {
+		rec := cookieRequest(t, mux, http.MethodPost, catalogPath(configPath),
+			oidcCookie(oidcencoding.Claims{"sub": ssoUser, "tid": "tenant-a"}))
 		requireUnauthorized(t, rec)
 	})
 }
