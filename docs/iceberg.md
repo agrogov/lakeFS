@@ -16,7 +16,7 @@ The catalog is mounted by the hook that also serves the datasets control plane
 | `/iceberg/relative_to` | The same catalog with the warehouse carried in the URL: `/iceberg/relative_to/<repo>[.<branch>]/api/…`. |
 
 `/mds/iceberg/api` is not a third addressing form: while `iceberg.enabled` and
-`metadata_search.enabled` are true it is the same catalog, mounted a second time at the prefix upstream
+`iceberg.metadata_search.enabled` are true it is the same catalog, mounted a second time at the prefix upstream
 clients use (`/mds/iceberg/api/v1/…`); otherwise it is unclaimed and answers `501`. See
 [Metadata Search](#metadata-search).
 
@@ -389,11 +389,21 @@ to search.
 | Ref you ask about | Where the table is read |
 |---|---|
 | a branch of `<repo>` | branch of the **same name** in `<repo>-metadata` |
-| a tag or a commit of `<repo>` | the ref the indexer's ref mapper names for that source commit, as recorded in the snapshot summaries (`lakefs.mds.source-commit`) |
+| a tag or a commit of `<repo>` | the tag `mds-<full commit id>` of `<repo>-metadata`, when the ref mapper is installed |
 
-A tag or a commit is not a branch, so there is no mirrored branch to read. Until the indexer
-registers its ref mapper, such a request answers `404 NoSuchTableException` rather than guessing the
-table of a branch the ref does not name. Existence checks (`HEAD`) follow the same rule.
+A tag or a commit is not a branch, so there is no mirrored branch to read. A tag, a full or short
+commit ID and a ref expression such as `main~2` are resolved to a commit first, and the indexer
+records each indexed commit of `<repo>` as the tag `mds-<full commit id>` of `<repo>-metadata`; that
+tag is the ref the table is read at (reads on a tag are read-only in the catalog, which is what a
+snapshot needs). If `<repo>-metadata` has no such tag - the commit was not indexed, is not on an
+indexed branch's first-parent chain, or the tag was retired by tag retention - the request answers
+`404 NoSuchTableException`, and the mapper never falls back to an ancestor's tag. Any other error
+(a storage failure, a server fault) is returned as it is, not turned into a 404.
+
+The mapper is installed by `lakefs-sso` (`pkg/mds/refmap`, assigned to
+`icebergcatalog.MetadataSearchRefMapper`) whenever the catalog runs in that binary. A build without
+it (plain `lakefs`) leaves the seam nil, so tags and commits answer `404 NoSuchTableException` and
+only the branch mapping above is served. Existence checks (`HEAD`) follow the same rule.
 
 ### Authorization
 
@@ -641,16 +651,25 @@ set up:
 |---|---|---|
 | Client's own storage credentials (**default**) | available | The client is configured with S3 credentials for the storage namespace, or writes through the lakeFS S3 gateway. The catalog returns `config` empty, so a client falls back to its own `FileIO`. |
 | Remote signing | served when the blockstore can sign | `POST …/tables/{t}/sign` is mounted and advertised in `GET /v1/config` when the blockstore is S3 and its pre-signer is available (`pkg/icebergcatalog/sign.go`); the endpoint honours `X-Iceberg-Access-Delegation: remote-signing` and requires `catalog:ReadTableData` / `catalog:WriteTableData` on the table. |
-| STS vended credentials | served when configured | `blockstore.s3.credentials_vending.{role_arn, session_duration, external_id, endpoint}` is parsed and validated (`session_duration` defaults to 1h and must be between 15m and 12h); `GET …/tables/{t}/credentials` (`pkg/icebergcatalog/creds.go`) is mounted and advertised when the blockstore is S3 and `role_arn` is set, and vends a read session scoped to the table prefix. |
+| STS vended credentials | served when configured | `blockstore.s3.credentials_vending.{role_arn, session_duration, external_id, endpoint}` is parsed and validated (`session_duration` defaults to 1h and must be between 15m and 12h); when the blockstore is S3 and `role_arn` is set, `GET …/tables/{t}/credentials` (`pkg/icebergcatalog/creds.go`) is mounted and advertised, and the same session is carried in the `storage-credentials` member of a table load and a create answer. The session is scoped to the table prefix and is a **write** session on a branch for a caller with `catalog:WriteTableData`; it is a read session otherwise, and on a tag or a commit. |
 
-A table load still returns an empty `config`: it carries no `storage-credentials` and does not set
-`s3.remote-signing-enabled`, so a standard client is not pointed at either endpoint and keeps its own
-`FileIO` unless it calls `/credentials` or `/sign` directly. **Both served modes are S3 only in this
+A table load and a create answer still leave `config` empty - they do not set
+`s3.remote-signing-enabled` - but when vending is configured and the client sends
+`X-Iceberg-Access-Delegation: vended-credentials`, both carry `storage-credentials`, which is where
+iceberg-go takes its session from; `GET …/tables/{t}/credentials` refreshes that session. The
+session is scoped to the table's own root (`<storage_namespace>/_iceberg/<table-uuid>/`), and a
+table whose metadata location is outside it is not vended. A write session also needs a namespace
+the catalog may be written: a namespace a table resolver reserves (the Metadata Search `system`
+namespace on a data repository) gets a read session even for a caller with `catalog:WriteTableData`.
+Vending is best effort: if STS is
+unreachable or refuses, the load or create still succeeds without `storage-credentials`, and the
+credentials endpoint answers an empty `storage-credentials` list, so the client falls back to its
+own `FileIO`. **Both served modes are S3 only in this
 build**: an Azure or GCS blockstore gets neither endpoint, and the client's own credentials is the mode
 to use there (see [Not supported in OSS](#not-supported-in-oss)). The delegation header is always safe to
-send: a client that asks for `vended-credentials` or `remote-signing` and does not receive
-`storage-credentials` falls back to its own credentials, which is what makes advertising either
-mechanism in the load response a non-breaking addition later.
+send: the catalog may choose any or none of the requested mechanisms, and a client that asks for
+`vended-credentials` or `remote-signing` and does not receive the matching member falls back to its
+own credentials.
 
 ## Garbage collection
 
@@ -762,7 +781,7 @@ only when it is mounted and tested.
 | `GET`, `HEAD`, `POST`, `DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}` | served |
 | `POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics` | served (accepted and discarded) |
 | `POST /v1/{prefix}/namespaces/{namespace}/register` | served (adopts a client-written `metadata.json`) |
-| `GET …/tables/{table}/credentials`, `POST …/tables/{table}/sign` | served and advertised only when supported: S3 blockstore for signing, S3 plus `credentials_vending.role_arn` for vending |
+| `GET …/tables/{table}/credentials`, `POST …/tables/{table}/sign` | served and advertised only when supported: S3 blockstore for signing, S3 plus `credentials_vending.role_arn` for vending (whose session a load and a create answer also carry) |
 | `GET`, `POST /v1/{prefix}/namespaces/{namespace}/views` | served (list and create) |
 | `GET`, `HEAD`, `POST`, `DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}` | served (load, exists, replace, drop) |
 | `tables/rename`, `views/rename`, `register-view`, `transactions/commit`, `plan`, `tasks` | out of scope for v1, never advertised |
@@ -857,10 +876,11 @@ that calls one gets the catalog's `404`. Multi-table transaction commit (`POST
 
 ## Current limitations
 
-- **Table load does not advertise the data-plane mechanisms.** `/credentials` and `/sign` are mounted
-  and advertised in `GET /v1/config`, but the `LoadTableResult` still carries an empty `config`, with
-  no `storage-credentials` and no `s3.remote-signing-enabled`. A standard client therefore keeps its own
-  `FileIO` unless it calls an endpoint directly (see [Data-plane access](#data-plane-access)).
+- **Table load carries vended credentials but not remote signing.** When vending is configured and the
+  client asks for `vended-credentials`, a load (and a create) answer carries `storage-credentials`;
+  without that delegation, or without vending, it carries none. Its `config` stays empty in every
+  case - no `s3.remote-signing-enabled` - so a client that relies on remote signing must call `/sign`
+  directly or keep its own `FileIO` (see [Data-plane access](#data-plane-access)).
 - **The Tables tab does not commit.** It creates and drops namespaces and tables (the four operations the
   cookie is accepted for), and everything else is still an Iceberg client's job: no commit, no register,
   no rename, no data write. It also explores one ref at a time — the one the page shows — with no
