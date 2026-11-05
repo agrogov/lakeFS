@@ -23,50 +23,58 @@ the bounded 409 retries, staging recovery, and the real-lakeFS probes that back 
 remaining debt is about bounds (memory, request count, timeouts) and about test coverage of the paths the
 fakes synthesise (paged `pending`, compaction through the indexer, the esti restart window, the engine
 scripts). These are review findings only: none of the five cards, and not this consolidation, changes any
-product code, test, design or doc.
+product code, test, design or doc. The fixes are six later commits, recorded in the Status column and
+under each finding: `6440e2f13` (IX-1, IO-2, TS-2, TS-1, IX-5), `7f952279b` (IX-2, TB-3),
+`db8172798` (IO-1, TS-5), `e3083e279` (TB-1), `d2811fdcc` (MDS-SEC-1, made on
+`feature/iceberg-catalog` and merged in `224fc82d3`) and `5b997972e` (MDS-SEC-2, MDS-SEC-5). Each
+carries the test that fails before its fix and a verification summary. The other MINOR and NIT
+findings stay open.
 
 ## Summary of findings
 
-| Key | Severity | Area | Title | Where |
-|---|---|---|---|---|
-| IX-1 | MAJOR | Indexer pipeline | `pending` reads and retains the whole remaining first-parent log on every branch tick | `pkg/mds/indexer/branch.go:418-451` |
-| IX-2 | MAJOR | Indexer pipeline | No timeout on either client: one wedged connection stalls the tick loop while `/_health` stays 200 | `pkg/mds/indexer/iceberg.go:94-103`; `pkg/mds/indexer/indexer.go:613` |
-| IO-1 | MAJOR | Indexer service | A second initialisation races into a duplicate `mds: init` commit that is refused as a foreign repository forever | `pkg/mds/indexer/repo.go:201-235` |
-| TB-1 | MAJOR | Table/refmap | Position delete files orphaned by a rebuild are never removed, so the compaction trigger can latch on forever | `pkg/mds/table/writer.go:291-338` |
-| MDS-SEC-1 | MAJOR | Server security | Remote signing hands out a write signature under `R-metadata`'s table location for the virtual table | `pkg/icebergcatalog/sign.go:345-392` |
-| MDS-SEC-2 | MAJOR | Server security | The `*-metadata` class of the §8 policies matches data-repository ARNs, not only companion repositories | `pkg/mds/bootstrap/bootstrap.go:102-118` |
-| TS-1 | MAJOR | Tests/esti | A recorded position that no longer exists fails the branch every tick forever; §4.7's rebuild fallback is not taken | `pkg/mds/indexer/branch.go:87-97` |
-| IX-3 | MINOR | Indexer pipeline | The per-commit table reload builds a new REST catalog, costing an extra config round trip and a connection pool per commit | `pkg/mds/indexer/iceberg.go:50-70` |
-| IX-4 | MINOR | Indexer pipeline | The "crashed during the iceberg commit" recovery case is not tested | `pkg/mds/indexer/branch_test.go:377-388` |
-| IX-5 | MINOR | Indexer pipeline | No test pages the `pending` walk, so the lag and multi-page stop-at logic is unverified | `pkg/mds/indexer/branch_test.go` (no case sets `fake.pageSize`) |
-| IO-3 | MINOR | Indexer service | With `delete_branches: false` a deleted branch keeps its `/_health` entry and lag gauge, so `/_health` stays 503 | `pkg/mds/indexer/indexer.go:484-490` |
-| IO-4 | MINOR | Indexer service | A branch that fails before the pending list is built reports `lag_commits: 0` and loses `last_indexed` | `pkg/mds/indexer/indexer.go:494-511` |
-| TB-2 | MINOR | Table/refmap | Compaction writes rows in scan order, so the declared `path ASC` sort order no longer describes its files | `pkg/mds/table/writer.go:287-307` |
-| MDS-SEC-3 | MINOR | Server security | The catalog serves any repository named `R-metadata` as `R`'s index, while the indexer refuses such a repository | `pkg/icebergcatalog/resolver.go:297-320` |
-| MDS-SEC-4 | MINOR | Server security | `iceberg.metadata_search.enabled` without `iceberg.enabled` is accepted, half-applied, and answers 501 | `pkg/icebergcatalog/config.go:196-209` |
-| TS-3 | MINOR | Tests/esti | The fake's write methods are more lenient than lakeFS on a missing branch, and its one modelled refusal carries the wrong status | `pkg/mds/indexer/fake_test.go:579-620` |
-| TS-4 | MINOR | Tests/esti | Nothing checks that the companion repository is writable; `ReadOnly` is dead and a read-only `R-metadata` fails every tick | `pkg/mds/client/lakefs.go:119` |
-| TS-5 | MINOR | Tests/esti | Startup verifies the initialisation commit by walking the entire first-parent history into memory | `pkg/mds/indexer/repo.go:152-185` |
-| TS-6 | MINOR | Tests/esti | The engine scripts only assert that *some* `orders/` row came back | `esti/ops/mds-engines/run-spark.sh:72-73` |
-| TS-7 | MINOR | Tests/esti | No end-to-end test of §4.9 compaction and tag retention, or of the §4.8 branch-deletion mirror | `esti/mds_test.go:864-879` |
-| TS-8 | MINOR | Tests/esti | The esti "indexer restart" case is opportunistic and still passes when the kill lands between ticks | `esti/mds_test.go:476-497` |
-| IX-6 | NIT | Indexer pipeline | Five error messages print `branch@repository` where every other message prints `repository@branch` | `pkg/mds/indexer/branch.go:65` |
-| IX-7 | NIT | Indexer pipeline | `Table.SnapshotCount` is documented as the `every_commits` counter, which it is not | `pkg/mds/indexer/tables.go:25-27` |
-| IO-5 | NIT | Indexer service | `/_health` keeps the previous error while a repo is in progress, and a cancelled tick leaves `in_progress` stuck | `pkg/mds/health.go:103-120` |
-| IO-6 | NIT | Indexer service | `compaction.*` is neither validated nor disableable: an explicit `0` is silently turned into the default | `pkg/mds/config.go:268-303` |
-| IO-7 | NIT | Indexer service | Dead code and one stale doc comment around the health/metrics/stage seams | `pkg/mds/metrics.go:38-46` |
-| TB-4 | NIT | Table/refmap | `Compact` accepts `…Option` and discards all of them | `pkg/mds/table/writer.go:280` |
-| TB-5 | NIT | Table/refmap | Nothing at compile time or in unit tests proves `*catalog.Catalog` still satisfies the ref mapper's `refResolver` | `pkg/mds/refmap/refmap.go:47-50` |
-| MDS-SEC-5 | NIT | Server security | The deny does not cover `fs:UpdateRepository`, which writes a companion repository | `pkg/mds/bootstrap/bootstrap.go:140-148` |
-| TS-9 | NIT | Tests/esti | The esti reads are full scans, so the filtered-scan examples of the guide are not what the suite verifies | `esti/mds_test.go:2241` |
-| TS-10 | NIT | Tests/esti | The fake's merge base is "any common ancestor", not graveler's best common ancestor, plus two smaller divergences | `pkg/mds/indexer/fake_test.go:479-512` |
+| Key | Severity | Area | Title | Where | Status |
+|---|---|---|---|---|---|
+| IX-1 | MAJOR | Indexer pipeline | `pending` reads and retains the whole remaining first-parent log on every branch tick | `pkg/mds/indexer/branch.go:418-451` | Fixed in `6440e2f13` |
+| IX-2 | MAJOR | Indexer pipeline | No timeout on either client: one wedged connection stalls the tick loop while `/_health` stays 200 | `pkg/mds/indexer/iceberg.go:94-103`; `pkg/mds/indexer/indexer.go:613` | Fixed in `7f952279b` |
+| IO-1 | MAJOR | Indexer service | A second initialisation races into a duplicate `mds: init` commit that is refused as a foreign repository forever | `pkg/mds/indexer/repo.go:201-235` | Fixed in `db8172798` |
+| TB-1 | MAJOR | Table/refmap | Position delete files orphaned by a rebuild are never removed, so the compaction trigger can latch on forever | `pkg/mds/table/writer.go:291-338` | Fixed in `e3083e279` |
+| MDS-SEC-1 | MAJOR | Server security | Remote signing hands out a write signature under `R-metadata`'s table location for the virtual table | `pkg/icebergcatalog/sign.go:345-392` | Fixed in `d2811fdcc` |
+| MDS-SEC-2 | MAJOR | Server security | The `*-metadata` class of the §8 policies matches data-repository ARNs, not only companion repositories | `pkg/mds/bootstrap/bootstrap.go:102-118` | Fixed in `5b997972e` |
+| TS-1 | MAJOR | Tests/esti | A recorded position that no longer exists fails the branch every tick forever; §4.7's rebuild fallback is not taken | `pkg/mds/indexer/branch.go:87-97` | Fixed in `6440e2f13` |
+| IX-3 | MINOR | Indexer pipeline | The per-commit table reload builds a new REST catalog, costing an extra config round trip and a connection pool per commit | `pkg/mds/indexer/iceberg.go:50-70` | Open |
+| IX-4 | MINOR | Indexer pipeline | The "crashed during the iceberg commit" recovery case is not tested | `pkg/mds/indexer/branch_test.go:377-388` | Open |
+| IX-5 | MINOR | Indexer pipeline | No test pages the `pending` walk, so the lag and multi-page stop-at logic is unverified | `pkg/mds/indexer/branch_test.go` (no case sets `fake.pageSize`) | Fixed in `6440e2f13` |
+| IO-3 | MINOR | Indexer service | With `delete_branches: false` a deleted branch keeps its `/_health` entry and lag gauge, so `/_health` stays 503 | `pkg/mds/indexer/indexer.go:484-490` | Open |
+| IO-4 | MINOR | Indexer service | A branch that fails before the pending list is built reports `lag_commits: 0` and loses `last_indexed` | `pkg/mds/indexer/indexer.go:494-511` | Open |
+| TB-2 | MINOR | Table/refmap | Compaction writes rows in scan order, so the declared `path ASC` sort order no longer describes its files | `pkg/mds/table/writer.go:287-307` | Open |
+| MDS-SEC-3 | MINOR | Server security | The catalog serves any repository named `R-metadata` as `R`'s index, while the indexer refuses such a repository | `pkg/icebergcatalog/resolver.go:297-320` | Open |
+| MDS-SEC-4 | MINOR | Server security | `iceberg.metadata_search.enabled` without `iceberg.enabled` is accepted, half-applied, and answers 501 | `pkg/icebergcatalog/config.go:196-209` | Open |
+| TS-3 | MINOR | Tests/esti | The fake's write methods are more lenient than lakeFS on a missing branch, and its one modelled refusal carries the wrong status | `pkg/mds/indexer/fake_test.go:579-620` | Open |
+| TS-4 | MINOR | Tests/esti | Nothing checks that the companion repository is writable; `ReadOnly` is dead and a read-only `R-metadata` fails every tick | `pkg/mds/client/lakefs.go:119` | Open |
+| TS-5 | MINOR | Tests/esti | Startup verifies the initialisation commit by walking the entire first-parent history into memory | `pkg/mds/indexer/repo.go:152-185` | Fixed in `db8172798` |
+| TS-6 | MINOR | Tests/esti | The engine scripts only assert that *some* `orders/` row came back | `esti/ops/mds-engines/run-spark.sh:72-73` | Open |
+| TS-7 | MINOR | Tests/esti | No end-to-end test of §4.9 compaction and tag retention, or of the §4.8 branch-deletion mirror | `esti/mds_test.go:864-879` | Open |
+| TS-8 | MINOR | Tests/esti | The esti "indexer restart" case is opportunistic and still passes when the kill lands between ticks | `esti/mds_test.go:476-497` | Open |
+| IX-6 | NIT | Indexer pipeline | Five error messages print `branch@repository` where every other message prints `repository@branch` | `pkg/mds/indexer/branch.go:65` | Open |
+| IX-7 | NIT | Indexer pipeline | `Table.SnapshotCount` is documented as the `every_commits` counter, which it is not | `pkg/mds/indexer/tables.go:25-27` | Open |
+| IO-5 | NIT | Indexer service | `/_health` keeps the previous error while a repo is in progress, and a cancelled tick leaves `in_progress` stuck | `pkg/mds/health.go:103-120` | Open |
+| IO-6 | NIT | Indexer service | `compaction.*` is neither validated nor disableable: an explicit `0` is silently turned into the default | `pkg/mds/config.go:268-303` | Open |
+| IO-7 | NIT | Indexer service | Dead code and one stale doc comment around the health/metrics/stage seams | `pkg/mds/metrics.go:38-46` | Open |
+| TB-4 | NIT | Table/refmap | `Compact` accepts `…Option` and discards all of them | `pkg/mds/table/writer.go:280` | Open |
+| TB-5 | NIT | Table/refmap | Nothing at compile time or in unit tests proves `*catalog.Catalog` still satisfies the ref mapper's `refResolver` | `pkg/mds/refmap/refmap.go:47-50` | Open |
+| MDS-SEC-5 | NIT | Server security | The deny does not cover `fs:UpdateRepository`, which writes a companion repository | `pkg/mds/bootstrap/bootstrap.go:140-148` | Fixed in `5b997972e` |
+| TS-9 | NIT | Tests/esti | The esti reads are full scans, so the filtered-scan examples of the guide are not what the suite verifies | `esti/mds_test.go:2241` | Open |
+| TS-10 | NIT | Tests/esti | The fake's merge base is "any common ancestor", not graveler's best common ancestor, plus two smaller divergences | `pkg/mds/indexer/fake_test.go:479-512` | Open |
 
 Duplicates merged: IO-2 → IX-1, TB-3 → IX-2, TS-2 → IX-1 (its paging-test-gap half is IX-5). The
 duplicate keys are also listed under the retained finding. IO-7 overlaps IX-7 and TS-4 but is kept as
-its own entry because the rest of it is distinct.
+its own entry because the rest of it is distinct. IO-2 and TS-2 are fixed by `6440e2f13`, TB-3 by
+`7f952279b`, together with the findings they were merged into. The MINOR and NIT findings are open,
+except IX-5, TS-5 and MDS-SEC-5, which the same commits fixed.
 
 All MAJORs were verified against the code: 7 CONFIRMED, 0 DISPUTED (see the verification line in each
-MAJOR entry). No BLOCKER was reported.
+MAJOR entry). No BLOCKER was reported. All seven are fixed; see the Status column and the Fixed in
+line under each entry.
 
 ## Verified
 
@@ -101,7 +109,15 @@ Every entry here was re-checked against the code and is CONFIRMED.
 
 ### IX-1 - MAJOR: `pending` reads and retains the whole remaining first-parent log on every branch tick
 
-**Duplicates:** IO-2 (indexer service, MAJOR — same walk, same lines, same claim; this entry is kept) and TS-2 (tests, MINOR — same defect rated lower; its paging-test-gap half is IX-5).
+**Fixed in `6440e2f13`** — `pending` keeps a window of the oldest `max_commits`+1 commits read so far
+and stops after `max_commits` plus one page, so one tick holds O(`max_commits` + one page) commits and
+makes O(`max_commits`/page + 1) `LogCommits` requests; the lag is counted per page, so it stays exact.
+A position deeper than that window reports `errTooFarBehind` and the tick takes the §4.7 full rebuild
+at the head. `TestFarBehindBranchIsRebuiltInsteadOfWalked` asserts 2 requests and 4 commits read (21
+requests before the fix), and `TestPendingPagesTheLog` (IX-5) pages the walk. IO-2 and TS-2 are fixed by
+the same commit.
+
+**Duplicates:** IO-2 (indexer service, MAJOR — same walk, same lines, same claim; this entry is kept) and TS-2 (tests, MINOR — same defect rated lower; its paging-test-gap half is IX-5). Both are fixed in `6440e2f13`, together with this entry.
 
 **Verification: CONFIRMED** — `pending` (branch.go:418-457) appends every page of the log, reverses and truncates only after the walk, and takes `total := len(commits)` after the full walk, so the tick holds the whole backlog and re-reads it every time; IO-2 cites the same lines.
 
@@ -135,7 +151,15 @@ for two ticks), not 23.
 
 ### IX-2 - MAJOR: no timeout on either client, so one wedged connection stalls the tick loop forever while `/_health` stays 200
 
-**Duplicate:** TB-3 (table/refmap, MINOR — the same missing timeout, seen from the writer's catalog; this entry is kept).
+**Fixed in `7f952279b`** — `metadata_search.request_timeout` (default 60s, must be positive) bounds
+both production clients: `newLakeFSClient` now builds `http.Client{Timeout: …}`, and
+`table.CatalogConfig.RequestTimeout` rides a per-request deadline in a `rest.WithTransportFactory`
+transport, because iceberg-go builds its own client; the factory covers the `GET /v1/config` exchange
+and every later table call. A stalled request fails its branch, or its repository when the call is not
+attributable to one branch, and `/_health` answers 503. Tests: `pkg/mds/indexer/timeout_test.go`,
+`pkg/mds/table/catalog_test.go`, `pkg/mds/config_test.go`. TB-3 is fixed by the same commit.
+
+**Duplicate:** TB-3 (table/refmap, MINOR — the same missing timeout, seen from the writer's catalog; this entry is kept). Fixed in `7f952279b`, together with this entry.
 
 **Verification: CONFIRMED** — `newLakeFSClient` (indexer.go:613-622) passes no `WithHTTPClient`, so apigen falls back to `http.DefaultClient` (no `Timeout`); `IcebergStore.catalog` (iceberg.go:94-103) builds `table.NewCatalog` with no transport or timeout, and the tick runs on the process context (service.go:186-197). `grep -rn Timeout pkg/mds` finds only the health server's read-header and shutdown bounds.
 
@@ -164,6 +188,14 @@ deadline from `period` inside `Indexer.Tick` and report the stall as a branch er
 the probe above, asserting the tick returns (with the repository marked failed) within the timeout.
 
 ### IO-1 - MAJOR: a second initialisation races into a duplicate `mds: init` commit that is refused as a foreign repository forever
+
+**Fixed in `db8172798`** — the initialisation commit is now the idempotency point: `AllowEmpty: false`,
+so the loser of the race finds nothing staged, gets `lakefsErrNoChanges`, re-verifies the branch and
+adopts the winner's initialisation commit. `initScan` replaces `initCommitAccepted` and accepts a
+contiguous run of `mds: init` commits that reaches the root or ends directly above the automatic root,
+recording the member closest to the root as the initialisation commit; a marker outside such a run is
+still refused. Tests: `TestConcurrentInitialisationCommitsOnce`,
+`TestDuplicateInitCommitsAboveTheAutomaticRootAreAccepted`, `TestInitMarkerOutsideTheRunIsStillRefused`.
 
 **Verification: CONFIRMED** — `initialise` commits with `AllowEmpty: true` (repo.go:224), and `initCommitAccepted` (repo.go:184-191) accepts the marker only at `len-1`, or at `len-2` above an automatic root, so a second `mds: init` on top of the first (`[init2 init1 root]`, index 0) is refused as `ErrForeignRepository` on every later tick.
 
@@ -221,6 +253,14 @@ it next to `TestInterruptedInitialisationIsCompleted`).
 
 ### TB-1 - MAJOR: position delete files orphaned by a rebuild are never removed, so the compaction trigger can latch on forever
 
+**Fixed in `e3083e279`** — `Rebuild` now runs `ReplaceFiles` over every live data file and every live
+delete file of the current snapshot followed by `Append`, instead of a single unqualified `Overwrite`
+(which drives copy-on-write deletion of the data files only). `Compact` now removes every delete file
+of the current snapshot, enumerated from its manifest list (`snapshotFilesOf`) rather than from the
+scan tasks, so a delete file no task carries is removed too. `TestRebuild` and `TestCompact` fail
+before the fix with `total-delete-files == 2`; `TestCompact` also covers a delete file orphaned without
+a rebuild.
+
 **Verification: CONFIRMED** — `Compact` removes only the delete files carried by the *current* scan tasks (writer.go:291, 322-338), and `Rebuild` calls `txn.Overwrite` with no filter (writer.go:241), which in iceberg-go drives `performCopyOnWriteDeletion` and deletes/rewrites data files only (table/transaction.go:2466-2479); the trigger compares the snapshot summary's `total-delete-files` (maintenance.go:53-55, iceberg.go:129-139), so orphaned files keep being counted and `due` never clears.
 
 **Where.** `pkg/mds/table/writer.go:291` (`dataFiles, deleteFiles := filesOf(tasks)`), `writer.go:301`
@@ -275,6 +315,15 @@ the fix: extend `TestRebuild`'s delete-file case with `table.Compact` and requir
 
 ### MDS-SEC-1 - MAJOR: remote signing hands out a **write** signature under `R-metadata`'s table location for the virtual table
 
+**Fixed in `d2811fdcc`** (made on `feature/iceberg-catalog`, merged into this branch in `224fc82d3`) —
+every write sign (`PUT`, `POST`, `DELETE`, `PATCH`, any method classified as
+`catalog:WriteTableData`) now calls `Store.RequireWritableNamespace` after the permission decision, on
+the requested address and, after resolution, on the target, before the redirected table is read. A
+refusal is answered as 403 `ForbiddenException` (`*ReservedNamespaceError`); read signs are unchanged.
+`TestRemoteSigningReservedNamespace` pins PUT/POST/DELETE/PATCH 403 and GET 200 on the virtual table, a
+PUT sign on an ordinary writable table 200, and a resolver that redirects an ordinary address into a
+reserved namespace refused on the target for a write and not for a read.
+
 **Verification: CONFIRMED** — `sign.go` contains no `RequireWritableNamespace`/`writableNamespace` call at all: it authorizes `OpWriteTableData` on the requested virtual address (sign.go:345-358), then scopes the signature to the resolved address's table location (sign.go:372-392), while `creds.go:452` (`if isBranch && s.writableNamespace(addr)`) is exactly the guard it lacks.
 
 **Where**: `pkg/icebergcatalog/sign.go:345-358` (authorize `OpWriteTableData` on the requested address),
@@ -325,6 +374,16 @@ the indexer's own `PUT` on `R-metadata.system.object_metadata` still succeeds).
 
 ### MDS-SEC-2 - MAJOR: the `*-metadata` class of the §8 policies matches data-repository ARNs, not only companion repositories
 
+**Fixed in `5b997972e`** — the policies no longer use a wildcard for the repository name (or for the
+catalog kind). Both build exact ARNs from the companion repositories the server knows: every repository
+in the catalog plus the names in `metadata_search.repositories`, mapped `R` → `R-metadata`. The bootstrap
+starts a refresher bound to the server's context that re-derives the set every minute and repairs a
+policy whose statements changed, and `fs:Update*` joined the deny (MDS-SEC-5). The server now requires
+`deps.Catalog` (`ErrMissingDeps`) for the repository list. Tests:
+`TestMDSPoliciesDoNotReachDataRepositories` (29 decisions; 16 failed before the fix),
+`TestKnownDataRepositories`, `TestPolicyRefresher`, `TestIndexerPolicyStatements`,
+`TestMetadataRepoProtectPolicyStatements`.
+
 **Verification: CONFIRMED** — the patterns (bootstrap.go:102-118) lean on `*` crossing `/`, which `pkg/auth/wildcard.Match` does (it matches to the end of the string, see the "Trailing * matches rest of string" arm), so `repository/*-metadata` matches `repository/analytics/object/-metadata` and `repository/*-metadata/*` matches `.../object/foo-metadata/data.yml`; the bootstrap comment states the same property.
 
 **Where**: `pkg/mds/bootstrap/bootstrap.go:96-110` (`MetadataRepositoryPattern`,
@@ -371,6 +430,12 @@ pin each with a test asserting that `ObjectArn("analytics","-metadata")` and
 allowed for a guard group, which fails today.
 
 ### TS-1 - MAJOR: a recorded position that no longer exists fails the branch every tick forever; §4.7's rebuild fallback is not taken
+
+**Fixed in `6440e2f13`** — a 404 from `FindMergeBase`, or from the log's `stop_at` dereference, is
+treated as "the position is gone" only after `GetCommit(position)` also answers 404, and then the
+existing §4.7 full rebuild runs at the head, logged as a rebuild. A 404 that is not about the position
+(the head, most of all) still fails the tick. Tests: `TestCollectedPositionIsRebuilt`,
+`TestCollectedPositionDuringTheWalkIsRebuilt`, `TestNotFoundThatIsNotThePositionIsAFailure`.
 
 **Verification: CONFIRMED** — the `FindMergeBase` switch (branch.go:87-97) routes only `client.ErrNoMergeBase` to `rewrite` and returns every other error, and the client maps the server's 404 on the missing position to `ErrNotFound` (lakefs.go:481-483), so a collected or re-created position fails the branch on every tick with `rewrite` never reached.
 
@@ -454,6 +519,10 @@ files but never committed the pointer) and assert one `resetCalls` entry and the
 fails on an indexer that treats any staging as "already applied".
 
 ### IX-5 - MINOR: no test pages the `pending` walk, so the lag and multi-page stop-at logic is unverified
+
+**Fixed in `6440e2f13`** — `TestPendingPagesTheLog` pages a five-commit walk (3 requests, 6 commits),
+applies the oldest pending commit with `pageSize=2` and `max_commits=1`, and covers a position reachable
+only through a merge's second parent with `pageSize=1`.
 
 **Duplicate in part:** the second paragraph of TS-2 (see IX-1).
 
@@ -692,6 +761,12 @@ must not block commits on `*-metadata`; the test that fails before it is a `fake
 
 ### TS-5 - MINOR: startup verifies the initialisation commit by walking the entire first-parent history of `R-metadata` into memory
 
+**Fixed in `db8172798`** — `verifyInitCommit` is replaced by a streaming `initScan` that keeps O(1)
+state and stops at the commit that decides the answer, so a refusal is decided where it becomes one.
+`TestInitialisationCheckStopsAtTheAnswer` (1 `LogCommits` page instead of 9) and
+`TestInitialisationCheckKeepsTheHistoryOutOfMemory` (121 KiB of live-heap growth instead of
+11 003 360 bytes on a 100 000-commit history) pin it.
+
 **Where** `pkg/mds/indexer/repo.go:152-185` (`verifyInitCommit`) and `:249-275`
 (`firstParentHistory`).
 
@@ -927,6 +1002,11 @@ that builds the resolver over a real catalog (the `pkg/api`/`pkg/catalog` test f
 `pkg/mds/table/server_test.go`) and maps a tag of `R` to `mds-<commit>`.
 
 ### MDS-SEC-5 - NIT: the deny does not cover `fs:UpdateRepository`, which writes a companion repository
+
+**Fixed in `5b997972e`** — `fs:Update*` joined `metadataRepoProtectFSDeniedActions`, so
+`fs:UpdateRepository` (`SetRepositoryMetadata` / `DeleteRepositoryMetadata`) is denied on a companion
+repository. `TestMDSPoliciesDoNotReachDataRepositories` and `TestMetadataRepoProtectPolicyStatements`
+cover it; the import pair (`fs:ImportFromStorage`, `fs:ImportCancel`) is deliberately still uncovered.
 
 **Where**: `pkg/mds/bootstrap/bootstrap.go:140-148` (`metadataRepoProtectFSDeniedActions`), used at
 `:231-253`.

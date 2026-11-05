@@ -130,7 +130,16 @@ Per tick (`period`): for each configured repository, list `R`'s branches, match 
 in parallel. Within a branch everything is sequential.
 
 Run **one** indexer replica. Correctness under accidental concurrency comes from the Iceberg CAS and the
-idempotency check (4.4), not from a lease; a second replica only wastes work and produces 409s.
+idempotency check (4.4), not from a lease; a second replica only wastes work and produces 409s. A second
+process that meets the first on a freshly created `R-metadata` does not damage it either: the `mds: init`
+commit is made with `allow_empty=false`, so only one of them can commit it, and the loser adopts the winner's
+initialisation commit (4.8, commit `db8172798`).
+
+Every HTTP request either production client sends is bounded by `metadata_search.request_timeout` (default
+60s, section 7): a connection that neither answers nor resets fails its branch, or its repository when the
+call is not attributable to one branch, instead of stalling the tick loop. Without the bound a single wedged
+request stopped every repository from being indexed while `/_health` stayed 200 because the tick was merely
+"in progress" (commit `7f952279b`).
 
 ### 4.2 Per-branch tick
 
@@ -141,8 +150,17 @@ idempotency check (4.4), not from a lease; a second replica only wastes work and
    after 4" - it repairs only a missing tag, or one whose commit does not record `last` - and the 4.9 compaction
    check still run.
 4. If `last` is not an ancestor of `head` (`findMergeBase(R, last, head)` ≠ `last`) → history rewrite (4.7).
+   A 404 from `findMergeBase` whose `getCommit(last)` also answers 404 means the recorded position no longer
+   exists → the §4.7 rebuild (commit `6440e2f13`).
 5. `todo` = first-parent commits of `R@b` after `last` up to `head`, **oldest first**, at most `max_commits`
-   (`logCommits(R, head, first_parent=true, stop_at=last)` paged, then reversed).
+   (`logCommits(R, head, first_parent=true, stop_at=last)` paged, then reversed). The walk is bounded: it keeps
+   a window of the oldest `max_commits`+1 commits read so far and stops after `max_commits` plus one page, so
+   one tick holds O(`max_commits` + one page) commits and makes O(`max_commits`/page + 1) `logCommits`
+   requests, not one per page of the whole backlog (commit `6440e2f13`). A position deeper than that window
+   (more than `max_commits` plus one page behind) cannot be continued from without the unbounded read this
+   bound removes, so it takes the §4.7 full-rebuild at the head instead: the head becomes the position and the
+   lag is 0. Raise `max_commits` until the backlog fits one window to catch up commit by commit. The count is
+   kept per page, so a walk that reaches `last` reports the exact lag (§9).
 6. For each commit `C` in `todo`, apply it (4.3). A failure stops this branch for this tick; the next tick resumes at
    the recorded position.
 
@@ -178,8 +196,14 @@ before it. That is equivalent to the logical order above:
    call per empty object, in exchange for never writing a size the server did not confirm (commit `1cb131f13`).
    `committer` and `creation_date` come from `C` (`getCommit`), the same for every row of the commit.
 2. **Large change sets.** If upserts + deletes > `rebuild_threshold` (default 100 000), skip the delta and do a
-   full rebuild of the branch at `C`: rows = paged `listObjects(R, C)`, all with `commit_id = C`, written with
-   `Transaction.Overwrite` (no filter). This bounds memory and the size of delete predicates. The walk of the diff
+   full rebuild of the branch at `C`: rows = paged `listObjects(R, C)`, all with `commit_id = C`, written in one
+   transaction as `Transaction.ReplaceFiles` over every live data file and every live delete file of the current
+   snapshot, followed by `Append`. `Transaction.Overwrite` (no filter) is not used: iceberg-go's overwrite
+   rewrites the data files and leaves their position delete files in the snapshot, where they stay referenced by
+   the live snapshot and no cleanup can reclaim them (§4.9). The removal is snapshot-relative, so iceberg-go
+   marks the commit non-replayable: a concurrent writer is refused with a conflict instead of having the removal
+   replayed against a newer snapshot, and the branch tick retries it (§4.4, commit `e3083e279`). This bounds
+   memory and the size of delete predicates. The walk of the diff
    stops at the first entry that takes the count over the threshold (`changeSet.large`): the entries read so far
    are dropped and no `statObject` call is made for that commit, so a commit that is going to be rebuilt costs
    neither the rest of its diff nor a single stat (commit `1cb131f13`). The loss of per-object `commit_id` history
@@ -272,6 +296,19 @@ force-move), and when `last` is an ancestor of `head` only through a merge's sec
 never meets `last` there, so replaying the chain would rebuild the table from the root on top of the stale one.
 (A normal `revert` is a new commit and needs none of this; commit `383bf37b5`.)
 
+The same full listing at `head` is the fallback for two more conditions (commit `6440e2f13`):
+
+- **The recorded position no longer exists in `R`.** Committed GC after a force-move while the indexer was
+  down, or `R` deleted and re-created under the same name (§4.8), make the position unreachable. A 404 from
+  `findMergeBase` — or from the log's `stop_at`, which `pkg/catalog` dereferences before it walks — is treated
+  as "the position is gone" only after `getCommit(last)` also answers 404; a 404 about the head, or any other
+  transient 404, still fails the tick. Without the fallback the branch reported `last_error` on every tick
+  forever, with `/_health` at 503 and no way back.
+- **The position is deeper than one tick may walk** (`max_commits` plus one page, §4.2 step 5).
+
+Both run the full listing at `head` on a branch hard-reset to the initialisation commit, logged as a rebuild
+(`mds: rebuilding the metadata branch at the data branch head` with the reason).
+
 ### 4.8 Branch and repository lifecycle
 
 | Event in `R` | Indexer action |
@@ -279,20 +316,26 @@ never meets `last` there, so replaying the chain would rebuild the table from th
 | matching branch created | 4.5 |
 | matching branch deleted | delete `R-metadata@b` if `delete_branches` (default true). Its tags stay, so commit/tag reads of its history still work. Its `/_health` entry and lag gauge are removed, so a failed last attempt of the deleted branch does not keep `/_health` at 503. `R-metadata`'s **default branch is never deleted**, even when its name is no longer a branch of `R` (an `R` default-branch rename): lakeFS refuses a default-branch delete (`pkg/graveler/graveler.go` `DeleteBranch` returns `ErrDeleteDefaultBranch`), so the indexer skips it and logs the skip once per process. |
 | branch stops matching the config | nothing to the table (left as is); its `/_health` entry is removed, so a stale error does not keep `/_health` at 503. |
-| repository added to config | create `R-metadata` (3.3). lakeFS creates it non-bare, so its default branch starts with the automatic `Repository created` root; create namespace `system` and the table through the catalog on the default branch, then lakeFS commit `mds: init` as the first commit after that root (the **initialisation commit**, metadata `lakefs.mds.init=true`). Then 4.5 for each matching branch. |
-| `R-metadata` exists and its history is only lakeFS's automatic `Repository created` root | complete the initialisation on top: create namespace `system` and the table, then the `mds: init` commit (metadata `lakefs.mds.init=true`). |
-| `R-metadata` exists with the `lakefs.mds.init=true` marker at its root (a bare repository) or at its first commit after the automatic root | accept it as the indexer's; later commits are indexing commits. |
-| `R-metadata` exists with any other history and no init marker at one of the two accepted positions | refuse that repository, log an error. In particular, a foreign commit after the automatic root without the marker is refused. |
+| repository added to config | create `R-metadata` (3.3). lakeFS creates it non-bare, so its default branch starts with the automatic `Repository created` root; create namespace `system` and the table through the catalog on the default branch, then lakeFS commit `mds: init` as the first commit after that root (the **initialisation commit**, metadata `lakefs.mds.init=true`), with `allow_empty=false`. Then 4.5 for each matching branch. |
+| `R-metadata` exists and its history is only lakeFS's automatic `Repository created` root | complete the initialisation on top: create namespace `system` and the table, then the `mds: init` commit (metadata `lakefs.mds.init=true`) with `allow_empty=false`. Only one of two concurrent processes can commit it, because the commit carries the table creation; the loser finds nothing staged, gets `lakefsErrNoChanges`, re-verifies the branch, and adopts the winner's initialisation commit instead of writing a second marker (commit `db8172798`). |
+| `R-metadata` exists with a contiguous run of `mds: init` commits (`lakefs.mds.init=true`) that reaches the root (a bare repository) or ends directly above the automatic root | accept it as the indexer's; later commits are indexing commits. The run, not a single commit, is the idempotency point: a duplicate marker left by an older indexer (`[init2 init1 root]`) is accepted. The member closest to the root is recorded as the initialisation commit — the one that created the table and the one 4.5 and 4.7 reset to. |
+| `R-metadata` exists with any other history, or with a marker outside such a run | refuse that repository, log an error. In particular, a foreign commit after the automatic root without the marker is refused. |
 | repository deleted | log, skip. `R-metadata` is left for the admin. |
 
 ### 4.9 Maintenance
 
 - **Compaction.** Position deletes accumulate. When the table has more than `compaction.max_delete_files`
   (default 200) delete files, or every `compaction.every_commits` (default 500) commits, the indexer scans the table
-  at the current snapshot and, in one transaction, removes every data and delete file (`Transaction.ReplaceFiles`)
-  and appends the scanned rows, with the same `lakefs.mds.source-commit`. A plain `Overwrite` is not enough: it
-  rewrites data files but leaves their delete files in place, so deletes would keep accumulating. Then it does a lakeFS commit `mds: compact <R>@<C>` (no new tag; the tag
-  stays on the pre-compaction commit, which has the same rows).
+  at the current snapshot and, in one transaction, removes every data file of the scan plan and every delete file
+  of the current snapshot (`Transaction.ReplaceFiles`), then appends the scanned rows, with the same
+  `lakefs.mds.source-commit`. A plain `Overwrite` is not enough: it rewrites data files but leaves their delete
+  files in place, so deletes would keep accumulating. The delete files are enumerated from the snapshot's
+  manifest list, not from the scan tasks: a scan task carries a delete file only through the data file it
+  applies to, so a delete file whose data files a rebuild (§4.3 step 2) replaced is carried by no task, yet it
+  is still referenced by the live snapshot — no file cleanup can reclaim it, and `total-delete-files`, the
+  counter of the delete-file trigger, would never fall back to zero and the trigger would latch on forever
+  (commit `e3083e279`). Then it does a lakeFS commit `mds: compact <R>@<C>` (no new tag; the tag stays on the
+  pre-compaction commit, which has the same rows).
 - **Snapshot expiry and file sweep** are not done by the indexer: run `lakectl iceberg cleanup -r <R>-metadata`
   on a schedule (`cmd/lakectl/cmd/iceberg_cleanup.go`). It honours lakeFS references (branch heads, tags, commits
   retained by GC), so `mds-*` tags keep their snapshots readable.
@@ -352,6 +395,15 @@ On a data repository, writes under `system` answer 403 `ForbiddenException` (`Re
 `GET`/`HEAD` of the namespace is 404 (no marker). Listings show `system` and `object_metadata`. The catalog has no
 rename endpoint, so there is nothing to block there. In `R-metadata`, `system` is a normal namespace.
 
+The rule covers the data plane as well as the catalog API: a remote-signature request for a write (`PUT`,
+`POST`, `DELETE`, `PATCH` — any method the authorizer classifies as `catalog:WriteTableData`) into a reserved
+namespace is refused with 403 `ForbiddenException` (`*ReservedNamespaceError`), on the address the caller named
+and, after resolution, on the address a table resolver redirects the read to, so a redirect cannot turn a write
+the caller may make on `R` into a signature for `R-metadata`'s `metadata.json`, manifests or data files. Read
+signs (`GET`, `HEAD`) stay allowed: the virtual table stays readable. The vended-credentials path already refused
+that write (`pkg/icebergcatalog/creds.go`); the signing path now does too (commit `d2811fdcc`; the
+`pkg/icebergcatalog` comments cite this rule as §5.4).
+
 ### 5.4 Config (landed)
 
 `iceberg.metadata_search.enabled` (default false). When it is false, nothing changes.
@@ -403,7 +455,8 @@ Errors other than not-found are returned as is (500).
 ## 7. Indexer configuration
 
 Read by `lakefs-sso mds run` from the top-level key `metadata_search` (upstream-compatible name). The server reads
-only `iceberg.metadata_search.enabled`. Both can live in the same file.
+`iceberg.metadata_search.enabled` and, for the §8 policies, the repository names in `metadata_search.repositories`
+(never the rest of the section). Both processes can read the same file.
 
 ```yaml
 metadata_search:
@@ -412,6 +465,7 @@ metadata_search:
   secret_key: ...                              # required
   listen_address: 0.0.0.0:8080                 # /_health, /metrics, /_pprof/
   period: 60s                                  # > 0
+  request_timeout: 60s                         # bound on one HTTP request, > 0
   concurrency: 25                              # branches in parallel, > 0
   max_commits: 1000                            # per branch per tick, > 0
   since: 2026-01-01T00:00:00Z                  # optional, RFC 3339; with backfill: history
@@ -435,8 +489,15 @@ metadata_search:
       storage_namespace: s3://bucket/metadata/my-repo   # optional (3.3)
 ```
 
-Startup fails with one error per problem when: the endpoint or keys are empty; `period`, `concurrency`,
-`max_commits`, `seed_lookback` or `rebuild_threshold` are not positive; `backfill` is unknown; `repositories`
+`request_timeout` bounds every HTTP request the indexer's lakeFS API client and its Iceberg catalog client send,
+including the catalog's `GET /v1/config`. It does not cover data-plane file reads and writes, which go through
+the object-store client's own timeouts. A request that exceeds the bound fails its branch, or its repository
+when the call is not attributable to one branch, and `/_health` answers 503 rather than staying 200 while the
+tick hangs (commit `7f952279b`). `0` is rejected: the bound is not disableable.
+
+Startup fails with one error per problem when: the endpoint or keys are empty; `period`,
+`request_timeout`, `concurrency`, `max_commits`, `seed_lookback` or `rebuild_threshold` are not positive;
+`backfill` is unknown; `repositories`
 or a `branches` list is empty; a repository name ends in `-metadata` or is longer than 54 characters; a glob has a
 `*` that is not trailing; or `since` does not parse. Per-repository runtime errors (repository missing, namespace
 not derivable or overlapping) mark that repository failed in `/_health` and metrics, and the others continue.
@@ -449,22 +510,48 @@ Two principals, as upstream separates indexing from querying:
 
 | Principal | Created by | Permissions |
 |---|---|---|
-| `mds-indexer` (group `MetadataSearchIndexers`, policy `mds-indexer`) | `pkg/mds` bootstrap, an extra routes builder in lakefs-sso that runs when `iceberg.metadata_search.enabled`. It creates user, group and policy idempotently. **Credentials are created by an admin** (`lakectl auth users credentials create --id mds-indexer`) and placed in the indexer config. | On `*` (data repos): `fs:ReadRepository`, `fs:ListObjects`, `fs:ReadObject`, `fs:ListBranches`, `fs:ReadBranch`, `fs:ListCommits`, `fs:ReadCommit`. On `arn:lakefs:fs:::repository/*-metadata` and below: `fs:*`, `catalog:*` on `arn:lakefs:catalog:::*/*-metadata/*`, `fs:CreateRepository` on the repository ARN pattern, and `fs:AttachStorageNamespace` on `arn:lakefs:fs:::namespace/*-metadata`. The last two are the pair `CreateRepository` checks. The namespace pattern is the narrowest one that covers the derived namespaces of 3.3 (`<R namespace>-metadata`); an explicit `storage_namespace` that does not itself end in `-metadata` needs an additional grant. |
+| `mds-indexer` (group `MetadataSearchIndexers`, policy `mds-indexer`) | `pkg/mds` bootstrap, an extra routes builder in lakefs-sso that runs when `iceberg.metadata_search.enabled`. It creates user, group and policy idempotently. **Credentials are created by an admin** (`lakectl auth users credentials create --id mds-indexer`) and placed in the indexer config. | On `*` (data repos): `fs:ReadRepository`, `fs:ListObjects`, `fs:ReadObject`, `fs:ListBranches`, `fs:ReadBranch`, `fs:ListCommits`, `fs:ReadCommit`. On each companion repository `R-metadata` and below it (`arn:lakefs:fs:::repository/<R>-metadata` and `…/*`): `fs:*`; on `arn:lakefs:catalog:::table/<R>-metadata/*`, `…/namespace/<R>-metadata/*` and `…/view/<R>-metadata/*`: `catalog:*`. `fs:CreateRepository` on the companion repository ARN and `fs:AttachStorageNamespace` on `arn:lakefs:fs:::namespace/*-metadata` are the pair `CreateRepository` checks. The namespace stays a pattern because the companion repository of a repository the server knows need not exist yet; an explicit `storage_namespace` that does not itself end in `-metadata` needs an additional grant. |
 | query users | existing users | Through the catalog: only read on `R` (5.2). Engines reading `R-metadata` directly (not through the virtual table) need read on `R-metadata` like any repository. |
 
+The policies name companion repositories explicitly; they do not use a `*-metadata` wildcard for the repository
+name (commit `5b997972e`). `pkg/auth/wildcard.Match` lets `*` span `/`, so
+`arn:lakefs:fs:::repository/*-metadata` also matched `arn:lakefs:fs:::repository/analytics/object/-metadata`, and
+`repository/*-metadata/object/*` matched an object key such as `a/b-metadata/object/c`; the catalog pattern
+`catalog:::*/*-metadata/*` likewise matched a data-repository table whose namespace ended in `-metadata`. That
+gave `mds-indexer` — which §8 limits to reads on data repositories — write actions on such objects and tables, and
+made the deny refuse an ordinary `foo-metadata/data.yml` object inside a data repository to its own guard-group
+members. No resource pattern can express "the repository name ends in `-metadata`", so the fix stops using a
+wildcard for the repository name.
+
+The set of companion repositories is derived on the server from every repository in the catalog plus the names in
+`metadata_search.repositories`, mapped through `R` → `R-metadata` (a name that already ends in `-metadata` is kept
+as it is). Both policies spell the same set, so the indexer's grant and the deny cannot drift. Because an exact ARN
+is a snapshot, the bootstrap starts a refresher bound to the server's context that re-derives the set every minute
+and repairs a policy whose statements changed. A repository created after startup is therefore covered without a
+restart; between its creation and the next refresh the indexer fails closed on that repository (an authorization
+error in `/_health`, never a silent write) and the deny does not yet cover its companion repository. The indexer
+bootstrap requires the server's catalog (`deps.Catalog`, else `ErrMissingDeps`) because that is where the
+repository names come from.
+
 Write protection of `R-metadata`: policy `mds-metadata-repo-protect` (Deny `fs:Write*`, `fs:Delete*`,
-`fs:Create*`, `fs:Revert*`, `catalog:Create*`, `catalog:Update*`, `catalog:Delete*`, `catalog:WriteTableData` on
-the `*-metadata` ARNs), attached to the caller's guard groups - `cmd/lakefs-sso/main.go`'s `guardGroups()`, which is
+`fs:Create*`, `fs:Revert*`, `fs:Update*`, `catalog:Create*`, `catalog:Update*`, `catalog:Delete*`,
+`catalog:WriteTableData` on the same exact ARNs as the allow), attached to the caller's guard groups - `cmd/lakefs-sso/main.go`'s `guardGroups()`, which is
 `datasets.PinsProtectGroups(datasets.immutable_guard_groups)`: the base groups of both group templates plus the
 operator's extras, the same list `iceberg-reserved-prefix-protect` uses - and never to `MetadataSearchIndexers`,
 which the bootstrap drops from the list with a warning even when `datasets.immutable_guard_groups` names it
-(commit `451bca5a1`). As with the reserved-prefix deny, an auth
+(commit `451bca5a1`). `fs:Update*` covers `fs:UpdateRepository` (`SetRepositoryMetadata` / `DeleteRepositoryMetadata`),
+which writes a companion repository and was outside the deny (commit `5b997972e`, review MDS-SEC-5). The remaining
+`fs:` writes the list does not cover are the import pair (`fs:ImportFromStorage`, `fs:ImportCancel`), deliberately
+left to a decision about §8 rather than widened silently. As with the reserved-prefix deny, an auth
 service without policies (`BasicAuthService`) logs a warning naming what is not enforced, and startup continues.
 
 ## 9. Operations
 
 - **Health:** `/_health` returns 200 when every repository's last tick succeeded or is in progress, 503 otherwise,
-  with a JSON body per repository and branch (`last_indexed`, `head`, `lag_commits`, `last_error`).
+  with a JSON body per repository and branch (`last_indexed`, `head`, `lag_commits`, `last_error`). `lag_commits` is
+  exact, never a lower bound: the bounded walk of 4.2 step 5 counts it per page, and a rebuild at the head leaves it
+  at 0 (commit `6440e2f13`). A request that exceeds `request_timeout` fails the branch or the repository, so the
+  probe turns 503 instead of staying 200 while the tick hangs (commit `7f952279b`).
 - **Metrics** (Prometheus, prefix `lakefs_mds_`): `indexed_commits_total{repository}`,
   `lag_commits{repository,branch}`, `errors_total{repository,stage}`, `tick_duration_seconds`,
   `rows_written_total`, `rebuilds_total`, `compactions_total`.
@@ -478,7 +565,8 @@ service without policies (`BasicAuthService`) logs a warning naming what is not 
   is a later version.
 - **Security tests:** a user without `fs:ReadRepository` on `R` gets 403 on the virtual table; a user with access to
   `R-metadata` only gets 403 through `R.<ref>.system.object_metadata`; a non-indexer user cannot write `R-metadata`
-  when the deny is in force; `system` on `R` rejects writes.
+  when the deny is in force; `system` on `R` rejects writes, and a write signature for `R.<ref>.system.object_metadata`
+  is 403 while a read signature on the same address is 200.
 
 ## 10. Decisions (former open questions)
 
@@ -486,10 +574,12 @@ service without policies (`BasicAuthService`) logs a warning naming what is not 
 2. `iceberg-go` v0.7.0 writes merge-on-read position deletes (`Transaction.Delete` with `write.delete.mode=merge-on-read`
    on v2), equality deletes (`WriteEqualityDeletes` + `RowDelta`) and copy-on-write (`Overwrite` with filter).
    Position deletes are chosen because PyIceberg does not read equality deletes. M3's spike confirmed the catalog
-   stages position delete files. `Overwrite` is used for rebuilds; compaction uses `ReplaceFiles` + `Append` (4.9).
+   stages position delete files. Rebuilds and compaction both use `ReplaceFiles` + `Append` (4.3 step 2, 4.9):
+   `Overwrite` leaves the position delete files it rewrites in the snapshot.
 3. Commit/tag mapping: `mds-<commit>` tags in `R-metadata` plus lakeFS commit metadata. No index file, no
    snapshot-summary scan at read time.
-4. Config: top-level `metadata_search` for the indexer, `iceberg.metadata_search.enabled` for the server.
+4. Config: top-level `metadata_search` for the indexer, `iceberg.metadata_search.enabled` for the server; the server
+   also reads the repository names in `metadata_search.repositories` to build the §8 policies.
 5. Endpoint: `/mds/iceberg/api` alias plus the existing `/iceberg/api` and `/iceberg/relative_to`.
 
 ## 11. Future: option B (not built now)

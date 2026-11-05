@@ -79,16 +79,29 @@ whose statements drifted from the built-in ones, and tolerates a rerun.
 |---|---|---|
 | user `mds-indexer`, member of group `MetadataSearchIndexers` | `lakefs-sso` bootstrap | the identity the indexer authenticates as |
 | group `MetadataSearchIndexers` | `lakefs-sso` bootstrap | carries the `mds-indexer` allow policy, and only that policy |
-| policy `mds-indexer` (allow) | `lakefs-sso` bootstrap | read on every data repository, full `fs:`/`catalog:` access on `*-metadata` repositories |
-| policy `mds-metadata-repo-protect` (deny) | `lakefs-sso` bootstrap | keeps ordinary principals from writing `*-metadata` repositories |
+| policy `mds-indexer` (allow) | `lakefs-sso` bootstrap | read on every data repository, full `fs:`/`catalog:` access on the companion repositories |
+| policy `mds-metadata-repo-protect` (deny) | `lakefs-sso` bootstrap | keeps ordinary principals from writing the companion repositories |
 
 The indexer's allow policy is deliberately narrow on data repositories: `fs:ReadRepository`,
 `fs:ListObjects`, `fs:ReadObject`, `fs:ListBranches`, `fs:ReadBranch`, `fs:ListCommits` and
-`fs:ReadCommit` on `*`. On `arn:lakefs:fs:::repository/*-metadata` and everything below it (and on
-`arn:lakefs:catalog:::*/*-metadata/*`) it has `fs:*` and `catalog:*`, which covers creating the
-companion repository, its branches, objects and tables. A companion repository whose
+`fs:ReadCommit` on `*`. Its write grants name each companion repository explicitly — `fs:*` on
+`arn:lakefs:fs:::repository/<R>-metadata` and below it, `catalog:*` on its table, namespace and view
+ARNs, `fs:CreateRepository` on its repository ARN and `fs:AttachStorageNamespace` on
+`arn:lakefs:fs:::namespace/*-metadata` — which covers creating the companion repository, its branches,
+objects and tables. The set is every repository in the catalog plus the names in
+`metadata_search.repositories` (the server reads that list for this purpose), mapped `R` →
+`R-metadata`. A `*-metadata` wildcard is deliberately not used: lakeFS policy matching lets `*` span
+`/`, so `repository/*-metadata` would also match an object or branch of a data repository whose key
+ends in `-metadata`. A companion repository whose
 `metadata_search.repositories.<R>.storage_namespace` does not end in `-metadata` is outside the
 namespace grant and needs an extra statement (see [`Limits`](#limits-and-known-deviations)).
+
+The same exact set is used by the deny policy, and the server re-derives it every minute; a repository
+created after startup is therefore covered without a restart. Until the next refresh, the indexer fails
+closed on that repository (an authorization error in `/_health`, never a silent write) and the deny does
+not yet cover its companion repository. The deny covers `fs:UpdateRepository`, which writes repository
+metadata, through `fs:Update*`; the import actions (`fs:ImportFromStorage`, `fs:ImportCancel`) are not
+covered.
 
 Credentials are **not** created by the bootstrap: an administrator creates them once and places
 them in the indexer configuration.
@@ -112,10 +125,10 @@ The deny policy is attached to the base groups of both lakeFS group templates �
 the reserved-prefix deny are attached to. It is never attached to `MetadataSearchIndexers`, and the
 bootstrap drops that group from the list with a warning even when
 `datasets.immutable_guard_groups` names it (design §8). It denies `fs:Write*`, `fs:Delete*`,
-`fs:Create*`, `fs:Revert*`, `catalog:Create*`, `catalog:Update*`, `catalog:Delete*` and
-`catalog:WriteTableData` on `*-metadata` ARNs, so an administrator's `fs:*` allow cannot make a
-companion repository a hand-edited second source of truth. The indexer and the catalog are not in
-those groups and keep writing.
+`fs:Create*`, `fs:Revert*`, `fs:Update*`, `catalog:Create*`, `catalog:Update*`, `catalog:Delete*` and
+`catalog:WriteTableData` on the exact ARNs of the companion repositories, so an administrator's
+`fs:*` allow cannot make a companion repository a hand-edited second source of truth. The indexer
+and the catalog are not in those groups and keep writing.
 
 **Auth backends without policies.** The default `auth.basic` service stores a single administrator
 and implements no policy API. The bootstrap detects that, logs a warning naming what is not
@@ -137,6 +150,7 @@ metadata_search:
   secret_key: ...                              # required
   listen_address: 0.0.0.0:8080                 # /_health, /metrics, /_pprof/
   period: 60s                                  # > 0
+  request_timeout: 60s                         # bound on one HTTP request, > 0
   concurrency: 25                              # branches in parallel, > 0
   max_commits: 1000                            # per branch per tick, > 0
   since: 2026-01-01T00:00:00Z                  # optional, RFC 3339
@@ -172,6 +186,7 @@ Every key, its default and its meaning:
 | `secret_key` | string | — (required) | Secret key of `mds-indexer`. |
 | `listen_address` | string | `0.0.0.0:8080` | Address of the indexer's own HTTP server: `/_health`, `/metrics`, `/_pprof/`. |
 | `period` | duration | `60s` | Interval between ticks. Every tick processes every configured repository. |
+| `request_timeout` | duration | `60s` | Bound on every HTTP request the indexer sends, on the lakeFS API client and on the Iceberg catalog client (including its `GET /v1/config`). A request that exceeds it fails the branch, or the repository when the call is not attributable to one branch, so `/_health` answers `503` instead of staying `200` while indexing hangs. `0` is rejected. |
 | `concurrency` | int | `25` | Number of branches one tick processes in parallel. Within a branch everything is sequential. |
 | `max_commits` | int | `1000` | Upper bound on source commits one branch applies per tick. The next tick resumes at the recorded position. |
 | `since` | RFC 3339 timestamp | unset | Oldest commit a first indexing starts at, by creation date. When set, the indexer walks first-parent history back to the oldest commit created at or after it, whatever `backfill` says. |
@@ -197,6 +212,7 @@ bad file is fixed in one pass. Startup fails when:
 
 - `lakefs_mds_endpoint`, `access_key_id` or `secret_key` is empty;
 - `period`, `concurrency`, `max_commits`, `seed_lookback` or `rebuild_threshold` is not positive;
+- `request_timeout` is not positive;
 - `backfill` is neither `head` nor `history`;
 - `repositories` or a `repositories.<R>.branches` list is empty;
 - a repository name ends in `-metadata`, or is longer than 54 characters;
@@ -239,7 +255,9 @@ lakefs-sso mds run --config /etc/lakefs/config.yaml
 `listen_address`, and ticks until `SIGTERM` or `SIGINT`; it shuts down gracefully and logs
 `mds: indexer stopped`. Run **one** replica. Correctness under accidental concurrency comes from the
 Iceberg compare-and-swap and the crash recovery, not from a lease, so a second replica mostly wastes
-work and produces `409` responses.
+work and produces `409` responses. A second process that meets the first on a brand-new companion
+repository is harmless: the `mds: init` commit carries the table creation, so only one of them commits
+it and the other adopts it instead of failing the repository as foreign.
 
 What a first run does, in order (design §4.2, §4.5, §4.8):
 
@@ -668,6 +686,14 @@ or `GET /api/v1/repositories/my-repo/branches/main` and its `commit_id` field. I
 the table is at the branch head; if not, the indexer has not caught up yet. One tick is bounded by
 `period` plus the work of `max_commits` commits, so the usual lag is one period.
 
+`/_health`'s `lag_commits` and the `lakefs_mds_lag_commits` metric are exact, not a lower bound. When a
+branch is more than `max_commits` plus one log page behind, the indexer does not page through the
+backlog commit by commit: it rebuilds the branch's table from a full listing at the head, and the lag
+drops to `0` in that tick. Raise `max_commits` above the backlog if you want incremental catch-up
+instead of a rebuild. Every HTTP request is bounded by `request_timeout`, so a connection that stops
+answering fails the branch (or the repository) and `/_health` turns `503`; it does not freeze indexing
+silently.
+
 The upstream SQL recipe filters by the head commit:
 
 ```sql
@@ -696,7 +722,7 @@ reports `lag_commits` per branch.
 | One row per object | No change history is stored in the table; `commit_id` is the last change. |
 | `commit_id` after backfill/rebuild | The starting (or rebuilding) commit, not the original change, as described in [`Deviations`](#deviations-from-the-commit-that-changed-the-object). |
 | Rebuild memory | Above `rebuild_threshold` upserts plus deletes, the indexer stops reading the diff at the first entry over the threshold and rebuilds from a full listing rather than holding a huge delta in memory; a rebuilt commit makes no per-object stat call. A full listing still costs one page per `listObjects` page and one row per object. |
-| Per-tick work | One branch applies at most `max_commits` commits per tick; a long backlog needs several ticks. `concurrency` bounds parallel branches, not commits. |
+| Per-tick work | One branch applies at most `max_commits` commits per tick, and the log walk reads at most `max_commits` plus one page; a backlog deeper than that is rebuilt from a full listing at the head (the lag drops to `0`) instead of being paged through. `concurrency` bounds parallel branches, not commits. |
 | Query scale | The table is unpartitioned and sorted by `path` within each file. There is no path-prefix partitioning and no server-side scan planning, so a filtered query is only as selective as the Iceberg expression the engine pushes down. Partitioning by prefix is a later version. |
 | Structured metadata only | There is no full-text, vector or JSON-path search. `user_metadata` is a map of strings, queryable with the engine's map functions. |
 | Azure and GCS | Out of scope for this version: no credential vending and no remote signing. Static `storage` properties may work; they are not tested. |
@@ -740,8 +766,11 @@ Other permission facts:
   `my-repo-metadata`, like any repository. This is useful for inspecting the indexer's own table but
   is not the supported query path.
 - Ordinary principals cannot write `my-repo-metadata` while `mds-metadata-repo-protect` is in force;
-  the deny wins over an administrator's `fs:*` allow. The indexer and the catalog are outside its
-  groups and keep writing.
+  the deny wins over an administrator's `fs:*` allow. It covers `fs:Write*`, `fs:Delete*`,
+  `fs:Create*`, `fs:Revert*`, `fs:Update*` (including `fs:UpdateRepository`, which sets repository
+  metadata) and the catalog write actions on the companion repositories; the import actions
+  (`fs:ImportFromStorage`, `fs:ImportCancel`) are not covered. The indexer and the catalog are outside
+  its groups and keep writing.
 - On an auth backend without policies (`auth.basic`), the deny is not enforced and the bootstrap
   prints a warning naming that consequence. Do not rely on the deny in that mode.
 - The `system` namespace of a data repository is read-only for clients while the feature is enabled:
@@ -765,7 +794,10 @@ change. The indexer compacts a branch's table when either trigger in `metadata_s
 crossed: more than `max_delete_files` delete files, or `every_commits` indexed commits since the
 last compaction. A compaction scans the table at the current snapshot, replaces all data and delete
 files with rewritten data files in one transaction, keeps `lakefs.mds.source-commit`, and commits
-with `mds: compact <R>@<C>`. It does not create a new tag; the existing `mds-*` tag still points at
+with `mds: compact <R>@<C>`. The delete files are taken from the snapshot's manifest list, not from the
+scan plan, so a delete file that no scan task carries any more — a rebuild replaces the data files it
+applied to — is removed too; `max_delete_files` therefore counts a number that a compaction actually
+drives to zero. It does not create a new tag; the existing `mds-*` tag still points at
 the pre-compaction commit, which holds the same rows. Compactions are counted by
 `lakefs_mds_compactions_total`.
 
@@ -842,7 +874,13 @@ branch: lakeFS refuses a default-branch delete, so the indexer keeps it and logs
 
 - Restarting the indexer is safe and is part of normal operation; it resumes at the recorded
   position. A restart does not defer a scheduled compaction: the `every_commits` count is read
-  back from the companion branch's commit log, not kept in process state.
+  back from the companion branch's commit log, not kept in process state. A rolling restart that
+  overlaps two processes is safe even during the first initialisation of a companion repository:
+  only one of them commits `mds: init`, and the other adopts it.
+- If the recorded position no longer exists in `R` — committed GC after a force-move while the
+  indexer was down, or `R` deleted and re-created under the same name — the indexer does not fail the
+  branch forever. The next tick rebuilds the branch's table from a full listing at the head and logs
+  `mds: rebuilding the metadata branch at the data branch head`.
 - A lakeFS upgrade that changes the catalog or the table schema should be followed by a normal
   indexer tick. The indexer reloads the table before every commit and takes field IDs from the
   loaded table.
