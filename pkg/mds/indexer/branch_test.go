@@ -8,6 +8,7 @@ package indexer_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -842,4 +843,206 @@ func TestReloadTableBeforeApplyingCommit(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "s2", state.sourceCommit)
 	require.Equal(t, []string{"a", "b"}, state.paths())
+}
+
+// TestBackfillHeadSince pins §4.5 step 2's since bound with the default backfill: head. since wins
+// over backfill: head - the branch starts at the oldest first-parent commit created at or after
+// since, so objects that only exist before it are never indexed.
+func TestBackfillHeadSince(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	since := base.Add(24 * time.Hour)
+	e := newEnv(t, func(opts *indexer.Options) {
+		opts.Since = &since
+		// Backfill is left at its default, head.
+	})
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.setCommitDate("repo", "s1", base)
+	e.fake.addCommit("repo", "main", "s2", []string{"s1"},
+		[]client.ObjectStat{object("a", 10), object("b", 20)})
+	e.fake.setCommitDate("repo", "s2", base.Add(48*time.Hour))
+	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, []client.ObjectStat{object("b", 20)})
+	e.fake.setCommitDate("repo", "s3", since.Add(time.Hour))
+	e.fake.setDiff("repo", "s2", "s3", []client.Change{removed("a")})
+
+	e.tick()
+
+	require.NoError(t, e.health.repositoryError("repo"))
+	require.Equal(t, 1, e.fake.rebuildCalls, "one full listing, at the oldest commit inside the since window")
+	require.Equal(t, 1, e.fake.applyCalls, "the commits after it are deltas")
+	require.Equal(t, 2, e.metrics.indexed["repo"], "s2 and s3, not the commit before since")
+	_, ok := e.fake.tagCommit("repo-metadata", "mds-s1")
+	require.False(t, ok, "the commit before since is not indexed")
+	require.Equal(t, []string{"b"}, e.paths("main"))
+	e.requireRow("main", "b", "s2", 20)
+}
+
+// TestSeedLookbackBoundsTheSeedingWalk pins §4.5 step 1: the first indexing of a branch looks for
+// an indexed ancestor only within seed_lookback commits of its head. A tag further back is not used;
+// the branch is written from a full listing of its head instead.
+func TestSeedLookbackBoundsTheSeedingWalk(t *testing.T) {
+	// seededChain leaves main indexed at s1 - the only commit of the history with an mds- tag - and
+	// R@feature at s4, three commits behind that tag.
+	seededChain := func(t *testing.T) *env {
+		t.Helper()
+		e := newEnv(t, func(opts *indexer.Options) {
+			opts.Repositories[0].Branches = []string{"main"}
+		})
+		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.tick()
+		require.Equal(t, 1, e.fake.rebuildCalls)
+
+		e.fake.addCommit("repo", "main", "s2", []string{"s1"},
+			[]client.ObjectStat{object("a", 10), object("b", 20)})
+		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+		e.fake.addCommit("repo", "main", "s3", []string{"s2"},
+			[]client.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
+		e.fake.setDiff("repo", "s2", "s3", []client.Change{added("c", 30)})
+		e.fake.addCommit("repo", "main", "s4", []string{"s3"},
+			[]client.ObjectStat{object("a", 10), object("b", 20), object("c", 30), object("d", 40)})
+		e.fake.setDiff("repo", "s3", "s4", []client.Change{added("d", 40)})
+
+		e.fake.setBranchHead("repo", "feature", "s4")
+		return e
+	}
+	// indexFeature runs one tick that follows only R@feature, with the given seed_lookback.
+	indexFeature := func(t *testing.T, e *env, lookback int) {
+		t.Helper()
+		idx, err := indexer.New(indexer.Options{
+			LakeFS:       e.fake,
+			Tables:       e.fake,
+			Health:       e.health,
+			Metrics:      e.metrics,
+			Repositories: []indexer.Repository{{Name: "repo", Branches: []string{"feature"}}},
+			SeedLookback: lookback,
+		})
+		require.NoError(t, err)
+		require.NoError(t, idx.Tick(t.Context()))
+	}
+
+	t.Run("within the bound", func(t *testing.T) {
+		e := seededChain(t)
+		indexFeature(t, e, 4)
+
+		require.NoError(t, e.health.repositoryError("repo"))
+		require.Len(t, e.fake.createdBranches, 1)
+		require.Equal(t, createdBranch{repository: "repo-metadata", branch: "feature", source: "mds-s1"},
+			e.fake.createdBranches[0], "the tag inside seed_lookback seeds the branch")
+		require.Equal(t, 1, e.fake.rebuildCalls, "a seeded branch is not rebuilt")
+		require.Equal(t, 3, e.fake.applyCalls, "s2, s3 and s4 are applied as deltas")
+		e.requireRow("feature", "a", "s1", 10)
+		e.requireRow("feature", "d", "s4", 40)
+	})
+
+	t.Run("beyond the bound", func(t *testing.T) {
+		e := seededChain(t)
+		indexFeature(t, e, 3)
+
+		require.NoError(t, e.health.repositoryError("repo"))
+		require.Len(t, e.fake.createdBranches, 1)
+		require.Equal(t, e.fake.initCommitID(), e.fake.createdBranches[0].source,
+			"a tag beyond seed_lookback is not used")
+		require.Equal(t, 2, e.fake.rebuildCalls, "the branch is written from a full listing of its head")
+		require.Zero(t, e.fake.applyCalls)
+		require.Empty(t, e.fake.statCalls)
+		state, ok := e.fake.tableState("feature")
+		require.True(t, ok)
+		require.Equal(t, []string{"a", "b", "c", "d"}, state.paths())
+		for path, size := range map[string]int64{"a": 10, "b": 20, "c": 30, "d": 40} {
+			e.requireRow("feature", path, "s4", size)
+		}
+	})
+}
+
+// probeTimeout bounds how long a branch tick waits for another one to start, so an indexer that
+// runs its branches one at a time fails the assertion of the concurrency test instead of hanging.
+const probeTimeout = 3 * time.Second
+
+// inFlightProbe measures how many branch ticks of one indexer run at the same time (§4.1). A tick
+// counts as in flight while the fake answers the head read it starts with; enter blocks until want
+// ticks are in flight together, or until probeTimeout.
+type inFlightProbe struct {
+	want    int
+	mu      sync.Mutex
+	in      int
+	peak    int
+	reached chan struct{}
+	once    sync.Once
+}
+
+func newInFlightProbe(want int) *inFlightProbe {
+	return &inFlightProbe{want: want, reached: make(chan struct{})}
+}
+
+func (p *inFlightProbe) enter(string) func() {
+	p.mu.Lock()
+	p.in++
+	if p.in > p.peak {
+		p.peak = p.in
+	}
+	enough := p.in >= p.want
+	p.mu.Unlock()
+	if enough {
+		p.once.Do(func() { close(p.reached) })
+	}
+	select {
+	case <-p.reached:
+	case <-time.After(probeTimeout):
+		// The indexer did not run want branches at once. Let the tick finish so that the test
+		// reports the peak it measured instead of timing out.
+	}
+	return func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.in--
+	}
+}
+
+// maxInFlight returns the largest number of branch ticks the probe saw at once.
+func (p *inFlightProbe) maxInFlight() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.peak
+}
+
+// TestConcurrencyBoundsBranchesInFlight pins §4.1: one repository tick processes up to `concurrency`
+// branches in parallel and never more, and it does use the parallelism it is configured with.
+func TestConcurrencyBoundsBranchesInFlight(t *testing.T) {
+	const (
+		branches    = 4
+		concurrency = 2
+	)
+	e := newEnv(t, func(opts *indexer.Options) {
+		opts.Concurrency = concurrency
+		opts.Repositories[0].Branches = []string{"b*"}
+	})
+	for i := 1; i <= branches; i++ {
+		branch := fmt.Sprintf("b%d", i)
+		e.fake.addCommit("repo", branch, "s1-"+branch, nil, []client.ObjectStat{object("a", 10)})
+	}
+	e.tick()
+	require.Equal(t, branches, e.fake.rebuildCalls, "every branch is backfilled")
+
+	// One more commit per branch, so the next tick has work to do on all of them at once.
+	probe := newInFlightProbe(concurrency)
+	e.fake.setDataBranchHook(probe.enter)
+	for i := 1; i <= branches; i++ {
+		branch := fmt.Sprintf("b%d", i)
+		commit := "s2-" + branch
+		e.fake.addCommit("repo", branch, commit, []string{"s1-" + branch},
+			[]client.ObjectStat{object("a", 10), object("b", 20)})
+		e.fake.setDiff("repo", "s1-"+branch, commit, []client.Change{added("b", 20)})
+	}
+
+	e.tick()
+
+	require.NoError(t, e.health.repositoryError("repo"))
+	require.Equal(t, concurrency, probe.maxInFlight(),
+		"indexRepository processes concurrency branches at a time, and not more than that")
+	for i := 1; i <= branches; i++ {
+		branch := fmt.Sprintf("b%d", i)
+		health := e.health.branch("repo", branch)
+		require.NoError(t, health.err, "branch %q", branch)
+		require.Zero(t, health.lag, "branch %q", branch)
+		e.requireRow(branch, "b", "s2-"+branch, 20)
+	}
 }

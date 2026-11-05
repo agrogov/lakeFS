@@ -5,7 +5,9 @@ package indexer_test
 // back to statObject, and when a change set is written as a full rebuild instead of a delta.
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/mds/client"
@@ -67,6 +69,136 @@ func TestChangeSetFallsBackToStatObject(t *testing.T) {
 	require.Equal(t, object("b", 20).Mtime, b.LastModified)
 	require.Equal(t, map[string]string{"X-Amz-Meta-Owner": "alice"}, b.UserMetadata)
 	e.requireRow("main", "c", "s2", 30)
+}
+
+// TestStatFallbackCoversEveryNeededField pins §4.3 step 1's rule that a needed field missing from the
+// right-side stat means one statObject call - not just an empty checksum or a zero mtime. The right
+// side of a diff is used as it is only when it carries the checksum, the modification time and the
+// size; content_type and user metadata may legitimately be empty, so they never trigger the
+// fallback.
+func TestStatFallbackCoversEveryNeededField(t *testing.T) {
+	mtime := object("b", 20).Mtime
+	right := func(mutate func(*client.ObjectStat)) *client.ObjectStat {
+		stat := client.ObjectStat{Path: "b", SizeBytes: 20, ETag: "etag-b", Mtime: mtime}
+		if mutate != nil {
+			mutate(&stat)
+		}
+		return &stat
+	}
+
+	cases := []struct {
+		name     string
+		change   client.Change
+		wantStat bool
+	}{
+		{
+			name:   "complete right side",
+			change: client.Change{Path: "b", Type: client.ChangeAdded, SizeBytes: 20, Right: right(nil)},
+		},
+		{
+			// include_right_stats is not honoured at all: the whole right-side stat is absent.
+			name:     "no right side",
+			change:   client.Change{Path: "b", Type: client.ChangeAdded, SizeBytes: 20},
+			wantStat: true,
+		},
+		{
+			name: "no checksum",
+			change: client.Change{Path: "b", Type: client.ChangeAdded, SizeBytes: 20,
+				Right: right(func(stat *client.ObjectStat) { stat.ETag = "" })},
+			wantStat: true,
+		},
+		{
+			name: "no modification time",
+			change: client.Change{Path: "b", Type: client.ChangeChanged, SizeBytes: 20,
+				Right: right(func(stat *client.ObjectStat) { stat.Mtime = time.Time{} })},
+			wantStat: true,
+		},
+		{
+			// The size is on the diff entry, not inside the right-side stat, and a size the
+			// server did not report arrives as zero.
+			name:     "no size",
+			change:   client.Change{Path: "b", Type: client.ChangeAdded, Right: right(nil)},
+			wantStat: true,
+		},
+		{
+			name: "empty content type and metadata are not missing fields",
+			change: client.Change{Path: "b", Type: client.ChangeAdded, SizeBytes: 20,
+				Right: right(func(stat *client.ObjectStat) { stat.ContentType = ""; stat.UserMetadata = nil })},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+			e.tick()
+
+			e.fake.addCommit("repo", "main", "s2", []string{"s1"},
+				[]client.ObjectStat{object("a", 10), object("b", 20)})
+			e.fake.setDiff("repo", "s1", "s2", []client.Change{tc.change})
+			e.tick()
+
+			require.NoError(t, e.health.repositoryError("repo"))
+			if tc.wantStat {
+				require.Equal(t, []string{"b"}, e.fake.statCalls, "a needed field is missing, so the entry is statted")
+			} else {
+				require.Empty(t, e.fake.statCalls, "the right-side stat is complete and used as it is")
+			}
+
+			b := e.requireRow("main", "b", "s2", 20)
+			require.Equal(t, "etag-b", b.ETag)
+			require.Equal(t, mtime, b.LastModified)
+		})
+	}
+}
+
+// TestChangeSetStopsAtRebuildThreshold pins the bound §4.3 step 2 is about: the change set of one
+// commit is bounded by rebuild_threshold, not by the size of its diff. The indexer stops paging the
+// diff at the first entry above the threshold and rebuilds the table at the commit, so it neither
+// reads the rest of the diff nor statts any of its entries.
+func TestChangeSetStopsAtRebuildThreshold(t *testing.T) {
+	const (
+		threshold = 2
+		entries   = 10
+	)
+	e := newEnv(t, func(opts *indexer.Options) { opts.RebuildThreshold = threshold })
+	// Two entries per page: a full read of the diff below takes five DiffRefs calls.
+	e.fake.pageSize = 2
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.tick()
+	require.Equal(t, 1, e.fake.rebuildCalls)
+	require.Zero(t, e.fake.diffRefsCalls(), "the first indexing is a rebuild, not a diff")
+
+	// No right-side stats at all, so a change set that was read to the end would stat every entry.
+	objects := make([]client.ObjectStat, 0, entries)
+	upserts := make([]client.Change, 0, entries)
+	for i := range entries {
+		path := fmt.Sprintf("p%02d", i)
+		size := int64(10 * (i + 1))
+		objects = append(objects, object(path, size))
+		upserts = append(upserts, client.Change{Path: path, Type: client.ChangeAdded, SizeBytes: size})
+	}
+	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, objects)
+	e.fake.setDiff("repo", "s1", "s2", upserts)
+
+	e.tick()
+
+	require.NoError(t, e.health.repositoryError("repo"))
+	require.Equal(t, 2, e.fake.diffRefsCalls(),
+		"the diff is read only up to the first entry above rebuild_threshold, so two of five pages")
+	require.Empty(t, e.fake.statCalls, "a commit that is rebuilt costs no statObject call")
+	require.Zero(t, e.fake.applyCalls, "the cut-off change set is never applied as a delta")
+	require.Equal(t, 2, e.fake.rebuildCalls, "the commit is written as a full listing instead")
+	// One page for the backfill listing of s1, and five for the rebuild listing of ten objects in
+	// pages of two.
+	require.Equal(t, 6, e.fake.listObjectCalls(), "the rebuild reads the full listing of the commit")
+
+	state, ok := e.fake.tableState("main")
+	require.True(t, ok)
+	require.Len(t, state.rows, entries)
+	for _, path := range state.paths() {
+		require.Equal(t, "s2", state.rows[path].CommitID)
+	}
 }
 
 // TestUnknownChangeTypeIsRefused pins the strictness of §4.3 step 1: a diff type the indexer does

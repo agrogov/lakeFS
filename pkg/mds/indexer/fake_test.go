@@ -68,9 +68,16 @@ type fake struct {
 	deletedTags         []string
 	statCalls           []string
 	events              []string
+	diffCalls           int
+	listCalls           int
 	applyCalls          int
 	rebuildCalls        int
 	compactCalls        int
+
+	// dataBranchHook, when set, is run for every head read that starts a branch tick of a data
+	// repository (indexer.runBranchOnce reads it with GetCommit). It lets a test hold several branch
+	// ticks in flight at once and measure how many the indexer runs in parallel (design §4.1).
+	dataBranchHook func(branch string) (done func())
 
 	// Injected failures. Each is one-shot unless documented otherwise.
 	applyErr    error
@@ -314,6 +321,41 @@ func (f *fake) resetCalls() []string {
 	return slices.Clone(f.resetBranches)
 }
 
+// setDataBranchHook installs the hook that enterDataBranch runs for the head read of a data branch.
+func (f *fake) setDataBranchHook(hook func(branch string) (done func())) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dataBranchHook = hook
+}
+
+// enterDataBranch runs the concurrency probe, when one is installed, for a head read of a branch of
+// a data repository. Reads of the metadata repository are excluded: they belong to a branch tick
+// that is already running, they do not start one.
+func (f *fake) enterDataBranch(repository, branch string) func() {
+	f.mu.Lock()
+	hook := f.dataBranchHook
+	metadata := f.metadataRepo
+	f.mu.Unlock()
+	if hook == nil || repository == metadata {
+		return nil
+	}
+	return hook(branch)
+}
+
+// diffRefsCalls returns how many pages of a diff the indexer read.
+func (f *fake) diffRefsCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.diffCalls
+}
+
+// listObjectCalls returns how many pages of a listing the indexer read.
+func (f *fake) listObjectCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.listCalls
+}
+
 // madeCommits returns the lakeFS commits the indexer made.
 func (f *fake) madeCommits() []client.CommitOptions {
 	f.mu.Lock()
@@ -518,6 +560,9 @@ func (f *fake) LogCommits(_ context.Context, repository, ref string, opts client
 }
 
 func (f *fake) GetCommit(_ context.Context, repository, commitID string) (client.Commit, error) {
+	if done := f.enterDataBranch(repository, commitID); done != nil {
+		defer done()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	id, err := f.resolveLocked(repository, commitID)
@@ -634,6 +679,7 @@ func (f *fake) DeleteTag(_ context.Context, repository, tag string) error {
 func (f *fake) ListObjects(_ context.Context, repository, ref, after string) ([]client.ObjectStat, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.listCalls++
 	objects, ok := f.objects[repository][ref]
 	if !ok {
 		return nil, false, &client.NotFoundError{Operation: "list objects", Subject: ref}
@@ -647,6 +693,7 @@ func (f *fake) ListObjects(_ context.Context, repository, ref, after string) ([]
 func (f *fake) DiffRefs(_ context.Context, repository, leftRef, rightRef, after string) ([]client.Change, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.diffCalls++
 	changes, ok := f.diffs[repository][leftRef+".."+rightRef]
 	if !ok {
 		return nil, false, &client.NotFoundError{Operation: "diff refs", Subject: leftRef + ".." + rightRef}

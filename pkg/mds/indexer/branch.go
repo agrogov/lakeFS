@@ -544,9 +544,11 @@ func (x *Indexer) applyCommit(ctx context.Context, repository, branch string, ha
 	handle.swap(tbl)
 
 	var written int64
-	if changes.count() > x.rebuildThreshold {
+	if changes.large || changes.count > x.rebuildThreshold {
 		// §4.3 step 2: a change set this large is cheaper written as a full listing, and it
-		// bounds both the memory of the delta and the size of its delete predicate.
+		// bounds both the memory of the delta and the size of its delete predicate. changeSet
+		// stops reading the diff as soon as it knows this, so the change set is incomplete and
+		// is not touched here.
 		if err := x.rebuild(ctx, repository, tbl, commit, &written); err != nil {
 			return err
 		}
@@ -554,8 +556,9 @@ func (x *Indexer) applyCommit(ctx context.Context, repository, branch string, ha
 		x.log.WithFields(logging.Fields{
 			"repository":        repository,
 			"commit":            commit.ID,
-			"changes":           changes.count(),
+			"changes":           changes.count,
 			"rebuild_threshold": x.rebuildThreshold,
+			"cut_off":           changes.large,
 		}).Info("mds: change set above rebuild_threshold, rebuilt the branch table")
 	} else if tbl.SourceCommit() != commit.ID {
 		// §4.4: a staged table that already records this commit only misses its lakeFS commit.
