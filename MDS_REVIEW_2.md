@@ -1283,3 +1283,200 @@ assigned before `Execute` so the catalog sees it at mount time. `guardGroups()` 
 - Both MAJORs were confirmed by reading the code and the on-disk module sources (arrow-go v18.8.0,
   iceberg-go v0.7.0); their probes were not re-run, because this card may not add a test file.
 - This card changed no code, test, design or doc file, and did not touch `MDS_REVIEW.md`.
+
+## Final esti run
+
+The esti-run report this card was asked for, on the final HEAD of the branch — in the `## esti run`
+format (HEAD, one table of step / command / result / wall time, then `FE-<n>` failures), appended
+rather than rewriting the earlier `## esti run` section, which is the previous run this one is
+compared against.
+
+**HEAD:** `b4c8c24ba0935de5f6a2d2b9c78593e90f78b7b7` (`b4c8c24ba`) — *docs: record the MDS fix-review
+fixes* — on branch `feature/metadata-search`, working tree clean before and after. Run on 2026-11-05,
+17:31–17:49 CET (the step logs print `+01:00`). Report-only: no code, test or doc was changed; the
+only file this card wrote is this section.
+
+### Environment
+
+- Docker 27.3.1 on colima (x86_64 VM on an arm64 host), **no compose plugin**.
+- Object store: the **already-running** container `esti-seaweedfs` (`chrislusf/seaweedfs:latest`,
+  digest `c2658820e763`, `0.0.0.0:8333->8333`) — reused, never started, stopped or inspected for
+  writes by this card; S3 on `:8333` answered (403 on `/` without credentials, as expected). It was
+  not started with the brief's `docker run` line because it was already up.
+- Go: `export PATH=$HOME/sdk/go1.25.8/bin:$PATH GOTOOLCHAIN=auto`; `go.mod` declares `go 1.26.4`, so
+  the auto toolchain resolved to **go1.26.4 darwin/arm64** for every step.
+- esti client image `esti-iceberg-client:pinned` (`de45778c6117`, pyiceberg/pyarrow/duckdb), so no
+  per-step pip install. Engine images at the README's pinned digests were already local:
+  `tabulario/spark-iceberg` `790a72e744e0`, `trinodb/trino` `2704eb53935a`.
+- Common esti environment for the three `go test` steps (`ESTI_SETUP_LAKEFS=false`: the suite starts
+  its own `lakefs-sso` and its own `lakefs-sso mds run`, exactly as the
+  `metadata-search-system-tests` CI job does):
+
+  ```bash
+  LAKEFS_BLOCKSTORE_TYPE=s3
+  LAKEFS_BLOCKSTORE_S3_ENDPOINT=http://127.0.0.1:8333
+  LAKEFS_BLOCKSTORE_S3_CREDENTIALS_ACCESS_KEY_ID=estiaccesskey
+  LAKEFS_BLOCKSTORE_S3_CREDENTIALS_SECRET_ACCESS_KEY=estisecretkey
+  LAKEFS_BLOCKSTORE_S3_FORCE_PATH_STYLE=true
+  AWS_REGION=us-east-1
+  ESTI_SETUP_LAKEFS=false
+  ESTI_ICEBERG_CLIENT_IMAGE=esti-iceberg-client:pinned
+  ESTI_STORAGE_NAMESPACE=s3://esti-mds-test/mds3-<step>-<epoch>   # one unique prefix per step
+  ```
+
+- **FAIL FAST.** Every step ran under a wrapper (`/tmp/mds3/bounded.py`) that starts the command in
+  its own process group, polls it once a second, and at the bound writes
+  `=== TIMEOUT after Ns: killing process group <pid>` into the step log, sends `TERM` to the whole
+  group and `KILL` after 20 s (`rc=124`); a child that exits early is reaped by `wait` at once and
+  never waited out. The wrapper's kill path was self-tested before step 1 (`selftest rc=124
+  wall=5.0s`, `pgrep` empty afterwards) and its reaping path too (`selftest2 rc=3 wall=1.1s`). It
+  never fired. `go test -timeout` was set on all three esti steps as well, and the suite's own
+  in-code bounds (`mdsIndexTimeout` 60s, `mdsBackfillIndexTimeout` 10m,
+  `mdsBucketOperationTimeout` 10m) were left untouched. Step logs are in `/tmp/mds3/<step>.log`;
+  wall time below is the wrapper's clock for the whole step.
+
+### Steps
+
+| # | Step | Command | Result | Wall time |
+|---|------|---------|--------|-----------|
+| 1 | Build | `go build ./...` (bound 1200s) | pass, `rc=0`, no output | **17.9s** |
+| 2 | Vet (esti) | `go vet ./esti/...` (bound 600s) | pass, `rc=0`, no output | **1.8s** |
+| 3 | E2E suite, whole test | `go test -count=1 -timeout 20m -v ./esti -system-tests -use-local-credentials -run '^TestMetadataSearchEndToEnd$'` (bound 1500s) | pass — `--- PASS: TestMetadataSearchEndToEnd (358.84s)`, `ok … 360.145s`, **32/32 PASS (1 parent + 31 subtests), 0 FAIL, 0 SKIP** | **364.7s** |
+| 4 | Backfill, 10k | same env + `ESTI_MDS_BACKFILL_OBJECTS=10000`, `go test -count=1 -timeout 15m -v ./esti -system-tests -use-local-credentials -run '^TestMetadataSearchBackfill$'` (bound 1200s) | pass — `--- PASS: TestMetadataSearchBackfill (52.21s)`, `ok … 53.664s` | **57.3s** |
+| 5 | Backfill, 100k | same env + `ESTI_MDS_BACKFILL_OBJECTS=100000`, `go test -count=1 -timeout 30m -v ./esti … -run '^TestMetadataSearchBackfill$'` (bound 1800s) | pass — `--- PASS: TestMetadataSearchBackfill (181.79s)`, `ok … 182.951s` | **186.4s** |
+| 6 | Engine recipes | `./esti/ops/mds-engines/run-all.sh` (bound 1800s; `env-up.sh` → `run-spark.sh` → `run-trino.sh` → `env-down.sh`, 300s per engine container) | pass — `mds-engines: all engine snippets passed`, 4/4 variants | **348.0s** |
+
+**Totals:** 6 of 6 steps passed; 32 of 32 esti subtests passed, 0 skipped; 4 of 4 engine variants
+passed; 0 failures, 0 timeouts. Total wall time 976.1s (16m16s). This card's list is the six steps
+above; the plan-M6 `go vet ./pkg/mds/... ./cmd/lakefs-sso/...` row the earlier run also had was not on
+this card's list and was not re-run.
+
+### Step 3 — TestMetadataSearchEndToEnd, every subtest
+
+All 15 top-level cases of METADATA_SEARCH_DESIGN.md §9 passed (31 `--- PASS` subtest lines: 15
+top-level, of which `system on R rejects writes` adds 2 mount parents and 7 cases × 2 mounts),
+and every read went through
+all four recipes (PyIceberg `pyiceberg`, PyIceberg `pyiceberg_relative` on
+`/iceberg/relative_to/{repo}.{ref}/api`, DuckDB `duckdb`, DuckDB identifier form) at each state:
+
+| Subtest | Time | Subtest | Time |
+|---|---|---|---|
+| upload and commit | 24.10s | tag and short commit id | 42.64s |
+| overwrite | 38.45s | hard reset | 21.67s |
+| delete | 22.29s | indexer restart | 27.35s |
+| s3 gateway user metadata | 20.03s | user without access is refused | 0.00s |
+| filtered scan | 20.78s | R-metadata access does not open the virtual table | 0.02s |
+| new branch is seeded | 41.42s | non-indexer cannot write R-metadata | 0.00s |
+| merge | 20.83s | system on R rejects writes (7 cases × 2 mounts) | 38.29s |
+| indexer still owns R-metadata | 26.26s | | |
+
+Observed index latency after each state change: **502ms–2.509s** (`mds_test.go:328/362/376/392/427/430/481/499/525/542/566/796`),
+consistent with `period: 2s`. No `level=error` or `level=warning` line, no retry and no rebuild in the
+whole log.
+
+### Steps 4–5 — backfill timings vs the guide and vs the previous run
+
+Guide figures are from `docs/metadata-search.md`:810-816. "Previous" is the `## esti run` section
+above (HEAD `df9744488`), same host, same SeaweedFS container.
+
+| Measure | Guide | Previous run (`df9744488`) | This run (`b4c8c24ba`) |
+|---|---|---|---|
+| 10k: first indexed after indexer start | 2.7s | 2.711s | **2.710s** |
+| 10k: throughput | — | 3,689 objects/s | **3,690 objects/s** |
+| 10k: `lakefs_mds_tick_duration_seconds_sum` | 0.46s | 0.546551s | **0.49021225s** |
+| 10k: ticks / rebuilds | 1 / — | 1 / 1 | **1 / 1** |
+| 10k: `mds_rows_written_total` | 10,000 | 10,000 | **10,000** |
+| 10k: rows counted by the engines | 10,000 | 10,000 both | **10,000 on all four paths** |
+| 10k: source-commit setup | — | 18.174s | **17.185s** |
+| 10k: whole test / step | — | 57.75s / 64s | **52.21s / 57.3s** |
+| 100k: source-commit setup | 5m46.159s | 2m49.911s | **2m24.881s** |
+| 100k: first indexed after indexer start | 3.212s | 3.213s | **3.215s** |
+| 100k: throughput | 31,135 objects/s | 31,125 objects/s | **31,101 objects/s** |
+| 100k: `lakefs_mds_tick_duration_seconds_sum` | 0.86s | 0.823102s | **0.8172325s** |
+| 100k: ticks / rebuilds | 1 / 1 | 1 / 1 | **1 / 1** |
+| 100k: `mds_rows_written_total` | 100,000 | 100,000 | **100,000** |
+| 100k: rows counted by the engines | 100,000, `source_commit` at head | 100,000 both, `source_commit` at head | **100,000 on all four paths, `source_commit` at head** |
+| 100k: whole test / step | 447.26s | 209.90s / 217s | **181.79s / 186.4s** |
+
+The indexer-side figures reproduce the documented ones: first-indexed is within 10ms (10k) and 3ms
+(100k) of the guide, throughput is 0.11% below the guide at 100k and 0.07% below the previous run,
+`tick_duration_seconds_sum` is 6.6% above the guide at 10k and 5.0% below it at 100k (10.3% and 0.7%
+below the previous run), and tick count, rebuild count, rows written and rows read back are identical
+everywhere.
+`source_commit` equals the head commit in both the 10k and 100k runs, on every engine path.
+
+Two figures keep moving and are **not** indexing work:
+
+- **100k source-commit setup** — 2m24.881s here, 2m49.911s in the previous run, 5m46.159s in the
+  guide. It is the import of 100,000 entries on this host and SeaweedFS state (2m24.848s of it is the
+  import call, 20ms the one uploaded object); the trend is downward across the three runs.
+- **Whole-test wall time** — follows the setup figure (181.79s vs 209.90s vs 447.26s). The guide's
+  sentence that what used to exceed the test timeout was building the source commit, not indexing
+  it, still holds.
+
+### Step 6 — the four engine recipes
+
+`run-all.sh` passed: `mds-engines: all engine snippets passed`. Each engine container ran under
+`run-spark.sh` / `run-trino.sh`'s own 300s bound and none approached it.
+
+| Variant | Endpoint | Evidence |
+|---|---|---|
+| Spark `mds` | `http://lakefs:8000/mds/iceberg/api` | guide snippet `Time taken: 21.129 seconds, Fetched 3 row(s)`; exactly the 3 `orders/` rows at `SOURCE_COMMIT`, 1 `part-*` file |
+| Spark `relative` | `http://lakefs:8000/iceberg/relative_to/my-repo.main/api` | `Time taken: 20.854 seconds, Fetched 3 row(s)`; same 3 rows; `Spark returned the same rows through both catalog endpoints` |
+| Trino `mds` | `/mds/iceberg/api` | `Trino mds returned exactly the three expected orders/ rows at f44b680e…34017` |
+| Trino `relative` | `/iceberg/relative_to/my-repo.main/api` | `Trino relative returned exactly the three expected orders/ rows`; `Trino returned the same rows through both catalog endpoints` |
+
+Captured rows (both engines, both endpoints,
+`SOURCE_COMMIT=f44b680e6603bf59019efd5707865fa8166f7d8807e8924b8faa0969c5734017`):
+
+```
+orders/2024/one.parquet    34  <SOURCE_COMMIT>  {}
+orders/2024/two.parquet    34  <SOURCE_COMMIT>  {}
+orders/2025/three.parquet  36  <SOURCE_COMMIT>  {}
+```
+
+`customers/c1.json` stayed outside the `orders/%` filter, as the README expects. Repo `my-repo`,
+branch `main`, namespace `s3://esti-mds-engines/mds-engines-20261105174222/my-repo`; the indexer
+first-indexed 4 rows 2s after it started (`backfill=head`, `period=2s`, `concurrency=4`). Total wall
+348.0s — against 373s for the previous run's `run-all.sh` and 508s for the rerun recorded in
+`esti/ops/mds-engines/README.md` ("Rerun after the row-gate fix (2026-11-05)"), which is 6.7% and
+31.5% faster respectively; the scripts, digests and container bounds are identical in all three.
+
+As in the previous run, Spark wrote **one** `part-*` file per variant ("`Spark mds wrote 1 part
+file(s) …; comparing all of them`"), so the multi-file path of R2T-4's fix was again not exercised by
+the run; `./run-spark.sh --self-test` is what proves it, and it was not re-run here (this card's list
+runs the four recipes).
+
+### Failures
+
+**None.** 0 failures, 0 skips, 0 timeouts, so **no `FE-<n>` entry exists** in this run and there is
+nothing to classify as product bug, test bug or environment. For the record, the failure protocol was
+live rather than assumed: the step wrapper's `TERM`/`KILL` path and its early-reap path were both
+self-tested before step 1 (see "Environment"), every step had both a wrapper bound and a
+`go test -timeout`, and no child process died early in any step.
+
+### Teardown and post-run checks
+
+- `run-all.sh`'s own `env-down.sh` (trap on success and failure) stopped everything it started:
+  `stopping indexer (pid 47609)`, `stopping server (pid 47289)`, `stopping oidc (pid 47203)`,
+  `environment stopped`.
+- The esti steps clean up their own `lakefs-sso` server, indexer and run prefix, and their PyIceberg
+  / DuckDB client containers.
+- Nothing this card started is left running; the `esti-seaweedfs` container was up before the run and
+  was not started or stopped here.
+
+```
+$ ps -ef | grep -E "lakefs-sso|mds run|oidc" | grep -v grep
+(no output)
+$ docker ps --format '{{.Names}}\t{{.Status}}'
+esti-seaweedfs	Up 4 hours           # pre-existing, reused, untouched
+$ docker ps -a --format '{{.Names}}' | grep -Ei "mds|spark|trino|lakefs"
+(none)
+$ lsof -nP -iTCP:8000  -sTCP:LISTEN   # empty
+$ lsof -nP -iTCP:18080 -sTCP:LISTEN   # empty
+$ lsof -nP -iTCP:18099 -sTCP:LISTEN   # empty
+$ git status --porcelain              # clean; only MDS_REVIEW_2.md is modified by this commit
+```
+
+`esti/ops/mds-engines/.run/` was written by the recipes as documented; it is git-ignored
+(`esti/ops/mds-engines/.gitignore:.run/`), so it is not part of the commit.
