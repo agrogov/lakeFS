@@ -54,3 +54,17 @@ func TestChangedPaths(t *testing.T) {
 	require.Equal(t, []string{"a", "b", "c"}, changedPaths(rows, []string{"c", "a"}))
 	require.Empty(t, changedPaths(nil, nil))
 }
+
+// CompactRecordBatchSize sets how many rows one record batch of a compaction carries and returns
+// the function that restores the previous value.
+//
+// It is the test half of the multi-batch write path of Compact (MDS_REVIEW.md TB-2): iceberg-go
+// sorts every record batch it is handed on its own, so a compaction that writes several batches is
+// only in the table's declared path order if the writer sorted the rows before batching them. The
+// alternative to this seam is a test table of 65 537 rows, because Compact takes no options and
+// therefore no batch size (TB-4). It exists only in the test build of the package.
+func CompactRecordBatchSize(size int) (restore func()) {
+	previous := compactRecordBatchSize
+	compactRecordBatchSize = size
+	return func() { compactRecordBatchSize = previous }
+}

@@ -49,6 +49,13 @@ type refResolver interface {
 	GetTag(ctx context.Context, repositoryID, tagID string) (string, error)
 }
 
+// The server's catalog is the only implementation of refResolver, and New type-asserts it at
+// startup: without this assertion a change to GetCommit or GetTag of *catalog.Catalog would make
+// the assertion fail silently, New would return nil, and every tag and commit read of
+// R.<ref>.system.object_metadata would answer NoSuchTableException with one Warn line as the only
+// signal (§6, MDS_REVIEW.md TB-5). With it, the build breaks instead.
+var _ refResolver = (*catalog.Catalog)(nil)
+
 // mapper is the RefMapper of §6. It holds the resolved refResolver, never the BranchLister it was
 // built from: New refuses a lister that cannot answer the two questions the mapping needs.
 type mapper struct {

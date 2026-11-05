@@ -105,6 +105,17 @@ func TestNew(t *testing.T) {
 	})
 }
 
+// TestCatalogSatisfiesRefResolver is the unit-test half of MDS_REVIEW.md TB-5: the production
+// catalog, *catalog.Catalog, is the refResolver New type-asserts, and the compile-time assertion
+// in refmap.go breaks the build if its GetCommit or GetTag is ever re-shaped. A typed nil is
+// enough here because the assertion is about the method set, not about a live catalog: if the
+// method set drifted, New would refuse it and return nil, which is the silent fallback to
+// "no mapper" that TB-5 is about.
+func TestCatalogSatisfiesRefResolver(t *testing.T) {
+	require.NotNil(t, New((*catalog.Catalog)(nil)),
+		"*catalog.Catalog implements refResolver, so New must install a mapper")
+}
+
 func TestMapRef(t *testing.T) {
 	errBoom := errors.New("storage failure")
 

@@ -5,9 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"slices"
 	"sort"
+	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/iceberg-go"
 	icebergio "github.com/apache/iceberg-go/io"
 	icebergtable "github.com/apache/iceberg-go/table"
@@ -20,6 +24,12 @@ const (
 	// a delta (§4.3 step 2), so this bounds one predicate and not the work of one commit.
 	DefaultDeleteChunkSize = 10_000
 )
+
+// compactRecordBatchSize is how many rows one record batch of a compaction carries. It is a
+// variable, and not DefaultRecordBatchSize, only so that the package's tests can exercise the
+// multi-batch write path of Compact without building 65 536 rows: CompactRecordBatchSize in
+// writer_internal_test.go sets it for one test. Production never changes it.
+var compactRecordBatchSize = DefaultRecordBatchSize
 
 var (
 	// ErrNoRepository is returned when the table carries no lakefs.mds.repository property: the
@@ -34,6 +44,13 @@ var (
 
 	// ErrUnknownDeleteMode is returned for a write.delete.mode the writer does not implement.
 	ErrUnknownDeleteMode = errors.New("unknown write.delete.mode")
+
+	// ErrRowsOutOfOrder is returned when a row source of a rebuild yields a path that does not
+	// come after the previous one. The table declares sort order path ASC (§3.1), and a rebuild
+	// streams its source instead of collecting it (design §4.3 step 2), so the order of the files
+	// it writes is the order of the source: rather than writing files that contradict the table's
+	// declared order, a source that breaks it is refused (MDS_REVIEW.md TB-2).
+	ErrRowsOutOfOrder = errors.New("rows are not in path order")
 
 	// ErrNoTable is returned when a write is applied without a loaded table. The caller loads the
 	// table from the catalog (design §4.2 step 2 and §4.4), so a nil table is a programming error
@@ -225,6 +242,11 @@ func ApplyDelta(ctx context.Context, tbl *icebergtable.Table, upserts []Row, del
 // total-delete-files - the counter of §4.9's compaction trigger - would never fall back to zero
 // (TB-1). The rows written are the same either way; a whole-table rewrite replaces the rows those
 // delete files applied to.
+//
+// The rows are written in the order the source yields them, which is the table's declared sort
+// order (§3.1: path ASC): the source is streamed, so the writer cannot sort it without collecting
+// the branch in memory, and a source that breaks the order is refused with ErrRowsOutOfOrder
+// rather than written into files that contradict the declared order (MDS_REVIEW.md TB-2).
 func Rebuild(ctx context.Context, tbl *icebergtable.Table, rows Rows, sourceCommit string, opts ...Option) (*icebergtable.Table, error) {
 	if tbl == nil {
 		return nil, ErrNoTable
@@ -242,7 +264,7 @@ func Rebuild(ctx context.Context, tbl *icebergtable.Table, rows Rows, sourceComm
 	}
 	snapshotProps := SnapshotProperties(repository, sourceCommit)
 
-	reader, err := NewRowsRecordReader(tbl.Schema(), rows, o.recordBatchSize)
+	reader, err := NewRowsRecordReader(tbl.Schema(), orderedRows(rows), o.recordBatchSize)
 	if err != nil {
 		return nil, err
 	}
@@ -285,10 +307,26 @@ func Rebuild(ctx context.Context, tbl *icebergtable.Table, rows Rows, sourceComm
 // cleanup could reclaim it - and the snapshot summary's total-delete-files, which is exactly what
 // §4.9's delete-file trigger compares, would never fall back to zero (TB-1).
 //
-// The rows are read through a scan and streamed back through the same transaction, so compaction
-// does not collect the table in memory. The caller commits R-metadata afterwards with the
-// "mds: compact" message and without a new tag (§4.9, M4's maintenance task).
-func Compact(ctx context.Context, tbl *icebergtable.Table, sourceCommit string, opts ...Option) (*icebergtable.Table, error) {
+// The rows are read through a scan and re-sorted by path before they are written back: the scan
+// plans the table's data files in the order they were committed, not in the table's declared sort
+// order, and iceberg-go sorts each record batch it is handed on its own ("Sort each batch
+// independently before writing. This is per-batch, not per-file", table/rolling_data_writer.go),
+// so streaming the scan's batches straight back into Append writes files of [b d a c] for the data
+// files [a c] and [b d] - a table whose files no longer carry the `path ASC` order the table
+// metadata advertises (§3.1; the iceberg spec's sort order is what writers honour, MDS_REVIEW.md
+// TB-2). Sorting the rows first and batching them after makes every batch a contiguous slice of
+// the sorted table, so the batches the writer sorts are already in the declared order. Two commits
+// of interleaved paths compact into one file of [a b c d], and the per-file lower/upper bounds on
+// path stay narrow, which is what the next delta's IN (path ...) scan prunes with. Sorting needs
+// the rows, not the batches: they are collected as rows and handed to the writer one batch at a
+// time (rowBatches), so the peak memory is the table's rows plus one record batch. The caller
+// commits R-metadata afterwards with the "mds: compact" message and without a new tag (§4.9, M4's
+// maintenance task).
+//
+// Compact takes no Option: it removes and re-adds whole files and writes no delete predicate, so
+// the delete mode and the delete chunk size of a delta do not apply, and the batch size is the
+// one rowBatches uses (MDS_REVIEW.md TB-4).
+func Compact(ctx context.Context, tbl *icebergtable.Table, sourceCommit string) (*icebergtable.Table, error) {
 	if tbl == nil {
 		return nil, ErrNoTable
 	}
@@ -298,9 +336,6 @@ func Compact(ctx context.Context, tbl *icebergtable.Table, sourceCommit string, 
 	}
 	if sourceCommit == "" {
 		return nil, ErrNoSourceCommit
-	}
-	if _, err := resolve(tbl, opts); err != nil {
-		return nil, err
 	}
 	snapshotProps := SnapshotProperties(repository, sourceCommit)
 
@@ -319,7 +354,12 @@ func Compact(ctx context.Context, tbl *icebergtable.Table, sourceCommit string, 
 	if err != nil {
 		return nil, fmt.Errorf("scan the table at %s: %w", sourceCommit, err)
 	}
-	reader := NewBatchesRecordReader(schema, batches)
+	rows, err := rowsOfBatches(batches)
+	if err != nil {
+		return nil, fmt.Errorf("read the rows of the table at %s: %w", sourceCommit, err)
+	}
+	slices.SortFunc(rows, func(a, b Row) int { return cmp.Compare(a.Path, b.Path) })
+	reader := NewBatchesRecordReader(schema, rowBatches(schema, rowSource(rows), compactRecordBatchSize))
 	defer reader.Release()
 
 	txn := tbl.NewTransaction()
@@ -472,4 +512,120 @@ func pathFilter(paths []string, chunkSize int) iceberg.BooleanExpression {
 	default:
 		return iceberg.NewOr(filters[0], filters[1], filters[2:]...)
 	}
+}
+
+// orderedRows wraps a row source and enforces the table's declared sort order: every row must
+// name a path that comes after the previous one (§3.1: path ASC, and the identifier field, so a
+// path appears once). It is how a rebuild keeps streaming its source - memory bounded by the
+// record batch rather than by the branch (design §4.3 step 2) - and still writes only files whose
+// rows follow the order their table metadata declares (MDS_REVIEW.md TB-2).
+func orderedRows(rows Rows) Rows {
+	return func(yield func(Row, error) bool) {
+		last := ""
+		seen := false
+		rows(func(row Row, err error) bool {
+			if err != nil {
+				return yield(Row{}, err)
+			}
+			if seen && row.Path <= last {
+				return yield(Row{}, fmt.Errorf("%w: %q is not after %q", ErrRowsOutOfOrder, row.Path, last))
+			}
+			seen, last = true, row.Path
+			return yield(row, nil)
+		})
+	}
+}
+
+// rowSource turns rows into a row source, which is what rowBatches reads. Compact materialises
+// the table's rows to sort them and hands them back one batch at a time, so that the batch being
+// appended is not a second copy of the whole table.
+func rowSource(rows []Row) Rows {
+	return func(yield func(Row, error) bool) {
+		for _, row := range rows {
+			if !yield(row, nil) {
+				return
+			}
+		}
+	}
+}
+
+// rowsOfBatches decodes a scan's record batches into rows, in the order the batches and their rows
+// carry them. Compact uses it to re-sort the table before it writes it back.
+//
+// Every batch is released as soon as its rows are decoded: the sorted rows are the only copy
+// Compact keeps.
+func rowsOfBatches(batches iter.Seq2[arrow.RecordBatch, error]) ([]Row, error) {
+	var rows []Row
+	for batch, err := range batches {
+		if err != nil {
+			if batch != nil {
+				batch.Release()
+			}
+			return nil, err
+		}
+		for i := range int(batch.NumRows()) {
+			rows = append(rows, rowOfBatch(batch, i))
+		}
+		batch.Release()
+	}
+	return rows, nil
+}
+
+// rowOfBatch decodes row i of one record batch. The columns are addressed by the positions of the
+// fixed schema, the same ones appendRow writes (rows.go): the scan returns the table's columns in
+// schema order, and schema changes only append optional columns with new IDs (§3.1), so the first
+// ten positions stay the ones of that fixed schema.
+func rowOfBatch(batch arrow.RecordBatch, i int) Row {
+	return Row{
+		Repository:   batch.Column(columnRepository).(*array.String).Value(i),
+		Path:         batch.Column(columnPath).(*array.String).Value(i),
+		CommitID:     batch.Column(columnCommitID).(*array.String).Value(i),
+		SizeBytes:    batch.Column(columnSizeBytes).(*array.Int64).Value(i),
+		LastModified: timestampOf(batch.Column(columnLastModified).(*array.Timestamp), i),
+		ETag:         batch.Column(columnETag).(*array.String).Value(i),
+		UserMetadata: userMetadataOf(batch.Column(columnUserMetadata).(*array.Map), i),
+		Committer:    optionalStringOf(batch.Column(columnCommitter).(*array.String), i),
+		ContentType:  optionalStringOf(batch.Column(columnContentType).(*array.String), i),
+		CreationDate: optionalTimestampOf(batch.Column(columnCreationDate).(*array.Timestamp), i),
+	}
+}
+
+// timestampOf reads one timestamp cell as a time. appendRow writes it as Unix microseconds in UTC,
+// so the round trip through a scan gives the same value back.
+func timestampOf(values *array.Timestamp, i int) time.Time {
+	return time.UnixMicro(int64(values.Value(i))).UTC()
+}
+
+// userMetadataOf reads one user_metadata map cell. A null map becomes a nil map, which appendRow
+// writes back as the empty map the schema requires (§3.1).
+func userMetadataOf(values *array.Map, i int) map[string]string {
+	if values.IsNull(i) {
+		return nil
+	}
+	start, end := values.ValueOffsets(i)
+	keys := values.Keys().(*array.String)
+	items := values.Items().(*array.String)
+	metadata := make(map[string]string, end-start)
+	for j := start; j < end; j++ {
+		metadata[keys.Value(int(j))] = items.Value(int(j))
+	}
+	return metadata
+}
+
+// optionalStringOf reads one cell of an optional string column: null is the unset value.
+func optionalStringOf(values *array.String, i int) *string {
+	if values.IsNull(i) {
+		return nil
+	}
+	value := values.Value(i)
+	return &value
+}
+
+// optionalTimestampOf reads one cell of an optional timestamp column: null is the unset value.
+func optionalTimestampOf(values *array.Timestamp, i int) *time.Time {
+	if values.IsNull(i) {
+		return nil
+	}
+	value := timestampOf(values, i)
+	return &value
 }

@@ -1,6 +1,7 @@
 package table_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -25,6 +26,37 @@ func rowSeq(rows []table.Row) table.Rows {
 // snapshotCount returns how many snapshots the table metadata carries.
 func snapshotCount(tbl *icebergtable.Table) int {
 	return len(tbl.Metadata().Snapshots())
+}
+
+// scanRowsInWriteOrder returns every row of the table at the branch head in the order its data
+// files carry it, unlike scanRows, which sorts by path. It is how a test sees the physical order
+// a compaction or a rebuild wrote: the table declares sort order path ASC (§3.1), so that order is
+// part of what the writer promises, and a path-sorted read cannot check it (MDS_REVIEW.md TB-2).
+func scanRowsInWriteOrder(t *testing.T, tbl *icebergtable.Table) []table.Row {
+	t.Helper()
+	scan := tbl.Scan()
+	defer func() { _ = scan.Close() }()
+	_, batches, err := scan.ToArrowRecords(t.Context())
+	require.NoError(t, err, "scan the table")
+
+	var rows []table.Row
+	for batch, err := range batches {
+		require.NoError(t, err)
+		for i := range int(batch.NumRows()) {
+			rows = append(rows, decodeRow(batch, i))
+		}
+		batch.Release()
+	}
+	return rows
+}
+
+// pathsOf returns the paths of rows in the order given.
+func pathsOf(rows []table.Row) []string {
+	paths := make([]string, 0, len(rows))
+	for _, row := range rows {
+		paths = append(paths, row.Path)
+	}
+	return paths
 }
 
 // summaryInt returns an integer of the current snapshot's summary, or 0 when the key is absent.
@@ -378,6 +410,113 @@ func TestCompact(t *testing.T) {
 		row(t, "w", "c4", 3, next, nil),
 		row(t, "z", "c6", 30, next, nil),
 	})
+}
+
+// TestCompactWritesRowsInPathOrder is MDS_REVIEW.md TB-2: the table declares sort order path ASC
+// (§3.1), so a compaction must write its files in that order. The scan plans the table's data files
+// in the order the commits that wrote them left them, so two commits of interleaved paths - data
+// files [a c] then [b d] - used to compact into a file of [b d a c], a table whose declared sort
+// order no longer describes its files. The rows are read back in the order the written files carry
+// them (scanRowsInWriteOrder): a path-sorted read cannot see the difference.
+//
+// The compaction writes two record batches here (CompactRecordBatchSize(2)), which is the case the
+// bug is about: iceberg-go sorts each batch it is given on its own, so a compaction that streams
+// the scan's batches back (one batch per data file) writes [b d][a c]. Sorting the rows before they
+// are batched is what makes the written order the declared one.
+func TestCompactWritesRowsInPathOrder(t *testing.T) {
+	restore := table.CompactRecordBatchSize(2)
+	t.Cleanup(restore)
+
+	env := newTestEnv(t)
+	tbl := env.createTable(t)
+	when := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	first, err := table.ApplyDelta(t.Context(), tbl, []table.Row{
+		row(t, "a", "c1", 1, when, nil),
+		row(t, "c", "c1", 3, when, nil),
+	}, nil, "c1")
+	require.NoError(t, err)
+	second, err := table.ApplyDelta(t.Context(), first, []table.Row{
+		row(t, "b", "c2", 2, when, nil),
+		row(t, "d", "c2", 4, when, nil),
+	}, nil, "c2")
+	require.NoError(t, err)
+	plan := second.Scan()
+	tasks, err := plan.PlanFiles(t.Context())
+	require.NoError(t, err)
+	require.Len(t, tasks, 2, "the two commits wrote two data files")
+	require.NoError(t, plan.Close())
+
+	compacted, err := table.Compact(t.Context(), second, "c2")
+	require.NoError(t, err)
+	require.Equal(t, []string{"a", "b", "c", "d"},
+		pathsOf(scanRowsInWriteOrder(t, env.loadTable(t))),
+		"the compacted file carries the rows in the declared path ASC order")
+	require.Equal(t, first.SortOrder().OrderID(), compacted.SortOrder().OrderID(),
+		"compaction keeps the sort order it now obeys")
+}
+
+// TestRebuildRefusesRowsOutOfOrder is the rebuild half of MDS_REVIEW.md TB-2: a rebuild streams its
+// source (design §4.3 step 2), so it cannot sort it, and a source that does not yield the table's
+// declared path ASC order would write files that contradict the declared order. Such a source is
+// refused and the table is left as it was, rather than being rewritten unsorted.
+func TestRebuildRefusesRowsOutOfOrder(t *testing.T) {
+	env := newTestEnv(t)
+	tbl := env.createTable(t)
+	when := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	filled, err := table.ApplyDelta(t.Context(), tbl, []table.Row{
+		row(t, "m", "c1", 1, when, nil),
+	}, nil, "c1")
+	require.NoError(t, err)
+
+	_, err = table.Rebuild(t.Context(), filled, rowSeq([]table.Row{
+		row(t, "z", "c2", 2, when, nil),
+		row(t, "a", "c2", 3, when, nil),
+	}), "c2")
+	require.ErrorIs(t, err, table.ErrRowsOutOfOrder)
+
+	// Nothing was written: the failed rebuild committed no snapshot and the table still holds the
+	// row it had, in path order.
+	requireScanRows(t, env.loadTable(t), []table.Row{row(t, "m", "c1", 1, when, nil)})
+	require.Equal(t, []string{"m"}, pathsOf(scanRowsInWriteOrder(t, env.loadTable(t))))
+
+	// A duplicate path is out of order too: path is the identifier field, so a row appears once.
+	_, err = table.Rebuild(t.Context(), filled, rowSeq([]table.Row{
+		row(t, "b", "c2", 2, when, nil),
+		row(t, "b", "c2", 2, when, nil),
+	}), "c2")
+	require.ErrorIs(t, err, table.ErrRowsOutOfOrder)
+
+	// A sorted source is written in the order it yields, which is the declared order, so the
+	// written files are sorted too.
+	rebuilt, err := table.Rebuild(t.Context(), filled, rowSeq([]table.Row{
+		row(t, "a", "c3", 2, when, nil),
+		row(t, "b", "c3", 3, when, nil),
+	}), "c3")
+	require.NoError(t, err)
+	require.Equal(t, []string{"a", "b"}, pathsOf(scanRowsInWriteOrder(t, env.loadTable(t))))
+	require.Equal(t, 1, rebuilt.SortOrder().OrderID(), "the declared sort order is unchanged")
+}
+
+// TestCompactTakesNoOptions pins MDS_REVIEW.md TB-4: Compact used to accept the write options of
+// ApplyDelta and discard all of them. It has none now, so the options it used to pretend to honour
+// - delete mode, delete chunk size and record batch size - cannot be passed to it at all.
+// The compile-time check is the call below: Compact takes ctx, a table and a source commit.
+func TestCompactTakesNoOptions(t *testing.T) {
+	env := newTestEnv(t)
+	tbl := env.createTable(t)
+	when := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	filled, err := table.ApplyDelta(t.Context(), tbl, []table.Row{
+		row(t, "a", "c1", 1, when, nil),
+	}, nil, "c1")
+	require.NoError(t, err)
+
+	var compact func(context.Context, *icebergtable.Table, string) (*icebergtable.Table, error) = table.Compact
+	compacted, err := compact(t.Context(), filled, "c1")
+	require.NoError(t, err)
+	require.Equal(t, []string{"a"}, pathsOf(scanRowsInWriteOrder(t, compacted)))
 }
 
 // TestApplyDeltaValidation pins the errors of a malformed write.
