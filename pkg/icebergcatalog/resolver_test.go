@@ -37,6 +37,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/config"
 	"github.com/treeverse/lakefs/pkg/graveler"
+	"github.com/treeverse/lakefs/pkg/ident"
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/kv/kvparams"
 	"github.com/treeverse/lakefs/pkg/logging"
@@ -148,6 +149,21 @@ func newResolverFixture(t *testing.T) *resolverFixture {
 // that names none (MDS-SEC-3).
 func newResolverFixtureWithTableProperty(t *testing.T, repositoryProperty string) *resolverFixture {
 	t.Helper()
+	return newResolverFixtureWithCompanion(t, repositoryProperty, true)
+}
+
+// newResolverFixtureWithoutInitCommit builds the forged-companion fixture: the table carries the
+// right lakefs.mds.repository property, but the repository has no indexer initialisation commit.
+func newResolverFixtureWithoutInitCommit(t *testing.T) *resolverFixture {
+	t.Helper()
+	return newResolverFixtureWithCompanion(t, tablesTestRepo, false)
+}
+
+// newResolverFixtureWithCompanion builds the same fixture with the companion table's repository
+// property set to repositoryProperty and, when initCommit is true, the indexer's initialisation
+// commit on the mirrored branch.
+func newResolverFixtureWithCompanion(t *testing.T, repositoryProperty string, initCommit bool) *resolverFixture {
+	t.Helper()
 	base := newTablesFixture(t)
 	ctx := base.ctx
 
@@ -178,6 +194,9 @@ func newResolverFixtureWithTableProperty(t *testing.T, repositoryProperty string
 		TableUUID:        resolverMetaUUID,
 		FormatVersion:    2,
 	}), "create system.object_metadata in the companion repository")
+	if initCommit {
+		commitResolverInit(t, base.catalog, resolverMetaRepo, tablesTestRef, tablesTestRepo)
+	}
 
 	// alice may read the data repository (tablesReadStatements, fs on lakehouse only), carol may
 	// write it, dana may list one namespace of it, bob may do nothing.
@@ -285,6 +304,51 @@ func putResolverObject(t *testing.T, cat *catalog.Catalog, repository, location,
 		IdentifierType:   block.IdentifierTypeFull,
 	}, int64(len(content)), strings.NewReader(content), block.PutOpts{})
 	require.NoErrorf(t, err, "put %s", location)
+}
+
+// commitResolverInit writes the indexer's initialisation commit (METADATA_SEARCH_DESIGN.md §4.8)
+// on a companion repository: message "mds: init" and metadata lakefs.mds.init=true, with the data
+// repository it indexes. It commits everything staged before it, exactly as the indexer's initialise
+// does when it creates the namespace and the table.
+func commitResolverInit(t *testing.T, cat *catalog.Catalog, repository, branch, dataRepo string) {
+	t.Helper()
+	_, err := cat.Commit(t.Context(), repository, branch, MetadataSearchInitCommitMessage, "mds",
+		catalog.Metadata{
+			MetadataSearchInitProperty:     MetadataSearchInitValue,
+			"lakefs.mds.source-repository": dataRepo,
+		}, nil, nil, false)
+	require.NoErrorf(t, err, "commit the initialisation of %s@%s", repository, branch)
+}
+
+// addResolverInitCommitRecord writes the indexer's initialisation commit as a commit record without
+// a new meta-range and moves the branch to it, for a fixture whose repository lives at an s3://
+// namespace the fixture's catalog block adapter cannot write. It is the same history the ownership
+// proof reads: an mds: init commit on the first-parent chain above the automatic root.
+func addResolverInitCommitRecord(t *testing.T, cat *catalog.Catalog, repository, branch, dataRepo string) {
+	t.Helper()
+	ctx := t.Context()
+	head, err := cat.GetCommit(ctx, repository, branch)
+	require.NoErrorf(t, err, "head of %s@%s", repository, branch)
+	commit := graveler.Commit{
+		Version:      graveler.CommitVersion(head.Version),
+		Committer:    "mds",
+		Message:      MetadataSearchInitCommitMessage,
+		MetaRangeID:  graveler.MetaRangeID(head.MetaRangeID),
+		CreationDate: head.CreationDate,
+		Parents:      graveler.CommitParents{graveler.CommitID(head.Reference)},
+		Metadata: graveler.Metadata{
+			MetadataSearchInitProperty:     MetadataSearchInitValue,
+			"lakefs.mds.source-repository": dataRepo,
+		},
+		Generation: graveler.CommitGeneration(head.Generation),
+	}
+	commitID := ident.NewHexAddressProvider().ContentAddress(commit)
+	err = cat.CreateCommitRecord(ctx, repository, commitID, int(commit.Version), commit.Committer,
+		commit.Message, string(commit.MetaRangeID), commit.CreationDate.Unix(),
+		[]string{head.Reference}, map[string]string(commit.Metadata), int32(commit.Generation))
+	require.NoErrorf(t, err, "create the initialisation commit of %s@%s", repository, branch)
+	require.NoErrorf(t, cat.HardResetBranch(ctx, repository, branch, commitID),
+		"move %s@%s to its initialisation commit", repository, branch)
 }
 
 // virtualTarget is the /iceberg/api load/head URL of the virtual table on one ref of the data
@@ -713,7 +777,20 @@ func TestMetadataSearchCompanionRepositoryProof(t *testing.T) {
 			http.StatusNotFound, ErrTypeNoSuchTable)
 	})
 
-	t.Run("a companion table that names the data repository is served", func(t *testing.T) {
+	t.Run("a companion table with the property but no init commit is not served", func(t *testing.T) {
+		f := newResolverFixtureWithoutInitCommit(t)
+		requireEnvelope(t, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", ""),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+		requireEnvelope(t, f.request(t, http.MethodHead, virtualTarget(tablesTestRef), "alice", ""),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+		// A forged property is not proof for the data plane either.
+		_, err := newTableScopeResolver(f.store)(t.Context(), resolverVirtualAddress(tablesTestRef),
+			func(context.Context, Address) error { return nil })
+		var noTable *NoSuchTableException
+		require.ErrorAs(t, err, &noTable)
+	})
+
+	t.Run("a companion table that names the data repository and has the init commit is served", func(t *testing.T) {
 		f := newResolverFixture(t)
 		require.Equal(t, http.StatusOK, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", "").Code)
 	})

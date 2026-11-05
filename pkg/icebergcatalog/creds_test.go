@@ -755,6 +755,44 @@ blockstore:
 	})
 }
 
+// TestCredentialVendingReservedTarget is the credential half of the reserved-namespace rule
+// (creds.go, sign.go, METADATA_SEARCH_DESIGN.md §5.4): a write vend whose resolved target is a
+// namespace the resolver reserved falls back to a read session. The requested address is ordinary,
+// so the old check on the requested namespace passed; only the target is reserved. The fixture is
+// sign_test.go's redirecting resolver, which proves the check follows a redirect instead of trusting
+// the address the caller named.
+func TestCredentialVendingReservedTarget(t *testing.T) {
+	f := newSignResolverFixture(t)
+	front := Address{
+		Repo: tablesTestRepo, Ref: tablesTestRef,
+		Namespace: Namespace{"inventory", "books"}, Table: signWritableTable,
+	}
+	target := Address{
+		Repo: f.metaRepo, Ref: tablesTestRef,
+		Namespace: Namespace{SystemNamespace}, Table: resolverObjectMetadataTable,
+	}
+	store := NewStore(f.catalog, f.objects, WithTableResolver(signRedirectResolver{
+		from: front, to: target, reserved: target,
+	}))
+	stsFake := &credsFakeSTS{}
+	service := NewCredentialService(store, NewAuthorizer(f.authz.svc), f.catalog,
+		&Config{Prefix: CatalogPrefix, CredentialsVending: credsTestVending()}, stsFake, nil)
+	require.True(t, service.Enabled(), "the fake object store can vend")
+
+	credentials, err := service.TableCredentials(t.Context(), Caller{Username: "carol"}, front, true)
+	require.NoError(t, err)
+	require.Len(t, credentials, 1)
+	require.Equal(t, f.metaTableLocation, credentials[0].Prefix,
+		"the session is scoped to the table the resolver read")
+	require.Equal(t, 1, stsFake.calls, "the write attempt must not reach STS")
+
+	document := policyOf(t, stsFake.input)
+	objectStatement := document.Statement[0]
+	require.NotContains(t, objectStatement.Action, "s3:PutObject",
+		"a redirect into a reserved namespace must fall back to a read session")
+	require.Contains(t, objectStatement.Action, "s3:GetObject")
+}
+
 // TestVendMinIO is the integration half of the validation: it assumes a real role through STS,
 // and then proves with the credentials it got back that the session is scoped to the table prefix
 // - a read inside the prefix works, a read outside it and a write from a read session do not.

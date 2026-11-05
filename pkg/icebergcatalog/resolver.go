@@ -93,7 +93,9 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 
+	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/graveler"
 )
 
@@ -124,7 +126,30 @@ const (
 	// package for MetadataRepository and Address). The two spellings are pinned together by the
 	// design §3.1, not by a Go identifier.
 	MetadataSearchRepositoryProperty = "lakefs.mds.repository"
+
+	// MetadataSearchInitProperty, MetadataSearchInitValue and MetadataSearchInitCommitMessage are
+	// the initialisation marker the indexer writes on R-metadata (METADATA_SEARCH_DESIGN.md §4.8).
+	// They are the second proof of ownership, and the one a forger cannot fake without writing
+	// R-metadata's history: the table property alone lives in metadata.json, which anyone who can
+	// create that repository can write (MDS-SEC-3).
+	//
+	// The literals are restated here rather than imported: pkg/mds/indexer/repo.go
+	// (MetadataKeyInit, MetadataKeyInitValue) and pkg/mds/indexer/indexer.go (InitCommitMessage)
+	// write them, and this package must not import pkg/mds - the dependency runs the other way.
+	// The design §4.8 pins the two spellings together.
+	MetadataSearchInitProperty      = "lakefs.mds.init"
+	MetadataSearchInitValue         = "true"
+	MetadataSearchInitCommitMessage = "mds: init"
+	metadataSearchInitPageSize      = 256
 )
+
+// commitLogLister is the lakeFS commit-history read the ownership proof needs. *catalog.Catalog
+// implements it; the resolver reaches it through the BranchLister it was registered with, so a
+// caller that only knows how to answer "is this a branch?" still resolves addresses, but cannot
+// prove a companion table is the indexer's.
+type commitLogLister interface {
+	ListCommits(ctx context.Context, repositoryID string, ref string, params catalog.LogParams) ([]*catalog.CommitLog, bool, error)
+}
 
 // ErrInvalidResolution is returned when a registered TableResolver answers with a target that is
 // not a table address. It is a server-side misconfiguration (a resolver bug), never a property of
@@ -301,6 +326,13 @@ type MetadataSearchResolver struct {
 	// mapper maps a tag or a commit to a ref of the companion repository (§5.2). A nil mapper
 	// refuses those refs with NoSuchTableException instead of guessing.
 	mapper RefMapper
+
+	// initMu guards initCache, the result of the first-parent initialisation-commit walk keyed by
+	// repository and by the served ref's head commit. The walk is O(history length) because the
+	// init commit is the oldest non-root commit; the cache makes it once per head commit instead
+	// of once per request.
+	initMu    sync.Mutex
+	initCache map[string]bool
 }
 
 // NewMetadataSearchResolver builds the built-in resolver. branches answers "is this ref a branch?"
@@ -308,7 +340,11 @@ type MetadataSearchResolver struct {
 // meaning in the companion repository. Both may be nil: no lister means every ref is treated as a
 // branch, no mapper means a tag or a commit is not indexed and therefore NoSuchTable.
 func NewMetadataSearchResolver(branches BranchLister, mapper RefMapper) *MetadataSearchResolver {
-	return &MetadataSearchResolver{branches: branches, mapper: mapper}
+	return &MetadataSearchResolver{
+		branches:  branches,
+		mapper:    mapper,
+		initCache: make(map[string]bool),
+	}
 }
 
 // Resolve answers the virtual-table address of §5.2 and leaves every other address alone.
@@ -392,28 +428,134 @@ func (r *MetadataSearchResolver) metadataRef(ctx context.Context, addr Address) 
 	return mapped, nil
 }
 
-// VerifyResolved implements ResolvedTableVerifier: R-metadata is R's index only when its table says
-// it is (MDS-SEC-3). The indexer writes lakefs.mds.repository = R into every system.object_metadata
-// table it creates (§3.1), so a table that carries another repository's name, or no property at
-// all, was not written for R - R-metadata may be an ordinary repository someone created before the
-// indexer did, and serving it would show every reader of R attacker-chosen rows under the server's
-// own identity (§5.2). The indexer refuses such a repository permanently (§4.8), so the catalog has
-// to refuse it too: the state never heals by itself.
+// VerifyResolved implements ResolvedTableVerifier: R-metadata is R's index only when it was created
+// by the indexer (MDS-SEC-3). Two independent facts have to hold, because either one alone can be
+// written by whoever created R-metadata:
+//
+//   - the table property lakefs.mds.repository names R (§3.1); and
+//   - the served ref's first-parent history carries the indexer's initialisation commit (§4.8):
+//     message "mds: init" and metadata lakefs.mds.init=true. That commit is written by the indexer
+//     after it creates the table, so it also commits the table and makes the repository's history
+//     the state a forger cannot reproduce by editing metadata.json.
+//
+// A repository someone else created under the companion name can copy the property, but it has no
+// initialisation commit on the history the resolver is about to serve. It is answered as an absent
+// table: R-metadata may be an ordinary repository, and serving it would show every reader of R
+// attacker-chosen rows under the server's own identity (§5.2). The indexer refuses such a
+// repository permanently (§4.8), so the catalog has to refuse it too.
 //
 // The answer is NoSuchTableException for the address the caller named, which is the 404 the design
 // promises for an unindexed ref: from the caller's side there is no object_metadata table on that
 // ref of R, and there is nothing else it could mean.
-func (r *MetadataSearchResolver) VerifyResolved(_ context.Context, requested, _ Address, tbl *Table) error {
-	if tbl != nil && tbl.Metadata != nil &&
-		tbl.Metadata.Properties()[MetadataSearchRepositoryProperty] == requested.Repo {
-		return nil
+func (r *MetadataSearchResolver) VerifyResolved(ctx context.Context, requested, target Address, tbl *Table) error {
+	if tbl == nil || tbl.Metadata == nil ||
+		tbl.Metadata.Properties()[MetadataSearchRepositoryProperty] != requested.Repo {
+		return noSuchMetadataTable(requested)
 	}
+	carries, err := r.firstParentCarriesInitCommit(ctx, target)
+	if err != nil {
+		return err
+	}
+	if !carries {
+		return noSuchMetadataTable(requested)
+	}
+	return nil
+}
+
+// noSuchMetadataTable is the 404 of a virtual table whose companion cannot prove it is R's index.
+func noSuchMetadataTable(requested Address) error {
 	return &NoSuchTableException{
 		Repo:      requested.Repo,
 		Ref:       requested.Ref,
 		Namespace: requested.Namespace,
 		Table:     requested.Table,
 	}
+}
+
+// firstParentCarriesInitCommit reports whether the first-parent history of target.Ref carries the
+// indexer's initialisation commit (§4.8). The walk is newest first and stops at the first commit
+// that cannot have an ancestor (the root), so the cost is the length of the served history in the
+// worst case - the init commit is the oldest non-root commit - and one page in the common case of a
+// repository whose head still remembers a cached answer. The result is cached by repository and by
+// the served ref's head commit, so an unchanged branch pays for the walk once per process.
+//
+// A resolver built with a BranchLister that cannot read commit history fails closed: the property
+// proves nothing without the commit, so the virtual table is the 404 an unindexed ref answers.
+func (r *MetadataSearchResolver) firstParentCarriesInitCommit(ctx context.Context, target Address) (bool, error) {
+	lister, ok := r.branches.(commitLogLister)
+	if !ok {
+		return false, nil
+	}
+
+	after := ""
+	head := ""
+	for {
+		params := catalog.LogParams{FirstParent: true, Amount: metadataSearchInitPageSize}
+		if after != "" {
+			params.FromReference = after
+		}
+		page, hasMore, err := lister.ListCommits(ctx, target.Repo, target.Ref, params)
+		if err != nil {
+			return false, fmt.Errorf("read the first-parent log of %q@%s: %w", target.Repo, target.Ref, err)
+		}
+		if len(page) == 0 {
+			return false, nil
+		}
+		if head == "" {
+			head = page[0].Reference
+			if found, cached := r.cachedInitCommit(target.Repo, head); cached {
+				return found, nil
+			}
+		}
+		for _, commit := range page {
+			if isMetadataSearchInitCommit(commit) {
+				r.cacheInitCommit(target.Repo, head, true)
+				return true, nil
+			}
+			if len(commit.Parents) == 0 {
+				// The root: no ancestor can carry the marker.
+				r.cacheInitCommit(target.Repo, head, false)
+				return false, nil
+			}
+		}
+		if !hasMore {
+			r.cacheInitCommit(target.Repo, head, false)
+			return false, nil
+		}
+		last := page[len(page)-1].Reference
+		if last == "" || last == after {
+			return false, fmt.Errorf("%w: the first-parent log of %q@%s did not advance",
+				ErrInvalidResolution, target.Repo, target.Ref)
+		}
+		after = last
+	}
+}
+
+// isMetadataSearchInitCommit reports whether commit is the indexer's initialisation commit.
+// Both the metadata marker and the message are required, so a commit that merely copied one of
+// them is not mistaken for the indexer's.
+func isMetadataSearchInitCommit(commit *catalog.CommitLog) bool {
+	return commit != nil &&
+		commit.Message == MetadataSearchInitCommitMessage &&
+		commit.Metadata[MetadataSearchInitProperty] == MetadataSearchInitValue
+}
+
+// cachedInitCommit returns the cached answer for one repository head, if the walk already ran for it.
+func (r *MetadataSearchResolver) cachedInitCommit(repo, head string) (bool, bool) {
+	r.initMu.Lock()
+	defer r.initMu.Unlock()
+	found, ok := r.initCache[repo+"\x00"+head]
+	return found, ok
+}
+
+// cacheInitCommit records the answer of one walk, keyed by repository and head commit.
+func (r *MetadataSearchResolver) cacheInitCommit(repo, head string, found bool) {
+	r.initMu.Lock()
+	defer r.initMu.Unlock()
+	if r.initCache == nil {
+		r.initCache = make(map[string]bool)
+	}
+	r.initCache[repo+"\x00"+head] = found
 }
 
 // VirtualNamespaces implements VirtualTableSource: a data repository ref lists system as its one

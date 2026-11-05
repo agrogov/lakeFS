@@ -206,14 +206,19 @@ func dataAccessFor(op Operation) (dataAccess, bool) {
 }
 
 // tableDataScope is what the catalog knows about a table's physical storage: the root the session
-// is scoped to and the location the table's metadata.json names. The two are compared before
-// anything is vended (see the file comment).
+// is scoped to, the location the table's metadata.json names, and the address the resolver actually
+// read. The first two are compared before anything is vended (see the file comment); the address is
+// what a write session checks for a reserved namespace (§5.4) when a resolver redirected the read.
 type tableDataScope struct {
 	// Root is the table's physical root, <storage_namespace>/_iceberg/<table-uuid> (§6.3, Q-I5).
 	Root string
 
 	// Location is metadata.json's `location`: where this table's files actually are.
 	Location string
+
+	// Target is the address the table was read from, after the registered table resolver. It is the
+	// address whose namespace a write session must be allowed to write.
+	Target Address
 }
 
 // credentialService serves GET …/tables/{table}/credentials and vends the sessions the write path
@@ -438,13 +443,26 @@ func (s *credentialService) Vend(ctx context.Context, caller Caller, req Request
 	if err != nil {
 		return nil, err
 	}
+	// A write session is scoped to the table that was actually read. When a table resolver
+	// redirects the write, the requested namespace may be ordinary while the target is reserved
+	// (§5.4): the session must not write the companion repository's files. TableCredentials turns
+	// this refusal into a read session, exactly as it does for a write denial; a direct write Vend
+	// gets the refusal.
+	if req.Op == OpWriteTableData && !s.writableNamespace(scope.Target) {
+		return nil, &ReservedNamespaceError{
+			Repo:      scope.Target.Repo,
+			Ref:       scope.Target.Ref,
+			Namespace: scope.Target.Namespace,
+		}
+	}
 	return s.vendScope(ctx, caller, req.Address, scope, access), nil
 }
 
 // TableCredentials vends the session a client gets for a table that exists on addr.Ref: a write
 // session when the ref is a branch, the namespace is not reserved (§5.4) and the caller is allowed
-// catalog:WriteTableData, and a read session otherwise. A write denial falls back to the read
-// session; any other failure, and a read denial, is Vend's.
+// catalog:WriteTableData, and a read session otherwise. A write denial, a read-only ref, or a
+// redirect whose resolved target is a reserved namespace falls back to the read session; any other
+// failure, and a read denial, is Vend's.
 //
 // The reserved-namespace check is what keeps a write session away from a virtual table: the
 // resolver reads it from the companion repository, and a caller who may write the data repository
@@ -533,10 +551,12 @@ func (s *credentialService) refIsBranch(ctx context.Context, addr Address) (bool
 	}
 }
 
-// isWriteRefusal reports whether err is the authorizer's refusal of a write session - a denial or
-// the Q-I4 read-only ref - which a caller answers with a read session instead.
+// isWriteRefusal reports whether err is a refusal of a write session - the authorizer's denial, the
+// Q-I4 read-only ref, or a resolved target in a namespace the resolver reserved (§5.4) - which a
+// caller answers with a read session instead.
 func isWriteRefusal(err error) bool {
-	return errors.Is(err, ErrPermissionDenied) || errors.Is(err, ErrRefReadOnly)
+	return errors.Is(err, ErrPermissionDenied) || errors.Is(err, ErrRefReadOnly) ||
+		errors.Is(err, ErrReservedNamespace)
 }
 
 // logNotVending records why a LoadTableResult carries no storage credentials.
@@ -847,7 +867,7 @@ func newTableScopeResolver(store *Store) func(ctx context.Context, addr Address,
 		if err != nil {
 			return tableDataScope{}, err
 		}
-		return tableDataScope{Root: root, Location: table.Metadata.Location()}, nil
+		return tableDataScope{Root: root, Location: table.Metadata.Location(), Target: target}, nil
 	}
 }
 
