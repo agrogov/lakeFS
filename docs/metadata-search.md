@@ -65,7 +65,11 @@ While either switch is false the virtual table does not resolve, no namespace is
 `/mds/iceberg/api` is not mounted: the request falls through to the core router's not-implemented
 placeholder and answers **`501 Not Implemented`**, the same answer a plain `lakefs` binary gives at
 `/iceberg/api` (design §5.5; `pkg/api/services.go`, mounted by `cmd/lakefs/cmd/run.go`). It is not a
-`404`. There is no per-repository switch in this version: enabling the
+`404`. Metadata Search is a mode of the catalog, so `iceberg.metadata_search.enabled: true` with
+`iceberg.enabled: false` is a **startup error**, not a half-applied state: the server refuses it with
+`metadata_search.enabled requires enabled: Metadata Search is served by the Iceberg catalog, which is
+off` and installs no principals (design §5.4). Set both keys or neither. There is no per-repository
+switch in this version: enabling the
 feature with a configuration that lists no repositories is harmless, because the indexer, not the
 catalog, decides what is indexed.
 
@@ -99,9 +103,14 @@ namespace grant and needs an extra statement (see [`Limits`](#limits-and-known-d
 The same exact set is used by the deny policy, and the server re-derives it every minute; a repository
 created after startup is therefore covered without a restart. Until the next refresh, the indexer fails
 closed on that repository (an authorization error in `/_health`, never a silent write) and the deny does
-not yet cover its companion repository. The deny covers `fs:UpdateRepository`, which writes repository
-metadata, through `fs:Update*`; the import actions (`fs:ImportFromStorage`, `fs:ImportCancel`) are not
-covered.
+not yet cover its companion repository. That one-minute window is an **accepted trade-off**: the policies
+must name companion repositories exactly (a `*-metadata` wildcard would also match data-repository
+objects, see below) and an exact ARN is a snapshot, so a repository created in the last minute is the
+price of the exact naming. The wait is bounded by the refresher and needs no operator action, and the
+uncovered state is loud — the new repository's first tick fails in `/_health` — rather than silent. The
+deny covers `fs:UpdateRepository`, which writes repository metadata, through `fs:Update*`, and the import
+pair (`fs:ImportFromStorage`, `fs:ImportCancel`) through `fs:Import*`; see
+[`Permissions`](#permissions) for what each of the two import actions is and is not denied on.
 
 Credentials are **not** created by the bootstrap: an administrator creates them once and places
 them in the indexer configuration.
@@ -217,10 +226,17 @@ bad file is fixed in one pass. Startup fails when:
 - `repositories` or a `repositories.<R>.branches` list is empty;
 - a repository name ends in `-metadata`, or is longer than 54 characters;
 - a branch selector contains a `*` that is not the final character, or is empty;
-- `since` is not an RFC 3339 timestamp.
+- `since` is not an RFC 3339 timestamp;
+- `tag_retention`, `compaction.max_delete_files` or `compaction.every_commits` is negative.
+
+`0` is a valid value, not a mistake: `tag_retention: 0s` keeps every `mds-*` tag forever, and
+`compaction.max_delete_files: 0` / `compaction.every_commits: 0` turn that compaction trigger off. The
+defaults in the table above apply only when the key is **absent**; a negative value is refused at startup
+rather than silently replaced by the default (design §7).
 
 Per-repository problems that can only be discovered against the server — the data repository does
-not exist, `R-metadata` cannot be derived or overlaps `R`, `R-metadata` is not the indexer's — do
+not exist, `R-metadata` cannot be derived or overlaps `R`, `R-metadata` is not the indexer's, or
+`R-metadata` is read-only — do
 not stop the process: that repository is marked failed in `/_health` and in the metrics, and the
 other repositories continue.
 
@@ -290,7 +306,10 @@ curl -s http://indexer:8080/metrics | grep '^lakefs_mds_'
 ```
 
 `/_health` answers `200` while every repository's last tick succeeded or is in progress, and `503`
-as soon as one repository or branch carries an error. Its body is per repository and per branch:
+as soon as one repository or branch carries an error. A tick in progress does **not** hide the result
+of the previous one: a repository whose last tick failed stays `503` for the whole of its retry, and a
+tick cancelled by a graceful stop ends `in_progress` without changing the previous result. Its body is
+per repository and per branch:
 
 ```json
 {
@@ -311,10 +330,18 @@ as soon as one repository or branch carries an error. Its body is per repository
 ```
 
 `last_error` appears only when the last attempt failed. A repository-level failure (missing
-repository, companion namespace not derivable or overlapping) is on the repository object; a branch
+repository, companion namespace not derivable or overlapping, companion repository read-only) is on the
+repository object; a branch
 failure is in that branch's object and clears on the next successful attempt. A branch that is no
 longer mirrored — deleted in `my-repo`, or no longer matching `branches` — is removed from the
-report, so its last error does not keep `/_health` at `503` until the indexer restarts.
+report together with its `lakefs_mds_lag_commits` series, whatever `delete_branches` says, so its
+last error does not keep `/_health` at `503` until the indexer restarts (design §4.8).
+
+`lag_commits` is normally the exact number of source commits not indexed yet. It is **`-1`** when the
+last attempt failed before it could count them: the branch then also reports the position it recorded
+(`last_indexed`), so a stuck branch shows *where* it stopped and an unknown lag rather than a
+misleading `0` (design §9). Alert on `lag_commits != 0` rather than `> 0` to catch that state; a
+healthy branch never reports `-1`.
 
 ## Querying
 
@@ -578,17 +605,26 @@ through `/mds/iceberg/api` (identifier form) and through `/iceberg/relative_to`,
 `/iceberg/relative_to` and through `/mds/iceberg/api` with the three-level identifier. Every read of
 the suite takes all four paths and requires them to agree on path, `commit_id`, etag, `size_bytes`
 and user metadata (commit `91b30f485`), including tags, short commit IDs, a hard reset and an indexer
-restart.
+restart. The filtered reads of the guide are covered too: a step runs PyIceberg's `row_filter`
+(`GreaterThan(size_bytes, 0) & StartsWith(path, "data/")`) and DuckDB's
+`WHERE path LIKE 'data/%' AND size_bytes > 0 ORDER BY size_bytes DESC LIMIT 20` through all four
+engine/mount recipes and requires the same rows and the `DESC` ordering. The restart case is
+deterministic: it holds the companion branch's lakeFS commit, so the kill lands between the staged
+Iceberg commit and the lakeFS commit (§4.4) instead of hoping to hit a tick. §4.9 compaction and tag
+retention, and the §4.8 branch-deletion mirror, run end to end as well, including
+`lakefs_mds_compactions_total` and the `/_health` entry of a deleted branch (commit `866d4e85c`).
 
-The Spark and Trino snippets are not part of the esti suite; they were run separately against the
+The Spark and Trino snippets are run separately from the esti suite, against the
 same local recipe (a `lakefs-sso` with both switches on, an indexer with `period: 2s`, and the
 SeaweedFS of `esti/ops/docker-compose-mds.yaml`) with the runnable scripts in
 [`../esti/ops/mds-engines/`](../esti/ops/mds-engines/): Spark 3.5.5 with Iceberg 1.8.1
 (`tabulario/spark-iceberg@sha256:790a72e744e0d09f161e1b4c7c2f79625cc598cf0476da4703e62f1f4e023460`)
 and Trino 484 (`trinodb/trino@sha256:2704eb53935af5e582d63d6033e9bf99d20c325e9b0e30b1016ef59a4773979f`).
 Both `/mds/iceberg/api` and `/iceberg/relative_to` returned the same three rows for the same
-objects, with the same `commit_id`. The scripts' README records the exact commands and the
-environment they expect.
+objects, with the same `commit_id`. The scripts capture the rows, require exactly those three and
+diff the two endpoints against each other, so the observation is repeatable rather than read off a
+log; the image defaults are the digests above. The scripts' README records the exact commands and
+the environment they expect.
 
 ## Columns and semantics
 
@@ -690,7 +726,9 @@ the table is at the branch head; if not, the indexer has not caught up yet. One 
 branch is more than `max_commits` plus one log page behind, the indexer does not page through the
 backlog commit by commit: it rebuilds the branch's table from a full listing at the head, and the lag
 drops to `0` in that tick. Raise `max_commits` above the backlog if you want incremental catch-up
-instead of a rebuild. Every HTTP request is bounded by `request_timeout`, so a connection that stops
+instead of a rebuild. A failed attempt that could not count the backlog reports the recorded position
+and a lag of `-1` (unknown) instead of `0`; see [`Verify`](#5-verify). Every HTTP request is bounded by
+`request_timeout`, so a connection that stops
 answering fails the branch (or the repository) and `/_health` turns `503`; it does not freeze indexing
 silently.
 
@@ -725,6 +763,8 @@ reports `lag_commits` per branch.
 | Per-tick work | One branch applies at most `max_commits` commits per tick, and the log walk reads at most `max_commits` plus one page; a backlog deeper than that is rebuilt from a full listing at the head (the lag drops to `0`) instead of being paged through. `concurrency` bounds parallel branches, not commits. |
 | Query scale | The table is unpartitioned and sorted by `path` within each file. There is no path-prefix partitioning and no server-side scan planning, so a filtered query is only as selective as the Iceberg expression the engine pushes down. Partitioning by prefix is a later version. |
 | Structured metadata only | There is no full-text, vector or JSON-path search. `user_metadata` is a map of strings, queryable with the engine's map functions. |
+| Companion table identity | The catalog serves `my-repo.<ref>.system.object_metadata` only when the companion table's `lakefs.mds.repository` property names `my-repo`. A repository named `my-repo-metadata` that the indexer did not create — the name is taken by an ordinary repository — answers `404 NoSuchTableException` on the virtual address instead of serving someone else's rows (design §5.1). |
+| Companion repository must be writable | `my-repo-metadata` must not be created with `read_only: true`, and a branch-protection rule must not block `COMMIT` on its branches. The indexer checks this every tick: a read-only companion repository fails at the repository level, once per tick, with a message naming both causes, instead of failing every branch forever (design §3.3). |
 | Azure and GCS | Out of scope for this version: no credential vending and no remote signing. Static `storage` properties may work; they are not tested. |
 | One indexer replica | Run exactly one. A second replica does duplicate work and gets `409` responses; it does not corrupt the table. |
 | No UI, no server-side SQL | OSS has no Metadata Search tab and no SQL endpoint. Queries run in the engine that connects to the catalog (PyIceberg, DuckDB, Spark, Trino). Option B is future work (see [`Option B`](#option-b-outlook)). |
@@ -768,8 +808,13 @@ Other permission facts:
 - Ordinary principals cannot write `my-repo-metadata` while `mds-metadata-repo-protect` is in force;
   the deny wins over an administrator's `fs:*` allow. It covers `fs:Write*`, `fs:Delete*`,
   `fs:Create*`, `fs:Revert*`, `fs:Update*` (including `fs:UpdateRepository`, which sets repository
-  metadata) and the catalog write actions on the companion repositories; the import actions
-  (`fs:ImportFromStorage`, `fs:ImportCancel`) are not covered. The indexer and the catalog are outside
+  metadata) and the catalog write actions on the companion repositories. It also covers the import
+  actions through `fs:Import*`: cancelling an import on a companion branch is denied outright, and an
+  import whose **destination** is a companion repository is denied by the `fs:WriteObject` on that
+  branch and object and the `fs:CreateCommit` on it, whatever the source. An import whose *source*
+  is a companion repository's namespace is **not** denied: it writes another repository and copies
+  files out, which is what reading the companion repository already allows; the deny protects writes
+  inside a companion repository, not copies of its data. The indexer and the catalog are outside
   its groups and keep writing.
 - On an auth backend without policies (`auth.basic`), the deny is not enforced and the bootstrap
   prints a warning naming that consequence. Do not rely on the deny in that mode.
@@ -792,9 +837,13 @@ same table maintenance any Iceberg table does, plus the tag lifecycle that makes
 Merge-on-read deletes accumulate position-delete files instead of rewriting data files on every
 change. The indexer compacts a branch's table when either trigger in `metadata_search.compaction` is
 crossed: more than `max_delete_files` delete files, or `every_commits` indexed commits since the
-last compaction. A compaction scans the table at the current snapshot, replaces all data and delete
+last compaction. A trigger set to `0` is off — it is not read as "use the default", which applies
+only when the key is absent — and a negative value is refused at startup. A compaction scans the table
+at the current snapshot, replaces all data and delete
 files with rewritten data files in one transaction, keeps `lakefs.mds.source-commit`, and commits
-with `mds: compact <R>@<C>`. The delete files are taken from the snapshot's manifest list, not from the
+with `mds: compact <R>@<C>`. The rewritten rows are sorted by `path` before they are written, so the
+table's declared `path ASC` order keeps describing its files and their per-file path bounds stay
+narrow, which is what a later filtered scan prunes with. The delete files are taken from the snapshot's manifest list, not from the
 scan plan, so a delete file that no scan task carries any more — a rebuild replaces the data files it
 applied to — is removed too; `max_delete_files` therefore counts a number that a compaction actually
 drives to zero. It does not create a new tag; the existing `mds-*` tag still points at
@@ -868,7 +917,10 @@ A tag whose source commit no longer exists is retired too, because it can no lon
 `delete_branches` (default `true`) deletes the mirrored branch when a matching branch of `R` is
 deleted. Its tags stay, so history that was tagged remains readable; the branch itself does not. The
 companion repository's own default branch is never deleted, even after `R` renames its default
-branch: lakeFS refuses a default-branch delete, so the indexer keeps it and logs the skip once.
+branch: lakeFS refuses a default-branch delete, so the indexer keeps it and logs the skip once. With
+`delete_branches: false` the mirror is kept and only its `/_health` entry and
+`lakefs_mds_lag_commits` series are dropped, so a failed last attempt of the deleted branch cannot
+keep `/_health` at `503`.
 
 ### Upgrades and restarts
 
@@ -897,7 +949,7 @@ prefix (design §9):
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `lakefs_mds_indexed_commits_total` | counter | `repository` | Source commits applied to the mirror. |
-| `lakefs_mds_lag_commits` | gauge | `repository`, `branch` | Source commits of a branch not indexed yet. |
+| `lakefs_mds_lag_commits` | gauge | `repository`, `branch` | Source commits of a branch not indexed yet; `-1` when the last attempt failed before it counted them. |
 | `lakefs_mds_errors_total` | counter | `repository`, `stage` | Failures by stage: `tick`, `repository` or `branch`. |
 | `lakefs_mds_tick_duration_seconds` | histogram | — | Duration of one tick. |
 | `lakefs_mds_rows_written_total` | counter | — | Object metadata rows written. |
@@ -905,7 +957,8 @@ prefix (design §9):
 | `lakefs_mds_compactions_total` | counter | — | Compactions of a branch's table. |
 
 Alert on `_health` returning `503`, on `lakefs_mds_errors_total` increasing, and on
-`lakefs_mds_lag_commits` staying above zero for longer than a few periods.
+`lakefs_mds_lag_commits` staying away from zero (`> 0`, or `-1` for "unknown") for longer than a few
+periods.
 
 ## Option B outlook
 

@@ -20,15 +20,20 @@ compaction/rebuild interaction with position delete files (TB-1), the trust boun
 on the signing and policy sides (MDS-SEC-1, MDS-SEC-2), and one missing recovery branch when the recorded
 position disappears (TS-1). Crash and concurrency behaviour is otherwise well covered — the §4.4 table,
 the bounded 409 retries, staging recovery, and the real-lakeFS probes that back every claim. The
-remaining debt is about bounds (memory, request count, timeouts) and about test coverage of the paths the
+debt found was about bounds (memory, request count, timeouts) and about test coverage of the paths the
 fakes synthesise (paged `pending`, compaction through the indexer, the esti restart window, the engine
 scripts). These are review findings only: none of the five cards, and not this consolidation, changes any
 product code, test, design or doc. The fixes are six later commits, recorded in the Status column and
 under each finding: `6440e2f13` (IX-1, IO-2, TS-2, TS-1, IX-5), `7f952279b` (IX-2, TB-3),
 `db8172798` (IO-1, TS-5), `e3083e279` (TB-1), `d2811fdcc` (MDS-SEC-1, made on
-`feature/iceberg-catalog` and merged in `224fc82d3`) and `5b997972e` (MDS-SEC-2, MDS-SEC-5). Each
-carries the test that fails before its fix and a verification summary. The other MINOR and NIT
-findings stay open.
+`feature/iceberg-catalog` and merged in `224fc82d3`) and `5b997972e` (MDS-SEC-2, MDS-SEC-5). Six
+further commits fix the MINOR and NIT findings: `4aaf60cb3` (MDS-SEC-3, MDS-SEC-4, made on
+`feature/iceberg-catalog` and merged in `a397ed971`), `98f035d34` (IO-3, IO-4, IO-5, IO-6, IO-7),
+`f884a0627` (IX-3, IX-4, IX-6, IX-7, TS-3, TS-4, TS-10), `9cf0869c8` (the import half of MDS-SEC-5,
+decided by the owner), `2daeca114` (TB-2, TB-4, TB-5) and `866d4e85c` (TS-6, TS-7, TS-8, TS-9, the
+esti suite and the engine harness, which it ran against SeaweedFS, Spark and Trino). Each carries
+the test that fails before its fix and a verification summary. Every finding in this file is
+therefore fixed — the Status column and the `Fixed in` line under it; no finding is left open.
 
 ## Summary of findings
 
@@ -41,36 +46,38 @@ findings stay open.
 | MDS-SEC-1 | MAJOR | Server security | Remote signing hands out a write signature under `R-metadata`'s table location for the virtual table | `pkg/icebergcatalog/sign.go:345-392` | Fixed in `d2811fdcc` |
 | MDS-SEC-2 | MAJOR | Server security | The `*-metadata` class of the §8 policies matches data-repository ARNs, not only companion repositories | `pkg/mds/bootstrap/bootstrap.go:102-118` | Fixed in `5b997972e` |
 | TS-1 | MAJOR | Tests/esti | A recorded position that no longer exists fails the branch every tick forever; §4.7's rebuild fallback is not taken | `pkg/mds/indexer/branch.go:87-97` | Fixed in `6440e2f13` |
-| IX-3 | MINOR | Indexer pipeline | The per-commit table reload builds a new REST catalog, costing an extra config round trip and a connection pool per commit | `pkg/mds/indexer/iceberg.go:50-70` | Open |
-| IX-4 | MINOR | Indexer pipeline | The "crashed during the iceberg commit" recovery case is not tested | `pkg/mds/indexer/branch_test.go:377-388` | Open |
+| IX-3 | MINOR | Indexer pipeline | The per-commit table reload builds a new REST catalog, costing an extra config round trip and a connection pool per commit | `pkg/mds/indexer/iceberg.go:50-70` | Fixed in `f884a0627` |
+| IX-4 | MINOR | Indexer pipeline | The "crashed during the iceberg commit" recovery case is not tested | `pkg/mds/indexer/branch_test.go:377-388` | Fixed in `f884a0627` |
 | IX-5 | MINOR | Indexer pipeline | No test pages the `pending` walk, so the lag and multi-page stop-at logic is unverified | `pkg/mds/indexer/branch_test.go` (no case sets `fake.pageSize`) | Fixed in `6440e2f13` |
-| IO-3 | MINOR | Indexer service | With `delete_branches: false` a deleted branch keeps its `/_health` entry and lag gauge, so `/_health` stays 503 | `pkg/mds/indexer/indexer.go:484-490` | Open |
-| IO-4 | MINOR | Indexer service | A branch that fails before the pending list is built reports `lag_commits: 0` and loses `last_indexed` | `pkg/mds/indexer/indexer.go:494-511` | Open |
-| TB-2 | MINOR | Table/refmap | Compaction writes rows in scan order, so the declared `path ASC` sort order no longer describes its files | `pkg/mds/table/writer.go:287-307` | Open |
-| MDS-SEC-3 | MINOR | Server security | The catalog serves any repository named `R-metadata` as `R`'s index, while the indexer refuses such a repository | `pkg/icebergcatalog/resolver.go:297-320` | Open |
-| MDS-SEC-4 | MINOR | Server security | `iceberg.metadata_search.enabled` without `iceberg.enabled` is accepted, half-applied, and answers 501 | `pkg/icebergcatalog/config.go:196-209` | Open |
-| TS-3 | MINOR | Tests/esti | The fake's write methods are more lenient than lakeFS on a missing branch, and its one modelled refusal carries the wrong status | `pkg/mds/indexer/fake_test.go:579-620` | Open |
-| TS-4 | MINOR | Tests/esti | Nothing checks that the companion repository is writable; `ReadOnly` is dead and a read-only `R-metadata` fails every tick | `pkg/mds/client/lakefs.go:119` | Open |
+| IO-3 | MINOR | Indexer service | With `delete_branches: false` a deleted branch keeps its `/_health` entry and lag gauge, so `/_health` stays 503 | `pkg/mds/indexer/indexer.go:484-490` | Fixed in `98f035d34` |
+| IO-4 | MINOR | Indexer service | A branch that fails before the pending list is built reports `lag_commits: 0` and loses `last_indexed` | `pkg/mds/indexer/indexer.go:494-511` | Fixed in `98f035d34` |
+| TB-2 | MINOR | Table/refmap | Compaction writes rows in scan order, so the declared `path ASC` sort order no longer describes its files | `pkg/mds/table/writer.go:287-307` | Fixed in `2daeca114` |
+| MDS-SEC-3 | MINOR | Server security | The catalog serves any repository named `R-metadata` as `R`'s index, while the indexer refuses such a repository | `pkg/icebergcatalog/resolver.go:297-320` | Fixed in `4aaf60cb3` |
+| MDS-SEC-4 | MINOR | Server security | `iceberg.metadata_search.enabled` without `iceberg.enabled` is accepted, half-applied, and answers 501 | `pkg/icebergcatalog/config.go:196-209` | Fixed in `4aaf60cb3` |
+| TS-3 | MINOR | Tests/esti | The fake's write methods are more lenient than lakeFS on a missing branch, and its one modelled refusal carries the wrong status | `pkg/mds/indexer/fake_test.go:579-620` | Fixed in `f884a0627` |
+| TS-4 | MINOR | Tests/esti | Nothing checks that the companion repository is writable; `ReadOnly` is dead and a read-only `R-metadata` fails every tick | `pkg/mds/client/lakefs.go:119` | Fixed in `f884a0627` |
 | TS-5 | MINOR | Tests/esti | Startup verifies the initialisation commit by walking the entire first-parent history into memory | `pkg/mds/indexer/repo.go:152-185` | Fixed in `db8172798` |
-| TS-6 | MINOR | Tests/esti | The engine scripts only assert that *some* `orders/` row came back | `esti/ops/mds-engines/run-spark.sh:72-73` | Open |
-| TS-7 | MINOR | Tests/esti | No end-to-end test of §4.9 compaction and tag retention, or of the §4.8 branch-deletion mirror | `esti/mds_test.go:864-879` | Open |
-| TS-8 | MINOR | Tests/esti | The esti "indexer restart" case is opportunistic and still passes when the kill lands between ticks | `esti/mds_test.go:476-497` | Open |
-| IX-6 | NIT | Indexer pipeline | Five error messages print `branch@repository` where every other message prints `repository@branch` | `pkg/mds/indexer/branch.go:65` | Open |
-| IX-7 | NIT | Indexer pipeline | `Table.SnapshotCount` is documented as the `every_commits` counter, which it is not | `pkg/mds/indexer/tables.go:25-27` | Open |
-| IO-5 | NIT | Indexer service | `/_health` keeps the previous error while a repo is in progress, and a cancelled tick leaves `in_progress` stuck | `pkg/mds/health.go:103-120` | Open |
-| IO-6 | NIT | Indexer service | `compaction.*` is neither validated nor disableable: an explicit `0` is silently turned into the default | `pkg/mds/config.go:268-303` | Open |
-| IO-7 | NIT | Indexer service | Dead code and one stale doc comment around the health/metrics/stage seams | `pkg/mds/metrics.go:38-46` | Open |
-| TB-4 | NIT | Table/refmap | `Compact` accepts `…Option` and discards all of them | `pkg/mds/table/writer.go:280` | Open |
-| TB-5 | NIT | Table/refmap | Nothing at compile time or in unit tests proves `*catalog.Catalog` still satisfies the ref mapper's `refResolver` | `pkg/mds/refmap/refmap.go:47-50` | Open |
-| MDS-SEC-5 | NIT | Server security | The deny does not cover `fs:UpdateRepository`, which writes a companion repository | `pkg/mds/bootstrap/bootstrap.go:140-148` | Fixed in `5b997972e` |
-| TS-9 | NIT | Tests/esti | The esti reads are full scans, so the filtered-scan examples of the guide are not what the suite verifies | `esti/mds_test.go:2241` | Open |
-| TS-10 | NIT | Tests/esti | The fake's merge base is "any common ancestor", not graveler's best common ancestor, plus two smaller divergences | `pkg/mds/indexer/fake_test.go:479-512` | Open |
+| TS-6 | MINOR | Tests/esti | The engine scripts only assert that *some* `orders/` row came back | `esti/ops/mds-engines/run-spark.sh:72-73` | Fixed in `866d4e85c` |
+| TS-7 | MINOR | Tests/esti | No end-to-end test of §4.9 compaction and tag retention, or of the §4.8 branch-deletion mirror | `esti/mds_test.go:864-879` | Fixed in `866d4e85c` |
+| TS-8 | MINOR | Tests/esti | The esti "indexer restart" case is opportunistic and still passes when the kill lands between ticks | `esti/mds_test.go:476-497` | Fixed in `866d4e85c` |
+| IX-6 | NIT | Indexer pipeline | Five error messages print `branch@repository` where every other message prints `repository@branch` | `pkg/mds/indexer/branch.go:65` | Fixed in `f884a0627` |
+| IX-7 | NIT | Indexer pipeline | `Table.SnapshotCount` is documented as the `every_commits` counter, which it is not | `pkg/mds/indexer/tables.go:25-27` | Fixed in `f884a0627` |
+| IO-5 | NIT | Indexer service | `/_health` keeps the previous error while a repo is in progress, and a cancelled tick leaves `in_progress` stuck | `pkg/mds/health.go:103-120` | Fixed in `98f035d34` |
+| IO-6 | NIT | Indexer service | `compaction.*` is neither validated nor disableable: an explicit `0` is silently turned into the default | `pkg/mds/config.go:268-303` | Fixed in `98f035d34` |
+| IO-7 | NIT | Indexer service | Dead code and one stale doc comment around the health/metrics/stage seams | `pkg/mds/metrics.go:38-46` | Fixed in `98f035d34`, `f884a0627` |
+| TB-4 | NIT | Table/refmap | `Compact` accepts `…Option` and discards all of them | `pkg/mds/table/writer.go:280` | Fixed in `2daeca114` |
+| TB-5 | NIT | Table/refmap | Nothing at compile time or in unit tests proves `*catalog.Catalog` still satisfies the ref mapper's `refResolver` | `pkg/mds/refmap/refmap.go:47-50` | Fixed in `2daeca114` |
+| MDS-SEC-5 | NIT | Server security | The deny does not cover `fs:UpdateRepository`, which writes a companion repository | `pkg/mds/bootstrap/bootstrap.go:140-148` | Fixed in `5b997972e`; import actions in `9cf0869c8` |
+| TS-9 | NIT | Tests/esti | The esti reads are full scans, so the filtered-scan examples of the guide are not what the suite verifies | `esti/mds_test.go:2241` | Fixed in `866d4e85c` |
+| TS-10 | NIT | Tests/esti | The fake's merge base is "any common ancestor", not graveler's best common ancestor, plus two smaller divergences | `pkg/mds/indexer/fake_test.go:479-512` | Fixed in `f884a0627` |
 
 Duplicates merged: IO-2 → IX-1, TB-3 → IX-2, TS-2 → IX-1 (its paging-test-gap half is IX-5). The
 duplicate keys are also listed under the retained finding. IO-7 overlaps IX-7 and TS-4 but is kept as
-its own entry because the rest of it is distinct. IO-2 and TS-2 are fixed by `6440e2f13`, TB-3 by
-`7f952279b`, together with the findings they were merged into. The MINOR and NIT findings are open,
-except IX-5, TS-5 and MDS-SEC-5, which the same commits fixed.
+its own entry because the rest of it is distinct; its two overlapping items were fixed by the
+commits that fixed IX-7 and TS-4 (`f884a0627`). IO-2 and TS-2 are fixed by `6440e2f13`, TB-3 by
+`7f952279b`, IX-5, TS-5 and MDS-SEC-5 by the commits of the findings they were merged into. Every
+remaining MINOR and NIT is fixed by one of the later commits (`4aaf60cb3`, `98f035d34`,
+`f884a0627`, `9cf0869c8`, `2daeca114`, and `866d4e85c` for TS-6…TS-9).
 
 All MAJORs were verified against the code: 7 CONFIRMED, 0 DISPUTED (see the verification line in each
 MAJOR entry). No BLOCKER was reported. All seven are fixed; see the Status column and the Fixed in
@@ -481,6 +488,13 @@ fails before the fix is the probe above asserted as `require.NoError(branch.err)
 
 ### IX-3 - MINOR: the per-commit table reload builds a new REST catalog, costing an extra config round trip and a new connection pool per commit
 
+**Fixed in `f884a0627`** — the reload before §4.4 step 3 and after a reset or hard reset now goes
+through `Table.Refresh` on the branch's existing handle instead of a fresh `TableStore.LoadTable`,
+which built a new `rest.Catalog` (eager `/v1/config`) and closed the previous handle's connection
+pool once per applied commit. `TestReloadReusesTheBranchCatalog` counts `/v1/config` on an
+in-process lakeFS: one for a tick that applies two commits (three before the fix). No behaviour
+change: the reload still reads durable branch state.
+
 **Where** `pkg/mds/indexer/iceberg.go:50-70` (`LoadTable`), called per applied commit from `branch.go:540`.
 
 **What happens** §4.4 requires reloading the table before step 3, and `applyCommit` does that with
@@ -500,6 +514,11 @@ Test that would fail first: count requests to `/v1/config` on the in-process cat
 applies two commits; today it is ≥ 3, after the fix 1.
 
 ### IX-4 - MINOR: the "crashed during the iceberg commit" recovery case is not tested — the subtest injects no crash and asserts nothing new
+
+**Fixed in `f884a0627`** — `TestRecovery` now also covers the partial-write half of §4.4 row 2: rows
+staged with an empty `lakefs.mds.source-commit` are discarded with exactly one reset and the
+pending commit is applied as a normal delta, so an indexer that treats any staging as "already
+applied" fails it. The old row-5 case stays, documented as the no-staging/orphan-files case.
 
 **Where** `pkg/mds/indexer/branch_test.go:377-388` (`TestRecovery/crashed_during_the_iceberg_commit`).
 
@@ -542,6 +561,15 @@ only through a second parent with `pageSize = 1` (the §4.7 fallback across page
 
 ### IO-3 - MINOR: with `delete_branches: false` a deleted branch keeps its `/_health` entry and lag gauge, so `/_health` stays 503 until restart
 
+**Fixed in `98f035d34`** — the `/_health` entry **and** the lag gauge of a branch that is no longer
+followed are cleared whatever `delete_branches` says; only the deletion of `R-metadata@b` depends on
+that flag (design §4.8). `indexRepository` now clears `lakefs_mds_lag_commits` as well as the health
+entry for every branch that stops matching the configuration, and the new
+`retireUnfollowedBranches` diffs the set of branches the previous tick followed against this tick's
+matching set and retires everything that dropped out — which also reaches a branch that failed
+before its metadata branch existed. `TestDeletedBranchLeavesHealthWithoutDeletingTheMirror` and
+`TestBranchStopsMatchingClearsItsLagGauge` both fail on the code before the change.
+
 **Where** `pkg/mds/indexer/indexer.go:485-490` (the `if x.deleteBranches` gate around
 `retireDeletedBranches`), `pkg/mds/indexer/branch.go:650-676` (`ClearLag`/`RemoveBranch` only inside
 the delete loop), and `pkg/mds/indexer/indexer.go:462-466` (a branch that stops matching loses its
@@ -579,6 +607,14 @@ the lag series gone.
 
 ### IO-4 - MINOR: a branch that fails before the pending list is built reports `lag_commits: 0` and loses `last_indexed`, so lag alerts go blind while the indexer is stuck
 
+**Fixed in `98f035d34`** — `branchState.lag` starts at `indexer.LagUnknown` (`-1`), so a tick that
+never reaches §4.2 step 5 cannot report `0` by accident, and a pass that failed before it recorded
+a position reads the durable position back from the head of `R-metadata@b` and publishes that. A
+healthy branch that returned without counting (deleted between the listing of `R` and its own tick)
+still reports `0`, so a healthy report never carries an unknown lag. Design §9 records `-1`.
+`TestFailedBranchReportsTheRecordedPosition` and `TestFailedBranchReportsThePositionItAdvancedTo`
+are red before the fix.
+
 **Where** `pkg/mds/indexer/indexer.go:494-511` (`indexBranch` publishes `state` unconditionally),
 `pkg/mds/indexer/branch.go:70-105` (`state.last = last` at 105, after `ensureTag` at 82 and
 `FindMergeBase` at 87) and `:129` (`state.lag` is set only after `pending`).
@@ -608,6 +644,14 @@ and either the real lag or an explicit "unknown".
 
 ### TB-2 - MINOR: compaction writes rows in scan order, so the table's declared sort order (`path ASC`) no longer describes its files
 
+**Fixed in `2daeca114`** — `Compact` decodes the scan's batches into rows, sorts them by path and
+hands them to the writer one batch at a time, so every batch is a contiguous slice of the sorted
+table and two commits of interleaved paths compact into `[a b c d]` with narrow path
+lower/upper bounds. `Rebuild` keeps streaming and now enforces the declared order instead of
+trusting it: an out-of-order source is refused with the new `table.ErrRowsOutOfOrder` (design §4.3
+step 2, §4.9). `TestCompactWritesRowsInPathOrder` fails before the fix with `[b d a c]`;
+`TestRebuildRefusesRowsOutOfOrder` covers the new refusal.
+
 **Where.** `pkg/mds/table/writer.go:287-307` (`Compact` streams the scan's batches straight into `Append`, with no
 sort); `pkg/mds/table/schema.go:199-213` (`SortOrder()` = order id 1, field 2, `SortASC`, applied at creation and
 kept forever); contrast `writer.go:148` where the delta path does `sort.SliceStable` by path and `rows.go:96-100`
@@ -636,6 +680,15 @@ ordered, drop/replace the sort order in the same transaction. Test: compact two 
 written order is `[a b c d]`.
 
 ### MDS-SEC-3 - MINOR: the catalog serves any repository named `R-metadata` as `R`'s index, while the indexer refuses such a repository
+
+**Fixed in `4aaf60cb3`** (made on `feature/iceberg-catalog`, merged into this branch in
+`a397ed971`) — `MetadataSearchResolver` implements `ResolvedTableVerifier`, and `Store.Resolve`
+loads the target table and serves it only when its `lakefs.mds.repository` property equals the data
+repository the caller named. A table naming another repository, or with no property at all, answers
+`NoSuchTableException` (404) for the address the caller asked about. Because the check lives in
+`Store.Resolve` it also covers HEAD, metrics, vended credentials and remote signing, whose
+scope/location is taken from the resolved table. Design §5.1/§5.2 record the rule;
+`TestMetadataSearchCompanionRepositoryProof` fails before the fix with 200 where 404 is expected.
 
 **Where**: `pkg/icebergcatalog/resolver.go:297-320` (`Resolve` builds the target from
 `MetadataRepository(addr.Repo)` and constants only), `pkg/icebergcatalog/config.go:264`
@@ -667,6 +720,14 @@ today (the table is served).
 
 ### MDS-SEC-4 - MINOR: `iceberg.metadata_search.enabled` without `iceberg.enabled` is accepted, half-applied, and answers 501 at the documented endpoint
 
+**Fixed in `4aaf60cb3`** (made on `feature/iceberg-catalog`, merged into this branch in
+`a397ed971`) — `Config.Validate` now rejects `iceberg.metadata_search.enabled` without
+`iceberg.enabled` with one error, "metadata_search.enabled requires enabled: Metadata Search is
+served by the Iceberg catalog, which is off", so startup fails instead of installing the
+principals and the deny for a feature whose documented endpoint answers 501.
+`TestLoadConfigValidationErrors` fails before the fix; design §5.4 and `docs/metadata-search.md`
+record the rule.
+
 **Where**: `pkg/icebergcatalog/config.go:196-209` (`LoadConfig`) and `:359-404` (`Validate`) — no
 cross-check; `pkg/icebergcatalog/http.go:122-125` (early `MountDisabled` return before the alias mount at
 `:222-224`); `pkg/api/services.go:14-20` (`/mds/iceberg/api/` placeholder).
@@ -694,6 +755,14 @@ error, one test), or make `MountDisabled` claim `MetadataSearchBasePath` too so 
 catalog's disabled envelope in every build.
 
 ### TS-3 - MINOR: the fake's write methods are more lenient than lakeFS on a missing branch, and its one modelled refusal carries the wrong status
+
+**Fixed in `f884a0627`** — `Commit`, `ResetBranch` and `HardResetBranch` return a typed 404 for a
+missing branch or repository, `Commit` no longer re-creates a branch that is gone, the
+default-branch delete refusal carries 403 (`graveler.ErrDeleteDefaultBranch` is
+`http.StatusForbidden`, not BadRequest), and a write to a read-only repository is refused with 403.
+`TestFakeWriteMethodsRefuseAMissingBranchOrRepository` pins each answer and
+`TestMetadataBranchDeletedDuringATickFails` is the review's probe through the indexer; no existing
+test needed loosening.
 
 **Where** `pkg/mds/indexer/fake_test.go:579-620` (`Commit`), `:454-461` (`ResetBranch`), `:463-476`
 (`HardResetBranch`), `:436-451` (`DeleteBranch`); compare `pkg/api/controller.go:3188-3194` (404) and
@@ -731,6 +800,14 @@ the fake commits, the tick reports no error, and the branch head has no parents.
 cases above asserted against those errors.
 
 ### TS-4 - MINOR: nothing checks that the companion repository is writable; `client.Repository.ReadOnly` is dead and a read-only or protected `R-metadata` fails every tick forever
+
+**Fixed in `f884a0627`** — a companion repository that lakeFS reports read-only is refused at the
+repository level with the new `ErrReadOnlyMetadataRepository` before any branch is touched, so a
+read-only (or COMMIT-protected) `R-metadata` fails the repository once per tick, with a message
+naming both causes and the fix, instead of the same 403 on every branch forever while `/_health`
+stays 503. The previously dead `client.Repository.ReadOnly` is what the check reads, and the fake
+now models the read-only write refusal. `TestReadOnlyMetadataRepositoryFailsTheRepository` pins it;
+design §4.8 and `docs/metadata-search.md` state the requirement.
 
 **Overlap:** IO-7 lists the dead `ReadOnly` field as a NIT; this is the substantive finding.
 
@@ -795,6 +872,13 @@ values alive (or a `-benchmem` bound on `verifyInitCommit`).
 
 ### TS-6 - MINOR: the engine scripts only assert that *some* `orders/` row came back, so the documented "both endpoints return the same three rows with the same commit_id" is an unrepeatable observation
 
+**Fixed in `866d4e85c`** — `run-spark.sh` and `run-trino.sh` capture each variant's rows, require
+exactly the three expected `orders/` rows (path, size and `SOURCE_COMMIT` from `.run/state.env`) and
+`diff` the two endpoints' captures inside the scripts, and the image defaults are the digests the
+README records (`MDS_SPARK_IMAGE` / `MDS_TRINO_IMAGE` still override). `./esti/ops/mds-engines/run-all.sh`
+reported "all engine snippets passed" in 5m56.588s with Spark and Trino each returning the three
+expected rows on both endpoints and empty endpoint diffs.
+
 **Where** `esti/ops/mds-engines/run-spark.sh:72-73`, `esti/ops/mds-engines/run-trino.sh:107-108`;
 the claim is `docs/metadata-search.md:565-575` and `esti/ops/mds-engines/README.md` § "Observed
 result".
@@ -816,6 +900,15 @@ versions.
 image variables to the pinned digests and keep `:latest` behind an explicit override.
 
 ### TS-7 - MINOR: no end-to-end test of §4.9 (compaction, tag retention) or of the §4.8 branch-deletion mirror; the indexer's `Compact` is a stub in the only test that calls it
+
+**Fixed in `866d4e85c`** — `TestMetadataSearchCompactionAndTagRetention` runs §4.9 on a real
+catalog (`max_delete_files: 1`, `tag_retention: 1s`): two deletes cross the threshold, the
+`mds: compact <R>@<C>` commit is present, `mds-<C>` stays on the pre-compaction commit, rows and
+`lakefs.mds.source-commit` are unchanged, `lakefs_mds_compactions_total` is 1, the old tag is
+retired and the live position's tag remains. `TestMetadataSearchBranchDeletion` runs §4.8: deleting
+a data branch removes its `R-metadata` branch, its tags remain, the commit is still readable through
+the `mds-<commit>` tag, and `/_health` drops the branch. Both ran against SeaweedFS
+(121.461s).
 
 **Where** `esti/mds_test.go:864-879` (the generated `metadata_search` section: no `compaction`,
 `tag_retention`, `delete_branches`, `seed_lookback`, `rebuild_threshold`; `period` is `2s`);
@@ -844,6 +937,15 @@ its tags remain.
 
 ### TS-8 - MINOR: the esti "indexer restart" case is opportunistic and still passes when the kill lands between ticks, so the crash-window claim in the file header is not proven by a run
 
+**Fixed in `866d4e85c`** — the indexer's lakeFS endpoint now points at an in-process reverse proxy,
+and the restart case arms a hold on the next POST of `R-metadata`'s lakeFS commit, waits a bounded
+10s for that observable request and fails when the window is missed, so the kill lands after the
+Iceberg commit staged the pointer and before the lakeFS commit. After the restart it asserts the
+staging was non-empty at the kill, no staging remains, both missed commits are present, and
+`R-metadata`'s log holds exactly one indexing commit per missed commit (no replay). The
+opportunistic `stopIndexerWhenTicking` and its "between ticks is also fine" log are gone; it ran as
+part of `TestMetadataSearchEndToEnd` (418.096s against SeaweedFS).
+
 **Where** `esti/mds_test.go:476-497` (the case), `:1095-1116` (`stopIndexerWhenTicking`), and the
 claim at `esti/mds_test.go:44` / `docs/metadata-search.md:562-563`.
 
@@ -868,6 +970,9 @@ periods; after the restart, additionally assert that `R-metadata@main` has no le
 
 ### IX-6 - NIT: five error messages print `branch@repository` where every other message prints `repository@branch`
 
+**Fixed in `f884a0627`** — the five messages now print `repository@branch`, like the rest of the
+package, pinned by `TestErrorMessagesNameTheRepositoryBeforeTheBranch` (message-only, but tested).
+
 **Where** `pkg/mds/indexer/branch.go:65`, `:338`, `:485`, `:508`, `:542`.
 
 **What happens** `fmt.Errorf("load the metadata table of %s@%s: %w", branch, repository, err)` (and the same
@@ -883,6 +988,11 @@ line 48.
 on a forced `LoadTable` failure in `TestReloadTableBeforeApplyingCommit`-style setup fails before the fix.
 
 ### IX-7 - NIT: `Table.SnapshotCount` is documented as the `every_commits` counter, which it is not
+
+**Fixed in `f884a0627`** — `Table.SnapshotCount`'s comment no longer claims that §4.9's
+`every_commits` trigger counts snapshots. It is a log field; the trigger counts indexing commits
+from the first-parent log of `R-metadata@b` (`indexedSinceCompaction`), and compaction adds a
+snapshot itself. Comment-only, no behaviour change.
 
 **Duplicate in part:** the `SnapshotCount` doc-comment item of IO-7 (indexer service), kept there as part of a wider dead-code finding; this is the specific one.
 
@@ -901,6 +1011,15 @@ count for a snapshot count that compaction itself increments — the exact bug c
 `SnapshotCount` from the interface and log `len(tbl.metadata.Snapshots())` in the writer instead.
 
 ### IO-5 - NIT: `/_health` keeps the previous error while a repo is in progress, and a cancelled tick leaves `in_progress` stuck
+
+**Fixed in `98f035d34`**, with the precedence decided and pinned: a tick in progress never clears the
+outcome of the previous one, and a cancelled tick ends the in-progress flag without touching that
+outcome. `mds.Health` gains `CancelTick` (clear `in_progress`, keep `lastError` and `branches`),
+reached through the optional `indexer.TickCanceller` interface, and `indexer.tickRepository` calls
+it on the cancelled path, so a cancelled tick no longer leaves a repository "in progress" for the
+life of the process. `TestHealthInProgressVersusPreviousError` and
+`TestCancelledTickIsNotLeftInProgress` (red before the fix) pin both halves; design §9 states the
+precedence.
 
 **Where** `pkg/mds/health.go:103-120` (`BeginTick` sets `inProgress`, leaves `lastError`),
 `pkg/mds/health.go:175-200` (`Report`), `pkg/mds/indexer/indexer.go:427-440` (`tickRepository`
@@ -925,6 +1044,15 @@ test that asserts the chosen answer for "previous tick failed, current tick in p
 
 ### IO-6 - NIT: `compaction.*` is neither validated nor disableable — an explicit `0` is silently turned into the default
 
+**Fixed in `98f035d34`** — `0` means disabled, which is what the sample configuration and
+`docs/metadata-search.md` already said. `indexer.applyDefaults` no longer rewrites a zero
+compaction threshold to 200/500, a negative value is refused by `Config.Validate` (one error per
+problem for `tag_retention`, `compaction.max_delete_files` and `compaction.every_commits`), and the
+documented defaults live only in `pkg/mds/config.go`'s `setDefaults`, which applies them to an
+absent key. `TestCompactionDisabledByZero`, `TestLoadConfigMaintenanceDisabledByZero` and three
+rows of `TestLoadConfigValidationRules` are red without the fix; design §7 and the operator guide
+record the semantics.
+
 **Where** `pkg/mds/config.go:268-303` (`setDefaults` keeps an explicitly written `0`), `:309-360`
 (`Validate` has no rule for `compaction.max_delete_files`, `compaction.every_commits` or
 `tag_retention`), `pkg/mds/indexer/indexer.go:382-406` (`applyDefaults` maps `<= 0` to the default),
@@ -947,6 +1075,15 @@ document it. Test: `compaction.max_delete_files: 0` must either fail validation 
 message or leave the trigger off (today neither).
 
 ### IO-7 - NIT: dead code and one stale doc comment around the health/metrics/stage seams
+
+**Fixed in `98f035d34`** for the items in this card's files: `mds.StageRepository` and
+`mds.StageBranch` are gone (the indexer's own constants are the only stage vocabulary;
+`mds.metrics` declares only `StageTick` and `AllRepositories`, and the service test uses
+`indexer.StageBranch`), `Health.SetBranchError` and the test-only `Health.SetBranch` are deleted
+(the tests use `SetBranchState`), and the `BeginTick`/`Report`/`SetBranchState`/`SetLag` doc
+comments describe the precedence and the unknown lag. Its two items in other cards' files were
+fixed separately by `f884a0627`: the `SnapshotCount` comment (IX-7) and the dead
+`client.Repository.ReadOnly`, which TS-4's fix now reads.
 
 **Overlap:** its `SnapshotCount` doc-comment item duplicates IX-7 and its dead-`ReadOnly` item is TS-4; the unused stage constants and `SetBranchError` are unique to this entry.
 
@@ -973,6 +1110,12 @@ it for IO-4, and fix the `SnapshotCount` comment.
 
 ### TB-4 - NIT: `Compact` accepts `…Option` and discards all of them
 
+**Fixed in `2daeca114`** by removing the parameter: `Compact(ctx, tbl, sourceCommit)` takes no
+`Option`, because delete mode and delete chunk size do not describe a whole-table file replace
+(compaction writes no delete predicate) and a record batch size could not work while the writer
+fixed it. Callers passed no options, so the change is source-compatible; the batch size is now an
+internal variable with a test-only setter. `TestCompactTakesNoOptions` pins the new signature.
+
 **Where.** `pkg/mds/table/writer.go:280` (`if _, err := resolve(tbl, opts); err != nil`) — the resolved
 `writeOptions` are thrown away; the body never reads them (`writer.go:269-318`).
 
@@ -986,6 +1129,16 @@ options and document which ones compaction ignores. Test: `Compact` with an inva
 the signature no longer promises the rest.
 
 ### TB-5 - NIT: nothing at compile time or in unit tests proves `*catalog.Catalog` still satisfies the ref mapper's `refResolver`
+
+**Fixed in `2daeca114`** with a compile-time assertion plus a unit test: `var _ refResolver =
+(*catalog.Catalog)(nil)` sits next to the interface (no import cycle), so a re-shaped
+`GetCommit`/`GetTag` breaks the build instead of making `New` return nil and turning every tag and
+commit read into `NoSuchTableException` with one `Warn` as the only signal, and
+`TestCatalogSatisfiesRefResolver` pins the same behaviour through `New` with a typed nil.
+**Not done as suggested:** the wiring test over a real catalog — the in-process lakeFS fixture
+lives in `pkg/mds/table`'s external test package, and rebuilding it in `refmap` would duplicate a
+whole server for a NIT whose regressable defect is the missing assertion, which now cannot regress
+silently.
 
 **Where.** `pkg/mds/refmap/refmap.go:47-50` (unexported `refResolver`), `refmap.go:73-78` (runtime type assertion;
 failure returns `nil` + one warning), `cmd/lakefs-sso/main.go:93` (the only installation), tests use only the
@@ -1006,7 +1159,14 @@ that builds the resolver over a real catalog (the `pkg/api`/`pkg/catalog` test f
 **Fixed in `5b997972e`** — `fs:Update*` joined `metadataRepoProtectFSDeniedActions`, so
 `fs:UpdateRepository` (`SetRepositoryMetadata` / `DeleteRepositoryMetadata`) is denied on a companion
 repository. `TestMDSPoliciesDoNotReachDataRepositories` and `TestMetadataRepoProtectPolicyStatements`
-cover it; the import pair (`fs:ImportFromStorage`, `fs:ImportCancel`) is deliberately still uncovered.
+cover it. The import pair (`fs:ImportFromStorage`, `fs:ImportCancel`) is covered as well: the owner
+decided the deny must protect the companion repositories against imports, and `9cf0869c8` added
+`fs:Import*` to the list (design §8). `ImportCancel` authorizes `fs:ImportCancel` on the companion
+branch ARN, which the companion subtree statement matches; `ImportFromStorage` is authorized on the
+*source* namespace, never on a repository ARN, so no namespace statement was added — an import into
+a companion repository is already denied by the `fs:WriteObject`/`fs:CreateCommit` on its
+destination, and importing *out of* a companion namespace writes the destination repository, which
+is the read the deny deliberately leaves open.
 
 **Where**: `pkg/mds/bootstrap/bootstrap.go:140-148` (`metadataRepoProtectFSDeniedActions`), used at
 `:231-253`.
@@ -1030,6 +1190,12 @@ only `Write/Delete/Create/Revert`.
 
 ### TS-9 - NIT: the esti reads are full scans, so the filtered-scan examples of the guide (PyIceberg `row_filter`, DuckDB `WHERE … ORDER BY … LIMIT`) are not what "runs the snippets above" verifies
 
+**Fixed in `866d4e85c`** — a new filtered-scan step runs PyIceberg's
+`row_filter=GreaterThan(size_bytes, 0) & StartsWith(path, "data/")` and DuckDB's
+`WHERE path LIKE 'data/%' AND size_bytes > 0 ORDER BY size_bytes DESC LIMIT 20` through all four
+engine/mount recipes and requires the expected rows, the same signatures and the DuckDB `DESC`
+ordering; it ran inside `TestMetadataSearchEndToEnd`.
+
 **Where** `esti/mds_test.go:2241` (`scanned = table.scan().to_arrow()`), `:2326`
 (`SELECT … FROM lakefs."system"."object_metadata"`, no predicate), vs
 `docs/metadata-search.md:369-373` (`row_filter=GreaterThan("size_bytes", …) & StartsWith("path", …)`)
@@ -1045,6 +1211,14 @@ verified by neither the esti suite nor the Spark/Trino scripts in the same shape
 signatures from all four paths.
 
 ### TS-10 - NIT: the fake's merge base is "any common ancestor", not graveler's best common ancestor, and two smaller fake-side divergences
+
+**Fixed in `f884a0627`** — the fake models `FirstParent: false` by walking every parent (breadth
+first), so dropping `FirstParent: true` from a walk changes what a test sees; `FindMergeBase`
+implements graveler's best-common-ancestor rule (generation-ordered, newest-first tie-break) from
+`pkg/graveler/ref/merge_base_finder.go`; and `enterDataBranch`'s second parameter is named
+`commitID`. `TestFakeFindMergeBaseIsTheBestCommonAncestor`,
+`TestFakeLogCommitsHonoursFirstParent` and `TestMergeUsesTheFirstParent` (which now asserts that
+every log read asked for the first parent) pin it.
 
 **Where** `pkg/mds/indexer/fake_test.go:479-512` (BFS from `sourceRef`), `:527-545` (`LogCommits`
 ignores `opts.FirstParent`), `:334-345` + `:562-566` (`enterDataBranch` receives a commit ID under the
