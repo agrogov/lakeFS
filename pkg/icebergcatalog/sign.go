@@ -15,7 +15,7 @@ package icebergcatalog
 // object-store grant.
 //
 // The signing endpoint is a capability with a sharp edge: a presigned URL is a bearer capability
-// for the object it names. Two checks keep it scoped to the table the caller is authorized for:
+// for the object it names. Three checks keep it scoped to the table the caller is authorized for:
 //
 //  1. the requested URI must resolve, lexically, to an S3 URI under the table's location. The
 //     location is the `location` field of the table's current metadata.json. The comparison is a
@@ -27,6 +27,12 @@ package icebergcatalog
 //     access. A write additionally needs a branch ref (Q-I4), so a tag or commit ref is refused
 //     as read-only. The Authorizer also adds fs:ReadRepository and, for a write,
 //     fs:WriteObject on the reserved _lakefs_iceberg/ area.
+//  3. a write must not name a namespace a table resolver reserved (§5.4, METADATA_SEARCH_DESIGN.md:
+//     the system namespace of a data repository belongs to the virtual table). The check runs on
+//     the address the caller named and on the address the resolver sends the table read to, so a
+//     redirect cannot turn a write the caller may make on the data repository into a write
+//     signature for the companion repository's files. Reads of a reserved namespace stay allowed:
+//     the virtual table is what it is for.
 //
 // Advertisement. The blockstore, not the URL, decides whether remote signing exists: it is
 // enabled when the configured blockstore is S3 and its pre-signer is available
@@ -163,11 +169,21 @@ type RefResolver interface {
 // the future route-table change needs: Routes, TableConfig and Enabled. Tests in this package
 // build it directly with a fixed table location and a fake block adapter.
 type remoteSigningService struct {
-	// locate resolves the current table location (metadata.json's `location`) for an address,
-	// authorizing the addresses the table resolver names on the way (resolver.go): a virtual table
-	// is signed from where it actually lives - the companion repository - while the caller was
-	// authorized on the data repository (§5.3).
-	locate func(ctx context.Context, addr Address, authorize AuthorizeFunc) (string, error)
+	// resolve asks the registered table resolver about an address and authorizes any address it
+	// names besides the requested one (Store.ResolveAuthorized, resolver.go): a virtual table is
+	// signed from where it actually lives - the companion repository - while the caller was
+	// authorized on the data repository (§5.3). The resolved target is what a write checks for a
+	// reserved namespace before the table is read (§5.4).
+	resolve func(ctx context.Context, addr Address, authorize AuthorizeFunc) (ResolvedTable, error)
+
+	// locationOf reads the current location (metadata.json's `location`) of a resolved table
+	// address.
+	locationOf func(ctx context.Context, addr Address) (string, error)
+
+	// requireWritableNamespace refuses a write into a namespace a table resolver reserved on a data
+	// repository (Store.RequireWritableNamespace, §5.4). It is nil for a service built without a
+	// store, i.e. while no resolver is registered and nothing is reserved.
+	requireWritableNamespace func(addr Address) error
 
 	// authz is the §7.2 authorizer.
 	authz *Authorizer
@@ -191,14 +207,16 @@ type remoteSigningService struct {
 // blockstore that signs; when it is nil the store's own adapter is used. cfg supplies the prefix
 // (an empty configuration falls back to CatalogPrefix, like server.prefix in http.go).
 func NewRemoteSigningService(store *Store, authz *Authorizer, adapter block.Adapter, refs RefResolver, cfg *Config) *remoteSigningService {
-	var locate func(ctx context.Context, addr Address, authorize AuthorizeFunc) (string, error)
+	var (
+		resolve                  func(ctx context.Context, addr Address, authorize AuthorizeFunc) (ResolvedTable, error)
+		locationOf               func(ctx context.Context, addr Address) (string, error)
+		requireWritableNamespace func(addr Address) error
+	)
 	if store != nil {
-		locate = func(ctx context.Context, addr Address, authorize AuthorizeFunc) (string, error) {
-			resolved, err := store.ResolveAuthorized(ctx, addr, authorize)
-			if err != nil {
-				return "", err
-			}
-			table, err := store.GetTable(ctx, resolved.Target)
+		resolve = store.ResolveAuthorized
+		requireWritableNamespace = store.RequireWritableNamespace
+		locationOf = func(ctx context.Context, addr Address) (string, error) {
+			table, err := store.GetTable(ctx, addr)
 			if err != nil {
 				return "", err
 			}
@@ -216,12 +234,14 @@ func NewRemoteSigningService(store *Store, authz *Authorizer, adapter block.Adap
 		prefix = cfg.Prefix
 	}
 	return &remoteSigningService{
-		locate:  locate,
-		authz:   authz,
-		adapter: adapter,
-		refs:    refs,
-		prefix:  prefix,
-		enabled: RemoteSigningSupported(adapter),
+		resolve:                  resolve,
+		locationOf:               locationOf,
+		requireWritableNamespace: requireWritableNamespace,
+		authz:                    authz,
+		adapter:                  adapter,
+		refs:                     refs,
+		prefix:                   prefix,
+		enabled:                  RemoteSigningSupported(adapter),
 	}
 }
 
@@ -291,9 +311,11 @@ func delegationRequests(header, mechanism string) bool {
 
 // handleSign is POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/sign.
 //
-// The order is prefix, delegation, identifier, authorization, method, table lookup, location
-// check, signing: a caller learns nothing about the table (or its location) before the §7.2
-// decision, and the blockstore is never asked for a URL that has not passed the location check.
+// The order is prefix, delegation, identifier, authorization, reserved namespace, method, table
+// lookup, location check, signing: a caller learns nothing about the table (or its location)
+// before the §7.2 decision, a write into a reserved namespace is refused before the method is
+// asked about, and the blockstore is never asked for a URL that has not passed the location
+// check.
 func (s *remoteSigningService) handleSign(w http.ResponseWriter, r *http.Request) {
 	if !s.Enabled() {
 		writeIcebergError(w, http.StatusNotImplemented, ErrTypeNotImplemented,
@@ -357,6 +379,17 @@ func (s *remoteSigningService) handleSign(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	if op == OpWriteTableData {
+		// §5.4 for the data plane: a write signature is a bearer capability for the files it
+		// names, so a write into a namespace the resolver reserved is refused. It runs on the
+		// requested address here and on the address the resolver sends the write to below, after
+		// the table is resolved; reads of the same address stay allowed.
+		if err := s.requireWritable(addr); err != nil {
+			s.writeError(w, err)
+			return
+		}
+	}
+
 	mode, ok := signingMode(method)
 	if !ok {
 		// The method is recognized (and was authorized as a write above), but the block adapter
@@ -368,8 +401,13 @@ func (s *remoteSigningService) handleSign(w http.ResponseWriter, r *http.Request
 
 	// The location is the one of the table the resolver reads (resolver.go), not necessarily the
 	// one of the address the caller named; the signature is therefore scoped to the files of the
-	// table that will actually be read.
-	location, err := s.tableLocation(r.Context(), addr, func(ctx context.Context, authzAddr Address) error {
+	// table that will actually be read. A write also refuses a namespace the resolver redirected
+	// it into (§5.4).
+	locate := s.tableLocation
+	if op == OpWriteTableData {
+		locate = s.writableTableLocation
+	}
+	location, err := locate(r.Context(), addr, func(ctx context.Context, authzAddr Address) error {
 		return s.authz.Authorize(ctx, caller, Request{Op: op, Address: authzAddr, RefIsBranch: refIsBranch})
 	})
 	if err != nil {
@@ -466,12 +504,56 @@ func (s *remoteSigningService) refIsBranch(ctx context.Context, addr Address) (b
 }
 
 // tableLocation resolves the current location of the table at addr, authorizing any address the
-// table resolver names on the way.
+// table resolver names on the way. It is the read path: a read of a reserved namespace is allowed
+// (§5.4), and the signature is scoped to where the table actually lives.
 func (s *remoteSigningService) tableLocation(ctx context.Context, addr Address, authorize AuthorizeFunc) (string, error) {
-	if s.locate == nil {
+	resolved, err := s.resolveTable(ctx, addr, authorize)
+	if err != nil {
+		return "", err
+	}
+	return s.loadLocation(ctx, resolved.Target)
+}
+
+// writableTableLocation is tableLocation for a write. In addition to the requested address, which
+// handleSign has already checked, it refuses a reserved namespace of the address the resolver sent
+// the write to: a redirect must not turn a write the caller may make on the data repository into a
+// write signature for the companion repository's files (§5.4). The refusal comes before the
+// redirected table is read.
+func (s *remoteSigningService) writableTableLocation(ctx context.Context, addr Address, authorize AuthorizeFunc) (string, error) {
+	resolved, err := s.resolveTable(ctx, addr, authorize)
+	if err != nil {
+		return "", err
+	}
+	if err := s.requireWritable(resolved.Target); err != nil {
+		return "", err
+	}
+	return s.loadLocation(ctx, resolved.Target)
+}
+
+// resolveTable resolves addr through the registered table resolver. A service built without a
+// store cannot answer it.
+func (s *remoteSigningService) resolveTable(ctx context.Context, addr Address, authorize AuthorizeFunc) (ResolvedTable, error) {
+	if s.resolve == nil {
+		return ResolvedTable{}, errNoTableLocator
+	}
+	return s.resolve(ctx, addr, authorize)
+}
+
+// loadLocation reads the location of a resolved table address.
+func (s *remoteSigningService) loadLocation(ctx context.Context, addr Address) (string, error) {
+	if s.locationOf == nil {
 		return "", errNoTableLocator
 	}
-	return s.locate(ctx, addr, authorize)
+	return s.locationOf(ctx, addr)
+}
+
+// requireWritable refuses an address whose namespace a table resolver reserved (§5.4). It is a
+// no-op while no resolver is registered, like the reservation itself.
+func (s *remoteSigningService) requireWritable(addr Address) error {
+	if s.requireWritableNamespace == nil {
+		return nil
+	}
+	return s.requireWritableNamespace(addr)
 }
 
 // checkPrefix validates the {prefix} path segment against the catalog's configured prefix
@@ -506,6 +588,7 @@ func (s *remoteSigningService) writeError(w http.ResponseWriter, err error) {
 	var (
 		denied       *PermissionDeniedError
 		readOnly     *ReadOnlyRefError
+		reserved     *ReservedNamespaceError
 		authzFailure *AuthorizationError
 		noTable      *NoSuchTableException
 	)
@@ -518,6 +601,10 @@ func (s *remoteSigningService) writeError(w http.ResponseWriter, err error) {
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, err.Error())
 	case errors.As(err, &readOnly):
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, readOnly.Message())
+	case errors.As(err, &reserved):
+		// A write into a namespace a table resolver owns (resolver.go, §5.4): the caller may write
+		// the repository, just not the namespace the catalog serves from it.
+		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, reserved.Error())
 	case errors.As(err, &denied):
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, denied.Error())
 	case errors.As(err, &authzFailure):
