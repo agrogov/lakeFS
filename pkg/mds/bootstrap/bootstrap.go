@@ -12,8 +12,15 @@
 // turn are readable but not writable by ordinary principals: mds-metadata-repo-protect is a deny,
 // so it wins over an administrator's fs:* allow, and only the catalog and the indexer
 // (which are not in a group it can match) write there. Attaching it to
-// MetadataSearchIndexers would disarm the indexer, which is why that group is not in the group
-// list and is asserted to stay policy-free in the tests.
+// MetadataSearchIndexers would disarm the indexer, which is why the bootstrap drops that group from
+// any group list it is handed (datasets.immutable_guard_groups is operator-controlled) and the
+// tests assert it stays policy-free.
+//
+// The deny's group list is not computed here. It is the caller's, and cmd/lakefs-sso passes the same
+// guardGroups() it gives icebergcatalog.Bootstrap - the base groups of both group templates plus
+// datasets.immutable_guard_groups - so both installation-wide denies cover exactly the same
+// principals (§8). Taking the list from the caller is what keeps a configured extra guard group
+// from getting the reserved-prefix deny but not this one.
 //
 // Everything here is idempotent, so it runs on every startup:
 //
@@ -50,11 +57,9 @@ import (
 	"slices"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	cmdpkg "github.com/treeverse/lakefs/cmd/lakefs/cmd"
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/model"
-	"github.com/treeverse/lakefs/pkg/datasets"
 	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/permissions"
@@ -247,16 +252,22 @@ func MetadataRepoProtectPolicy(ts time.Time) *model.Policy {
 	}
 }
 
-// RoutesBuilder is the extra routes builder cmd/lakefs-sso registers with
-// cmd.AddExtraRoutesBuilder. It mounts no route; it exists so the principals of §8 are installed
-// from the same hook loop, and before the first request is served, as the catalog's own controls.
+// RoutesBuilder is the startup hook cmd/lakefs-sso registers with cmd.AddExtraRoutesBuilder
+// (wrapped in a closure that supplies guardGroups(), since a routes builder takes no arguments). It
+// mounts no route; it exists so the principals of §8 are installed from the same hook loop, and
+// before the first request is served, as the catalog's own controls.
+//
+// guardGroups is the deny's group list, and it must be the caller's guardGroups(): the base groups
+// of both group templates plus datasets.immutable_guard_groups, i.e. exactly the list
+// icebergcatalog.Bootstrap hands to iceberg-reserved-prefix-protect (§8). MetadataSearchIndexers is
+// dropped from it even when a caller lists it (see metadataRepoProtectGroups).
 //
 // While iceberg.metadata_search.enabled is false it does nothing at all: the catalog does not
 // resolve the virtual table, so no indexer can read a data repository through it and no companion
 // repository is written. A configuration error is returned - and so made fatal by the hook loop in
 // run.go - for the same reason the catalog's builder fails on one: an installation that meant to
 // enable Metadata Search must be told that it did not.
-func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, _ *chi.Mux) error {
+func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, guardGroups []string) error {
 	cfg, err := icebergcatalog.LoadConfig()
 	if err != nil {
 		return err
@@ -268,7 +279,7 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, _ *chi.Mux) erro
 		return ErrMissingDeps
 	}
 
-	inForce, err := EnsurePrincipals(ctx, deps.AuthService, time.Now())
+	inForce, err := EnsurePrincipals(ctx, deps.AuthService, time.Now(), guardGroups)
 	if err != nil {
 		return err
 	}
@@ -295,7 +306,14 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, _ *chi.Mux) erro
 //	user   mds-indexer             member of MetadataSearchIndexers
 //	group  MetadataSearchIndexers  carries mds-indexer, never mds-metadata-repo-protect
 //	policy mds-indexer             allow, attached to MetadataSearchIndexers
-//	policy mds-metadata-repo-protect  deny, attached to datasets.PinsProtectGroups(nil)
+//	policy mds-metadata-repo-protect  deny, attached to guardGroups minus MetadataSearchIndexers
+//
+// guardGroups is the full list of groups that must carry the deny - the same list
+// iceberg-reserved-prefix-protect uses, which cmd/lakefs-sso computes once in guardGroups() as
+// datasets.PinsProtectGroups(datasets.immutable_guard_groups) and passes to both bootstraps (§8).
+// It is an argument rather than something this package computes, because computing it here is how
+// an operator's datasets.immutable_guard_groups once silently got no deny: the list must be the
+// catalog's list, not a second copy of it. A nil or empty list attaches the deny to no group.
 //
 // ts is the creation timestamp recorded on entities that have to be created (the caller passes
 // time.Now(), as the datasets and catalog bootstraps do).
@@ -310,7 +328,7 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, _ *chi.Mux) erro
 // refusing to start it. That case is a warning naming the consequence and a nil error; every other
 // error is returned, so a genuine failure on a backend that does store policies still fails
 // startup. See icebergcatalog.EnsureReservedPrefixProtectPolicy for the same contract.
-func EnsurePrincipals(ctx context.Context, authService auth.Service, ts time.Time) (bool, error) {
+func EnsurePrincipals(ctx context.Context, authService auth.Service, ts time.Time, guardGroups []string) (bool, error) {
 	if authService == nil {
 		return false, ErrNoAuthorizer
 	}
@@ -356,11 +374,11 @@ func EnsurePrincipals(ctx context.Context, authService auth.Service, ts time.Tim
 		return false, fmt.Errorf("mds bootstrap: attach policy %s to group %s: %w", IndexerPolicyName, GroupName, err)
 	}
 
-	// The deny goes to the non-service groups of both group templates, the same list
-	// datasets-pins-protect and iceberg-reserved-prefix-protect use (§8). MetadataSearchIndexers is
-	// deliberately not in that list, and is not attached here: the indexer is the one principal that
-	// must be able to write a companion repository.
-	for _, group := range datasets.PinsProtectGroups(nil) {
+	// The deny goes to the guard list the caller supplied - the same base groups plus
+	// datasets.immutable_guard_groups that datasets-pins-protect and iceberg-reserved-prefix-protect
+	// cover (§8) - minus MetadataSearchIndexers: the indexer is the one principal that must be able
+	// to write a companion repository, so the deny must never reach it.
+	for _, group := range metadataRepoProtectGroups(ctx, guardGroups) {
 		err := authService.AttachPolicyToGroup(ctx, MetadataRepoProtectPolicyName, group)
 		switch {
 		case err == nil, errors.Is(err, auth.ErrAlreadyExists):
@@ -376,6 +394,38 @@ func EnsurePrincipals(ctx context.Context, authService auth.Service, ts time.Tim
 		}
 	}
 	return true, nil
+}
+
+// metadataRepoProtectGroups returns the groups the deny is attached to: guardGroups deduplicated,
+// with empty names and MetadataSearchIndexers dropped. The order is kept, so the attachments (and
+// the debug logs for groups an installation does not have) are deterministic.
+//
+// Dropping GroupName is not theoretical: guardGroups() ends with
+// datasets.immutable_guard_groups, which an operator writes by hand. Listing MetadataSearchIndexers
+// there would otherwise attach a deny of every fs:/catalog: write to the only principal that writes
+// companion repositories, and the indexer would fail every tick. It is dropped with a warning naming
+// the consequence rather than an error, because the rest of the list is still valid and a startup
+// that refused to run would leave even the base groups unprotected.
+func metadataRepoProtectGroups(ctx context.Context, guardGroups []string) []string {
+	seen := make(map[string]struct{}, len(guardGroups))
+	groups := make([]string, 0, len(guardGroups))
+	for _, group := range guardGroups {
+		switch group {
+		case "":
+			continue
+		case GroupName:
+			logging.FromContext(ctx).WithField("group", group).Warn(
+				"mds bootstrap: ignoring " + GroupName + " in the metadata-repo deny group list: the deny is " +
+					"never attached to the indexer group, whose principal must be able to write companion repositories")
+			continue
+		}
+		if _, ok := seen[group]; ok {
+			continue
+		}
+		seen[group] = struct{}{}
+		groups = append(groups, group)
+	}
+	return groups
 }
 
 // policyBackendAvailable reports whether authService can manage policies at all, i.e. whether

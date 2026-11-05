@@ -33,6 +33,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/auth/crypt"
 	"github.com/treeverse/lakefs/pkg/auth/model"
 	authparams "github.com/treeverse/lakefs/pkg/auth/params"
+	"github.com/treeverse/lakefs/pkg/datasets"
 	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"github.com/treeverse/lakefs/pkg/kv/kvtest"
 	"github.com/treeverse/lakefs/pkg/logging"
@@ -123,7 +124,7 @@ func TestEnsurePrincipals(t *testing.T) {
 	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
 	require.NoError(t, err, "one group of the deny's list exists in this installation")
 
-	inForce, err := EnsurePrincipals(t.Context(), svc, bootstrapTS)
+	inForce, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups())
 	require.NoError(t, err)
 	require.True(t, inForce, "a backend that stores policies has the principals in force")
 
@@ -155,6 +156,40 @@ func TestEnsurePrincipals(t *testing.T) {
 		"the deny must never be attached to MetadataSearchIndexers")
 }
 
+// TestEnsurePrincipalsConfiguredGuardGroups is the regression test for the guard list coming from
+// cmd/lakefs-sso: guardGroups() is datasets.PinsProtectGroups(datasets.immutable_guard_groups), the
+// same list icebergcatalog.Bootstrap attaches iceberg-reserved-prefix-protect to (§8). The bootstrap
+// used to recompute datasets.PinsProtectGroups(nil) itself, so an operator's configured extra group
+// got the reserved-prefix deny but no metadata-repo deny at all.
+func TestEnsurePrincipalsConfiguredGuardGroups(t *testing.T) {
+	svc := newACLService(t)
+	const extraGuardGroup = "metadata-operators"
+	for _, group := range []string{"Admins", extraGuardGroup, GroupName} {
+		_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: group, CreatedAt: bootstrapTS})
+		require.NoError(t, err)
+	}
+
+	// Exactly what cmd/lakefs-sso/main.go passes after guardGroups() read
+	// datasets.immutable_guard_groups: [metadata-operators]. MetadataSearchIndexers is appended to
+	// prove the bootstrap filters it out even when an operator lists it there.
+	groups := datasets.PinsProtectGroups([]string{extraGuardGroup, GroupName})
+
+	readLog := capturePackageLog(t)
+	inForce, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, groups)
+	require.NoError(t, err)
+	require.True(t, inForce)
+
+	require.Contains(t, policyNames(t, svc, extraGuardGroup), MetadataRepoProtectPolicyName,
+		"a configured extra guard group gets the deny exactly like a base group")
+	require.Contains(t, policyNames(t, svc, "Admins"), MetadataRepoProtectPolicyName)
+	require.NotContains(t, policyNames(t, svc, GroupName), MetadataRepoProtectPolicyName,
+		"the deny is never attached to MetadataSearchIndexers, even when the guard list names it")
+
+	output := readLog()
+	require.Contains(t, output, "level=warning", "dropping the indexer group from the guard list is logged")
+	require.Contains(t, output, GroupName)
+}
+
 // TestEnsurePrincipalsAuthorization checks what the two policies actually decide, through the same
 // ACL engine the server uses: the indexer writes companion repositories and only reads data
 // repositories, and an administrator's fs:* does not write a companion repository.
@@ -162,7 +197,7 @@ func TestEnsurePrincipalsAuthorization(t *testing.T) {
 	svc := newACLService(t)
 	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
 	require.NoError(t, err)
-	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS)
+	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups())
 	require.NoError(t, err)
 
 	// An administrator: a member of Admins (so the deny applies) with an installation-wide allow,
@@ -285,7 +320,7 @@ func TestEnsurePrincipalsAuthorization(t *testing.T) {
 func TestEnsurePrincipalsIdempotent(t *testing.T) {
 	svc := newACLService(t)
 
-	_, err := EnsurePrincipals(t.Context(), svc, bootstrapTS)
+	_, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups())
 	require.NoError(t, err)
 	first, err := svc.GetPolicy(t.Context(), IndexerPolicyName)
 	require.NoError(t, err)
@@ -293,7 +328,7 @@ func TestEnsurePrincipalsIdempotent(t *testing.T) {
 	// A second startup, one hour later: nothing is re-created, so the policy keeps its original
 	// creation timestamp and its statements.
 	later := bootstrapTS.Add(time.Hour)
-	inForce, err := EnsurePrincipals(t.Context(), svc, later)
+	inForce, err := EnsurePrincipals(t.Context(), svc, later, defaultGuardGroups())
 	require.NoError(t, err, "a rerun is a success, not an already-exists error")
 	require.True(t, inForce)
 	second, err := svc.GetPolicy(t.Context(), IndexerPolicyName)
@@ -339,7 +374,7 @@ func TestEnsurePrincipalsRepairsDriftedPolicy(t *testing.T) {
 				"a predictable policy name can be pre-created")
 
 			readLog := capturePackageLog(t)
-			inForce, err := EnsurePrincipals(t.Context(), svc, bootstrapTS)
+			inForce, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups())
 			require.NoError(t, err)
 			require.True(t, inForce)
 
@@ -372,7 +407,7 @@ func TestEnsurePrincipalsDegradesWithoutPolicyBackend(t *testing.T) {
 	require.NoError(t, err)
 
 	readLog := capturePackageLog(t)
-	inForce, err := EnsurePrincipals(t.Context(), basic, bootstrapTS)
+	inForce, err := EnsurePrincipals(t.Context(), basic, bootstrapTS, defaultGuardGroups())
 	require.NoError(t, err, "a service that cannot store policies must not refuse to start Metadata Search")
 	require.False(t, inForce, "nothing is in force on a backend without policies")
 
@@ -409,7 +444,7 @@ func (s policyStub) GetPolicy(context.Context, string) (*model.Policy, error) {
 // backend that does store policies and failed must still fail startup.
 func TestEnsurePrincipalsPolicyErrorIsFatal(t *testing.T) {
 	genuine := errors.New("kv: connection refused")
-	_, err := EnsurePrincipals(t.Context(), policyStub{policyErr: fmt.Errorf("get policy: %w", genuine)}, bootstrapTS)
+	_, err := EnsurePrincipals(t.Context(), policyStub{policyErr: fmt.Errorf("get policy: %w", genuine)}, bootstrapTS, defaultGuardGroups())
 	require.Error(t, err)
 	require.ErrorIs(t, err, genuine, "the real cause is preserved")
 	require.EqualError(t, err, fmt.Sprintf("mds bootstrap: read policy %s: get policy: %v", IndexerPolicyName, genuine),
@@ -417,7 +452,7 @@ func TestEnsurePrincipalsPolicyErrorIsFatal(t *testing.T) {
 }
 
 func TestEnsurePrincipalsNoAuthService(t *testing.T) {
-	_, err := EnsurePrincipals(t.Context(), nil, bootstrapTS)
+	_, err := EnsurePrincipals(t.Context(), nil, bootstrapTS, defaultGuardGroups())
 	require.ErrorIs(t, err, ErrNoAuthorizer)
 }
 
@@ -427,7 +462,7 @@ func TestRoutesBuilder(t *testing.T) {
 	t.Run("disabled section does nothing", func(t *testing.T) {
 		useConfig(t, "iceberg:\n  enabled: true\n")
 		svc := newACLService(t)
-		require.NoError(t, RoutesBuilder(t.Context(), cmdpkg.ServerDeps{AuthService: svc, Logger: logging.DummyLogger{}}, nil),
+		require.NoError(t, RoutesBuilder(t.Context(), cmdpkg.ServerDeps{AuthService: svc, Logger: logging.DummyLogger{}}, defaultGuardGroups()),
 			"a disabled Metadata Search section is not an error")
 		_, err := svc.GetUser(t.Context(), UserName)
 		require.ErrorIs(t, err, auth.ErrNotFound, "no principal is created while Metadata Search is off")
@@ -438,7 +473,7 @@ func TestRoutesBuilder(t *testing.T) {
 	t.Run("explicitly disabled section does nothing", func(t *testing.T) {
 		useConfig(t, "iceberg:\n  enabled: true\n  metadata_search:\n    enabled: false\n")
 		svc := newACLService(t)
-		require.NoError(t, RoutesBuilder(t.Context(), cmdpkg.ServerDeps{AuthService: svc, Logger: logging.DummyLogger{}}, nil))
+		require.NoError(t, RoutesBuilder(t.Context(), cmdpkg.ServerDeps{AuthService: svc, Logger: logging.DummyLogger{}}, defaultGuardGroups()))
 		_, err := svc.GetUser(t.Context(), UserName)
 		require.ErrorIs(t, err, auth.ErrNotFound)
 	})
@@ -446,20 +481,24 @@ func TestRoutesBuilder(t *testing.T) {
 	t.Run("enabled section bootstraps the principals", func(t *testing.T) {
 		useConfig(t, "iceberg:\n  enabled: true\n  metadata_search:\n    enabled: true\n")
 		svc := newACLService(t)
-		require.NoError(t, RoutesBuilder(t.Context(), cmdpkg.ServerDeps{AuthService: svc, Logger: logging.DummyLogger{}}, nil))
-		_, err := svc.GetUser(t.Context(), UserName)
+		_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
+		require.NoError(t, err)
+		require.NoError(t, RoutesBuilder(t.Context(), cmdpkg.ServerDeps{AuthService: svc, Logger: logging.DummyLogger{}}, defaultGuardGroups()))
+		_, err = svc.GetUser(t.Context(), UserName)
 		require.NoError(t, err)
 		_, err = svc.GetPolicy(t.Context(), MetadataRepoProtectPolicyName)
 		require.NoError(t, err, "both policies are created")
+		require.Contains(t, policyNames(t, svc, "Admins"), MetadataRepoProtectPolicyName,
+			"the builder forwards the guard group list it is handed, as cmd/lakefs-sso does")
 	})
 
 	t.Run("enabled section without dependencies is an error", func(t *testing.T) {
 		useConfig(t, "iceberg:\n  enabled: true\n  metadata_search:\n    enabled: true\n")
 		require.ErrorIs(t,
-			RoutesBuilder(t.Context(), cmdpkg.ServerDeps{Logger: logging.DummyLogger{}}, nil),
+			RoutesBuilder(t.Context(), cmdpkg.ServerDeps{Logger: logging.DummyLogger{}}, defaultGuardGroups()),
 			ErrMissingDeps, "a missing auth service must not be skipped silently")
 		require.ErrorIs(t,
-			RoutesBuilder(t.Context(), cmdpkg.ServerDeps{AuthService: newACLService(t)}, nil),
+			RoutesBuilder(t.Context(), cmdpkg.ServerDeps{AuthService: newACLService(t)}, defaultGuardGroups()),
 			ErrMissingDeps, "a missing logger must not be skipped silently")
 	})
 
@@ -469,15 +508,23 @@ func TestRoutesBuilder(t *testing.T) {
 		basic := auth.NewBasicAuthService(store, crypt.NewSecretStore([]byte("mds-bootstrap-basic-secret")),
 			authparams.ServiceCache{Enabled: false}, logging.DummyLogger{})
 		require.NoError(t,
-			RoutesBuilder(t.Context(), cmdpkg.ServerDeps{AuthService: basic, Logger: logging.DummyLogger{}}, nil),
+			RoutesBuilder(t.Context(), cmdpkg.ServerDeps{AuthService: basic, Logger: logging.DummyLogger{}}, defaultGuardGroups()),
 			"the documented default auth mode must still start the server")
 	})
 
 	t.Run("invalid configuration is fatal", func(t *testing.T) {
 		useConfig(t, "iceberg:\n  enabled: true\n  prefix: not-lakefs\n  metadata_search:\n    enabled: true\n")
-		require.Error(t, RoutesBuilder(t.Context(), cmdpkg.ServerDeps{AuthService: newACLService(t), Logger: logging.DummyLogger{}}, nil),
+		require.Error(t, RoutesBuilder(t.Context(), cmdpkg.ServerDeps{AuthService: newACLService(t), Logger: logging.DummyLogger{}}, defaultGuardGroups()),
 			"a configuration error is reported, not hidden behind a disabled builder")
 	})
+}
+
+// defaultGuardGroups is the group list cmd/lakefs-sso/main.go passes to both installation-wide
+// denies when datasets.immutable_guard_groups is unset: the base groups of both group templates. A
+// test that configures extra guard groups passes datasets.PinsProtectGroups(extras) instead, exactly
+// as guardGroups() builds it.
+func defaultGuardGroups() []string {
+	return datasets.PinsProtectGroups(nil)
 }
 
 // newACLService returns the simplified-ACL auth service the lakefs-sso binary uses, on an

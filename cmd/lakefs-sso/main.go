@@ -80,8 +80,12 @@ func main() {
 	// Create the Metadata Search principals and policies (METADATA_SEARCH_DESIGN.md §8) when
 	// iceberg.metadata_search.enabled is true. The builder mounts no route: it exists so the
 	// mds-indexer user, the MetadataSearchIndexers group and the two policies are in place before the
-	// first indexer request is authorized.
-	lakefsCmd.AddExtraRoutesBuilder(bootstrap.RoutesBuilder)
+	// first indexer request is authorized. It gets the same guardGroups() the reserved-prefix deny gets
+	// above, so mds-metadata-repo-protect covers exactly the principals iceberg-reserved-prefix-protect
+	// covers; the bootstrap itself never attaches it to MetadataSearchIndexers.
+	lakefsCmd.AddExtraRoutesBuilder(func(ctx context.Context, deps lakefsCmd.ServerDeps, _ *chi.Mux) error {
+		return bootstrap.RoutesBuilder(ctx, deps, guardGroups())
+	})
 
 	// Map the refs of a data repository to the companion repository's refs, so a tag or a commit read
 	// through the virtual table resolves to the snapshot the indexer recorded for it
