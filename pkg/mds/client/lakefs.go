@@ -576,8 +576,9 @@ func (c *Client) ListTags(ctx context.Context, repository, after string) ([]Tag,
 	return tags, hasMore, nil
 }
 
-// CreateTag implements Tags. §4.4 step 5 passes force=true so that a retry after a crash
-// overwrites a tag left by the crashed attempt.
+// CreateTag implements Tags. force only lets the tag be created in a read-only repository: lakeFS
+// never overwrites an existing tag (pkg/graveler/graveler.go CreateTag returns
+// ErrTagAlreadyExists, a 409), so a caller that moves a tag deletes it first (§4.4 step 5).
 func (c *Client) CreateTag(ctx context.Context, repository, tag, ref string, force bool) (Tag, error) {
 	body := apigen.TagCreation{
 		Id:    tag,

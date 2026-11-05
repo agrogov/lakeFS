@@ -627,7 +627,12 @@ func (x *Indexer) ensureTag(ctx context.Context, repository, branch, commit, ref
 		case err != nil && !errors.Is(err, client.ErrNotFound):
 			return fmt.Errorf("commit %q of tag %q of %q: %w", existing.CommitID, tag, metadata, err)
 		}
-		// The tag's commit is gone, or it records another source commit: repair it below.
+		// The tag's commit is gone, or it records another source commit: repair it below. lakeFS
+		// never overwrites a tag, even with force (pkg/graveler/graveler.go CreateTag returns
+		// ErrTagAlreadyExists), so the tag is deleted first.
+		if err := x.lakeFS.DeleteTag(ctx, metadata, tag); err != nil && !errors.Is(err, client.ErrNotFound) {
+			return fmt.Errorf("delete tag %q of %q: %w", tag, metadata, err)
+		}
 	case !errors.Is(err, client.ErrNotFound):
 		return fmt.Errorf("tag %q of %q: %w", tag, metadata, err)
 	}

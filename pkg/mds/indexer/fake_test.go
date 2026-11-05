@@ -638,7 +638,9 @@ func (f *fake) ListTags(_ context.Context, repository, after string) ([]client.T
 func (f *fake) CreateTag(_ context.Context, repository, tag, ref string, force bool) (client.Tag, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.tags[repository][tag]; ok && !force {
+	// Like lakeFS, force never overwrites: pkg/graveler/graveler.go CreateTag uses it only to
+	// pass the read-only check, then returns ErrTagAlreadyExists (409) for any existing tag.
+	if _, ok := f.tags[repository][tag]; ok {
 		return client.Tag{}, fmt.Errorf("create tag %q: %w", tag, client.ErrConflict)
 	}
 	commit, err := f.resolveLocked(repository, ref)
