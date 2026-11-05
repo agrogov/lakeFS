@@ -61,6 +61,13 @@ Or step by step, keeping the installation up between steps:
 ./esti/ops/mds-engines/env-down.sh
 ```
 
+`run-spark.sh` also has a self-test that needs neither docker nor an environment; it fabricates the
+`part-*` layouts Spark can write and proves the row gate:
+
+```bash
+./esti/ops/mds-engines/run-spark.sh --self-test
+```
+
 `run-all.sh` calls `env-down.sh` on success and on failure. `env-down.sh` stops only the
 `lakefs-sso`, indexer and OIDC processes these scripts started, plus their engine containers; it
 leaves SeaweedFS running.
@@ -85,7 +92,13 @@ the run.
    `main.last_indexed == head`.
 
 `run-spark.sh` writes the guide's Spark properties into `.run/spark-*.properties` and runs
-`spark-sql` in `tabulario/spark-iceberg` once per endpoint. The identifier form quotes each
+`spark-sql` in `tabulario/spark-iceberg` once per endpoint. The first SQL statement is the guide's
+snippet unchanged; the second writes the snippet's own projection (the same four columns, table
+and filter, `to_json(user_metadata)` so the map is text) into `.run/spark-<variant>.rows`. The gate
+then concatenates **every** `part-*` file Spark wrote before comparing them with the three expected
+rows, because `INSERT OVERWRITE DIRECTORY` writes one file per non-empty output partition: reading
+only the first file would miss an extra row in any other one, and would report a correct engine as
+wrong whenever Spark spreads the three rows over several files. The identifier form quotes each
 namespace level: ``lakefs.`my-repo`.`main`.`system`.object_metadata``.
 
 `run-trino.sh` writes the guide's Trino catalog properties into
@@ -137,6 +150,28 @@ That observation is a gate, not a reading of `.run/*.log`: each runner captures 
 sizes and `SOURCE_COMMIT` from `.run/state.env`, and diffs the two catalog endpoints' captures. A
 missing row, a stale snapshot, an extra row of another repository or a different commit fails the
 script.
+
+The Spark gate compares the guide's snippet's own projection, `path`, `size_bytes`, `commit_id`
+**and** `user_metadata` (the empty map the uploads have), and it concatenates every `part-*` file
+Spark wrote before comparing, so the three numbers above are checked over the whole result and an
+extra row in a second, third, … part file fails the run. `./run-spark.sh --self-test` proves both
+properties on fabricated part files without docker; the seven cases are a single part file with the
+expected rows, the same rows spread over two part files, an extra row in either part file (each of
+the two creation orders), a wrong `user_metadata` in either part file, and a directory with no
+`part-*` file at all.
+
+### Rerun after the row-gate fix (2026-11-05)
+
+`./run-all.sh` on the digests above, after the Spark gate was changed to concatenate every
+`part-*` file and to compare the guide's snippet's own four columns: 4/4 engine runs passed,
+wall **508s** (8m28s) including `env-up.sh` and `env-down.sh`, `SOURCE_COMMIT=962ec8eb…445ae`.
+
+Spark wrote **one** `part-*` file per variant in this run (`spark mds wrote 1 part file(s) …;
+comparing all of them`), so the layout this run happened to produce does not exercise the
+multi-file path. That path is proven by `./run-spark.sh --self-test` instead (7/7 cases pass): with
+the pre-fix gate (`find … -name 'part-*' | head -n 1`) the same self-test fails 3 cases — the rows
+split over two part files are reported as 2 rows, and an extra row in a part file goes unnoticed
+whenever the correct file is the one the gate reads.
 
 ## Snippet changes this run required
 

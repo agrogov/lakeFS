@@ -45,17 +45,33 @@ load_state() {
   . "$STATE_FILE"
 }
 
-# write_expected_orders_rows FILE COMMIT
-# The three rows env-up.sh uploads, as the guide's engine snippets project them: path, size_bytes,
-# commit_id. The commit is the SOURCE_COMMIT of state.env, so a stale snapshot, a row of another
-# repository or a different commit fails the comparison.
+# write_expected_orders_rows FILE COMMIT [COLUMNS]
+# The three rows env-up.sh uploads, as the guide's engine snippets project them. COLUMNS is 3, the
+# default (path, size_bytes, commit_id), or 4 for the Spark snippet's own projection, which also
+# selects user_metadata: every object the run uploads has the empty map. The commit is the
+# SOURCE_COMMIT of state.env, so a stale snapshot, a row of another repository or a different
+# commit fails the comparison.
 write_expected_orders_rows() {
-  local file=$1 commit=$2
-  printf '%s\t%s\t%s\n' \
-    'orders/2024/one.parquet' 34 "$commit" \
-    'orders/2024/two.parquet' 34 "$commit" \
-    'orders/2025/three.parquet' 36 "$commit" |
-    LC_ALL=C sort >"$file"
+  local file=$1 commit=$2 columns=${3:-3}
+  case "$columns" in
+  3)
+    printf '%s\t%s\t%s\n' \
+      'orders/2024/one.parquet' 34 "$commit" \
+      'orders/2024/two.parquet' 34 "$commit" \
+      'orders/2025/three.parquet' 36 "$commit" |
+      LC_ALL=C sort >"$file"
+    ;;
+  4)
+    printf '%s\t%s\t%s\t%s\n' \
+      'orders/2024/one.parquet' 34 "$commit" '{}' \
+      'orders/2024/two.parquet' 34 "$commit" '{}' \
+      'orders/2025/three.parquet' 36 "$commit" '{}' |
+      LC_ALL=C sort >"$file"
+    ;;
+  *)
+    die "write_expected_orders_rows: unsupported column count: ${columns}"
+    ;;
+  esac
 }
 
 # normalize_rows INPUT OUTPUT
@@ -66,16 +82,17 @@ normalize_rows() {
   tr -d '\r' <"$input" | sed '/^[[:space:]]*$/d' | LC_ALL=C sort >"$output"
 }
 
-# assert_orders_rows FILE DESCRIPTION
-# Require exactly the three expected orders/ rows of state.env. A file with a missing row, an extra
-# row, a different size or a different commit_id fails here, not in a human reading .run/*.log.
+# assert_orders_rows FILE DESCRIPTION [COLUMNS]
+# Require exactly the three expected orders/ rows of state.env, projected to COLUMNS columns (3 or
+# 4, see write_expected_orders_rows). A file with a missing row, an extra row, a different size, a
+# different commit_id or a different user_metadata fails here, not in a human reading .run/*.log.
 assert_orders_rows() {
-  local file=$1 description=$2
-  local expected="$RUN_DIR/expected-orders.tsv"
+  local file=$1 description=$2 columns=${3:-3}
+  local expected="$RUN_DIR/expected-orders-${columns}col.tsv"
   local normalized="$file.normalized"
   local count
 
-  write_expected_orders_rows "$expected" "$SOURCE_COMMIT"
+  write_expected_orders_rows "$expected" "$SOURCE_COMMIT" "$columns"
   normalize_rows "$file" "$normalized"
   count=$(wc -l <"$normalized" | tr -d ' ')
   if [ "$count" -ne 3 ]; then
@@ -87,6 +104,26 @@ assert_orders_rows() {
     die "$description rows differ from the expected orders/ rows (SOURCE_COMMIT=${SOURCE_COMMIT})"
   fi
   log "$description returned exactly the three expected orders/ rows at ${SOURCE_COMMIT}"
+}
+
+# concat_part_rows DIR OUTPUT DESCRIPTION
+# Concatenate every part-* file an `INSERT OVERWRITE DIRECTORY` result holds into OUTPUT. Spark
+# writes one file per non-empty output partition, so the first file alone is a strict subset of
+# what the engine returned: an extra row in any other part file would escape the comparison, and
+# the three expected rows spread over several files would look like a failure of a correct engine.
+# A directory with no part-* file at all is a failure, not an empty result. The files are
+# concatenated in whatever order `find` lists them; every caller normalises (sorts) before
+# comparing rows, so the order of the concatenation does not matter.
+concat_part_rows() {
+  local dir=$1 output=$2 description=$3
+  local parts
+
+  parts=$(find "$dir" -type f -name 'part-*' 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$parts" -eq 0 ]; then
+    die "$description wrote no part-* file under $dir"
+  fi
+  find "$dir" -type f -name 'part-*' -exec cat {} + >"$output"
+  log "$description wrote ${parts} part file(s) under ${dir}; comparing all of them"
 }
 
 # assert_same_rows FILE_A FILE_B DESCRIPTION
