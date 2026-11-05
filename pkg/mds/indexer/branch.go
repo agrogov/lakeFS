@@ -603,22 +603,29 @@ func (x *Indexer) finishCommit(ctx context.Context, repository, branch string, c
 	if err := x.ensureTag(ctx, repository, branch, commit.ID, indexed.ID); err != nil {
 		return err
 	}
-	// §4.9's every_commits trigger counts indexed commits: this is the one place every path
-	// (delta, rebuild, rewrite, a completed crash recovery) records exactly one.
-	x.addMaintenanceCommit(repository, branch)
 	return nil
 }
 
-// ensureTag makes sure tag mds-<commit> of R-metadata points at ref (§4.3 step 5). created with
-// force, so it also repairs the tag of a tick that crashed after its lakeFS commit (§4.4).
+// ensureTag makes sure tag mds-<commit> of R-metadata points at a commit that records commit
+// (§4.3 step 5, §4.4). A tag that already records commit is left where it is, even when it does
+// not point at ref: after a compaction (§4.9) the branch head is the compaction commit, and the
+// tag stays on the pre-compaction indexing commit, which has the same rows. Only a missing tag,
+// or one whose commit does not record commit, is created or moved to ref.
 func (x *Indexer) ensureTag(ctx context.Context, repository, branch, commit, ref string) error {
 	metadata := metadataRepository(repository)
 	tag := tagName(commit)
 	existing, err := x.lakeFS.GetTag(ctx, metadata, tag)
 	switch {
-	case err == nil && existing.CommitID == ref:
-		return nil
-	case err != nil && !errors.Is(err, client.ErrNotFound):
+	case err == nil:
+		indexed, err := x.lakeFS.GetCommit(ctx, metadata, existing.CommitID)
+		switch {
+		case err == nil && indexed.Metadata[MetadataKeySourceCommit] == commit:
+			return nil
+		case err != nil && !errors.Is(err, client.ErrNotFound):
+			return fmt.Errorf("commit %q of tag %q of %q: %w", existing.CommitID, tag, metadata, err)
+		}
+		// The tag's commit is gone, or it records another source commit: repair it below.
+	case !errors.Is(err, client.ErrNotFound):
 		return fmt.Errorf("tag %q of %q: %w", tag, metadata, err)
 	}
 	if _, err := x.lakeFS.CreateTag(ctx, metadata, tag, ref, true); err != nil {
@@ -628,8 +635,11 @@ func (x *Indexer) ensureTag(ctx context.Context, repository, branch, commit, ref
 }
 
 // retireDeletedBranches mirrors the deletion of a branch of R to R-metadata (§4.8). Its tags stay,
-// so a commit or tag read of the deleted branch's history still works (§6).
-func (x *Indexer) retireDeletedBranches(ctx context.Context, repository, metadata string, branches []string) error {
+// so a commit or tag read of the deleted branch's history still works (§6). R-metadata's default
+// branch is never deleted, even when its name is no longer a branch of R: lakeFS refuses to delete
+// a default branch (pkg/graveler/graveler.go DeleteBranch returns ErrDeleteDefaultBranch), which
+// used to fail this step on every tick after R renamed its default branch.
+func (x *Indexer) retireDeletedBranches(ctx context.Context, repository, metadata string, branches []string, defaultBranch string) error {
 	live := make(map[string]struct{}, len(branches))
 	for _, branch := range branches {
 		live[branch] = struct{}{}
@@ -644,10 +654,15 @@ func (x *Indexer) retireDeletedBranches(ctx context.Context, repository, metadat
 			if _, ok := live[branch.Name]; ok {
 				continue
 			}
+			if branch.Name == defaultBranch {
+				x.logDefaultBranchKeptOnce(repository, metadata, branch.Name)
+				continue
+			}
 			if err := x.lakeFS.DeleteBranch(ctx, metadata, branch.Name); err != nil && !errors.Is(err, client.ErrNotFound) {
 				return fmt.Errorf("delete %q@%s: %w", metadata, branch.Name, err)
 			}
 			x.metrics.ClearLag(repository, branch.Name)
+			x.health.RemoveBranch(repository, branch.Name)
 			x.log.WithFields(logging.Fields{
 				"repository": repository,
 				"branch":     branch.Name,
@@ -661,4 +676,23 @@ func (x *Indexer) retireDeletedBranches(ctx context.Context, repository, metadat
 			return fmt.Errorf("%w: list branches of %q: more results without a cursor", client.ErrBadPagination, metadata)
 		}
 	}
+}
+
+// logDefaultBranchKeptOnce reports a metadata default branch that has no branch of R any more,
+// once per process: the alternative is a warning on every tick for a repository whose data
+// default branch was renamed.
+func (x *Indexer) logDefaultBranchKeptOnce(repository, metadata, branch string) {
+	key := repository + "@" + branch
+	x.mu.Lock()
+	logged := x.defaultBranchKept[key]
+	x.defaultBranchKept[key] = true
+	x.mu.Unlock()
+	if logged {
+		return
+	}
+	x.log.WithFields(logging.Fields{
+		"repository": repository,
+		"metadata":   metadata,
+		"branch":     branch,
+	}).Info("mds: keeping the metadata default branch of a branch that is no longer in the data repository")
 }

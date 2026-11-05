@@ -137,25 +137,22 @@ func (x *Indexer) indexedSinceCompaction(ctx context.Context, repository, branch
 	return indexed, nil
 }
 
-// addMaintenanceCommit is the branch tick's report that one commit of R was just indexed (§4.3
-// step 4). §4.9's every_commits trigger no longer counts these in memory: it reads them back from
-// the commit log (indexedSinceCompaction), which is what makes the count survive a restart. The
-// tally is therefore write-only and the call site in the branch tick is what removes it.
-func (x *Indexer) addMaintenanceCommit(repository, branch string) {
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	x.maintenance[repository+"@"+branch]++
-}
-
 // retireTags deletes the mds-* tags of R-metadata whose source commit is older than tag_retention
 // (§4.9). A tag whose source commit is gone is retired too: it cannot be resolved through the
-// catalog any more (§6). tag_retention 0 keeps every tag.
+// catalog any more (§6). A tag that records the current position of a live branch is never retired,
+// however old its source commit is: §4.4 repairs a missing tag of an indexed position, so deleting
+// it would make the next tick recreate it and the tick after that delete it again. tag_retention 0
+// keeps every tag.
 func (x *Indexer) retireTags(ctx context.Context, repository string) error {
 	if x.tagRetention <= 0 {
 		return nil
 	}
 	metadata := metadataRepository(repository)
 	cutoff := time.Now().Add(-x.tagRetention)
+	live, err := x.currentSourceCommits(ctx, repository)
+	if err != nil {
+		return err
+	}
 
 	after := ""
 	for {
@@ -167,7 +164,7 @@ func (x *Indexer) retireTags(ctx context.Context, repository string) error {
 			if !strings.HasPrefix(tag.Name, TagPrefix) {
 				continue
 			}
-			retire, err := x.tagExpired(ctx, repository, tag, cutoff)
+			retire, err := x.tagExpired(ctx, repository, tag, cutoff, live)
 			if err != nil {
 				return err
 			}
@@ -192,10 +189,48 @@ func (x *Indexer) retireTags(ctx context.Context, repository string) error {
 	}
 }
 
+// currentSourceCommits returns the source commits recorded by the head of every branch of
+// R-metadata. They are the positions §4.4 repairs tags for, so retention keeps their tags.
+func (x *Indexer) currentSourceCommits(ctx context.Context, repository string) (map[string]struct{}, error) {
+	metadata := metadataRepository(repository)
+	positions := make(map[string]struct{})
+	after := ""
+	for {
+		branches, hasMore, err := x.lakeFS.ListBranches(ctx, metadata, after)
+		if err != nil {
+			return nil, fmt.Errorf("list branches of %q for tag retention: %w", metadata, err)
+		}
+		for _, branch := range branches {
+			if branch.CommitID == "" {
+				continue
+			}
+			head, err := x.lakeFS.GetCommit(ctx, metadata, branch.CommitID)
+			if errors.Is(err, client.ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("head commit %q of %q@%s for tag retention: %w", branch.CommitID, metadata, branch.Name, err)
+			}
+			if source := head.Metadata[MetadataKeySourceCommit]; source != "" {
+				positions[source] = struct{}{}
+			}
+		}
+		if !hasMore {
+			return positions, nil
+		}
+		after = lastNameOf(len(branches), func(i int) string { return branches[i].Name })
+		if after == "" {
+			return nil, fmt.Errorf("%w: list branches of %q: more results without a cursor", client.ErrBadPagination, metadata)
+		}
+	}
+}
+
 // tagExpired reports whether one mds-* tag is older than cutoff, by the creation date of the source
-// commit it records. A tag whose commit or source commit cannot be read any more is expired: it is
-// not resolvable, which is the reason retention exists.
-func (x *Indexer) tagExpired(ctx context.Context, repository string, tag client.Tag, cutoff time.Time) (bool, error) {
+// commit it records. A tag whose source commit is the current position of a live branch is kept: it
+// is not merely history, it is the tag that addresses the branch's current rows. A tag whose
+// commit or source commit cannot be read any more is expired: it is not resolvable, which is the
+// reason retention exists.
+func (x *Indexer) tagExpired(ctx context.Context, repository string, tag client.Tag, cutoff time.Time, live map[string]struct{}) (bool, error) {
 	metadata := metadataRepository(repository)
 	indexed, err := x.lakeFS.GetCommit(ctx, metadata, tag.CommitID)
 	switch {
@@ -206,6 +241,9 @@ func (x *Indexer) tagExpired(ctx context.Context, repository string, tag client.
 	}
 	source := indexed.Metadata[MetadataKeySourceCommit]
 	if source == "" {
+		return false, nil
+	}
+	if _, ok := live[source]; ok {
 		return false, nil
 	}
 	commit, err := x.lakeFS.GetCommit(ctx, repository, source)

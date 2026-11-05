@@ -114,6 +114,27 @@ func TestHealthServeHTTP(t *testing.T) {
 	require.Equal(t, "boom", body["repositories"].(map[string]any)["acme"].(map[string]any)["last_error"])
 }
 
+// TestHealthRemoveBranch pins §4.8's health side: a branch that was deleted (or stopped matching
+// the configuration) is removed from the report, so its last error cannot keep /_health at 503
+// until the process restarts.
+func TestHealthRemoveBranch(t *testing.T) {
+	health := NewHealth([]string{"acme"})
+	health.SetBranchState("acme", "feature", "a", "b", 1, errors.New("the branch could not be indexed"))
+	health.FinishTick("acme", nil)
+	require.False(t, health.Report().Healthy, "a failed branch makes the report unhealthy")
+
+	health.RemoveBranch("acme", "feature")
+
+	report := health.Report()
+	require.NotContains(t, report.Repositories["acme"].Branches, "feature")
+	require.True(t, report.Healthy, "removing the branch removes its error")
+
+	// Removing a branch or a repository that was never reported is harmless.
+	health.RemoveBranch("acme", "missing")
+	health.RemoveBranch("globex", "main")
+	require.True(t, health.Report().Healthy)
+}
+
 func TestHealthServeHTTPRejectsOtherMethods(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	NewHealth(nil).ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, HealthPath, nil))

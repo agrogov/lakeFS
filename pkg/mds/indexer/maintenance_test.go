@@ -52,6 +52,19 @@ func TestCompactionByDeleteFiles(t *testing.T) {
 	tagCommit, _ := e.fake.tagCommit("repo-metadata", "mds-s3")
 	head, _ := e.fake.branchHead("repo-metadata", "main")
 	require.NotEqual(t, head, tagCommit, "the compaction moved the branch and moved no tag")
+
+	// §4.4's tag repair runs at the start of every tick, and after a compaction the branch head is
+	// the compaction commit. It must leave the tag on the pre-compaction commit, whose rows are the
+	// same, instead of forcing it onto the head.
+	beforeCommits, beforeTags := len(e.fake.madeCommits()), len(e.fake.tagsMade)
+	e.tick()
+	require.Len(t, e.fake.madeCommits(), beforeCommits, "an idle compacted branch writes no commit")
+	require.Len(t, e.fake.tagsMade, beforeTags, "and creates no tag")
+	tagAfter, ok := e.fake.tagCommit("repo-metadata", "mds-s3")
+	require.True(t, ok)
+	require.Equal(t, tagCommit, tagAfter, "the tag does not move on the tick after the compaction")
+	head, _ = e.fake.branchHead("repo-metadata", "main")
+	require.NotEqual(t, head, tagAfter, "the tag stays on the indexing commit")
 }
 
 // TestCompactionEveryCommits pins the every_commits trigger: it counts indexed commits, not
@@ -208,6 +221,33 @@ func TestTagRetention(t *testing.T) {
 			require.True(t, ok, "tag mds-%s", commit)
 		}
 	})
+}
+
+// TestTagRetentionKeepsCurrentPosition pins the interaction between §4.9's tag_retention and §4.4's
+// tag repair: the tag of an idle branch records the branch's current position, so retention must
+// leave it alone however old its source commit is. Deleting it made the next tick recreate it and
+// the tick after that delete it again.
+func TestTagRetentionKeepsCurrentPosition(t *testing.T) {
+	now := time.Now().UTC()
+	e := newEnv(t, func(opts *indexer.Options) {
+		opts.TagRetention = 24 * time.Hour
+	})
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.setCommitDate("repo", "s1", now.Add(-72*time.Hour))
+
+	e.tick()
+
+	_, ok := e.fake.tagCommit("repo-metadata", "mds-s1")
+	require.True(t, ok, "the tag of the current position is kept although its commit is old")
+	require.Empty(t, e.fake.deletedTags, "retention does not delete the current position")
+	tagsMade := len(e.fake.tagsMade)
+
+	e.tick()
+
+	require.Empty(t, e.fake.deletedTags, "the second tick deletes nothing")
+	require.Len(t, e.fake.tagsMade, tagsMade, "and the tag repair creates nothing")
+	_, ok = e.fake.tagCommit("repo-metadata", "mds-s1")
+	require.True(t, ok)
 }
 
 // TestTagRetentionRetiresUnreadableTags pins the other half of tagExpired: a tag whose source commit

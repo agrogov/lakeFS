@@ -140,6 +140,15 @@ func (h *Health) SetBranchState(repository, branch, lastIndexed, head string, la
 	}
 }
 
+// RemoveBranch drops the state of a branch that is no longer mirrored (§4.8): a branch of R was
+// deleted, or it stopped matching the configuration. Keeping it would leave its last error in the
+// report and keep /_health at 503 until the process restarts.
+func (h *Health) RemoveBranch(repository, branch string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.repositoryLocked(repository).branches, branch)
+}
+
 // SetBranchError records that indexing one branch failed, leaving the rest of its state as it
 // was.
 func (h *Health) SetBranchError(repository, branch string, err error) {

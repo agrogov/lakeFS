@@ -656,6 +656,7 @@ func TestBranchDelete(t *testing.T) {
 		_, ok = e.fake.tagCommit("repo-metadata", "mds-s1")
 		require.True(t, ok, "its tags stay, so the history is still addressable (§4.8)")
 		require.Contains(t, e.metrics.cleared, "repo@feature")
+		require.False(t, e.health.hasBranch("repo", "feature"), "a deleted branch leaves /_health")
 	})
 
 	t.Run("delete_branches: false", func(t *testing.T) {
@@ -668,6 +669,88 @@ func TestBranchDelete(t *testing.T) {
 		_, ok := e.fake.branchHead("repo-metadata", "feature")
 		require.True(t, ok, "the metadata branch is left as it is")
 	})
+}
+
+// TestMetadataDefaultBranchIsNeverRetired pins the §4.8 branch-deletion mirror against R-metadata's
+// own default branch. R may rename its default branch and delete the old name; R-metadata keeps the
+// old name as its default branch, and lakeFS refuses to delete a default branch
+// (pkg/graveler/graveler.go DeleteBranch returns ErrDeleteDefaultBranch). Trying anyway failed the
+// repository tick every time and stopped tag retention after it.
+func TestMetadataDefaultBranchIsNeverRetired(t *testing.T) {
+	now := time.Now().UTC()
+	logger := &recordingLogger{}
+	e := newEnv(t, func(opts *indexer.Options) {
+		opts.Repositories[0].Branches = []string{"*"}
+		opts.TagRetention = time.Hour
+		opts.DeleteBranches = true
+		opts.Log = logger
+	})
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.setCommitDate("repo", "s1", now.Add(-72*time.Hour))
+	e.tick()
+
+	// A tag that retention may retire, to prove it still runs after the default-branch skip.
+	e.fake.addCommit("repo", "", "old-source", nil, nil)
+	e.fake.setCommitDate("repo", "old-source", now.Add(-72*time.Hour))
+	e.fake.setCommit("repo-metadata", client.Commit{
+		ID: "old-index",
+		Metadata: map[string]string{
+			indexer.MetadataKeySourceCommit:     "old-source",
+			indexer.MetadataKeySourceRepository: "repo",
+		},
+	})
+	e.fake.addTag("repo-metadata", "mds-old-source", "old-index")
+
+	// R renames its default branch to trunk and deletes main. R-metadata keeps main as its own
+	// default branch.
+	e.fake.branches["repo"]["trunk"] = "s1"
+	e.fake.repositories["repo"] = client.Repository{
+		Name:             "repo",
+		StorageNamespace: "s3://bucket/data",
+		DefaultBranch:    "trunk",
+		StorageID:        "storage-repo",
+	}
+	delete(e.fake.branches["repo"], "main")
+
+	e.tick()
+
+	require.NoError(t, e.health.repositoryError("repo"))
+	_, ok := e.fake.branchHead("repo-metadata", "main")
+	require.True(t, ok, "R-metadata's default branch is never deleted")
+	require.NotContains(t, e.fake.deletedBranches, "main")
+	require.Contains(t, e.fake.deletedTags, "mds-old-source", "tag retention still runs after the skip")
+	require.Equal(t, 1, logger.countInfos("keeping the metadata default branch"), "the skip is logged once")
+
+	// A later tick takes the same path but does not log it again.
+	e.tick()
+	require.Equal(t, 1, logger.countInfos("keeping the metadata default branch"), "the skip is logged once per process")
+}
+
+// TestBranchStopsMatchingDropsItsHealth pins the other half of §4.8's "branch stops matching" row:
+// the table is left as it is, but /_health must not keep reporting a branch the indexer no longer
+// follows.
+func TestBranchStopsMatchingDropsItsHealth(t *testing.T) {
+	e := newEnv(t, func(opts *indexer.Options) {
+		opts.Repositories[0].Branches = []string{"main", "feature"}
+	})
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.setBranchHead("repo", "feature", "s1")
+	e.tick()
+	require.True(t, e.health.hasBranch("repo", "feature"))
+
+	idx, err := indexer.New(indexer.Options{
+		LakeFS:       e.fake,
+		Tables:       e.fake,
+		Repositories: []indexer.Repository{{Name: "repo", Branches: []string{"main"}}},
+		Health:       e.health,
+		Metrics:      e.metrics,
+	})
+	require.NoError(t, err)
+	require.NoError(t, idx.Tick(t.Context()))
+
+	require.False(t, e.health.hasBranch("repo", "feature"), "a branch that stops matching leaves /_health")
+	_, ok := e.fake.branchHead("repo-metadata", "feature")
+	require.True(t, ok, "its table is left as it is (§4.8)")
 }
 
 // TestBranchStopsMatchingKeepsItsTable pins §4.8's "branch stops matching the config" row: nothing

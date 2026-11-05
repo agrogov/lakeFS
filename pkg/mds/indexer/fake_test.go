@@ -397,6 +397,12 @@ func (f *fake) DeleteBranch(_ context.Context, repository, branch string) error 
 	if _, ok := f.branches[repository][branch]; !ok {
 		return &client.NotFoundError{Operation: "delete branch", Subject: branch}
 	}
+	if f.repositories[repository].DefaultBranch == branch {
+		// Real lakeFS refuses to delete a repository's default branch: pkg/graveler/graveler.go
+		// DeleteBranch returns ErrDeleteDefaultBranch before touching the branch. Model that so an
+		// indexer that tries it fails the test instead of silently "succeeding".
+		return fmt.Errorf("delete branch %q: default branch: %w", branch, client.ErrBadRequest)
+	}
 	delete(f.branches[repository], branch)
 	delete(f.staged, branch)
 	f.deletedBranches = append(f.deletedBranches, branch)
@@ -872,6 +878,39 @@ func (t *fakeTable) Compact(_ context.Context, sourceCommit string) error {
 
 func (t *fakeTable) Close() error { return nil }
 
+// recordingLogger records the Info messages of the indexer, so a test can pin a line that must be
+// logged once per process rather than once per tick.
+type recordingLogger struct {
+	logging.DummyLogger
+
+	mu    sync.Mutex
+	infos []string
+}
+
+func (l *recordingLogger) WithContext(context.Context) logging.Logger { return l }
+func (l *recordingLogger) WithField(string, any) logging.Logger       { return l }
+func (l *recordingLogger) WithFields(logging.Fields) logging.Logger   { return l }
+func (l *recordingLogger) WithError(error) logging.Logger             { return l }
+
+func (l *recordingLogger) Info(args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.infos = append(l.infos, fmt.Sprint(args...))
+}
+
+// countInfos returns how many Info messages contain substr.
+func (l *recordingLogger) countInfos(substr string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	count := 0
+	for _, message := range l.infos {
+		if strings.Contains(message, substr) {
+			count++
+		}
+	}
+	return count
+}
+
 // fakeHealth records what the indexer reported on /_health (design §9).
 type fakeHealth struct {
 	mu       sync.Mutex
@@ -919,11 +958,25 @@ func (h *fakeHealth) SetBranchState(repository, branch, lastIndexed, head string
 	}
 }
 
+func (h *fakeHealth) RemoveBranch(repository, branch string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.branches, repository+"@"+branch)
+}
+
 // branch returns the recorded state of one branch.
 func (h *fakeHealth) branch(repository, branch string) branchRecord {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.branches[repository+"@"+branch]
+}
+
+// hasBranch reports whether /_health still has a record of one branch.
+func (h *fakeHealth) hasBranch(repository, branch string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_, ok := h.branches[repository+"@"+branch]
+	return ok
 }
 
 // repositoryError returns the error the repository tick finished with, if any.

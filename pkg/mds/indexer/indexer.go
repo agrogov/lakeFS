@@ -174,6 +174,7 @@ type Health interface {
 	BeginTick(repository string)
 	FinishTick(repository string, err error)
 	SetBranchState(repository, branch, lastIndexed, head string, lagCommits int64, err error)
+	RemoveBranch(repository, branch string)
 }
 
 // Repository is one configured data repository (§7): its name, the branch selectors to index and
@@ -304,32 +305,32 @@ type Indexer struct {
 	compaction       Compaction
 	repositories     []Repository
 
-	mu          sync.Mutex
-	metadata    map[string]metadataState
-	maintenance map[string]int
+	mu                sync.Mutex
+	metadata          map[string]metadataState
+	defaultBranchKept map[string]bool
 }
 
 // New returns an Indexer for opts. When opts.LakeFS or opts.Tables is nil it builds the production
 // implementation from the endpoint and the credentials of §4.6; a test passes fakes instead.
 func New(opts Options) (*Indexer, error) {
 	x := &Indexer{
-		lakeFS:           opts.LakeFS,
-		tables:           opts.Tables,
-		health:           opts.Health,
-		metrics:          opts.Metrics,
-		log:              opts.Log,
-		concurrency:      opts.Concurrency,
-		maxCommits:       opts.MaxCommits,
-		since:            opts.Since,
-		backfill:         opts.Backfill,
-		seedLookback:     opts.SeedLookback,
-		rebuildThreshold: opts.RebuildThreshold,
-		deleteBranches:   opts.DeleteBranches,
-		tagRetention:     opts.TagRetention,
-		compaction:       opts.Compaction,
-		repositories:     append([]Repository(nil), opts.Repositories...),
-		metadata:         make(map[string]metadataState, len(opts.Repositories)),
-		maintenance:      make(map[string]int),
+		lakeFS:            opts.LakeFS,
+		tables:            opts.Tables,
+		health:            opts.Health,
+		metrics:           opts.Metrics,
+		log:               opts.Log,
+		concurrency:       opts.Concurrency,
+		maxCommits:        opts.MaxCommits,
+		since:             opts.Since,
+		backfill:          opts.Backfill,
+		seedLookback:      opts.SeedLookback,
+		rebuildThreshold:  opts.RebuildThreshold,
+		deleteBranches:    opts.DeleteBranches,
+		tagRetention:      opts.TagRetention,
+		compaction:        opts.Compaction,
+		repositories:      append([]Repository(nil), opts.Repositories...),
+		metadata:          make(map[string]metadataState, len(opts.Repositories)),
+		defaultBranchKept: make(map[string]bool),
 	}
 	x.applyDefaults()
 
@@ -451,6 +452,18 @@ func (x *Indexer) indexRepository(ctx context.Context, repository Repository) er
 		return err
 	}
 	matching := selectBranches(repository.Branches, branches)
+	matchingSet := make(map[string]struct{}, len(matching))
+	for _, branch := range matching {
+		matchingSet[branch] = struct{}{}
+	}
+	for _, branch := range branches {
+		if _, ok := matchingSet[branch]; ok {
+			continue
+		}
+		// §4.8 leaves the table of a branch that stops matching the configuration as it is, but
+		// /_health must not keep reporting a branch this indexer no longer follows.
+		x.health.RemoveBranch(repository.Name, branch)
+	}
 
 	var wg sync.WaitGroup
 	semaphore := make(chan struct{}, x.concurrency)
@@ -469,7 +482,7 @@ func (x *Indexer) indexRepository(ctx context.Context, repository Repository) er
 	wg.Wait()
 
 	if x.deleteBranches {
-		if err := x.retireDeletedBranches(ctx, repository.Name, metadata, branches); err != nil {
+		if err := x.retireDeletedBranches(ctx, repository.Name, metadata, branches, x.metaInfo(repository.Name).defaultBranch); err != nil {
 			return err
 		}
 	}
@@ -673,3 +686,4 @@ func (nopHealth) BeginTick(string)         {}
 func (nopHealth) FinishTick(string, error) {}
 func (nopHealth) SetBranchState(string, string, string, string, int64, error) {
 }
+func (nopHealth) RemoveBranch(string, string) {}
