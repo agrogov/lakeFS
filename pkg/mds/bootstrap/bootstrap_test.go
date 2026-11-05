@@ -150,12 +150,15 @@ func TestIndexerPolicyStatements(t *testing.T) {
 func TestMetadataRepoProtectPolicyStatements(t *testing.T) {
 	t.Parallel()
 
-	// The deny statement list of §8: fs:Write*/Delete*/Create*/Revert*/Update* and the catalog writes
-	// on the companion repositories. Reads are deliberately not denied. fs:Update* is the review's
-	// MDS-SEC-5: fs:UpdateRepository writes a repository's metadata and matched none of the other
-	// four groups. The resources are the exact ARNs of the companion repositories of
-	// policyTestRepositories (MDS-SEC-2).
-	fsActions := []string{"fs:Write*", "fs:Delete*", "fs:Create*", "fs:Revert*", "fs:Update*"}
+	// The deny statement list of §8: fs:Write*/Delete*/Create*/Revert*/Update*/Import* and the catalog
+	// writes on the companion repositories. Reads are deliberately not denied. fs:Update* is the
+	// review's MDS-SEC-5: fs:UpdateRepository writes a repository's metadata and matched none of the
+	// other four groups. fs:Import* is the import pair of pkg/api/controller.go: ImportCancel is
+	// authorized on a branch ARN of the companion repository, so the subtree statement denies it;
+	// ImportFromStorage is authorized on a source storage namespace and is therefore not reached by
+	// these repository statements (see metadataRepoProtectFSDeniedActions). The resources are the
+	// exact ARNs of the companion repositories of policyTestRepositories (MDS-SEC-2).
+	fsActions := []string{"fs:Write*", "fs:Delete*", "fs:Create*", "fs:Revert*", "fs:Update*", "fs:Import*"}
 	catalogActions := []string{"catalog:Create*", "catalog:Update*", "catalog:Delete*", "catalog:WriteTableData"}
 	want := model.Statements{
 		{
@@ -636,6 +639,77 @@ func TestMDSPoliciesDoNotReachDataRepositories(t *testing.T) {
 	}
 }
 
+// TestMetadataRepoProtectCoversImportActions pins the import pair through the real ACL service.
+// ImportStart (pkg/api/controller.go) authorizes fs:WriteObject and fs:CreateCommit on the
+// destination branch plus, per source, fs:ImportFromStorage on the source storage namespace and
+// fs:WriteObject on the destination object; ImportCancel authorizes fs:ImportCancel on the
+// destination branch. Before fs:Import* joined the deny list a guard-group member could cancel an
+// import on a companion branch, because fs:ImportCancel matched none of Write*/Delete*/Create*/
+// Revert*/Update*. Import into a companion branch was already denied - its destination permissions
+// are fs:Write* and fs:Create* - and both actions stay allowed on an ordinary data repository and for
+// the indexer on its own companion repositories.
+//
+// The ImportFromStorage half of the decision is pinned here as well: an import whose source is a
+// companion repository's storage namespace but whose destination is a data repository stays allowed,
+// because it writes the data repository and only copies files out of the companion one - the read
+// that the deny deliberately leaves open (metadataRepoProtectFSDeniedActions explains why a namespace
+// statement is neither needed nor exact).
+func TestMetadataRepoProtectCoversImportActions(t *testing.T) {
+	const (
+		dataRepo           = "analytics"
+		metaRepo           = dataRepo + icebergcatalog.MetadataRepositorySuffix
+		companionNamespace = "s3://bucket/" + metaRepo
+		branch             = "main"
+	)
+	svc := newACLService(t)
+	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
+	require.NoError(t, err)
+	// analytics is a repository the server knows: the policies name analytics-metadata.
+	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), []string{dataRepo})
+	require.NoError(t, err)
+	operator := newOperatorPrincipal(t, svc)
+
+	sources := []importSource{{path: "s3://bucket/import", destination: "imported/a.parquet"}}
+
+	// ImportCancel on a companion branch is the case the new fs:Import* statement covers.
+	requireAuthorization(t, svc, operator, permissions.ImportCancelAction, permissions.BranchArn(metaRepo, branch), false,
+		"a guard-group member must not cancel an import on a companion branch")
+	requireAuthorization(t, svc, operator, permissions.ImportCancelAction, permissions.BranchArn(dataRepo, branch), true,
+		"an ordinary data repository is outside the deny")
+	requireAuthorization(t, svc, UserName, permissions.ImportCancelAction, permissions.BranchArn(metaRepo, branch), true,
+		"the deny must never reach the indexer")
+
+	// ImportStart's node, exactly as pkg/api/controller.go builds it.
+	requireNodeAuthorization(t, svc, operator, importPermissionNode(metaRepo, branch, sources), false,
+		"a guard-group member must not import into a companion branch")
+	requireNodeAuthorization(t, svc, operator, importPermissionNode(dataRepo, branch, sources), true,
+		"import into an ordinary data repository is outside the deny")
+
+	// The indexer keeps the companion-side permissions an import into its own companion repository
+	// needs: it is in no guard group and carries fs:* on the companion repository.
+	for _, permission := range []permissions.Permission{
+		{Action: permissions.WriteObjectAction, Resource: permissions.BranchArn(metaRepo, branch)},
+		{Action: permissions.CreateCommitAction, Resource: permissions.BranchArn(metaRepo, branch)},
+		{Action: permissions.WriteObjectAction, Resource: permissions.ObjectArn(metaRepo, "imported/a.parquet")},
+		{Action: permissions.ImportCancelAction, Resource: permissions.BranchArn(metaRepo, branch)},
+	} {
+		requireNodeAuthorization(t, svc, UserName, permissions.Node{Permission: permission}, true,
+			"the deny must not take the indexer's own companion repository away from it")
+	}
+
+	// The decision about fs:ImportFromStorage: it is authorized on the source storage namespace, a
+	// resource outside the companion repository ARNs, and the copy-out it performs is the read §8's
+	// deny does not take away. A destination that *is* a companion repository stays denied.
+	fromCompanion := []importSource{{path: companionNamespace, destination: "copied/a.parquet"}}
+	requireAuthorization(t, svc, operator, permissions.ImportFromStorageAction,
+		permissions.StorageNamespace(companionNamespace), true,
+		"fs:ImportFromStorage is authorized on the source namespace, not on a companion repository ARN")
+	requireNodeAuthorization(t, svc, operator, importPermissionNode(dataRepo, branch, fromCompanion), true,
+		"importing a companion repository's files into a data repository writes only the data repository")
+	requireNodeAuthorization(t, svc, operator, importPermissionNode(metaRepo, branch, fromCompanion), false,
+		"an import into a companion repository stays denied whatever its source")
+}
+
 func TestEnsurePrincipalsIdempotent(t *testing.T) {
 	svc := newACLService(t)
 
@@ -992,6 +1066,58 @@ func policyNamesRepository(policy *model.Policy, repo string) bool {
 		}
 	}
 	return false
+}
+
+// importSource is one paths entry of an import request: the source path (a storage namespace prefix)
+// and the destination key in the target repository.
+type importSource struct {
+	path        string
+	destination string
+}
+
+// importPermissionNode is the authorization node pkg/api/controller.go's ImportStart builds for one
+// import request: fs:WriteObject and fs:CreateCommit on the destination branch, plus
+// fs:ImportFromStorage on the source's storage namespace and fs:WriteObject on the destination object
+// for every path of the request. The tests import this shape rather than checking one permission at
+// a time, so the deny is shown to stop the request the server actually authorizes.
+func importPermissionNode(repository, branch string, sources []importSource) permissions.Node {
+	node := permissions.Node{
+		Type: permissions.NodeTypeAnd,
+		Nodes: []permissions.Node{
+			{Permission: permissions.Permission{
+				Action:   permissions.WriteObjectAction,
+				Resource: permissions.BranchArn(repository, branch),
+			}},
+			{Permission: permissions.Permission{
+				Action:   permissions.CreateCommitAction,
+				Resource: permissions.BranchArn(repository, branch),
+			}},
+		},
+	}
+	for _, source := range sources {
+		node.Nodes = append(node.Nodes,
+			permissions.Node{Permission: permissions.Permission{
+				Action:   permissions.ImportFromStorageAction,
+				Resource: permissions.StorageNamespace(source.path),
+			}},
+			permissions.Node{Permission: permissions.Permission{
+				Action:   permissions.WriteObjectAction,
+				Resource: permissions.ObjectArn(repository, source.destination),
+			}})
+	}
+	return node
+}
+
+// requireNodeAuthorization asserts the decision the ACL service gives username for one authorization
+// node, as the API's authorize helper would.
+func requireNodeAuthorization(t *testing.T, svc auth.Service, username string, node permissions.Node, want bool, msg string) {
+	t.Helper()
+	resp, err := svc.Authorize(t.Context(), &auth.AuthorizationRequest{
+		Username:            username,
+		RequiredPermissions: node,
+	})
+	require.NoError(t, err)
+	require.Equalf(t, want, resp.Allowed, "%s: %+v for %s", msg, node, username)
 }
 
 // requireAuthorization asserts the decision the ACL service gives username for one action on one

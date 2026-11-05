@@ -202,24 +202,41 @@ var indexerReadActions = []string{
 	permissions.ReadCommitAction,
 }
 
-// metadataRepoProtectFSDeniedActions are the fs: writes §8 denies on a companion repository: the
-// object and branch actions that could move an indexer's table, and the repository actions that
-// could remove it or change what it is. They are wildcards so that a future fs: write action is
-// covered without a bootstrap change; the deny is on the companion ARNs only, so ordinary data
+// metadataRepoProtectFSDeniedActions are the fs: actions §8 denies on a companion repository: the
+// object and branch actions that could move an indexer's table, the repository actions that could
+// remove it or change what it is, and the import pair. They are wildcards so that a future fs: action
+// is covered without a bootstrap change; the deny is on the companion ARNs only, so ordinary data
 // repositories are unaffected. fs:Update* is part of the list because fs:UpdateRepository is what
 // SetRepositoryMetadata / DeleteRepositoryMetadata write (the review's MDS-SEC-5): without it a
 // guard-group operator could still set and delete repository metadata on a companion repository,
 // which the deny's own contract - "no principal in a base group may write ... inside a companion
-// repository" - rules out. The remaining fs: write actions that neither group covers are the
-// import pair (fs:ImportFromStorage, fs:ImportCancel); they are deliberately left out of this
-// change because the review card only names fs:UpdateRepository, and they belong in a decision
-// about §8 rather than in a silent widening of the deny.
+// repository" - rules out.
+//
+// fs:Import* is the import pair of pkg/api/controller.go. ImportCancel authorizes fs:ImportCancel on
+// arn:lakefs:fs:::repository/<companion>/branch/<branch>, which the companion subtree statement
+// (repository/<companion>/*) matches, so a guard-group member can no longer cancel an import on a
+// companion branch. ImportFromStorage never appears on a repository ARN: ImportStart authorizes it
+// on the *source* storage namespace (arn:lakefs:fs:::namespace/<source path>), so these statements do
+// not reach it, and that is deliberate rather than an omission. An import whose destination is a
+// companion repository is already denied by the fs:WriteObject on the destination branch and object
+// and the fs:CreateCommit on that branch, whatever its source. An import whose *source* is a
+// companion repository's storage namespace writes the destination repository, not the companion one:
+// it copies files out, which is no more than fs:ReadObject on the companion repository already
+// allows, and §8's deny deliberately leaves reads open. A namespace statement would also not be
+// exact: the narrow pattern (namespace/*-metadata) that the indexer's AttachStorageNamespace grant
+// uses would deny imports from an ordinary data repository whose own namespace ends in -metadata,
+// and the server does not read the explicit metadata_search.repositories.<R>.storage_namespace
+// override (§7 reads only the names), so it could not name that namespace before the companion
+// repository exists in the catalog. The deny protects writes inside a companion repository; copying
+// its files out changes none, and the catalog and the indexer read the companion repository by name,
+// not the copy.
 var metadataRepoProtectFSDeniedActions = []string{
 	"fs:Write*",
 	"fs:Delete*",
 	"fs:Create*",
 	"fs:Revert*",
 	"fs:Update*",
+	"fs:Import*",
 }
 
 // metadataRepoProtectCatalogDeniedActions are the catalog: writes §8 denies on a companion
