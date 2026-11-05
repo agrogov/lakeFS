@@ -1,9 +1,11 @@
 package bootstrap
 
 // Tests for the principals and policies of METADATA_SEARCH_DESIGN.md §8: the exact statement
-// lists of the design, the create/repair/idempotent behaviour of EnsurePrincipals, and the one
-// degraded startup it accepts (an auth service without policies, exactly like
-// icebergcatalog.EnsureReservedPrefixProtectPolicy).
+// lists of the design, the create/repair/idempotent behaviour of EnsurePrincipals, the one degraded
+// startup it accepts (an auth service without policies, exactly like
+// icebergcatalog.EnsureReservedPrefixProtectPolicy), and the ARNs the two policies do *not* decide
+// anything about: the data repositories, their branches and their tables (the review's MDS-SEC-2,
+// TestMDSPoliciesDoNotReachDataRepositories).
 //
 // The behaviour is exercised through a real auth service - the simplified-ACL implementation the
 // lakefs-sso binary uses - and not a mock, because the questions are "what does a policy written by
@@ -33,18 +35,30 @@ import (
 	"github.com/treeverse/lakefs/pkg/auth/crypt"
 	"github.com/treeverse/lakefs/pkg/auth/model"
 	authparams "github.com/treeverse/lakefs/pkg/auth/params"
+	"github.com/treeverse/lakefs/pkg/block"
+	lakefscatalog "github.com/treeverse/lakefs/pkg/catalog"
+	"github.com/treeverse/lakefs/pkg/config"
 	"github.com/treeverse/lakefs/pkg/datasets"
 	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"github.com/treeverse/lakefs/pkg/kv/kvtest"
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/permissions"
+	"github.com/treeverse/lakefs/pkg/upload"
 )
+
+// policyTestRepositories are the repositories the two statement-list tests build their policies
+// from: two data repositories, one of them repeated, so the tests pin the order (sorted by companion
+// repository) and the deduplication as well as the statements themselves.
+var policyTestRepositories = []string{"orders", "analytics", "analytics"}
 
 func TestIndexerPolicyStatements(t *testing.T) {
 	t.Parallel()
 
 	// The §8 statement list, spelled as literals rather than as calls to this package's constants,
-	// so the design line and the built policy are pinned to each other.
+	// so the design line and the built policy are pinned to each other. The resources of a companion
+	// repository are exact ARNs, not the "*\u002dmetadata" patterns of the design: pkg/auth/wildcard
+	// lets "*" span "/", so those patterns also matched data-repository ARNs (MDS-SEC-2). The literal
+	// repository name in front of a trailing "*" is what makes the subtree ARN safe.
 	want := model.Statements{
 		{
 			Effect: model.StatementEffectAllow,
@@ -57,22 +71,62 @@ func TestIndexerPolicyStatements(t *testing.T) {
 		{
 			Effect:   model.StatementEffectAllow,
 			Action:   []string{"fs:*"},
-			Resource: "arn:lakefs:fs:::repository/*-metadata",
+			Resource: "arn:lakefs:fs:::repository/analytics-metadata",
 		},
 		{
 			Effect:   model.StatementEffectAllow,
 			Action:   []string{"fs:*"},
-			Resource: "arn:lakefs:fs:::repository/*-metadata/*",
-		},
-		{
-			Effect:   model.StatementEffectAllow,
-			Action:   []string{"catalog:*"},
-			Resource: "arn:lakefs:catalog:::*/*-metadata/*",
+			Resource: "arn:lakefs:fs:::repository/analytics-metadata/*",
 		},
 		{
 			Effect:   model.StatementEffectAllow,
 			Action:   []string{"fs:CreateRepository"},
-			Resource: "arn:lakefs:fs:::repository/*-metadata",
+			Resource: "arn:lakefs:fs:::repository/analytics-metadata",
+		},
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{"catalog:*"},
+			Resource: "arn:lakefs:catalog:::namespace/analytics-metadata/*",
+		},
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{"catalog:*"},
+			Resource: "arn:lakefs:catalog:::table/analytics-metadata/*/*",
+		},
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{"catalog:*"},
+			Resource: "arn:lakefs:catalog:::view/analytics-metadata/*/*",
+		},
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{"fs:*"},
+			Resource: "arn:lakefs:fs:::repository/orders-metadata",
+		},
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{"fs:*"},
+			Resource: "arn:lakefs:fs:::repository/orders-metadata/*",
+		},
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{"fs:CreateRepository"},
+			Resource: "arn:lakefs:fs:::repository/orders-metadata",
+		},
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{"catalog:*"},
+			Resource: "arn:lakefs:catalog:::namespace/orders-metadata/*",
+		},
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{"catalog:*"},
+			Resource: "arn:lakefs:catalog:::table/orders-metadata/*/*",
+		},
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{"catalog:*"},
+			Resource: "arn:lakefs:catalog:::view/orders-metadata/*/*",
 		},
 		{
 			Effect:   model.StatementEffectAllow,
@@ -80,40 +134,88 @@ func TestIndexerPolicyStatements(t *testing.T) {
 			Resource: "arn:lakefs:fs:::namespace/*-metadata",
 		},
 	}
-	policy := IndexerPolicy(time.Unix(0, 0))
+	policy := IndexerPolicy(policyTestRepositories, time.Unix(0, 0))
 	require.Equal(t, IndexerPolicyName, policy.DisplayName)
 	require.True(t, statementsEqual(want, policy.Statement),
 		"the mds-indexer policy is the statement list of §8; got %+v", policy.Statement)
+
+	// A server that knows no repository yet grants the reads and no companion-repository write: it
+	// must not fall back to a pattern.
+	empty := IndexerPolicy(nil, time.Unix(0, 0))
+	require.Len(t, empty.Statement, 2, "no repository, no companion statement: %+v", empty.Statement)
+	require.Equal(t, "*", empty.Statement[0].Resource)
+	require.Equal(t, MetadataNamespacePattern, empty.Statement[1].Resource)
 }
 
 func TestMetadataRepoProtectPolicyStatements(t *testing.T) {
 	t.Parallel()
 
-	// The deny statement list of §8: fs:Write*/Delete*/Create*/Revert* and the catalog writes on the
-	// *-metadata ARNs. Reads are deliberately not denied.
-	fsActions := []string{"fs:Write*", "fs:Delete*", "fs:Create*", "fs:Revert*"}
+	// The deny statement list of §8: fs:Write*/Delete*/Create*/Revert*/Update* and the catalog writes
+	// on the companion repositories. Reads are deliberately not denied. fs:Update* is the review's
+	// MDS-SEC-5: fs:UpdateRepository writes a repository's metadata and matched none of the other
+	// four groups. The resources are the exact ARNs of the companion repositories of
+	// policyTestRepositories (MDS-SEC-2).
+	fsActions := []string{"fs:Write*", "fs:Delete*", "fs:Create*", "fs:Revert*", "fs:Update*"}
 	catalogActions := []string{"catalog:Create*", "catalog:Update*", "catalog:Delete*", "catalog:WriteTableData"}
 	want := model.Statements{
 		{
 			Effect:   model.StatementEffectDeny,
 			Action:   fsActions,
-			Resource: "arn:lakefs:fs:::repository/*-metadata",
+			Resource: "arn:lakefs:fs:::repository/analytics-metadata",
 		},
 		{
 			Effect:   model.StatementEffectDeny,
 			Action:   fsActions,
-			Resource: "arn:lakefs:fs:::repository/*-metadata/*",
+			Resource: "arn:lakefs:fs:::repository/analytics-metadata/*",
 		},
 		{
 			Effect:   model.StatementEffectDeny,
 			Action:   catalogActions,
-			Resource: "arn:lakefs:catalog:::*/*-metadata/*",
+			Resource: "arn:lakefs:catalog:::namespace/analytics-metadata/*",
+		},
+		{
+			Effect:   model.StatementEffectDeny,
+			Action:   catalogActions,
+			Resource: "arn:lakefs:catalog:::table/analytics-metadata/*/*",
+		},
+		{
+			Effect:   model.StatementEffectDeny,
+			Action:   catalogActions,
+			Resource: "arn:lakefs:catalog:::view/analytics-metadata/*/*",
+		},
+		{
+			Effect:   model.StatementEffectDeny,
+			Action:   fsActions,
+			Resource: "arn:lakefs:fs:::repository/orders-metadata",
+		},
+		{
+			Effect:   model.StatementEffectDeny,
+			Action:   fsActions,
+			Resource: "arn:lakefs:fs:::repository/orders-metadata/*",
+		},
+		{
+			Effect:   model.StatementEffectDeny,
+			Action:   catalogActions,
+			Resource: "arn:lakefs:catalog:::namespace/orders-metadata/*",
+		},
+		{
+			Effect:   model.StatementEffectDeny,
+			Action:   catalogActions,
+			Resource: "arn:lakefs:catalog:::table/orders-metadata/*/*",
+		},
+		{
+			Effect:   model.StatementEffectDeny,
+			Action:   catalogActions,
+			Resource: "arn:lakefs:catalog:::view/orders-metadata/*/*",
 		},
 	}
-	policy := MetadataRepoProtectPolicy(time.Unix(0, 0))
+	policy := MetadataRepoProtectPolicy(policyTestRepositories, time.Unix(0, 0))
 	require.Equal(t, MetadataRepoProtectPolicyName, policy.DisplayName)
 	require.True(t, statementsEqual(want, policy.Statement),
 		"the mds-metadata-repo-protect policy is the deny list of §8; got %+v", policy.Statement)
+
+	require.Empty(t, MetadataRepoProtectPolicy(nil, time.Unix(0, 0)).Statement,
+		"no repository the server knows, nothing to deny: the deny never falls back to a pattern")
 }
 
 // bootstrapTS is a fixed creation timestamp, so the idempotency assertions compare exact values.
@@ -124,7 +226,7 @@ func TestEnsurePrincipals(t *testing.T) {
 	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
 	require.NoError(t, err, "one group of the deny's list exists in this installation")
 
-	inForce, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups())
+	inForce, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), policyTestRepositories)
 	require.NoError(t, err)
 	require.True(t, inForce, "a backend that stores policies has the principals in force")
 
@@ -136,7 +238,10 @@ func TestEnsurePrincipals(t *testing.T) {
 	require.Contains(t, groupNames(groups), GroupName, "mds-indexer is a member of MetadataSearchIndexers")
 
 	// Both policies exist with exactly the built-in statements.
-	for _, built := range []*model.Policy{IndexerPolicy(bootstrapTS), MetadataRepoProtectPolicy(bootstrapTS)} {
+	for _, built := range []*model.Policy{
+		IndexerPolicy(policyTestRepositories, bootstrapTS),
+		MetadataRepoProtectPolicy(policyTestRepositories, bootstrapTS),
+	} {
 		stored, err := svc.GetPolicy(t.Context(), built.DisplayName)
 		require.NoErrorf(t, err, "policy %s exists", built.DisplayName)
 		require.Truef(t, statementsEqual(built.Statement, stored.Statement),
@@ -175,7 +280,7 @@ func TestEnsurePrincipalsConfiguredGuardGroups(t *testing.T) {
 	groups := datasets.PinsProtectGroups([]string{extraGuardGroup, GroupName})
 
 	readLog := capturePackageLog(t)
-	inForce, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, groups)
+	inForce, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, groups, nil)
 	require.NoError(t, err)
 	require.True(t, inForce)
 
@@ -194,30 +299,19 @@ func TestEnsurePrincipalsConfiguredGuardGroups(t *testing.T) {
 // ACL engine the server uses: the indexer writes companion repositories and only reads data
 // repositories, and an administrator's fs:* does not write a companion repository.
 func TestEnsurePrincipalsAuthorization(t *testing.T) {
+	const dataRepo = "analytics"
 	svc := newACLService(t)
 	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
 	require.NoError(t, err)
-	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups())
+	// analytics is a repository the server knows: its companion repository is what the policies name.
+	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), []string{dataRepo})
 	require.NoError(t, err)
 
 	// An administrator: a member of Admins (so the deny applies) with an installation-wide allow,
 	// the §8 "wins over every allow" case.
-	const operator = "operator"
-	_, err = svc.CreateUser(t.Context(), &model.User{Username: operator, CreatedAt: bootstrapTS})
-	require.NoError(t, err)
-	require.NoError(t, svc.AddUserToGroup(t.Context(), operator, "Admins"))
-	require.NoError(t, svc.WritePolicy(t.Context(), &model.Policy{
-		CreatedAt:   bootstrapTS,
-		DisplayName: "operator-fs-all",
-		Statement: model.Statements{
-			{Effect: model.StatementEffectAllow, Action: []string{"fs:*"}, Resource: permissions.All},
-			{Effect: model.StatementEffectAllow, Action: []string{"catalog:*"}, Resource: permissions.All},
-		},
-	}, false))
-	require.NoError(t, svc.AttachPolicyToUser(t.Context(), "operator-fs-all", operator))
+	operator := newOperatorPrincipal(t, svc)
 
 	const (
-		dataRepo   = "analytics"
 		metaRepo   = dataRepo + icebergcatalog.MetadataRepositorySuffix
 		objectKey  = "_iceberg/table-uuid/data/part-00000.parquet"
 		tableARN   = "arn:lakefs:catalog:::table/" + metaRepo + "/system/object_metadata"
@@ -317,10 +411,235 @@ func TestEnsurePrincipalsAuthorization(t *testing.T) {
 	}
 }
 
+// newOperatorPrincipal creates the §8 "an administrator's fs:* does not write a companion
+// repository" principal: a member of the guard group Admins (so the metadata-repo deny is attached to
+// it) with an installation-wide fs:* and catalog:* allow of its own.
+func newOperatorPrincipal(t *testing.T, svc auth.Service) string {
+	t.Helper()
+	const username = "operator"
+	_, err := svc.CreateUser(t.Context(), &model.User{Username: username, CreatedAt: bootstrapTS})
+	require.NoError(t, err)
+	require.NoError(t, svc.AddUserToGroup(t.Context(), username, "Admins"))
+	require.NoError(t, svc.WritePolicy(t.Context(), &model.Policy{
+		CreatedAt:   bootstrapTS,
+		DisplayName: "operator-fs-all",
+		Statement: model.Statements{
+			{Effect: model.StatementEffectAllow, Action: []string{"fs:*"}, Resource: permissions.All},
+			{Effect: model.StatementEffectAllow, Action: []string{"catalog:*"}, Resource: permissions.All},
+		},
+	}, false))
+	require.NoError(t, svc.AttachPolicyToUser(t.Context(), "operator-fs-all", username))
+	return username
+}
+
+// TestMDSPoliciesDoNotReachDataRepositories is the regression test for MDS-SEC-2: the two §8
+// policies name companion repositories, and must not decide anything about a data repository, a
+// branch of one, or a table in one - including the adversarial ARNs whose key, branch name or
+// namespace ends in "-metadata" or carries "-metadata/" in the middle.
+//
+// The two policy patterns of the design leaned on "*" spanning "/" (pkg/auth/wildcard), so
+// repository/<R>/object/-metadata matched repository/*-metadata and
+// repository/<R>/object/a/b-metadata/object/c matched repository/*-metadata/object/*: the indexer
+// (which §8 restricts to reads on data repositories) could write and delete data-repository objects,
+// and the deny made an ordinary foo-metadata/data.yml object of a data repository unwritable for a
+// guard-group member. Every ARN below is checked against the real ACL service the server uses, for
+// both principals the policies are about.
+func TestMDSPoliciesDoNotReachDataRepositories(t *testing.T) {
+	const (
+		dataRepo = "analytics"
+		metaRepo = dataRepo + icebergcatalog.MetadataRepositorySuffix
+	)
+	svc := newACLService(t)
+	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
+	require.NoError(t, err)
+	// analytics is a repository the server knows: the policies are built from it.
+	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), []string{dataRepo})
+	require.NoError(t, err)
+	operator := newOperatorPrincipal(t, svc)
+
+	tests := []struct {
+		name     string
+		username string
+		action   string
+		resource string
+		want     bool
+	}{
+		// mds-indexer: §8 gives it reads on every data repository and writes on companion
+		// repositories only, so the adversarial data-repository ARNs must all be refused.
+		{
+			name:     "indexer does not write an object named -metadata in a data repository",
+			username: UserName, action: permissions.WriteObjectAction,
+			resource: permissions.ObjectArn(dataRepo, "-metadata"), want: false,
+		},
+		{
+			name:     "indexer does not delete an object named -metadata in a data repository",
+			username: UserName, action: permissions.DeleteObjectAction,
+			resource: permissions.ObjectArn(dataRepo, "-metadata"), want: false,
+		},
+		{
+			name:     "indexer does not write a foo-metadata key in a data repository",
+			username: UserName, action: permissions.WriteObjectAction,
+			resource: permissions.ObjectArn(dataRepo, "foo-metadata/data.yml"), want: false,
+		},
+		{
+			name:     "indexer does not delete a foo-metadata key in a data repository",
+			username: UserName, action: permissions.DeleteObjectAction,
+			resource: permissions.ObjectArn(dataRepo, "foo-metadata/data.yml"), want: false,
+		},
+		{
+			name:     "indexer does not write a key with -metadata in the middle in a data repository",
+			username: UserName, action: permissions.WriteObjectAction,
+			resource: permissions.ObjectArn(dataRepo, "a/b-metadata/object/c"), want: false,
+		},
+		{
+			name:     "indexer does not delete a branch named -metadata in a data repository",
+			username: UserName, action: permissions.DeleteBranchAction,
+			resource: permissions.BranchArn(dataRepo, "x-metadata"), want: false,
+		},
+		{
+			name:     "indexer does not create a table in a -metadata namespace of a data repository",
+			username: UserName, action: permissions.CatalogCreateTableAction,
+			resource: permissions.CatalogTableArn(dataRepo, "foo-metadata", "orders"), want: false,
+		},
+		{
+			name:     "indexer does not drop a table in a -metadata namespace of a data repository",
+			username: UserName, action: permissions.CatalogDeleteTableAction,
+			resource: permissions.CatalogTableArn(dataRepo, dataRepo+"-metadata", "orders"), want: false,
+		},
+		{
+			name:     "indexer still reads an object named -metadata in a data repository",
+			username: UserName, action: permissions.ReadObjectAction,
+			resource: permissions.ObjectArn(dataRepo, "-metadata"), want: true,
+		},
+
+		// mds-indexer on the companion repository itself: unaffected by the fix.
+		{
+			name:     "indexer writes a companion repository object",
+			username: UserName, action: permissions.WriteObjectAction,
+			resource: permissions.ObjectArn(metaRepo, "_iceberg/uuid/data/part-00000.parquet"), want: true,
+		},
+		{
+			name:     "indexer deletes a companion repository branch named -metadata",
+			username: UserName, action: permissions.DeleteBranchAction,
+			resource: permissions.BranchArn(metaRepo, "x-metadata"), want: true,
+		},
+		{
+			name:     "indexer creates a table in a -metadata namespace of the companion repository",
+			username: UserName, action: permissions.CatalogCreateTableAction,
+			resource: permissions.CatalogTableArn(metaRepo, "system-metadata", "orders"), want: true,
+		},
+		{
+			name:     "indexer updates the companion repository",
+			username: UserName, action: permissions.UpdateRepositoryAction,
+			resource: permissions.RepoArn(metaRepo), want: true,
+		},
+
+		// A guard-group member with an installation-wide fs:* and catalog:* allow: the deny must not
+		// take an ordinary data repository away from it (MDS-SEC-2).
+		{
+			name:     "the deny does not block an object named -metadata in a data repository",
+			username: operator, action: permissions.WriteObjectAction,
+			resource: permissions.ObjectArn(dataRepo, "-metadata"), want: true,
+		},
+		{
+			name:     "the deny does not block deleting an object named -metadata in a data repository",
+			username: operator, action: permissions.DeleteObjectAction,
+			resource: permissions.ObjectArn(dataRepo, "-metadata"), want: true,
+		},
+		{
+			name:     "the deny does not block a foo-metadata key in a data repository",
+			username: operator, action: permissions.WriteObjectAction,
+			resource: permissions.ObjectArn(dataRepo, "foo-metadata/data.yml"), want: true,
+		},
+		{
+			name:     "the deny does not block a key with -metadata in the middle in a data repository",
+			username: operator, action: permissions.WriteObjectAction,
+			resource: permissions.ObjectArn(dataRepo, "a/b-metadata/object/c"), want: true,
+		},
+		{
+			name:     "the deny does not block a branch named -metadata in a data repository",
+			username: operator, action: permissions.DeleteBranchAction,
+			resource: permissions.BranchArn(dataRepo, "x-metadata"), want: true,
+		},
+		{
+			name:     "the deny does not block a table in a -metadata namespace of a data repository",
+			username: operator, action: permissions.CatalogCreateTableAction,
+			resource: permissions.CatalogTableArn(dataRepo, "foo-metadata", "orders"), want: true,
+		},
+		{
+			name:     "the deny does not block a table in a namespace named after the companion repository",
+			username: operator, action: permissions.CatalogDeleteTableAction,
+			resource: permissions.CatalogTableArn(dataRepo, metaRepo, "orders"), want: true,
+		},
+		{
+			name:     "the deny does not block updating a data repository",
+			username: operator, action: permissions.UpdateRepositoryAction,
+			resource: permissions.RepoArn(dataRepo), want: true,
+		},
+
+		// The companion repository is still covered by the deny (MDS-SEC-5 adds
+		// fs:UpdateRepository to it).
+		{
+			name:     "the deny blocks a companion repository object",
+			username: operator, action: permissions.WriteObjectAction,
+			resource: permissions.ObjectArn(metaRepo, "forged/row.txt"), want: false,
+		},
+		{
+			name:     "the deny blocks deleting a companion repository object",
+			username: operator, action: permissions.DeleteObjectAction,
+			resource: permissions.ObjectArn(metaRepo, "forged/row.txt"), want: false,
+		},
+		{
+			name:     "the deny blocks a companion repository branch",
+			username: operator, action: permissions.DeleteBranchAction,
+			resource: permissions.BranchArn(metaRepo, "main"), want: false,
+		},
+		{
+			name:     "the deny blocks a table in a companion repository namespace",
+			username: operator, action: permissions.CatalogCreateTableAction,
+			resource: permissions.CatalogTableArn(metaRepo, "system", "object_metadata"), want: false,
+		},
+		{
+			name:     "the deny blocks a view in a companion repository",
+			username: operator, action: permissions.CatalogCreateViewAction,
+			resource: permissions.CatalogViewArn(metaRepo, "system", "forged"), want: false,
+		},
+		{
+			name:     "the deny blocks a namespace in a companion repository",
+			username: operator, action: permissions.CatalogCreateNamespaceAction,
+			resource: permissions.CatalogNamespaceArn(metaRepo, "forged"), want: false,
+		},
+		{
+			name:     "the deny blocks updating the companion repository (MDS-SEC-5)",
+			username: operator, action: permissions.UpdateRepositoryAction,
+			resource: permissions.RepoArn(metaRepo), want: false,
+		},
+		{
+			name:     "the deny still allows reading a companion repository",
+			username: operator, action: permissions.ReadObjectAction,
+			resource: permissions.ObjectArn(metaRepo, "system/object_metadata/data.parquet"), want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, err := svc.Authorize(t.Context(), &auth.AuthorizationRequest{
+				Username: tt.username,
+				RequiredPermissions: permissions.Node{Permission: permissions.Permission{
+					Action:   tt.action,
+					Resource: tt.resource,
+				}},
+			})
+			require.NoError(t, err)
+			require.Equal(t, tt.want, resp.Allowed,
+				"%s on %s for %s", tt.action, tt.resource, tt.username)
+		})
+	}
+}
+
 func TestEnsurePrincipalsIdempotent(t *testing.T) {
 	svc := newACLService(t)
 
-	_, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups())
+	_, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), nil)
 	require.NoError(t, err)
 	first, err := svc.GetPolicy(t.Context(), IndexerPolicyName)
 	require.NoError(t, err)
@@ -328,7 +647,7 @@ func TestEnsurePrincipalsIdempotent(t *testing.T) {
 	// A second startup, one hour later: nothing is re-created, so the policy keeps its original
 	// creation timestamp and its statements.
 	later := bootstrapTS.Add(time.Hour)
-	inForce, err := EnsurePrincipals(t.Context(), svc, later, defaultGuardGroups())
+	inForce, err := EnsurePrincipals(t.Context(), svc, later, defaultGuardGroups(), nil)
 	require.NoError(t, err, "a rerun is a success, not an already-exists error")
 	require.True(t, inForce)
 	second, err := svc.GetPolicy(t.Context(), IndexerPolicyName)
@@ -374,13 +693,13 @@ func TestEnsurePrincipalsRepairsDriftedPolicy(t *testing.T) {
 				"a predictable policy name can be pre-created")
 
 			readLog := capturePackageLog(t)
-			inForce, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups())
+			inForce, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), policyTestRepositories)
 			require.NoError(t, err)
 			require.True(t, inForce)
 
-			want := IndexerPolicy(bootstrapTS)
+			want := IndexerPolicy(policyTestRepositories, bootstrapTS)
 			if tt.policy.DisplayName == MetadataRepoProtectPolicyName {
-				want = MetadataRepoProtectPolicy(bootstrapTS)
+				want = MetadataRepoProtectPolicy(policyTestRepositories, bootstrapTS)
 			}
 			stored, err := svc.GetPolicy(t.Context(), tt.policy.DisplayName)
 			require.NoError(t, err)
@@ -407,7 +726,7 @@ func TestEnsurePrincipalsDegradesWithoutPolicyBackend(t *testing.T) {
 	require.NoError(t, err)
 
 	readLog := capturePackageLog(t)
-	inForce, err := EnsurePrincipals(t.Context(), basic, bootstrapTS, defaultGuardGroups())
+	inForce, err := EnsurePrincipals(t.Context(), basic, bootstrapTS, defaultGuardGroups(), nil)
 	require.NoError(t, err, "a service that cannot store policies must not refuse to start Metadata Search")
 	require.False(t, inForce, "nothing is in force on a backend without policies")
 
@@ -444,7 +763,7 @@ func (s policyStub) GetPolicy(context.Context, string) (*model.Policy, error) {
 // backend that does store policies and failed must still fail startup.
 func TestEnsurePrincipalsPolicyErrorIsFatal(t *testing.T) {
 	genuine := errors.New("kv: connection refused")
-	_, err := EnsurePrincipals(t.Context(), policyStub{policyErr: fmt.Errorf("get policy: %w", genuine)}, bootstrapTS, defaultGuardGroups())
+	_, err := EnsurePrincipals(t.Context(), policyStub{policyErr: fmt.Errorf("get policy: %w", genuine)}, bootstrapTS, defaultGuardGroups(), nil)
 	require.Error(t, err)
 	require.ErrorIs(t, err, genuine, "the real cause is preserved")
 	require.EqualError(t, err, fmt.Sprintf("mds bootstrap: read policy %s: get policy: %v", IndexerPolicyName, genuine),
@@ -452,7 +771,7 @@ func TestEnsurePrincipalsPolicyErrorIsFatal(t *testing.T) {
 }
 
 func TestEnsurePrincipalsNoAuthService(t *testing.T) {
-	_, err := EnsurePrincipals(t.Context(), nil, bootstrapTS, defaultGuardGroups())
+	_, err := EnsurePrincipals(t.Context(), nil, bootstrapTS, defaultGuardGroups(), nil)
 	require.ErrorIs(t, err, ErrNoAuthorizer)
 }
 
@@ -481,15 +800,24 @@ func TestRoutesBuilder(t *testing.T) {
 	t.Run("enabled section bootstraps the principals", func(t *testing.T) {
 		useConfig(t, "iceberg:\n  enabled: true\n  metadata_search:\n    enabled: true\n")
 		svc := newACLService(t)
+		cat := newBootstrapCatalog(t, "analytics")
 		_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
 		require.NoError(t, err)
-		require.NoError(t, RoutesBuilder(t.Context(), cmdpkg.ServerDeps{AuthService: svc, Logger: logging.DummyLogger{}}, defaultGuardGroups()))
+		require.NoError(t, RoutesBuilder(t.Context(), cmdpkg.ServerDeps{
+			AuthService: svc, Logger: logging.DummyLogger{}, Catalog: cat,
+		}, defaultGuardGroups()))
 		_, err = svc.GetUser(t.Context(), UserName)
 		require.NoError(t, err)
 		_, err = svc.GetPolicy(t.Context(), MetadataRepoProtectPolicyName)
 		require.NoError(t, err, "both policies are created")
 		require.Contains(t, policyNames(t, svc, "Admins"), MetadataRepoProtectPolicyName,
 			"the builder forwards the guard group list it is handed, as cmd/lakefs-sso does")
+
+		// The repository the catalog holds is the one the policies name.
+		deny, err := svc.GetPolicy(t.Context(), MetadataRepoProtectPolicyName)
+		require.NoError(t, err)
+		require.True(t, policyNamesRepository(deny, "analytics"+icebergcatalog.MetadataRepositorySuffix),
+			"the deny names the companion repository of the repository the server knows; got %+v", deny.Statement)
 	})
 
 	t.Run("enabled section without dependencies is an error", func(t *testing.T) {
@@ -500,6 +828,9 @@ func TestRoutesBuilder(t *testing.T) {
 		require.ErrorIs(t,
 			RoutesBuilder(t.Context(), cmdpkg.ServerDeps{AuthService: newACLService(t)}, defaultGuardGroups()),
 			ErrMissingDeps, "a missing logger must not be skipped silently")
+		require.ErrorIs(t,
+			RoutesBuilder(t.Context(), cmdpkg.ServerDeps{AuthService: newACLService(t), Logger: logging.DummyLogger{}}, defaultGuardGroups()),
+			ErrMissingDeps, "a missing catalog must not be skipped silently: the policies would name no companion repository")
 	})
 
 	t.Run("enabled section on a backend without policies degrades", func(t *testing.T) {
@@ -508,15 +839,112 @@ func TestRoutesBuilder(t *testing.T) {
 		basic := auth.NewBasicAuthService(store, crypt.NewSecretStore([]byte("mds-bootstrap-basic-secret")),
 			authparams.ServiceCache{Enabled: false}, logging.DummyLogger{})
 		require.NoError(t,
-			RoutesBuilder(t.Context(), cmdpkg.ServerDeps{AuthService: basic, Logger: logging.DummyLogger{}}, defaultGuardGroups()),
+			RoutesBuilder(t.Context(), cmdpkg.ServerDeps{
+				AuthService: basic, Logger: logging.DummyLogger{}, Catalog: newBootstrapCatalog(t),
+			}, defaultGuardGroups()),
 			"the documented default auth mode must still start the server")
 	})
 
 	t.Run("invalid configuration is fatal", func(t *testing.T) {
 		useConfig(t, "iceberg:\n  enabled: true\n  prefix: not-lakefs\n  metadata_search:\n    enabled: true\n")
-		require.Error(t, RoutesBuilder(t.Context(), cmdpkg.ServerDeps{AuthService: newACLService(t), Logger: logging.DummyLogger{}}, defaultGuardGroups()),
+		require.Error(t, RoutesBuilder(t.Context(), cmdpkg.ServerDeps{
+			AuthService: newACLService(t), Logger: logging.DummyLogger{},
+		}, defaultGuardGroups()),
 			"a configuration error is reported, not hidden behind a disabled builder")
 	})
+}
+
+// TestKnownDataRepositories pins how the policies learn which companion repositories to name: the
+// repositories the catalog holds (analytics, legacy-metadata) plus the ones this file's
+// metadata_search.repositories section lists (events, and a "bad/name" entry that is not a
+// repository ID and must never become an ARN).
+func TestKnownDataRepositories(t *testing.T) {
+	useConfig(t, `iceberg:
+  enabled: true
+  metadata_search:
+    enabled: true
+metadata_search:
+  repositories:
+    events:
+      branches: [main]
+    "bad/name":
+      branches: [main]
+`)
+	svc := newACLService(t)
+	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
+	require.NoError(t, err)
+	cat := newBootstrapCatalog(t, "analytics", "legacy-metadata")
+
+	dataRepositories, err := knownDataRepositories(t.Context(), cat)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"analytics", "events", "legacy-metadata"}, dataRepositories)
+
+	// legacy-metadata is a companion repository by §3.3, not a data repository whose companion
+	// would be legacy-metadata-metadata; bad/name is dropped because its companion would not be a
+	// valid repository ID.
+	require.Equal(t, []string{"analytics-metadata", "events-metadata", "legacy-metadata"},
+		companionRepositories(dataRepositories))
+
+	// End to end: the deny of a guard-group member names both the catalog's and the configured
+	// repository, and the indexer may write the companion repository of either.
+	require.NoError(t, RoutesBuilder(t.Context(), cmdpkg.ServerDeps{
+		AuthService: svc, Logger: logging.DummyLogger{}, Catalog: cat,
+	}, defaultGuardGroups()))
+	operator := newOperatorPrincipal(t, svc)
+
+	for _, companion := range []string{"analytics-metadata", "events-metadata"} {
+		requireAuthorization(t, svc, operator, permissions.UpdateRepositoryAction, permissions.RepoArn(companion), false,
+			"the deny must cover %s: it is a companion repository the server knows", companion)
+		requireAuthorization(t, svc, UserName, permissions.WriteObjectAction,
+			permissions.ObjectArn(companion, "_iceberg/uuid/data/part-00000.parquet"), true,
+			"the indexer must be able to write %s", companion)
+	}
+	requireAuthorization(t, svc, operator, permissions.WriteObjectAction,
+		permissions.ObjectArn("analytics", "foo-metadata/data.yml"), true,
+		"a data repository object stays writable whatever its key")
+}
+
+// TestPolicyRefresher adds a repository after the policies were built, the way an operator creates
+// one in a running installation: the refresher must bring both policies up to date without a server
+// restart, and stop when its context is cancelled.
+func TestPolicyRefresher(t *testing.T) {
+	useConfig(t, "iceberg:\n  enabled: true\n  metadata_search:\n    enabled: true\n")
+	svc := newACLService(t)
+	cat := newBootstrapCatalog(t)
+	_, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), nil)
+	require.NoError(t, err)
+
+	deny, err := svc.GetPolicy(t.Context(), MetadataRepoProtectPolicyName)
+	require.NoError(t, err)
+	require.Empty(t, deny.Statement, "no repository is known yet, so the deny names none")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := startPolicyRefresher(ctx, cmdpkg.ServerDeps{
+		AuthService: svc, Logger: logging.DummyLogger{}, Catalog: cat,
+	}, 10*time.Millisecond)
+
+	_, err = cat.CreateRepository(t.Context(), "analytics", "", "mem://analytics", "main", false)
+	require.NoError(t, err, "create the data repository after the policies were built")
+
+	require.Eventually(t, func() bool {
+		deny, err := svc.GetPolicy(ctx, MetadataRepoProtectPolicyName)
+		if err != nil {
+			return false
+		}
+		indexer, err := svc.GetPolicy(ctx, IndexerPolicyName)
+		if err != nil {
+			return false
+		}
+		return policyNamesRepository(deny, "analytics-metadata") && policyNamesRepository(indexer, "analytics-metadata")
+	}, 5*time.Second, 10*time.Millisecond,
+		"the refresher must add a repository created after startup to both policies")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the policy refresher did not stop when its context was cancelled")
+	}
 }
 
 // defaultGuardGroups is the group list cmd/lakefs-sso/main.go passes to both installation-wide
@@ -525,6 +953,60 @@ func TestRoutesBuilder(t *testing.T) {
 // as guardGroups() builds it.
 func defaultGuardGroups() []string {
 	return datasets.PinsProtectGroups(nil)
+}
+
+// newBootstrapCatalog builds the catalog RoutesBuilder lists the repositories from: a mem block
+// store over a mem KV store, the fixture pkg/api's controller tests use, with the given repositories
+// created on branch "main".
+func newBootstrapCatalog(t *testing.T, repositories ...string) *lakefscatalog.Catalog {
+	t.Helper()
+	ctx := t.Context()
+	viper.Set(config.BlockstoreTypeKey, block.BlockstoreTypeMem)
+	cfg := &config.ConfigImpl{}
+	_, err := config.NewConfig("", cfg)
+	require.NoError(t, err, "build the lakeFS configuration")
+	cfg.Committed.LocalCache.Dir = filepath.Join(t.TempDir(), "cache")
+	cat, err := lakefscatalog.New(context.WithoutCancel(ctx), lakefscatalog.Config{
+		Config:       cfg,
+		KVStore:      kvtest.GetStore(ctx, t),
+		PathProvider: upload.DefaultPathProvider,
+	})
+	require.NoError(t, err, "build the lakeFS catalog")
+	t.Cleanup(func() { _ = cat.Close() })
+	for _, name := range repositories {
+		_, err := cat.CreateRepository(ctx, name, "", "mem://"+name, "main", false)
+		require.NoErrorf(t, err, "create repository %s", name)
+	}
+	return cat
+}
+
+// policyNamesRepository reports whether a policy carries a statement below repo: its repository ARN
+// itself or an ARN of the form repository/<repo>/.... The exact statements this package builds are
+// pinned by the two statement-list tests; this predicate is for the tests that care about which
+// repositories a policy names, not about its exact text.
+func policyNamesRepository(policy *model.Policy, repo string) bool {
+	prefix := permissions.RepoArn(repo)
+	for _, statement := range policy.Statement {
+		if statement.Resource == prefix || strings.HasPrefix(statement.Resource, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// requireAuthorization asserts the decision the ACL service gives username for one action on one
+// resource.
+func requireAuthorization(t *testing.T, svc auth.Service, username, action, resource string, want bool, msgAndArgs ...any) {
+	t.Helper()
+	resp, err := svc.Authorize(t.Context(), &auth.AuthorizationRequest{
+		Username: username,
+		RequiredPermissions: permissions.Node{Permission: permissions.Permission{
+			Action:   action,
+			Resource: resource,
+		}},
+	})
+	require.NoError(t, err)
+	require.Equalf(t, want, resp.Allowed, "%s on %s for %s: %v", action, resource, username, msgAndArgs)
 }
 
 // newACLService returns the simplified-ACL auth service the lakefs-sso binary uses, on an
