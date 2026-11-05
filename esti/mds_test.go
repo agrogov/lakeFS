@@ -2,9 +2,10 @@
 //
 // mds_test.go is the Metadata Search end-to-end suite of METADATA_SEARCH_DESIGN.md §9 (task M6 of
 // METADATA_SEARCH_PLAN.md): the security tests of the design, plus the object-lifecycle cases the
-// index has to get right, run through the two published query engines - PyIceberg through the
-// upstream endpoint /mds/iceberg/api and DuckDB through /iceberg/relative_to/{repo}.{ref}/api - and
-// the timing of a 100k-object backfill.
+// index has to get right, run through both published query engines on both catalog mounts of
+// docs/metadata-search.md - PyIceberg and DuckDB, each through the upstream endpoint
+// /mds/iceberg/api (identifier form) and through /iceberg/relative_to/{repo}.{ref}/api (warehouse
+// form) - and the timing of a 100k-object backfill.
 //
 // # What runs
 //
@@ -36,7 +37,8 @@
 //	overwrite                the same row carries the new etag, size and commit_id
 //	delete                   the row is gone
 //	S3-gateway upload        the row carries the object's X-Amz-Meta-* user metadata
-//	new branch               the branch is seeded from the indexed state (§4.5)
+//	new branch               the branch is seeded from the mds-<commit> tag of the indexed
+//	                         ancestor (§4.5 step 1), which its own history proves
 //	merge                    the object a merge brings in gets the merge commit's id (§3.2)
 //	tag, short commit id     both refs read the snapshot the index recorded for that commit (§6)
 //	hard reset               the branch is rewritten to the indexed ancestor (§4.7)
@@ -104,6 +106,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/api/apigen"
 	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"github.com/treeverse/lakefs/pkg/mds/bootstrap"
+	"github.com/treeverse/lakefs/pkg/mds/indexer"
 )
 
 const (
@@ -282,6 +285,11 @@ func TestMetadataSearchEndToEnd(t *testing.T) {
 		firstCommit = env.commitBranch(t, cl, mdsBranch, "mds test: two objects")
 		env.waitIndexed(t, mdsBranch, firstCommit)
 
+		// Every read of the suite goes through all four recipes of docs/metadata-search.md -
+		// PyIceberg and DuckDB, each through /mds/iceberg/api and /iceberg/relative_to - and
+		// readRows fails when they disagree. The two recipes no earlier run exercised are
+		// PyIceberg through /iceberg/relative_to (load_table("system.object_metadata")) and
+		// DuckDB's three-level identifier form ("{repo}.{ref}.system"."object_metadata").
 		read := env.readRows(t, mdsBranch)
 		require.Equal(t, []string{"data/one.txt", "data/two.txt"}, mdsPaths(read.PyIceberg.Rows),
 			"PyIceberg through %s must see one row per object of %s", icebergcatalog.MetadataSearchBasePath, mdsBranch)
@@ -352,6 +360,13 @@ func TestMetadataSearchEndToEnd(t *testing.T) {
 	t.Run("new branch is seeded", func(t *testing.T) {
 		env.createBranch(t, cl, mdsFeatureBranch, mdsBranch)
 		require.Equal(t, afterGateway, env.headCommit(t, cl, mdsFeatureBranch))
+		// Let the indexer index the new branch at the commit it was created at, before the first
+		// commit of its own. That is the read of §4.5 step 1 this case is about - the branch
+		// exists at A, so its table must come from tag mds-<A> - and it makes the case
+		// deterministic: without the wait the indexer may first see the branch already at
+		// featureCommit, which is a valid seed too (the log walk of the new head finds mds-<A>),
+		// but exercises a different branch of the rule.
+		env.waitIndexed(t, mdsFeatureBranch, afterGateway)
 		env.uploadObject(t, mdsFeatureBranch, "data/feature.txt", "feature")
 		featureCommit := env.commitBranch(t, cl, mdsFeatureBranch, "mds test: object on the feature branch")
 		env.waitIndexed(t, mdsFeatureBranch, featureCommit)
@@ -363,6 +378,37 @@ func TestMetadataSearchEndToEnd(t *testing.T) {
 		seeded := mdsRowOf(t, read.PyIceberg.Rows, "data/gateway.txt")
 		require.Equal(t, afterGateway, seeded.CommitID,
 			"the seeded rows carry the commit the branch was created at (§3.2 backfill rows)")
+
+		// The rows alone do not prove the seeding of §4.5 step 1: this run configures
+		// backfill: head, so a branch rebuilt from a full listing at its head writes exactly the
+		// same rows with exactly the same commit_id. R-metadata's own history is what tells the
+		// two apart - a seed descends from the mds-<A> tag of an indexed ancestor, a backfill of
+		// the new head starts again at the initialisation commit.
+		mainLog := env.metadataLog(t, mdsBranch)
+		seededAt := env.metadataCommitTagged(t, afterGateway)
+		require.Equal(t, mainLog[0].Id, seededAt,
+			"tag %s%s must name main's commit that recorded %s - the indexed ancestor a seed is "+
+				"taken from (§4.5 step 1); main's history: %v", indexer.TagPrefix, afterGateway, afterGateway,
+			mdsCommitLog(mainLog))
+		featureLog := env.metadataLog(t, mdsFeatureBranch)
+		require.GreaterOrEqualf(t, len(featureLog), 2,
+			"R-metadata@%s must have a commit for %s on top of the commit it was seeded from; history: %v",
+			mdsFeatureBranch, featureCommit, mdsCommitLog(featureLog))
+		require.Equal(t, featureCommit, mdsSourceCommitOf(featureLog[0]),
+			"the new branch's table must be at %s, the commit made on it; history: %v",
+			featureCommit, mdsCommitLog(featureLog))
+		require.Equal(t, seededAt, featureLog[1].Id,
+			"R-metadata@%s must have been created from the commit tagged %s%s (the seed of §4.5 step 1): "+
+				"the one commit above the position is %s. A backfill of the new head would have rebuilt "+
+				"the table at %s from the initialisation commit instead; history: %v",
+			mdsFeatureBranch, indexer.TagPrefix, afterGateway, featureCommit, featureCommit, mdsCommitLog(featureLog))
+		require.Equal(t, mdsCommitIDs(mainLog), mdsCommitIDs(featureLog)[1:],
+			"below its own commit, R-metadata@%s must be main's history at %s - not a rebuild: the "+
+				"branch's first commits stay the automatic root and the %q commit of §4.8 (§4.5 step 1)",
+			mdsFeatureBranch, afterGateway, indexer.InitCommitMessage)
+		require.Equal(t, indexer.InitCommitMessage, featureLog[len(featureLog)-2].Message,
+			"the branch starts at R-metadata's initialisation commit and shares main's history; "+
+				"history: %v", mdsCommitLog(featureLog))
 
 		mainRead := env.readRows(t, mdsBranch)
 		require.NotContains(t, mdsPaths(mainRead.PyIceberg.Rows), "data/feature.txt",
@@ -1237,26 +1283,98 @@ type mdsClientRead struct {
 	SourceCommit     string   `json:"source_commit"`
 }
 
-// mdsRead is the result of one read step: the same table through both published engines.
+// mdsRead is the result of one read step: the same table through both published engines on both
+// catalog mounts of docs/metadata-search.md.
 type mdsRead struct {
+	// PyIceberg is PyIceberg through /mds/iceberg/api, loading the identifier
+	// [repository, ref, system, object_metadata].
 	PyIceberg mdsClientRead `json:"pyiceberg"`
-	DuckDB    mdsClientRead `json:"duckdb"`
+	// PyIcebergRelative is PyIceberg through /iceberg/relative_to/{repo}.{ref}/api, loading
+	// "system.object_metadata": the mount fixes the repository and the ref.
+	PyIcebergRelative mdsClientRead `json:"pyiceberg_relative"`
+	// DuckDB is DuckDB through /iceberg/relative_to/{repo}.{ref}/api, from
+	// "system"."object_metadata".
+	DuckDB mdsClientRead `json:"duckdb"`
+	// DuckDBIdentifier is DuckDB through /mds/iceberg/api, from
+	// "{repository}.{ref}.system"."object_metadata": the three levels are one schema.
+	DuckDBIdentifier mdsClientRead `json:"duckdb_identifier"`
 }
 
-// readRows reads the virtual table of R at ref with PyIceberg (through /mds/iceberg/api, the
-// upstream endpoint of §5.5) and with DuckDB (through /iceberg/relative_to/{repo}.{ref}/api), and
-// returns both. Every row of §3.1 is reported by PyIceberg; DuckDB reports the columns the cases
-// assert on, because that is what its published recipe selects.
+// requireAgrees asserts that every engine/mount combination of the guide reads the same table, so
+// that a case cannot pass on one form while the other serves something else. It compares the
+// columns every engine reports - path, commit_id, etag, size_bytes and user_metadata - and, when
+// the step materialises no rows, the count.
+func (r mdsRead) requireAgrees(t *testing.T, ref string) {
+	t.Helper()
+	engines := []struct {
+		name string
+		read mdsClientRead
+	}{
+		{"DuckDB through " + icebergcatalog.RelativeToBasePath, r.DuckDB},
+		{"PyIceberg through " + icebergcatalog.RelativeToBasePath, r.PyIcebergRelative},
+		{"DuckDB through " + icebergcatalog.MetadataSearchBasePath, r.DuckDBIdentifier},
+	}
+	if len(r.PyIceberg.Rows) == 0 {
+		// countRows: the rows are not materialised, so the count is the whole report.
+		for _, engine := range engines {
+			require.Equalf(t, r.PyIceberg.Count, engine.read.Count,
+				"%s must count the same rows of %s as PyIceberg through %s",
+				engine.name, ref, icebergcatalog.MetadataSearchBasePath)
+		}
+		return
+	}
+	want := mdsRowSignature(r.PyIceberg.Rows)
+	for _, engine := range engines {
+		require.Equalf(t, want, mdsRowSignature(engine.read.Rows),
+			"%s must read the same rows of %s as PyIceberg through %s: both mounts of the catalog "+
+				"serve the same table",
+			engine.name, ref, icebergcatalog.MetadataSearchBasePath)
+	}
+	require.Equalf(t, r.PyIceberg.SourceCommit, r.PyIcebergRelative.SourceCommit,
+		"PyIceberg must read the same %s property through %s as through %s",
+		mdsTableSourceCommit, icebergcatalog.RelativeToBasePath, icebergcatalog.MetadataSearchBasePath)
+}
+
+// mdsRowSignature is the part of a row that every engine and every mount reports, in a comparable
+// form (sorted by path, so the order a scan returns rows in is not part of the comparison).
+func mdsRowSignature(rows []mdsRow) []string {
+	signatures := make([]string, 0, len(rows))
+	for _, row := range rows {
+		keys := make([]string, 0, len(row.UserMetadata))
+		for key := range row.UserMetadata {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		metadata := make([]string, 0, len(keys))
+		for _, key := range keys {
+			metadata = append(metadata, key+"="+row.UserMetadata[key])
+		}
+		signatures = append(signatures, fmt.Sprintf("%s|%s|%s|%d|%s",
+			row.Path, row.CommitID, row.ETag, row.SizeBytes, strings.Join(metadata, ",")))
+	}
+	sort.Strings(signatures)
+	return signatures
+}
+
+// readRows reads the virtual table of R at ref with both published engines on both published
+// mounts: PyIceberg and DuckDB through /mds/iceberg/api (the upstream endpoint of §5.5) and through
+// /iceberg/relative_to/{repo}.{ref}/api, the four recipes of docs/metadata-search.md. Every row of
+// §3.1 is reported by PyIceberg; DuckDB reports the columns the cases assert on, because that is
+// what its published recipe selects. The four reports must agree (requireAgrees).
 func (e *mdsEnv) readRows(t *testing.T, ref string) mdsRead {
 	t.Helper()
-	return mdsDecode[mdsRead](t, e.runReadStep(t, ref, true))
+	read := mdsDecode[mdsRead](t, e.runReadStep(t, ref, true))
+	read.requireAgrees(t, ref)
+	return read
 }
 
 // countRows reads the same table without materialising the rows, for a table too large to pass
 // through the step's JSON result.
 func (e *mdsEnv) countRows(t *testing.T, ref string) mdsRead {
 	t.Helper()
-	return mdsDecode[mdsRead](t, e.runReadStep(t, ref, false))
+	read := mdsDecode[mdsRead](t, e.runReadStep(t, ref, false))
+	read.requireAgrees(t, ref)
+	return read
 }
 
 // runReadStep runs the read program in the client container and returns its JSON object.
@@ -1269,14 +1387,16 @@ func (e *mdsEnv) runReadStep(t *testing.T, ref string, withRows bool) map[string
 		rows = "0"
 	}
 	return e.runClient(t, "mds-read:"+ref, mdsReadScript, map[string]string{
-		"MDS_WAREHOUSE":       e.storageNamespace,
-		"MDS_IDENTIFIER":      string(identifier),
-		"MDS_CREDENTIAL":      e.key + ":" + e.secret,
-		"MDS_CATALOG_URI":     e.dockerReachableURL(e.baseURL + icebergcatalog.MetadataSearchBasePath),
-		"MDS_RELATIVE_URI":    e.dockerReachableURL(e.baseURL+icebergcatalog.RelativeToBasePath) + "/" + e.repo + "." + ref + "/api",
-		"MDS_OAUTH_URI":       e.dockerReachableURL(e.baseURL+icebergcatalog.MetadataSearchBasePath) + "/v1/oauth/tokens",
-		"MDS_DUCKDB_RELATION": icebergcatalog.SystemNamespace + "." + icebergcatalog.ObjectMetadataTable,
-		"MDS_ROWS":            rows,
+		"MDS_WAREHOUSE":          e.storageNamespace,
+		"MDS_IDENTIFIER":         string(identifier),
+		"MDS_CREDENTIAL":         e.key + ":" + e.secret,
+		"MDS_CATALOG_URI":        e.dockerReachableURL(e.baseURL + icebergcatalog.MetadataSearchBasePath),
+		"MDS_RELATIVE_URI":       e.dockerReachableURL(e.baseURL+icebergcatalog.RelativeToBasePath) + "/" + e.repo + "." + ref + "/api",
+		"MDS_OAUTH_URI":          e.dockerReachableURL(e.baseURL+icebergcatalog.MetadataSearchBasePath) + "/v1/oauth/tokens",
+		"MDS_RELATIVE_OAUTH_URI": e.dockerReachableURL(e.baseURL+icebergcatalog.APIBasePath) + "/v1/oauth/tokens",
+		"MDS_RELATIVE_TABLE":     icebergcatalog.SystemNamespace + "." + icebergcatalog.ObjectMetadataTable,
+		"MDS_MDS_SCHEMA":         e.repo + "." + ref + "." + icebergcatalog.SystemNamespace,
+		"MDS_ROWS":               rows,
 	})
 }
 
@@ -1433,6 +1553,85 @@ func requireMDSRefusal(t *testing.T, status int, body []byte, wantStatus int, wa
 	require.Equalf(t, wantStatus, status, "%s must be refused with %d %s: %s", what, wantStatus, wantType, body)
 	require.Equalf(t, wantType, envelope.Error.Type,
 		"%s must be refused with %d %s: %s", what, wantStatus, wantType, body)
+}
+
+// ---------------------------------------------------------------------------------------------
+// the companion repository's own history
+// ---------------------------------------------------------------------------------------------
+
+// metadataLog returns the first-parent log of R-metadata@branch, newest first (§3.3). It is how the
+// suite reads the indexing position and the seeding of a new branch (§4.5) from the companion
+// repository itself, instead of inferring them from rows a backfill writes the same way.
+func (e *mdsEnv) metadataLog(t *testing.T, branch string) []apigen.Commit {
+	t.Helper()
+	firstParent := true
+	amount := apigen.PaginationAmount(100)
+	after := ""
+	var commits []apigen.Commit
+	for {
+		params := &apigen.LogCommitsParams{FirstParent: &firstParent, Amount: &amount}
+		if after != "" {
+			cursor := apigen.PaginationAfter(after)
+			params.After = &cursor
+		}
+		res, err := e.admin.LogCommitsWithResponse(t.Context(), e.metadataRepo, branch, params)
+		require.NoErrorf(t, err, "log commits of %s@%s", e.metadataRepo, branch)
+		require.Equalf(t, http.StatusOK, res.StatusCode(),
+			"log commits of %s@%s: %s", e.metadataRepo, branch, res.Body)
+		require.NotNilf(t, res.JSON200, "log commits of %s@%s: %s", e.metadataRepo, branch, res.Body)
+		commits = append(commits, res.JSON200.Results...)
+		if !res.JSON200.Pagination.HasMore {
+			return commits
+		}
+		require.NotEmptyf(t, res.JSON200.Pagination.NextOffset,
+			"log commits of %s@%s has more results without a cursor", e.metadataRepo, branch)
+		after = res.JSON200.Pagination.NextOffset
+	}
+}
+
+// metadataCommitTagged returns the commit of R-metadata that tag mds-<sourceCommit> names (§3.3,
+// §4.3 step 5): the commit that recorded sourceCommit of R.
+func (e *mdsEnv) metadataCommitTagged(t *testing.T, sourceCommit string) string {
+	t.Helper()
+	tag := indexer.TagPrefix + sourceCommit
+	res, err := e.admin.GetTagWithResponse(t.Context(), e.metadataRepo, tag)
+	require.NoErrorf(t, err, "get tag %s of %s", tag, e.metadataRepo)
+	require.Equalf(t, http.StatusOK, res.StatusCode(),
+		"the indexer must tag %s with %s once it has indexed %s: %s", sourceCommit, tag, sourceCommit, res.Body)
+	require.NotNilf(t, res.JSON200, "get tag %s of %s: %s", tag, e.metadataRepo, res.Body)
+	return res.JSON200.CommitId
+}
+
+// mdsSourceCommitOf returns the commit of R a commit of R-metadata recorded, or "" on a commit that
+// carries no position (the automatic root and the initialisation commit of §4.8).
+func mdsSourceCommitOf(commit apigen.Commit) string {
+	if commit.Metadata == nil {
+		return ""
+	}
+	return commit.Metadata.AdditionalProperties[indexer.MetadataKeySourceCommit]
+}
+
+// mdsCommitIDs returns the ids of a commit log, in order.
+func mdsCommitIDs(commits []apigen.Commit) []string {
+	ids := make([]string, 0, len(commits))
+	for _, commit := range commits {
+		ids = append(ids, commit.Id)
+	}
+	return ids
+}
+
+// mdsCommitLog renders a commit log for a failure message: one "<short id> <message>" line per
+// commit, newest first.
+func mdsCommitLog(commits []apigen.Commit) []string {
+	lines := make([]string, 0, len(commits))
+	for _, commit := range commits {
+		id := commit.Id
+		if len(id) > 8 {
+			id = id[:8]
+		}
+		lines = append(lines, fmt.Sprintf("%s %s", id, commit.Message))
+	}
+	return lines
 }
 
 // mdsPaths returns the sorted paths of a read's rows.
@@ -1961,15 +2160,25 @@ func mdsFreePorts(t *testing.T, count int) []int {
 // the client program
 // ---------------------------------------------------------------------------------------------
 
-// mdsReadScript reads R.<ref>.system.object_metadata with both published engines and reports the
-// rows and the freshness property (§9).
+// mdsReadScript reads R.<ref>.system.object_metadata with both published engines on both published
+// mounts, exactly as docs/metadata-search.md publishes them, and reports the four results and the
+// freshness property (§9).
 //
-// PyIceberg uses the identifier form against /mds/iceberg/api, the upstream endpoint of §5.5: the
-// RestCatalog prepends the prefix from GET /v1/config, so the identifier is
+// PyIceberg, identifier form: /mds/iceberg/api, the upstream endpoint of §5.5. The RestCatalog
+// prepends the prefix from GET /v1/config, so the identifier is
 // [repository, ref, system, object_metadata].
 //
-// DuckDB uses the warehouse form against /iceberg/relative_to/{repository}.{ref}/api: the URL fixes
-// the repository and the ref, so the relation it queries is the client's own namespace and table.
+// PyIceberg, warehouse form: /iceberg/relative_to/{repository}.{ref}/api, where the URL fixes both
+// the repository and the ref, so `load_table("system.object_metadata")` names the table alone.
+//
+// DuckDB, warehouse form: /iceberg/relative_to/{repository}.{ref}/api, the relation
+// "system"."object_metadata".
+//
+// DuckDB, identifier form: /mds/iceberg/api, where the repository and the ref stay in the
+// identifier, so the schema has three levels and DuckDB spells them as one quoted schema:
+// "{repository}.{ref}.system"."object_metadata". Its OAuth server is the /mds one.
+//
+// The four reports must agree: mdsRead.requireAgrees compares them.
 //
 // MDS_ROWS=0 reports counts only, which is what the 100k-object case needs: a hundred thousand rows
 // of JSON would not survive a docker exec's output.
@@ -1990,6 +2199,10 @@ def required(name):
 
 def sql_literal(value):
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def sql_identifier(value):
+    return '"' + str(value).replace('"', '""') + '"'
 
 
 def metadata_map(value):
@@ -2015,90 +2228,129 @@ if os.environ.get("ICEBERG_S3_ENDPOINT"):
     s3_properties["s3.endpoint"] = os.environ["ICEBERG_S3_ENDPOINT"]
     s3_properties["s3.path-style-access"] = os.environ.get("ICEBERG_S3_PATH_STYLE", "true")
 
-# --- PyIceberg, through /mds/iceberg/api (the upstream endpoint of design §5.5) ---------------
-catalog = RestCatalog(
-    name="lakefs",
-    uri=required("MDS_CATALOG_URI"),
-    credential=required("MDS_CREDENTIAL"),
-    warehouse=required("MDS_WAREHOUSE"),
-    **s3_properties,
-)
-identifier = tuple(json.loads(required("MDS_IDENTIFIER")))
-table = catalog.load_table(identifier)
-scanned = table.scan().to_arrow()
-pyiceberg_rows = []
-if with_rows:
-    for row in scanned.to_pylist():
-        pyiceberg_rows.append({
-            "path": row["path"],
-            "repository": row["repository"],
-            "commit_id": row["commit_id"],
-            "etag": row["etag"],
-            "size_bytes": row["size_bytes"],
-            "user_metadata": metadata_map(row["user_metadata"]),
-            "committer": row["committer"],
-            "content_type": row["content_type"],
-            "last_modified": str(row["last_modified"]),
-            "creation_date": str(row["creation_date"]),
-        })
 
-# --- DuckDB, through /iceberg/relative_to/{repo}.{ref}/api ------------------------------------
-relation = required("MDS_DUCKDB_RELATION")
-con = duckdb.connect()
-con.execute("INSTALL iceberg")
-con.execute("LOAD iceberg")
-con.execute(
-    "CREATE OR REPLACE SECRET lakefs_catalog (TYPE iceberg, CLIENT_ID %s, "
-    "CLIENT_SECRET %s, OAUTH2_SERVER_URI %s)" % (
-        sql_literal(required("MDS_CREDENTIAL").split(":", 1)[0]),
-        sql_literal(required("MDS_CREDENTIAL").split(":", 1)[1]),
-        sql_literal(required("MDS_OAUTH_URI")),
+def pyiceberg_read(uri, identifier):
+    catalog = RestCatalog(
+        name="lakefs",
+        uri=uri,
+        credential=required("MDS_CREDENTIAL"),
+        warehouse=required("MDS_WAREHOUSE"),
+        **s3_properties,
     )
-)
-if os.environ.get("ICEBERG_S3_ENDPOINT"):
+    table = catalog.load_table(identifier)
+    scanned = table.scan().to_arrow()
+    rows = []
+    if with_rows:
+        for row in scanned.to_pylist():
+            rows.append({
+                "path": row["path"],
+                "repository": row["repository"],
+                "commit_id": row["commit_id"],
+                "etag": row["etag"],
+                "size_bytes": row["size_bytes"],
+                "user_metadata": metadata_map(row["user_metadata"]),
+                "committer": row["committer"],
+                "content_type": row["content_type"],
+                "last_modified": str(row["last_modified"]),
+                "creation_date": str(row["creation_date"]),
+            })
+    return {
+        "rows": rows,
+        "count": len(rows) if with_rows else scanned.num_rows,
+        "metadata_location": table.metadata_location,
+        "source_commit": table.properties.get("lakefs.mds.source-commit", ""),
+    }
+
+
+def duckdb_iceberg_connection(oauth_uri):
+    # A connection per mount: the catalog secret names the OAuth server of the mount the ATTACH
+    # below uses, and a fresh duckdb.connect() keeps the two secrets and ATTACHes apart.
+    con = duckdb.connect()
+    con.execute("INSTALL iceberg")
+    con.execute("LOAD iceberg")
+    if os.environ.get("ICEBERG_S3_ENDPOINT"):
+        con.execute(
+            "CREATE OR REPLACE SECRET lakefs_data (TYPE s3, KEY_ID %s, SECRET %s, REGION %s, "
+            "ENDPOINT %s, URL_STYLE 'path', USE_SSL %s)" % (
+                sql_literal(required("ICEBERG_S3_KEY")),
+                sql_literal(required("ICEBERG_S3_SECRET")),
+                sql_literal(os.environ.get("ICEBERG_S3_REGION", "us-east-1")),
+                sql_literal(required("ICEBERG_S3_HOST")),
+                "true" if os.environ["ICEBERG_S3_ENDPOINT"].startswith("https://") else "false",
+            )
+        )
     con.execute(
-        "CREATE OR REPLACE SECRET lakefs_data (TYPE s3, KEY_ID %s, SECRET %s, REGION %s, "
-        "ENDPOINT %s, URL_STYLE 'path', USE_SSL %s)" % (
-            sql_literal(required("ICEBERG_S3_KEY")),
-            sql_literal(required("ICEBERG_S3_SECRET")),
-            sql_literal(os.environ.get("ICEBERG_S3_REGION", "us-east-1")),
-            sql_literal(required("ICEBERG_S3_HOST")),
-            "true" if os.environ["ICEBERG_S3_ENDPOINT"].startswith("https://") else "false",
+        "CREATE OR REPLACE SECRET lakefs_catalog (TYPE iceberg, CLIENT_ID %s, "
+        "CLIENT_SECRET %s, OAUTH2_SERVER_URI %s)" % (
+            sql_literal(required("MDS_CREDENTIAL").split(":", 1)[0]),
+            sql_literal(required("MDS_CREDENTIAL").split(":", 1)[1]),
+            sql_literal(oauth_uri),
         )
     )
+    return con
+
+
+def duckdb_rows(con, query, columns):
+    rows = []
+    count = 0
+    for record in con.execute(query).fetchall():
+        if with_rows:
+            row = {}
+            for index, column in enumerate(columns):
+                value = record[index]
+                if column == "user_metadata":
+                    value = metadata_map(value)
+                row[column] = value
+            rows.append(row)
+        else:
+            count = record[0]
+    return {"rows": rows, "count": len(rows) if with_rows else count}
+
+
+# --- PyIceberg, through /mds/iceberg/api (the upstream endpoint of design §5.5) ---------------
+pyiceberg = pyiceberg_read(required("MDS_CATALOG_URI"), tuple(json.loads(required("MDS_IDENTIFIER"))))
+
+# --- PyIceberg, through /iceberg/relative_to/{repo}.{ref}/api (the warehouse form) ------------
+pyiceberg_relative = pyiceberg_read(required("MDS_RELATIVE_URI"), required("MDS_RELATIVE_TABLE"))
+
+# --- DuckDB, through /iceberg/relative_to/{repo}.{ref}/api ------------------------------------
+relation = required("MDS_RELATIVE_TABLE")
+duckdb_columns = ["path", "etag", "commit_id", "size_bytes", "user_metadata"]
+con = duckdb_iceberg_connection(required("MDS_RELATIVE_OAUTH_URI"))
 con.execute(
     "ATTACH %s AS lakefs (TYPE iceberg, ENDPOINT %s)" % (
         sql_literal(required("MDS_WAREHOUSE")),
         sql_literal(required("MDS_RELATIVE_URI")),
     )
 )
-duckdb_query = 'SELECT path, etag, commit_id, size_bytes, user_metadata FROM lakefs."system"."object_metadata"'
+duckdb_query = 'SELECT %s FROM lakefs."system"."object_metadata"' % ", ".join(duckdb_columns)
 if not with_rows:
     duckdb_query = 'SELECT count(*) FROM lakefs."system"."object_metadata"'
-duckdb_rows = []
-duckdb_count = 0
-for record in con.execute(duckdb_query).fetchall():
-    if with_rows:
-        duckdb_rows.append({
-            "path": record[0],
-            "etag": record[1],
-            "commit_id": record[2],
-            "size_bytes": record[3],
-            "user_metadata": metadata_map(record[4]),
-        })
-    else:
-        duckdb_count = record[0]
+duckdb_relative = duckdb_rows(con, duckdb_query, duckdb_columns)
+
+# --- DuckDB, through /mds/iceberg/api (the identifier form: one schema, three levels) ---------
+# The guide's note for this form: the OAuth token URI is the /mds one, and the repository and the
+# ref stay in the identifier, so the schema is the single quoted name
+# "{repository}.{ref}.system" and the table stands on its own.
+mds_schema = sql_identifier(required("MDS_MDS_SCHEMA"))
+con_mds = duckdb_iceberg_connection(required("MDS_OAUTH_URI"))
+con_mds.execute(
+    "ATTACH %s AS lakefs_mds (TYPE iceberg, ENDPOINT %s)" % (
+        sql_literal(required("MDS_WAREHOUSE")),
+        sql_literal(required("MDS_CATALOG_URI")),
+    )
+)
+duckdb_mds_query = 'SELECT %s FROM lakefs_mds.%s."object_metadata"' % (
+    ", ".join(duckdb_columns), mds_schema,
+)
+if not with_rows:
+    duckdb_mds_query = 'SELECT count(*) FROM lakefs_mds.%s."object_metadata"' % mds_schema
+duckdb_identifier = duckdb_rows(con_mds, duckdb_mds_query, duckdb_columns)
 
 print("RESULT:" + json.dumps({
-    "pyiceberg": {
-        "rows": pyiceberg_rows,
-        "count": len(pyiceberg_rows) if with_rows else scanned.num_rows,
-        "metadata_location": table.metadata_location,
-        "source_commit": table.properties.get("lakefs.mds.source-commit", ""),
-    },
-    "duckdb": {
-        "rows": duckdb_rows,
-        "count": len(duckdb_rows) if with_rows else duckdb_count,
-    },
+    "pyiceberg": pyiceberg,
+    "pyiceberg_relative": pyiceberg_relative,
+    "duckdb": duckdb_relative,
+    "duckdb_identifier": duckdb_identifier,
 }))
 `
