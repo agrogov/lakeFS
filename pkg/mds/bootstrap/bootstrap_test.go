@@ -3,7 +3,7 @@ package bootstrap
 // Tests for the principals and policies of METADATA_SEARCH_DESIGN.md §8: the exact statement
 // lists of the design, the create/repair/idempotent behaviour of EnsurePrincipals, the one degraded
 // startup it accepts (an auth service without policies, exactly like
-// icebergcatalog.EnsureReservedPrefixProtectPolicy), and the ARNs the two policies do *not* decide
+// icebergcatalog.EnsureReservedPrefixProtectPolicy), and the ARNs the policy set does *not* decide
 // anything about: the data repositories, their branches and their tables (the review's MDS-SEC-2,
 // TestMDSPoliciesDoNotReachDataRepositories).
 //
@@ -44,12 +44,15 @@ import (
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/permissions"
 	"github.com/treeverse/lakefs/pkg/upload"
+	"google.golang.org/protobuf/proto"
 )
 
-// policyTestRepositories are the repositories the two statement-list tests build their policies
-// from: two data repositories, one of them repeated, so the tests pin the order (sorted by companion
+// policyTestRepositories are the repositories the statement-list tests build their policies from:
+// two data repositories, one of them repeated, so the tests pin the order (sorted by companion
 // repository) and the deduplication as well as the statements themselves.
-var policyTestRepositories = []string{"orders", "analytics", "analytics"}
+var policyTestRepositories = []repositoryInfo{
+	{Name: "orders"}, {Name: "analytics"}, {Name: "analytics"},
+}
 
 func TestIndexerPolicyStatements(t *testing.T) {
 	t.Parallel()
@@ -59,7 +62,11 @@ func TestIndexerPolicyStatements(t *testing.T) {
 	// repository are exact ARNs, not the "*\u002dmetadata" patterns of the design: pkg/auth/wildcard
 	// lets "*" span "/", so those patterns also matched data-repository ARNs (MDS-SEC-2). The literal
 	// repository name in front of a trailing "*" is what makes the subtree ARN safe.
-	want := model.Statements{
+	policies := IndexerPolicies(policyTestRepositories, time.Unix(0, 0))
+	require.Len(t, policies, 2, "one base policy plus one chunk for two companion repositories")
+	base := policies[0]
+	require.Equal(t, IndexerPolicyName, base.DisplayName)
+	require.True(t, statementsEqual(model.Statements{
 		{
 			Effect: model.StatementEffectAllow,
 			Action: []string{
@@ -68,6 +75,16 @@ func TestIndexerPolicyStatements(t *testing.T) {
 			},
 			Resource: "*",
 		},
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{"fs:AttachStorageNamespace"},
+			Resource: "arn:lakefs:fs:::namespace/*-metadata",
+		},
+	}, base.Statement), "the base policy is the repository-independent part of §8; got %+v", base.Statement)
+
+	chunk := policies[1]
+	require.Equal(t, chunkPolicyName(IndexerPolicyName, 1), chunk.DisplayName)
+	want := model.Statements{
 		{
 			Effect:   model.StatementEffectAllow,
 			Action:   []string{"fs:*"},
@@ -128,23 +145,17 @@ func TestIndexerPolicyStatements(t *testing.T) {
 			Action:   []string{"catalog:*"},
 			Resource: "arn:lakefs:catalog:::view/orders-metadata/*/*",
 		},
-		{
-			Effect:   model.StatementEffectAllow,
-			Action:   []string{"fs:AttachStorageNamespace"},
-			Resource: "arn:lakefs:fs:::namespace/*-metadata",
-		},
 	}
-	policy := IndexerPolicy(policyTestRepositories, time.Unix(0, 0))
-	require.Equal(t, IndexerPolicyName, policy.DisplayName)
-	require.True(t, statementsEqual(want, policy.Statement),
-		"the mds-indexer policy is the statement list of §8; got %+v", policy.Statement)
+	require.True(t, statementsEqual(want, chunk.Statement),
+		"the first chunk is the companion statement list of §8; got %+v", chunk.Statement)
 
 	// A server that knows no repository yet grants the reads and no companion-repository write: it
-	// must not fall back to a pattern.
-	empty := IndexerPolicy(nil, time.Unix(0, 0))
-	require.Len(t, empty.Statement, 2, "no repository, no companion statement: %+v", empty.Statement)
-	require.Equal(t, "*", empty.Statement[0].Resource)
-	require.Equal(t, MetadataNamespacePattern, empty.Statement[1].Resource)
+	// must not fall back to a pattern, and it writes no chunk.
+	empty := IndexerPolicies(nil, time.Unix(0, 0))
+	require.Len(t, empty, 1, "no repository, no companion chunk: %+v", empty)
+	require.Len(t, empty[0].Statement, 2)
+	require.Equal(t, "*", empty[0].Statement[0].Resource)
+	require.Equal(t, MetadataNamespacePattern, empty[0].Statement[1].Resource)
 }
 
 func TestMetadataRepoProtectPolicyStatements(t *testing.T) {
@@ -156,14 +167,23 @@ func TestMetadataRepoProtectPolicyStatements(t *testing.T) {
 	// other four groups. fs:Import* is the import pair of pkg/api/controller.go: ImportCancel is
 	// authorized on a branch ARN of the companion repository, so the subtree statement denies it;
 	// ImportFromStorage is authorized on a source storage namespace and is therefore not reached by
-	// these repository statements (see metadataRepoProtectFSDeniedActions). The resources are the
-	// exact ARNs of the companion repositories of policyTestRepositories (MDS-SEC-2).
+	// these repository statements (see metadataRepoProtectFSDeniedActions). branches:
+	// SetBranchProtectionRules is denied on the repository ARN (R2S-7); retention actions stay
+	// allowed because deleting the live index still needs fs:DeleteBranch, which is denied. The
+	// resources are the exact ARNs of the companion repositories of policyTestRepositories
+	// (MDS-SEC-2).
 	fsActions := []string{"fs:Write*", "fs:Delete*", "fs:Create*", "fs:Revert*", "fs:Update*", "fs:Import*"}
+	repositoryActions := append(append([]string(nil), fsActions...), "branches:SetBranchProtectionRules")
 	catalogActions := []string{"catalog:Create*", "catalog:Update*", "catalog:Delete*", "catalog:WriteTableData"}
+	policies := MetadataRepoProtectPolicies(policyTestRepositories, time.Unix(0, 0))
+	require.Len(t, policies, 2, "one empty base policy plus one chunk for two companion repositories")
+	require.Equal(t, MetadataRepoProtectPolicyName, policies[0].DisplayName)
+	require.Empty(t, policies[0].Statement, "the base deny has no repository-independent statement")
+
 	want := model.Statements{
 		{
 			Effect:   model.StatementEffectDeny,
-			Action:   fsActions,
+			Action:   repositoryActions,
 			Resource: "arn:lakefs:fs:::repository/analytics-metadata",
 		},
 		{
@@ -188,7 +208,7 @@ func TestMetadataRepoProtectPolicyStatements(t *testing.T) {
 		},
 		{
 			Effect:   model.StatementEffectDeny,
-			Action:   fsActions,
+			Action:   repositoryActions,
 			Resource: "arn:lakefs:fs:::repository/orders-metadata",
 		},
 		{
@@ -212,12 +232,14 @@ func TestMetadataRepoProtectPolicyStatements(t *testing.T) {
 			Resource: "arn:lakefs:catalog:::view/orders-metadata/*/*",
 		},
 	}
-	policy := MetadataRepoProtectPolicy(policyTestRepositories, time.Unix(0, 0))
-	require.Equal(t, MetadataRepoProtectPolicyName, policy.DisplayName)
-	require.True(t, statementsEqual(want, policy.Statement),
-		"the mds-metadata-repo-protect policy is the deny list of §8; got %+v", policy.Statement)
+	chunk := policies[1]
+	require.Equal(t, chunkPolicyName(MetadataRepoProtectPolicyName, 1), chunk.DisplayName)
+	require.True(t, statementsEqual(want, chunk.Statement),
+		"the first chunk is the deny list of §8; got %+v", chunk.Statement)
 
-	require.Empty(t, MetadataRepoProtectPolicy(nil, time.Unix(0, 0)).Statement,
+	empty := MetadataRepoProtectPolicies(nil, time.Unix(0, 0))
+	require.Len(t, empty, 1)
+	require.Empty(t, empty[0].Statement,
 		"no repository the server knows, nothing to deny: the deny never falls back to a pattern")
 }
 
@@ -240,28 +262,40 @@ func TestEnsurePrincipals(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, groupNames(groups), GroupName, "mds-indexer is a member of MetadataSearchIndexers")
 
-	// Both policies exist with exactly the built-in statements.
-	for _, built := range []*model.Policy{
-		IndexerPolicy(policyTestRepositories, bootstrapTS),
-		MetadataRepoProtectPolicy(policyTestRepositories, bootstrapTS),
-	} {
-		stored, err := svc.GetPolicy(t.Context(), built.DisplayName)
-		require.NoErrorf(t, err, "policy %s exists", built.DisplayName)
-		require.Truef(t, statementsEqual(built.Statement, stored.Statement),
-			"policy %s has the built-in statements; got %+v", built.DisplayName, stored.Statement)
+	// Every policy exists with exactly the built-in statements.
+	built := append(IndexerPolicies(policyTestRepositories, bootstrapTS), MetadataRepoProtectPolicies(policyTestRepositories, bootstrapTS)...)
+	for _, policy := range built {
+		stored, err := svc.GetPolicy(t.Context(), policy.DisplayName)
+		require.NoErrorf(t, err, "policy %s exists", policy.DisplayName)
+		require.Truef(t, statementsEqual(policy.Statement, stored.Statement),
+			"policy %s has the built-in statements; got %+v", policy.DisplayName, stored.Statement)
 	}
 
-	// mds-indexer is attached to its group and nowhere else, in particular not to a base group.
+	// mds-indexer and its chunks are attached to their group and nowhere else, in particular not to
+	// a base group.
 	indexerPolicies := policyNames(t, svc, GroupName)
-	require.ElementsMatch(t, []string{IndexerPolicyName}, indexerPolicies,
-		"MetadataSearchIndexers carries mds-indexer and only mds-indexer")
+	indexerNames := make([]string, 0, len(IndexerPolicies(policyTestRepositories, bootstrapTS)))
+	for _, policy := range IndexerPolicies(policyTestRepositories, bootstrapTS) {
+		indexerNames = append(indexerNames, policy.DisplayName)
+	}
+	require.ElementsMatch(t, indexerNames, indexerPolicies,
+		"MetadataSearchIndexers carries mds-indexer and its chunks, and nothing else")
 
-	// The deny is attached to the base group this installation has...
-	require.Contains(t, policyNames(t, svc, "Admins"), MetadataRepoProtectPolicyName,
-		"the deny is attached to the base groups, as §8 requires")
-	// ... and never to the indexer group: attaching it there would disarm the indexer.
-	require.NotContains(t, indexerPolicies, MetadataRepoProtectPolicyName,
-		"the deny must never be attached to MetadataSearchIndexers")
+	// The deny policies are attached to the base group this installation has...
+	protectNames := make([]string, 0, len(MetadataRepoProtectPolicies(policyTestRepositories, bootstrapTS)))
+	for _, policy := range MetadataRepoProtectPolicies(policyTestRepositories, bootstrapTS) {
+		protectNames = append(protectNames, policy.DisplayName)
+	}
+	adminPolicies := policyNames(t, svc, "Admins")
+	for _, name := range protectNames {
+		require.Contains(t, adminPolicies, name,
+			"every deny chunk is attached to the base groups, as §8 requires")
+	}
+	// ... and never to the indexer group: attaching them there would disarm the indexer.
+	for _, name := range protectNames {
+		require.NotContains(t, indexerPolicies, name,
+			"the deny must never be attached to MetadataSearchIndexers")
+	}
 }
 
 // TestEnsurePrincipalsConfiguredGuardGroups is the regression test for the guard list coming from
@@ -298,7 +332,7 @@ func TestEnsurePrincipalsConfiguredGuardGroups(t *testing.T) {
 	require.Contains(t, output, GroupName)
 }
 
-// TestEnsurePrincipalsAuthorization checks what the two policies actually decide, through the same
+// TestEnsurePrincipalsAuthorization checks what the policy set actually decides, through the same
 // ACL engine the server uses: the indexer writes companion repositories and only reads data
 // repositories, and an administrator's fs:* does not write a companion repository.
 func TestEnsurePrincipalsAuthorization(t *testing.T) {
@@ -307,7 +341,7 @@ func TestEnsurePrincipalsAuthorization(t *testing.T) {
 	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
 	require.NoError(t, err)
 	// analytics is a repository the server knows: its companion repository is what the policies name.
-	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), []string{dataRepo})
+	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), repositoryInfos(dataRepo))
 	require.NoError(t, err)
 
 	// An administrator: a member of Admins (so the deny applies) with an installation-wide allow,
@@ -416,7 +450,8 @@ func TestEnsurePrincipalsAuthorization(t *testing.T) {
 
 // newOperatorPrincipal creates the §8 "an administrator's fs:* does not write a companion
 // repository" principal: a member of the guard group Admins (so the metadata-repo deny is attached to
-// it) with an installation-wide fs:* and catalog:* allow of its own.
+// it) with the installation-wide administrative allows of the RBAC template (fs:*, catalog:*,
+// branches:*, retention:*), so a deny test is about the deny and not about a missing allow.
 func newOperatorPrincipal(t *testing.T, svc auth.Service) string {
 	t.Helper()
 	const username = "operator"
@@ -427,8 +462,7 @@ func newOperatorPrincipal(t *testing.T, svc auth.Service) string {
 		CreatedAt:   bootstrapTS,
 		DisplayName: "operator-fs-all",
 		Statement: model.Statements{
-			{Effect: model.StatementEffectAllow, Action: []string{"fs:*"}, Resource: permissions.All},
-			{Effect: model.StatementEffectAllow, Action: []string{"catalog:*"}, Resource: permissions.All},
+			{Effect: model.StatementEffectAllow, Action: []string{"fs:*", "catalog:*", "branches:*", "retention:*"}, Resource: permissions.All},
 		},
 	}, false))
 	require.NoError(t, svc.AttachPolicyToUser(t.Context(), "operator-fs-all", username))
@@ -456,7 +490,7 @@ func TestMDSPoliciesDoNotReachDataRepositories(t *testing.T) {
 	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
 	require.NoError(t, err)
 	// analytics is a repository the server knows: the policies are built from it.
-	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), []string{dataRepo})
+	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), repositoryInfos(dataRepo))
 	require.NoError(t, err)
 	operator := newOperatorPrincipal(t, svc)
 
@@ -580,6 +614,30 @@ func TestMDSPoliciesDoNotReachDataRepositories(t *testing.T) {
 			resource: permissions.RepoArn(dataRepo), want: true,
 		},
 
+		// R2S-7: branch protection on a companion repository is a write that can stop the indexer
+		// permanently. Retention stays allowed because deleting the live index still needs
+		// fs:DeleteBranch, which the deny covers.
+		{
+			name:     "the deny blocks setting branch protection on a companion repository (R2S-7)",
+			username: operator, action: permissions.SetBranchProtectionRulesAction,
+			resource: permissions.RepoArn(metaRepo), want: false,
+		},
+		{
+			name:     "the deny does not block setting branch protection on a data repository",
+			username: operator, action: permissions.SetBranchProtectionRulesAction,
+			resource: permissions.RepoArn(dataRepo), want: true,
+		},
+		{
+			name:     "the deny leaves retention garbage collection rules allowed on a companion repository",
+			username: operator, action: permissions.SetGarbageCollectionRulesAction,
+			resource: permissions.RepoArn(metaRepo), want: true,
+		},
+		{
+			name:     "the deny leaves retention GC preparation allowed on a companion repository",
+			username: operator, action: permissions.PrepareGarbageCollectionCommitsAction,
+			resource: permissions.RepoArn(metaRepo), want: true,
+		},
+
 		// The companion repository is still covered by the deny (MDS-SEC-5 adds
 		// fs:UpdateRepository to it).
 		{
@@ -665,7 +723,7 @@ func TestMetadataRepoProtectCoversImportActions(t *testing.T) {
 	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
 	require.NoError(t, err)
 	// analytics is a repository the server knows: the policies name analytics-metadata.
-	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), []string{dataRepo})
+	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), repositoryInfos(dataRepo))
 	require.NoError(t, err)
 	operator := newOperatorPrincipal(t, svc)
 
@@ -752,11 +810,15 @@ func TestEnsurePrincipalsRepairsDriftedPolicy(t *testing.T) {
 			},
 		},
 		{
-			name: "deny policy with no statements",
+			name: "deny policy with a blanket allow",
 			policy: &model.Policy{
 				CreatedAt:   bootstrapTS,
 				DisplayName: MetadataRepoProtectPolicyName,
-				Statement:   model.Statements{},
+				Statement: model.Statements{{
+					Effect:   model.StatementEffectAllow,
+					Action:   []string{"fs:*"},
+					Resource: permissions.All,
+				}},
 			},
 		},
 	}
@@ -771,10 +833,15 @@ func TestEnsurePrincipalsRepairsDriftedPolicy(t *testing.T) {
 			require.NoError(t, err)
 			require.True(t, inForce)
 
-			want := IndexerPolicy(policyTestRepositories, bootstrapTS)
-			if tt.policy.DisplayName == MetadataRepoProtectPolicyName {
-				want = MetadataRepoProtectPolicy(policyTestRepositories, bootstrapTS)
+			var want *model.Policy
+			for _, built := range append(IndexerPolicies(policyTestRepositories, bootstrapTS),
+				MetadataRepoProtectPolicies(policyTestRepositories, bootstrapTS)...) {
+				if built.DisplayName == tt.policy.DisplayName {
+					want = built
+					break
+				}
 			}
+			require.NotNil(t, want)
 			stored, err := svc.GetPolicy(t.Context(), tt.policy.DisplayName)
 			require.NoError(t, err)
 			require.True(t, statementsEqual(want.Statement, stored.Statement),
@@ -883,15 +950,14 @@ func TestRoutesBuilder(t *testing.T) {
 		_, err = svc.GetUser(t.Context(), UserName)
 		require.NoError(t, err)
 		_, err = svc.GetPolicy(t.Context(), MetadataRepoProtectPolicyName)
-		require.NoError(t, err, "both policies are created")
+		require.NoError(t, err, "the policy set is created")
 		require.Contains(t, policyNames(t, svc, "Admins"), MetadataRepoProtectPolicyName,
 			"the builder forwards the guard group list it is handed, as cmd/lakefs-sso does")
 
 		// The repository the catalog holds is the one the policies name.
-		deny, err := svc.GetPolicy(t.Context(), MetadataRepoProtectPolicyName)
-		require.NoError(t, err)
-		require.True(t, policyNamesRepository(deny, "analytics"+icebergcatalog.MetadataRepositorySuffix),
-			"the deny names the companion repository of the repository the server knows; got %+v", deny.Statement)
+		require.True(t, policySetNamesRepository(t, svc, MetadataRepoProtectPolicyName,
+			"analytics"+icebergcatalog.MetadataRepositorySuffix),
+			"the deny names the companion repository of the repository the server knows")
 	})
 
 	t.Run("enabled section without dependencies is an error", func(t *testing.T) {
@@ -931,7 +997,9 @@ func TestRoutesBuilder(t *testing.T) {
 // TestKnownDataRepositories pins how the policies learn which companion repositories to name: the
 // repositories the catalog holds (analytics, legacy-metadata) plus the ones this file's
 // metadata_search.repositories section lists (events, and a "bad/name" entry that is not a
-// repository ID and must never become an ARN).
+// repository ID and must never become an ARN). legacy-metadata is an ordinary repository because
+// its data repository "legacy" does not exist (R2S-4): it must stay writable for its users and must
+// not be granted to the indexer.
 func TestKnownDataRepositories(t *testing.T) {
 	useConfig(t, `iceberg:
   enabled: true
@@ -949,15 +1017,20 @@ metadata_search:
 	require.NoError(t, err)
 	cat := newBootstrapCatalog(t, "analytics", "legacy-metadata")
 
-	dataRepositories, err := knownDataRepositories(t.Context(), cat)
+	repositories, err := knownRepositories(t.Context(), cat)
 	require.NoError(t, err)
-	require.ElementsMatch(t, []string{"analytics", "events", "legacy-metadata"}, dataRepositories)
+	names := make([]string, 0, len(repositories))
+	for _, repository := range repositories {
+		names = append(names, repository.Name)
+	}
+	require.ElementsMatch(t, []string{"analytics", "events", "legacy-metadata"}, names)
 
-	// legacy-metadata is a companion repository by §3.3, not a data repository whose companion
-	// would be legacy-metadata-metadata; bad/name is dropped because its companion would not be a
-	// valid repository ID.
-	require.Equal(t, []string{"analytics-metadata", "events-metadata", "legacy-metadata"},
-		companionRepositories(dataRepositories))
+	// analytics-metadata is the companion of a repository that exists; events-metadata is the
+	// companion of a configured repository that does not exist yet. legacy-metadata is not a
+	// companion because "legacy" does not exist; bad/name is dropped because its companion would not
+	// be a valid repository ID.
+	require.Equal(t, []string{"analytics-metadata", "events-metadata"},
+		companionNames(companionRepositories(repositories)))
 
 	// End to end: the deny of a guard-group member names both the catalog's and the configured
 	// repository, and the indexer may write the companion repository of either.
@@ -976,10 +1049,24 @@ metadata_search:
 	requireAuthorization(t, svc, operator, permissions.WriteObjectAction,
 		permissions.ObjectArn("analytics", "foo-metadata/data.yml"), true,
 		"a data repository object stays writable whatever its key")
+
+	// The ordinary *-metadata repository keeps its users' writes and gets no indexer grant (R2S-4).
+	requireAuthorization(t, svc, operator, permissions.WriteObjectAction,
+		permissions.ObjectArn("legacy-metadata", "data.yml"), true,
+		"an ordinary *-metadata repository stays writable for its users")
+	requireAuthorization(t, svc, operator, permissions.DeleteRepositoryAction,
+		permissions.RepoArn("legacy-metadata"), true,
+		"an ordinary *-metadata repository stays deletable for its users")
+	requireAuthorization(t, svc, UserName, permissions.WriteObjectAction,
+		permissions.ObjectArn("legacy-metadata", "data.yml"), false,
+		"the indexer gets no grant on an ordinary *-metadata repository")
+	requireAuthorization(t, svc, UserName, permissions.DeleteRepositoryAction,
+		permissions.RepoArn("legacy-metadata"), false,
+		"the indexer gets no repository grant on an ordinary *-metadata repository")
 }
 
 // TestPolicyRefresher adds a repository after the policies were built, the way an operator creates
-// one in a running installation: the refresher must bring both policies up to date without a server
+// one in a running installation: the refresher must bring the policy set up to date without a server
 // restart, and stop when its context is cancelled.
 func TestPolicyRefresher(t *testing.T) {
 	useConfig(t, "iceberg:\n  enabled: true\n  metadata_search:\n    enabled: true\n")
@@ -995,23 +1082,16 @@ func TestPolicyRefresher(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	done := startPolicyRefresher(ctx, cmdpkg.ServerDeps{
 		AuthService: svc, Logger: logging.DummyLogger{}, Catalog: cat,
-	}, 10*time.Millisecond)
+	}, defaultGuardGroups(), 10*time.Millisecond)
 
 	_, err = cat.CreateRepository(t.Context(), "analytics", "", "mem://analytics", "main", false)
 	require.NoError(t, err, "create the data repository after the policies were built")
 
 	require.Eventually(t, func() bool {
-		deny, err := svc.GetPolicy(ctx, MetadataRepoProtectPolicyName)
-		if err != nil {
-			return false
-		}
-		indexer, err := svc.GetPolicy(ctx, IndexerPolicyName)
-		if err != nil {
-			return false
-		}
-		return policyNamesRepository(deny, "analytics-metadata") && policyNamesRepository(indexer, "analytics-metadata")
+		return policySetNamesRepository(t, svc, MetadataRepoProtectPolicyName, "analytics-metadata") &&
+			policySetNamesRepository(t, svc, IndexerPolicyName, "analytics-metadata")
 	}, 5*time.Second, 10*time.Millisecond,
-		"the refresher must add a repository created after startup to both policies")
+		"the refresher must add a repository created after startup to the policy set")
 
 	cancel()
 	select {
@@ -1019,6 +1099,325 @@ func TestPolicyRefresher(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the policy refresher did not stop when its context was cancelled")
 	}
+}
+
+// TestPolicySizeAtScale is R2S-2: the statements of 1000 companion repositories are split across
+// chunk policies, so every stored policy stays below the documented cap (and therefore well below
+// DynamoDB's 400 KiB item limit) instead of growing into one item that the server cannot write.
+func TestPolicySizeAtScale(t *testing.T) {
+	const repositories = 1000
+	known := make([]repositoryInfo, 0, repositories*2)
+	for i := 0; i < repositories; i++ {
+		// A 54-character data repository ID is the longest whose -metadata companion is still a
+		// valid 63-character lakeFS repository ID, so this is the widest policy a real name can build.
+		name := fmt.Sprintf("r%053d", i)
+		known = append(known,
+			repositoryInfo{Name: name, StorageNamespace: "s3://bucket/" + name},
+			repositoryInfo{
+				Name:             icebergcatalog.MetadataRepository(name),
+				StorageNamespace: "s3://bucket/" + icebergcatalog.MetadataRepository(name),
+			})
+	}
+
+	svc := newACLService(t)
+	_, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, nil, known)
+	require.NoError(t, err)
+	policies, _, err := svc.ListPolicies(t.Context(), &model.PaginationParams{Amount: -1})
+	require.NoError(t, err)
+	require.Greater(t, len(policies), 2, "1000 repositories must be split into chunk policies")
+	var largest int
+	for _, policy := range policies {
+		encoded, err := proto.Marshal(model.ProtoFromPolicy(policy))
+		require.NoErrorf(t, err, "encode policy %s", policy.DisplayName)
+		largest = max(largest, len(encoded))
+		require.LessOrEqualf(t, len(encoded), MaxPolicyStoredBytes,
+			"policy %s is %d bytes, above the documented cap %d; chunking must bound every item",
+			policy.DisplayName, len(encoded), MaxPolicyStoredBytes)
+	}
+	t.Logf("1000 repositories: %d policies, largest %d bytes (cap %d)", len(policies), largest, MaxPolicyStoredBytes)
+}
+
+// TestPolicyChunksShrink is the other half of R2S-2: when the repository set shrinks, the chunks
+// that are no longer needed are deleted, so a removed repository's grant and deny do not survive.
+func TestPolicyChunksShrink(t *testing.T) {
+	svc := newACLService(t)
+	big := make([]repositoryInfo, 0, companionChunkSize*2+1)
+	for i := 0; i < companionChunkSize*2+1; i++ {
+		big = append(big, repositoryInfo{Name: fmt.Sprintf("repo-%03d", i)})
+	}
+	_, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), big)
+	require.NoError(t, err)
+	require.NotEmpty(t, ownedPolicyNames(t, svc, MetadataRepoProtectPolicyName, 3),
+		"the large repository set must create more than one deny chunk")
+
+	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS.Add(time.Hour), defaultGuardGroups(), big[:1])
+	require.NoError(t, err)
+	for _, base := range []string{IndexerPolicyName, MetadataRepoProtectPolicyName} {
+		require.ElementsMatch(t, []string{base, chunkPolicyName(base, 1)}, ownedPolicyNames(t, svc, base, 10),
+			"a shrunk repository set leaves only the base and the first chunk of %s", base)
+	}
+}
+
+// TestCompanionStorageNamespaceDeny is R2S-3: a guard-group member cannot create another repository
+// on a companion repository's existing storage namespace, while an ordinary namespace stays allowed
+// and the indexer's namespace/*-metadata grant stays in place.
+func TestCompanionStorageNamespaceDeny(t *testing.T) {
+	const (
+		dataRepo           = "analytics"
+		metaRepo           = dataRepo + icebergcatalog.MetadataRepositorySuffix
+		companionNamespace = "mem://" + metaRepo
+	)
+	svc := newACLService(t)
+	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
+	require.NoError(t, err)
+	cat := newBootstrapCatalog(t, dataRepo, metaRepo)
+	repositories, err := knownRepositories(t.Context(), cat)
+	require.NoError(t, err)
+	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), repositories)
+	require.NoError(t, err)
+	operator := newOperatorPrincipal(t, svc)
+
+	// The exact CreateRepository node of pkg/api/controller.go on the companion's namespace.
+	requireNodeAuthorization(t, svc, operator, permissions.Node{
+		Type: permissions.NodeTypeAnd,
+		Nodes: []permissions.Node{
+			{Permission: permissions.Permission{
+				Action:   permissions.CreateRepositoryAction,
+				Resource: permissions.RepoArn("evil"),
+			}},
+			{Permission: permissions.Permission{
+				Action:   permissions.AttachStorageNamespaceAction,
+				Resource: permissions.StorageNamespace(companionNamespace),
+			}},
+		},
+	}, false, "a guard-group member must not create a repository on a companion storage namespace")
+
+	requireAuthorization(t, svc, operator, permissions.AttachStorageNamespaceAction,
+		permissions.StorageNamespace(companionNamespace), false,
+		"the exact companion storage namespace is denied")
+	requireAuthorization(t, svc, operator, permissions.AttachStorageNamespaceAction,
+		permissions.StorageNamespace("mem://ordinary"), true,
+		"an ordinary storage namespace stays allowed")
+	requireAuthorization(t, svc, UserName, permissions.AttachStorageNamespaceAction,
+		permissions.StorageNamespace("s3://bucket/"+metaRepo), true,
+		"the indexer keeps the namespace/*-metadata pattern it creates companions with")
+}
+
+// TestOrdinaryMetadataSuffixRepository is R2S-4: a repository named x-metadata is a companion only
+// when its data repository x exists. An ordinary x-metadata repository stays writable for its users
+// and gets no indexer grant.
+func TestOrdinaryMetadataSuffixRepository(t *testing.T) {
+	const ordinary = "team-metadata"
+	svc := newACLService(t)
+	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
+	require.NoError(t, err)
+	repositories := []repositoryInfo{{Name: ordinary, StorageNamespace: "mem://" + ordinary}}
+	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), repositories)
+	require.NoError(t, err)
+	operator := newOperatorPrincipal(t, svc)
+
+	requireAuthorization(t, svc, operator, permissions.WriteObjectAction,
+		permissions.ObjectArn(ordinary, "data.yml"), true,
+		"an ordinary x-metadata repository stays writable for its users")
+	requireAuthorization(t, svc, operator, permissions.CreateCommitAction,
+		permissions.BranchArn(ordinary, "main"), true,
+		"an ordinary x-metadata repository stays committable for its users")
+	requireAuthorization(t, svc, operator, permissions.DeleteRepositoryAction,
+		permissions.RepoArn(ordinary), true,
+		"an ordinary x-metadata repository stays deletable for its users")
+	requireAuthorization(t, svc, UserName, permissions.WriteObjectAction,
+		permissions.ObjectArn(ordinary, "data.yml"), false,
+		"the indexer gets no write grant on an ordinary x-metadata repository")
+	requireAuthorization(t, svc, UserName, permissions.DeleteRepositoryAction,
+		permissions.RepoArn(ordinary), false,
+		"the indexer gets no repository grant on an ordinary x-metadata repository")
+}
+
+// TestOperatorPolicySurvivesRefresher is R2S-6 with the chosen fix: the operator puts the extra
+// grant for an explicit non-metadata storage namespace in a policy of its own, attached to
+// MetadataSearchIndexers. RoutesBuilder and a later refresh never touch that policy.
+func TestOperatorPolicySurvivesRefresher(t *testing.T) {
+	useConfig(t, "iceberg:\n  enabled: true\n  metadata_search:\n    enabled: true\n")
+	const (
+		policyName = "mds-indexer-extra-storage-namespace"
+		namespace  = "s3://bucket/explicit-metadata"
+	)
+	svc := newACLService(t)
+	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
+	require.NoError(t, err)
+	cat := newBootstrapCatalog(t, "analytics")
+	operatorPolicy := &model.Policy{
+		CreatedAt:   bootstrapTS,
+		DisplayName: policyName,
+		Statement: model.Statements{
+			{Effect: model.StatementEffectAllow, Action: []string{permissions.CreateRepositoryAction},
+				Resource: permissions.RepoArn("explicit-metadata")},
+			{Effect: model.StatementEffectAllow, Action: []string{permissions.AttachStorageNamespaceAction},
+				Resource: permissions.StorageNamespace(namespace)},
+		},
+	}
+	_, err = svc.CreateGroup(t.Context(), &model.Group{DisplayName: GroupName, CreatedAt: bootstrapTS})
+	require.NoError(t, err)
+	require.NoError(t, svc.WritePolicy(t.Context(), operatorPolicy, false))
+	require.NoError(t, svc.AttachPolicyToGroup(t.Context(), policyName, GroupName))
+
+	require.NoError(t, RoutesBuilder(t.Context(), cmdpkg.ServerDeps{
+		AuthService: svc, Logger: logging.DummyLogger{}, Catalog: cat,
+	}, defaultGuardGroups()))
+	require.Contains(t, policyNames(t, svc, GroupName), policyName,
+		"RoutesBuilder does not detach an operator's extra policy")
+
+	// A refresh that adds a repository and rewrites the chunks must leave the operator policy alone.
+	inForce, err := refreshPolicies(t.Context(), svc, repositoryInfos("analytics", "orders"), defaultGuardGroups(), bootstrapTS.Add(time.Hour))
+	require.NoError(t, err)
+	require.True(t, inForce)
+	stored, err := svc.GetPolicy(t.Context(), policyName)
+	require.NoError(t, err, "the refresher must not delete a policy it does not own")
+	require.True(t, statementsEqual(operatorPolicy.Statement, stored.Statement))
+	require.Contains(t, policyNames(t, svc, GroupName), policyName,
+		"the refresher does not detach an operator's extra policy")
+	requireAuthorization(t, svc, UserName, permissions.AttachStorageNamespaceAction,
+		permissions.StorageNamespace(namespace), true,
+		"the operator's extra grant is still in force for the indexer after a refresh")
+}
+
+// TestRoutesBuilderStartsPolicyRefresher is R2S-8: the production wiring, not just
+// startPolicyRefresher, must cover a repository created after RoutesBuilder returned.
+func TestRoutesBuilderStartsPolicyRefresher(t *testing.T) {
+	useConfig(t, "iceberg:\n  enabled: true\n  metadata_search:\n    enabled: true\n")
+	svc := newACLService(t)
+	cat := newBootstrapCatalog(t)
+	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
+	require.NoError(t, err)
+
+	oldInterval := policyRefreshInterval
+	policyRefreshInterval = 10 * time.Millisecond
+	t.Cleanup(func() { policyRefreshInterval = oldInterval })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	require.NoError(t, RoutesBuilder(ctx, cmdpkg.ServerDeps{
+		AuthService: svc, Logger: logging.DummyLogger{}, Catalog: cat,
+	}, defaultGuardGroups()))
+
+	_, err = cat.CreateRepository(t.Context(), "late", "", "mem://late", "main", false)
+	require.NoError(t, err, "create a repository after RoutesBuilder returned")
+	require.Eventually(t, func() bool {
+		return policySetNamesRepository(t, svc, MetadataRepoProtectPolicyName, "late-metadata") &&
+			policySetNamesRepository(t, svc, IndexerPolicyName, "late-metadata")
+	}, 5*time.Second, 10*time.Millisecond,
+		"RoutesBuilder must start the refresher that covers a repository created after startup")
+}
+
+// cachingPolicyService is an auth.Service with the cache behaviour of pkg/auth.APIAuthService:
+// WritePolicy stores the policy but does not purge this service's effective-policy cache. The
+// underlying ACL service is the real one, so authorization decisions are real.
+type cachingPolicyService struct {
+	*acl.AuthService
+	cache *auth.LRUCache
+}
+
+func newCachingPolicyService(t *testing.T) *cachingPolicyService {
+	t.Helper()
+	store := kvtest.GetStore(t.Context(), t)
+	return &cachingPolicyService{
+		AuthService: acl.NewAuthService(store, crypt.NewSecretStore([]byte("mds-bootstrap-cache-test-secret")),
+			authparams.ServiceCache{Enabled: false}),
+		cache: auth.NewLRUCache(1000, time.Minute, 0),
+	}
+}
+
+func (s *cachingPolicyService) Cache() auth.Cache {
+	return s.cache
+}
+
+func (s *cachingPolicyService) Authorize(ctx context.Context, req *auth.AuthorizationRequest) (*auth.AuthorizationResponse, error) {
+	policies, err := s.cache.GetUserPolicies(req.Username, func() ([]*model.Policy, error) {
+		policies, _, err := s.AuthService.ListEffectivePolicies(ctx, req.Username, &model.PaginationParams{Amount: -1})
+		return policies, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	audit := &auth.MissingPermissions{}
+	if auth.CheckPermissions(ctx, req.RequiredPermissions, req.Username, policies, audit) != auth.CheckAllow {
+		return &auth.AuthorizationResponse{Allowed: false, Error: fmt.Errorf("%w: %s", auth.ErrInsufficientPermissions, audit.String())}, nil
+	}
+	return &auth.AuthorizationResponse{Allowed: true}, nil
+}
+
+// nilCachePolicyService is an auth.Service with no cache at all: the bootstrap must keep working.
+type nilCachePolicyService struct {
+	*acl.AuthService
+}
+
+func (s *nilCachePolicyService) Cache() auth.Cache {
+	return nil
+}
+
+// TestRefreshPurgesPolicyCache is R2S-9: after a rewrite the refresher purges the auth service's
+// effective-policy cache, so the new deny is effective on the next Authorize instead of after
+// auth.cache.ttl. A service without a cache keeps working.
+func TestRefreshPurgesPolicyCache(t *testing.T) {
+	svc := newCachingPolicyService(t)
+	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
+	require.NoError(t, err)
+	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), repositoryInfosWithCompanionNamespaces("analytics"))
+	require.NoError(t, err)
+	operator := newOperatorPrincipal(t, svc)
+
+	ordersNamespace := permissions.StorageNamespace("s3://bucket/orders-metadata")
+	requireAuthorization(t, svc, operator, permissions.AttachStorageNamespaceAction, ordersNamespace, true,
+		"before orders exists its companion namespace is not denied; this also warms the cache")
+
+	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS.Add(time.Hour), defaultGuardGroups(),
+		repositoryInfosWithCompanionNamespaces("analytics", "orders"))
+	require.NoError(t, err)
+	requireAuthorization(t, svc, operator, permissions.AttachStorageNamespaceAction, ordersNamespace, false,
+		"the refresh must purge the cached effective policies so the new deny applies at once")
+
+	// The same rewrite on a service that has no cache at all must not panic.
+	store := kvtest.GetStore(t.Context(), t)
+	noCache := &nilCachePolicyService{AuthService: acl.NewAuthService(store,
+		crypt.NewSecretStore([]byte("mds-bootstrap-nocache-test-secret")), authparams.ServiceCache{Enabled: false})}
+	_, err = EnsurePrincipals(t.Context(), noCache, bootstrapTS, defaultGuardGroups(), repositoryInfosWithCompanionNamespaces("analytics"))
+	require.NoError(t, err)
+	_, err = EnsurePrincipals(t.Context(), noCache, bootstrapTS.Add(time.Hour), defaultGuardGroups(),
+		repositoryInfosWithCompanionNamespaces("analytics", "orders"))
+	require.NoError(t, err, "a service without a policy cache keeps working")
+}
+
+// TestPolicyRefresherAttachesNewChunks is the attachment half of R2S-2: a chunk created by the
+// refresher after the repository set grows past a chunk boundary is attached to the same groups as
+// the base policies, not left orphaned.
+func TestPolicyRefresherAttachesNewChunks(t *testing.T) {
+	useConfig(t, "iceberg:\n  enabled: true\n  metadata_search:\n    enabled: true\n")
+	svc := newACLService(t)
+	cat := newBootstrapCatalog(t)
+	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
+	require.NoError(t, err)
+
+	oldInterval := policyRefreshInterval
+	policyRefreshInterval = 10 * time.Millisecond
+	t.Cleanup(func() { policyRefreshInterval = oldInterval })
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	require.NoError(t, RoutesBuilder(ctx, cmdpkg.ServerDeps{
+		AuthService: svc, Logger: logging.DummyLogger{}, Catalog: cat,
+	}, defaultGuardGroups()))
+
+	for i := 0; i <= companionChunkSize; i++ {
+		name := fmt.Sprintf("chunk-repo-%03d", i)
+		_, err := cat.CreateRepository(t.Context(), name, "", "mem://"+name, "main", false)
+		require.NoErrorf(t, err, "create repository %s", name)
+	}
+
+	indexerChunk := chunkPolicyName(IndexerPolicyName, 2)
+	protectChunk := chunkPolicyName(MetadataRepoProtectPolicyName, 2)
+	require.Eventually(t, func() bool {
+		return groupHasPolicy(svc, GroupName, indexerChunk) && groupHasPolicy(svc, "Admins", protectChunk)
+	}, 10*time.Second, 10*time.Millisecond,
+		"the refresher must attach a new chunk to the indexer group and to the guard groups")
 }
 
 // defaultGuardGroups is the group list cmd/lakefs-sso/main.go passes to both installation-wide
@@ -1054,9 +1453,74 @@ func newBootstrapCatalog(t *testing.T, repositories ...string) *lakefscatalog.Ca
 	return cat
 }
 
+// repositoryInfos builds the repository list the policy builders take when a test does not need
+// storage namespaces.
+func repositoryInfos(names ...string) []repositoryInfo {
+	repositories := make([]repositoryInfo, len(names))
+	for i, name := range names {
+		repositories[i] = repositoryInfo{Name: name}
+	}
+	return repositories
+}
+
+// repositoryInfosWithCompanionNamespaces builds a repository list in which every data repository
+// and its companion exist, with the companion's derived storage namespace.
+func repositoryInfosWithCompanionNamespaces(names ...string) []repositoryInfo {
+	repositories := make([]repositoryInfo, 0, len(names)*2)
+	for _, name := range names {
+		companion := icebergcatalog.MetadataRepository(name)
+		repositories = append(repositories,
+			repositoryInfo{Name: name, StorageNamespace: "s3://bucket/" + name},
+			repositoryInfo{Name: companion, StorageNamespace: "s3://bucket/" + companion})
+	}
+	return repositories
+}
+
+// groupHasPolicy reports whether group carries policy, for the Eventually loops that wait for the
+// refresher. A transient list error is just "not yet".
+func groupHasPolicy(svc auth.Service, group, policyName string) bool {
+	policies, _, err := svc.ListGroupPolicies(context.Background(), group, &model.PaginationParams{Amount: -1})
+	if err != nil {
+		return false
+	}
+	for _, policy := range policies {
+		if policy.DisplayName == policyName {
+			return true
+		}
+	}
+	return false
+}
+
+// ownedPolicyNames lists the base/chunk policies of base, at most limit of them (for diagnostics).
+func ownedPolicyNames(t *testing.T, svc auth.Service, base string, limit int) []string {
+	t.Helper()
+	policies, _, err := svc.ListPolicies(t.Context(), &model.PaginationParams{Prefix: base, Amount: limit})
+	require.NoErrorf(t, err, "list policies with prefix %s", base)
+	names := make([]string, 0, len(policies))
+	for _, policy := range policies {
+		if isOwnedPolicyName(base, policy.DisplayName) {
+			names = append(names, policy.DisplayName)
+		}
+	}
+	return names
+}
+
+// policySetNamesRepository reports whether any policy of the base/chunk set names repo.
+func policySetNamesRepository(t *testing.T, svc auth.Service, base, repo string) bool {
+	t.Helper()
+	policies, _, err := svc.ListPolicies(t.Context(), &model.PaginationParams{Prefix: base, Amount: -1})
+	require.NoErrorf(t, err, "list policies with prefix %s", base)
+	for _, policy := range policies {
+		if isOwnedPolicyName(base, policy.DisplayName) && policyNamesRepository(policy, repo) {
+			return true
+		}
+	}
+	return false
+}
+
 // policyNamesRepository reports whether a policy carries a statement below repo: its repository ARN
 // itself or an ARN of the form repository/<repo>/.... The exact statements this package builds are
-// pinned by the two statement-list tests; this predicate is for the tests that care about which
+// pinned by the statement-list tests; this predicate is for the tests that care about which
 // repositories a policy names, not about its exact text.
 func policyNamesRepository(policy *model.Policy, repo string) bool {
 	prefix := permissions.RepoArn(repo)

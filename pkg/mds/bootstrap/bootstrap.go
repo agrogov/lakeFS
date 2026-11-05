@@ -1,9 +1,22 @@
 // Package bootstrap creates and maintains the Metadata Search principals and policies of
 // METADATA_SEARCH_DESIGN.md §8 on a lakeFS installation: the mds-indexer user, the
-// MetadataSearchIndexers group, the mds-indexer allow policy and the mds-metadata-repo-protect
-// deny policy. It runs as an extra routes builder of the lakefs-sso binary, after the catalog's
+// MetadataSearchIndexers group, the mds-indexer allow policies and the mds-metadata-repo-protect
+// deny policies. It runs as an extra routes builder of the lakefs-sso binary, after the catalog's
 // own builders, and mounts no route: the principals have to exist before the first indexer request
 // is authorized, whether or not a request ever arrives.
+//
+// The companion-repository statements are split into numbered chunk policies so that no stored
+// policy can grow without bound: mds-indexer and mds-metadata-repo-protect carry the statements
+// that do not depend on a repository, and mds-indexer-<n> / mds-metadata-repo-protect-<n> carry at
+// most companionChunkSize companion repositories each. Every chunk is attached to the same group
+// as its base policy. The refresher repairs the chunks and deletes a chunk that is no longer
+// needed when the repository set shrinks; it deletes only names this package owns (the base name
+// and numeric chunk suffixes), never an operator's policy.
+//
+// An explicit metadata_search.repositories.<R>.storage_namespace that does not itself end in
+// -metadata needs an extra grant that this package must not guess. The operator puts that grant in
+// a policy of its own (for example mds-indexer-extra-storage-namespace) and attaches it to
+// MetadataSearchIndexers. The refresher does not own that name, so it survives every repair.
 //
 // The split of §8 is deliberate. Indexing writes, so mds-indexer gets write (fs:*) on the
 // companion repositories R-metadata only, plus the read actions it needs to read a data repository
@@ -34,7 +47,7 @@
 //     installation's group template does not have is skipped with a debug log, exactly as
 //     pkg/datasets.Bootstrap treats datasets-pins-protect (no installation runs both templates).
 //
-// The two policies name the companion repositories explicitly instead of matching them with a
+// The policies name the companion repositories explicitly instead of matching them with a
 // "*-metadata" wildcard. The wildcard could not express "the repository name ends in -metadata":
 // pkg/auth/wildcard.Match lets "*" span "/", so arn:lakefs:fs:::repository/*-metadata also matched
 // arn:lakefs:fs:::repository/<R>/object/-metadata (the star took "<R>/object/"), and
@@ -44,7 +57,7 @@
 // which §8 limits to reads on a data repository, was granted writes on such objects and tables, and
 // the deny made an ordinary foo-metadata/data.yml object of a data repository unwritable for every
 // guard-group member. An exact ARN per companion repository has neither problem, so the policies are
-// built from the data repositories the server knows (knownDataRepositories) and RoutesBuilder keeps
+// built from the data repositories the server knows (knownRepositories) and RoutesBuilder keeps
 // them in step with the repository list while the server runs (startPolicyRefresher). The cost of
 // that completeness is one refresh interval (policyRefreshInterval): that is the longest a repository
 // created after startup - and every repository is covered after a refresh - can be missing from the
@@ -73,6 +86,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/spf13/viper"
@@ -140,40 +154,139 @@ const (
 // below are what covers its repositories.
 const configuredRepositoriesKey = "metadata_search.repositories"
 
+// companionChunkSize is the maximum number of companion repositories whose statements one chunk
+// policy stores. With six allow statements (indexer) or at most six deny statements (protect,
+// including the exact AttachStorageNamespace deny for an existing companion) per companion, a chunk
+// stays well under MaxPolicyStoredBytes even when every companion repository ID uses the
+// 63-character maximum. A smaller chunk would only add policies; a larger one would approach
+// DynamoDB's 400 KiB item limit.
+const companionChunkSize = 64
+
+// MaxPolicyStoredBytes is the documented upper bound on the encoded value of a single metadata
+// search policy. DynamoDB stores a policy as one item and rejects an item above 400 KiB, so this cap
+// leaves ample room for the KV key and encoding overhead. TestPolicySizeAtScale checks every policy
+// generated for 1000 repositories against it.
+const MaxPolicyStoredBytes = 160 << 10
+
 // policyRefreshInterval is how often RoutesBuilder re-derives the companion repository set while the
-// server runs. It bounds how long a repository created after startup can be missing from the two
+// server runs. It bounds how long a repository created after startup can be missing from the
 // policies: the deny does not cover its companion repository and the indexer's grant does not reach
 // it (so an indexer tick fails with an authorization error instead of writing anything) until the
-// next refresh.
-const policyRefreshInterval = time.Minute
+// next refresh. It is a variable only so the tests can shorten it; production leaves the default.
+var policyRefreshInterval = time.Minute
 
-// companionRepositories maps the data repository names the server knows to the companion repositories
-// the policies have to name: R-metadata (§3.3), or the name itself when it already ends in the
-// suffix, because such a repository *is* a companion repository (icebergcatalog.IsMetadataRepository)
-// and not one whose companion would be R-metadata-metadata. Names whose companion is not a valid
-// lakeFS repository ID are dropped: an exact ARN is only exact while the name cannot carry a "/", and
-// a name such as "a/object/b" would otherwise produce an ARN of an object inside "a". The result is
-// sorted and deduplicated, so the same set of repositories always builds the same statements - which
-// is what lets ensurePolicy tell "unchanged" from "changed" instead of rewriting on every startup.
-func companionRepositories(dataRepositories []string) []string {
-	seen := make(map[string]struct{}, len(dataRepositories))
-	companions := make([]string, 0, len(dataRepositories))
-	for _, name := range dataRepositories {
-		companion := name
-		if !icebergcatalog.IsMetadataRepository(name) {
-			companion = icebergcatalog.MetadataRepository(name)
-		}
-		if !validator.ReValidRepositoryID.MatchString(companion) {
-			continue
-		}
-		if _, ok := seen[companion]; ok {
-			continue
-		}
-		seen[companion] = struct{}{}
-		companions = append(companions, companion)
+// repositoryInfo is one repository the server knows: its name and, when it exists in the
+// catalog, its storage namespace. A name that comes only from metadata_search.repositories has an
+// empty StorageNamespace until the indexer creates the repository.
+type repositoryInfo struct {
+	Name             string
+	StorageNamespace string
+}
+
+// companionRepository is one companion repository the policies name. StorageNamespace is the
+// namespace the deny must cover for fs:AttachStorageNamespace; it is empty when the companion
+// repository does not exist yet, because an exact namespace ARN cannot be derived from a name.
+type companionRepository struct {
+	Name             string
+	StorageNamespace string
+}
+
+// companionRepositories maps the repositories the server knows to the companion repositories the
+// policies have to name: R-metadata (§3.3), plus an existing repository whose own name ends in the
+// suffix only when its data repository R exists too.
+//
+// A name that ends in -metadata is not sufficient proof that the repository is a companion: before
+// Metadata Search existed an operator could create an ordinary repository named team-metadata, and
+// the indexer refuses to index such a name as a data repository (pkg/mds/config.go). Treating it as
+// a companion would give mds-indexer fs:* on an ordinary data repository and make that repository
+// unwritable for its own users. The criterion here is the data repository's existence, not the
+// lakefs.mds.init marker, because the bootstrap already has the repository list (including the
+// configured names that do not exist yet) and does not otherwise read commits; requiring the marker
+// would walk the companion's history on every refresh and would still race an indexer that has
+// created the repository but not its init commit. A repository whose data repository is gone has
+// nothing to index and is therefore an ordinary repository again.
+//
+// Names whose companion is not a valid lakeFS repository ID are dropped: an exact ARN is only exact
+// while the name cannot carry a "/", and a name such as "a/object/b" would otherwise produce an ARN
+// of an object inside "a". The result is sorted and deduplicated, so the same set of repositories
+// always builds the same statements - which is what lets ensurePolicy tell "unchanged" from
+// "changed" instead of rewriting on every startup.
+func companionRepositories(repositories []repositoryInfo) []companionRepository {
+	known := make(map[string]repositoryInfo, len(repositories))
+	for _, repository := range repositories {
+		known[repository.Name] = repository
 	}
-	slices.Sort(companions)
+	seen := make(map[string]struct{}, len(repositories))
+	companions := make([]companionRepository, 0, len(repositories))
+	add := func(name string) {
+		if !validator.ReValidRepositoryID.MatchString(name) {
+			return
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		companions = append(companions, companionRepository{
+			Name:             name,
+			StorageNamespace: known[name].StorageNamespace,
+		})
+	}
+	for _, repository := range repositories {
+		if icebergcatalog.IsMetadataRepository(repository.Name) {
+			dataRepository := strings.TrimSuffix(repository.Name, icebergcatalog.MetadataRepositorySuffix)
+			if _, ok := known[dataRepository]; !ok {
+				continue
+			}
+			add(repository.Name)
+			continue
+		}
+		add(icebergcatalog.MetadataRepository(repository.Name))
+	}
+	slices.SortFunc(companions, func(a, b companionRepository) int {
+		return strings.Compare(a.Name, b.Name)
+	})
 	return companions
+}
+
+// companionChunks splits companions into fixed-size chunks. Each chunk becomes one numbered policy
+// (see chunkPolicyName), which bounds the size of every stored policy independently of the number of
+// repositories: a policy item is one KV value (pkg/kv/msg.go), so an unchunked policy crosses
+// DynamoDB's 400 KiB item limit at roughly 560 repositories.
+func companionChunks(companions []companionRepository) [][]companionRepository {
+	chunks := make([][]companionRepository, 0, (len(companions)+companionChunkSize-1)/companionChunkSize)
+	for start := 0; start < len(companions); start += companionChunkSize {
+		end := min(start+companionChunkSize, len(companions))
+		chunks = append(chunks, companions[start:end])
+	}
+	return chunks
+}
+
+// chunkPolicyName names chunk (1-based) of base. The base name itself (chunk 0) carries
+// only the statements that do not depend on a companion repository, so every companion statement
+// lives in a mds-indexer-<n> or mds-metadata-repo-protect-<n> policy with at most companionChunkSize
+// companions.
+func chunkPolicyName(base string, chunk int) string {
+	return fmt.Sprintf("%s-%d", base, chunk)
+}
+
+// isOwnedPolicyName reports whether name is a policy this package writes: the base name or one of
+// its numeric chunks. It is deliberately narrower than a prefix match, so an operator policy such
+// as mds-indexer-extra-storage-namespace is never deleted as a stale chunk; see the R2S-6 note in
+// the package comment.
+func isOwnedPolicyName(base, name string) bool {
+	if name == base {
+		return true
+	}
+	suffix, ok := strings.CutPrefix(name, base+"-")
+	if !ok || suffix == "" {
+		return false
+	}
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // catalogResources returns the catalog ARNs of one companion repository: its namespaces, tables and
@@ -261,71 +374,83 @@ var ErrNoAuthorizer = errors.New("mds bootstrap: no auth service configured")
 // the same way for the same reason.
 var ErrMissingDeps = errors.New("mds bootstrap: metadata search is enabled and the server passed no auth service, logger or catalog")
 
-// IndexerPolicy builds the mds-indexer allow policy of §8 for dataRepositories - the data
-// repositories the server knows, whose companion repositories the statements name:
+// IndexerPolicies builds the mds-indexer allow policies of §8 for repositories - the repositories
+// the server knows, whose companion repositories the statements name. The first policy carries the
+// statements that do not depend on a repository, and the rest are numbered chunks:
 //
 //	on *                    fs:ReadRepository, fs:ListObjects, fs:ReadObject, fs:ListBranches,
 //	                        fs:ReadBranch, fs:ListCommits, fs:ReadCommit
+//	on namespace/*-metadata               fs:AttachStorageNamespace
 //	on repository/<R>-metadata and below   fs:*, and catalog:* on table/, namespace/ and view/
 //	on repository/<R>-metadata             fs:CreateRepository
-//	on namespace/*-metadata               fs:AttachStorageNamespace
 //
 // The fs:CreateRepository statements are subsumed by the fs:* statements above them; they are
 // spelled out because §8 names them as separate grants, and keeping them visible makes the policy a
 // reader can check against the design line by line. CreateRepository checks both: fs:CreateRepository
 // on the repository ARN and fs:AttachStorageNamespace on the storage-namespace ARN
-// (pkg/api/controller.go). An empty dataRepositories list leaves the read statement and the
-// namespace pattern: the indexer can read every data repository, and it can write no companion
-// repository until the next refresh names one.
-func IndexerPolicy(dataRepositories []string, ts time.Time) *model.Policy {
-	companions := companionRepositories(dataRepositories)
-	var statements model.Statements
-	statements = append(statements, model.Statement{
-		Effect:   model.StatementEffectAllow,
-		Action:   append([]string(nil), indexerReadActions...),
-		Resource: permissions.All,
-	})
-	for _, companion := range companions {
-		statements = append(statements,
-			model.Statement{
-				Effect:   model.StatementEffectAllow,
-				Action:   []string{"fs:*"},
-				Resource: permissions.RepoArn(companion),
-			},
-			model.Statement{
-				Effect:   model.StatementEffectAllow,
-				Action:   []string{"fs:*"},
-				Resource: permissions.RepoArn(companion) + "/*",
-			},
-			model.Statement{
-				Effect:   model.StatementEffectAllow,
-				Action:   []string{permissions.CreateRepositoryAction},
-				Resource: permissions.RepoArn(companion),
-			},
-		)
-		for _, resource := range catalogResources(companion) {
-			statements = append(statements, model.Statement{
-				Effect:   model.StatementEffectAllow,
-				Action:   []string{"catalog:*"},
-				Resource: resource,
-			})
-		}
-	}
-	statements = append(statements, model.Statement{
-		Effect:   model.StatementEffectAllow,
-		Action:   []string{permissions.AttachStorageNamespaceAction},
-		Resource: MetadataNamespacePattern,
-	})
-	return &model.Policy{
+// (pkg/api/controller.go). An empty repositories list leaves the read statement and the namespace
+// pattern: the indexer can read every data repository, and it can write no companion repository
+// until the next refresh names one.
+func IndexerPolicies(repositories []repositoryInfo, ts time.Time) []*model.Policy {
+	companions := companionRepositories(repositories)
+	policies := []*model.Policy{{
 		CreatedAt:   ts,
 		DisplayName: IndexerPolicyName,
-		Statement:   statements,
+		Statement: model.Statements{
+			{
+				Effect:   model.StatementEffectAllow,
+				Action:   append([]string(nil), indexerReadActions...),
+				Resource: permissions.All,
+			},
+			{
+				Effect:   model.StatementEffectAllow,
+				Action:   []string{permissions.AttachStorageNamespaceAction},
+				Resource: MetadataNamespacePattern,
+			},
+		},
+	}}
+	for chunk, chunkCompanions := range companionChunks(companions) {
+		var statements model.Statements
+		for _, companion := range chunkCompanions {
+			statements = append(statements,
+				model.Statement{
+					Effect:   model.StatementEffectAllow,
+					Action:   []string{"fs:*"},
+					Resource: permissions.RepoArn(companion.Name),
+				},
+				model.Statement{
+					Effect:   model.StatementEffectAllow,
+					Action:   []string{"fs:*"},
+					Resource: permissions.RepoArn(companion.Name) + "/*",
+				},
+				model.Statement{
+					Effect:   model.StatementEffectAllow,
+					Action:   []string{permissions.CreateRepositoryAction},
+					Resource: permissions.RepoArn(companion.Name),
+				},
+			)
+			for _, resource := range catalogResources(companion.Name) {
+				statements = append(statements, model.Statement{
+					Effect:   model.StatementEffectAllow,
+					Action:   []string{"catalog:*"},
+					Resource: resource,
+				})
+			}
+		}
+		policies = append(policies, &model.Policy{
+			CreatedAt:   ts,
+			DisplayName: chunkPolicyName(IndexerPolicyName, chunk+1),
+			Statement:   statements,
+		})
 	}
+	return policies
 }
 
-// MetadataRepoProtectPolicy builds the mds-metadata-repo-protect deny policy of §8 for
-// dataRepositories: no principal in a base group may write, delete, create, revert or update
-// anything inside a companion repository, on the fs: or on the catalog: API.
+// MetadataRepoProtectPolicies builds the mds-metadata-repo-protect deny policies of §8 for
+// repositories: no principal in a base group may write, delete, create, revert or update anything
+// inside a companion repository, on the fs: or on the catalog: API, or change the branch protection
+// rules that decide whether the indexer may commit. The first policy is empty (there is no
+// repository-independent deny); the rest are numbered chunks.
 //
 // It is a deny, so it wins over every allow, including the fs:* allow of an administrator: the
 // indexer and the catalog write there, not an operator, and a hand-edit of a served table would be
@@ -335,44 +460,67 @@ func IndexerPolicy(dataRepositories []string, ts time.Time) *model.Policy {
 // is the defect this policy's shape fixes. The policy is still installation-wide in the sense §8
 // means - it is not scoped to one repository, and a repository indexed before Metadata Search was
 // enabled is covered as long as the server can see it.
-func MetadataRepoProtectPolicy(dataRepositories []string, ts time.Time) *model.Policy {
-	companions := companionRepositories(dataRepositories)
+//
+// branches:SetBranchProtectionRules is denied because setting a rule that blocks COMMIT on a
+// companion branch stops the indexer permanently, which is a write of repository state that decides
+// whether the indexer may write. retention:SetGarbageCollectionRules and
+// retention:PrepareGarbageCollectionCommits stay allowed: they cannot remove the live index without
+// first deleting the branch (fs:DeleteBranch is denied), and an operator may legitimately set a GC
+// policy for a companion repository.
+func MetadataRepoProtectPolicies(repositories []repositoryInfo, ts time.Time) []*model.Policy {
+	companions := companionRepositories(repositories)
 	fsActions := append([]string(nil), metadataRepoProtectFSDeniedActions...)
+	repositoryActions := append(append([]string(nil), fsActions...), permissions.SetBranchProtectionRulesAction)
 	catalogActions := append([]string(nil), metadataRepoProtectCatalogDeniedActions...)
-	var statements model.Statements
-	for _, companion := range companions {
-		statements = append(statements,
-			model.Statement{
-				Effect:   model.StatementEffectDeny,
-				Action:   fsActions,
-				Resource: permissions.RepoArn(companion),
-			},
-			model.Statement{
-				Effect:   model.StatementEffectDeny,
-				Action:   fsActions,
-				Resource: permissions.RepoArn(companion) + "/*",
-			},
-		)
-		for _, resource := range catalogResources(companion) {
-			statements = append(statements, model.Statement{
-				Effect:   model.StatementEffectDeny,
-				Action:   catalogActions,
-				Resource: resource,
-			})
-		}
-	}
-	return &model.Policy{
+	policies := []*model.Policy{{
 		CreatedAt:   ts,
 		DisplayName: MetadataRepoProtectPolicyName,
-		Statement:   statements,
+		Statement:   model.Statements{},
+	}}
+	for chunk, chunkCompanions := range companionChunks(companions) {
+		var statements model.Statements
+		for _, companion := range chunkCompanions {
+			statements = append(statements,
+				model.Statement{
+					Effect:   model.StatementEffectDeny,
+					Action:   repositoryActions,
+					Resource: permissions.RepoArn(companion.Name),
+				},
+				model.Statement{
+					Effect:   model.StatementEffectDeny,
+					Action:   fsActions,
+					Resource: permissions.RepoArn(companion.Name) + "/*",
+				},
+			)
+			for _, resource := range catalogResources(companion.Name) {
+				statements = append(statements, model.Statement{
+					Effect:   model.StatementEffectDeny,
+					Action:   catalogActions,
+					Resource: resource,
+				})
+			}
+			if companion.StorageNamespace != "" {
+				statements = append(statements, model.Statement{
+					Effect:   model.StatementEffectDeny,
+					Action:   []string{permissions.AttachStorageNamespaceAction},
+					Resource: permissions.StorageNamespace(companion.StorageNamespace),
+				})
+			}
+		}
+		policies = append(policies, &model.Policy{
+			CreatedAt:   ts,
+			DisplayName: chunkPolicyName(MetadataRepoProtectPolicyName, chunk+1),
+			Statement:   statements,
+		})
 	}
+	return policies
 }
 
 // RoutesBuilder is the startup hook cmd/lakefs-sso registers with cmd.AddExtraRoutesBuilder
 // (wrapped in a closure that supplies guardGroups(), since a routes builder takes no arguments). It
 // mounts no route; it exists so the principals of §8 are installed from the same hook loop, and
 // before the first request is served, as the catalog's own controls. It also starts the refresher
-// that keeps the two policies in step with the repository list while the server runs
+// that keeps the policy set in step with the repository list while the server runs
 // (startPolicyRefresher).
 //
 // guardGroups is the deny's group list, and it must be the caller's guardGroups(): the base groups
@@ -400,19 +548,20 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, guardGroups []st
 		return ErrMissingDeps
 	}
 
-	dataRepositories, err := knownDataRepositories(ctx, deps.Catalog)
+	repositories, err := knownRepositories(ctx, deps.Catalog)
 	if err != nil {
 		return err
 	}
-	inForce, err := EnsurePrincipals(ctx, deps.AuthService, time.Now(), guardGroups, dataRepositories)
+	ts := time.Now()
+	inForce, err := EnsurePrincipals(ctx, deps.AuthService, ts, guardGroups, repositories)
 	if err != nil {
 		return err
 	}
 	fields := logging.Fields{
 		"user":                   UserName,
 		"group":                  GroupName,
-		"policies":               []string{IndexerPolicyName, MetadataRepoProtectPolicyName},
-		"companion_repositories": companionRepositories(dataRepositories),
+		"policies":               metadataSearchPolicyNames(repositories, ts),
+		"companion_repositories": companionNames(companionRepositories(repositories)),
 	}
 	if !inForce {
 		// The warning EnsurePrincipals wrote says why; this line keeps the startup summary from
@@ -423,14 +572,14 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, guardGroups []st
 	}
 	deps.Logger.WithFields(fields).
 		Info("metadata search: mds-indexer user, group and policies are in place")
-	startPolicyRefresher(ctx, deps, policyRefreshInterval)
+	startPolicyRefresher(ctx, deps, guardGroups, policyRefreshInterval)
 	return nil
 }
 
-// knownDataRepositories returns the data repositories whose companion repositories the two policies
-// have to name: every repository the catalog holds, plus the ones named in this file's
-// metadata_search.repositories section (configuredRepositoriesKey). Neither source is sufficient
-// alone:
+// knownRepositories returns the repositories whose companion repositories the policies have to
+// name: every repository the catalog holds (with its storage namespace) plus the names in this
+// file's metadata_search.repositories section (configuredRepositoriesKey), which have no namespace
+// until they exist. Neither source is sufficient alone:
 //
 //   - the catalog cannot see a repository that does not exist yet, and the indexer creates
 //     R-metadata on its first tick of R. Without the configured list, a repository created after
@@ -442,8 +591,8 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, guardGroups []st
 //
 // A configured name that is not a valid repository ID is reported and dropped; nothing is returned
 // for it, and companionRepositories applies the same filter to the catalog's names.
-func knownDataRepositories(ctx context.Context, cat *catalog.Catalog) ([]string, error) {
-	var names []string
+func knownRepositories(ctx context.Context, cat *catalog.Catalog) ([]repositoryInfo, error) {
+	byName := make(map[string]repositoryInfo)
 	after := ""
 	for {
 		repositories, hasMore, err := cat.ListRepositories(ctx, catalog.ListRepositoriesLimitMax, "", "", after)
@@ -454,7 +603,10 @@ func knownDataRepositories(ctx context.Context, cat *catalog.Catalog) ([]string,
 			if !validator.ReValidRepositoryID.MatchString(repository.Name) {
 				continue
 			}
-			names = append(names, repository.Name)
+			byName[repository.Name] = repositoryInfo{
+				Name:             repository.Name,
+				StorageNamespace: repository.StorageNamespace,
+			}
 		}
 		if !hasMore || len(repositories) == 0 {
 			break
@@ -473,14 +625,47 @@ func knownDataRepositories(ctx context.Context, cat *catalog.Catalog) ([]string,
 					"its companion repository is left out of the metadata search policies")
 			continue
 		}
-		names = append(names, name)
+		if _, ok := byName[name]; !ok {
+			byName[name] = repositoryInfo{Name: name}
+		}
 	}
 
+	names := make([]string, 0, len(byName))
+	for name := range byName {
+		names = append(names, name)
+	}
 	slices.Sort(names)
-	return names, nil
+	repositories := make([]repositoryInfo, 0, len(names))
+	for _, name := range names {
+		repositories = append(repositories, byName[name])
+	}
+	return repositories, nil
 }
 
-// startPolicyRefresher keeps the statements of both policies in step with the repositories the
+// companionNames returns the names of companions in the order companionRepositories sorted them.
+func companionNames(companions []companionRepository) []string {
+	names := make([]string, len(companions))
+	for i, companion := range companions {
+		names[i] = companion.Name
+	}
+	return names
+}
+
+// metadataSearchPolicyNames returns the names of every policy EnsurePrincipals writes for
+// repositories. It is used for the startup summary; the policies themselves are returned by
+// IndexerPolicies and MetadataRepoProtectPolicies.
+func metadataSearchPolicyNames(repositories []repositoryInfo, ts time.Time) []string {
+	names := make([]string, 0)
+	for _, policy := range IndexerPolicies(repositories, ts) {
+		names = append(names, policy.DisplayName)
+	}
+	for _, policy := range MetadataRepoProtectPolicies(repositories, ts) {
+		names = append(names, policy.DisplayName)
+	}
+	return names
+}
+
+// startPolicyRefresher keeps the statements of the policy set in step with the repositories the
 // server knows for as long as the server runs, by re-deriving the companion repository set and
 // repairing a policy whose statements changed. It is a goroutine bound to ctx because the policies
 // are otherwise a snapshot of what existed at startup, and a snapshot is the one thing an exact ARN
@@ -498,7 +683,7 @@ func knownDataRepositories(ctx context.Context, cat *catalog.Catalog) ([]string,
 //
 // The returned channel is closed when the goroutine stops. RoutesBuilder ignores it; the tests use it
 // to assert a clean stop rather than a goroutine that outlives the test's store.
-func startPolicyRefresher(ctx context.Context, deps cmdpkg.ServerDeps, interval time.Duration) <-chan struct{} {
+func startPolicyRefresher(ctx context.Context, deps cmdpkg.ServerDeps, guardGroups []string, interval time.Duration) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -510,7 +695,7 @@ func startPolicyRefresher(ctx context.Context, deps cmdpkg.ServerDeps, interval 
 				return
 			case <-ticker.C:
 			}
-			dataRepositories, err := knownDataRepositories(ctx, deps.Catalog)
+			repositories, err := knownRepositories(ctx, deps.Catalog)
 			if err != nil {
 				if ctx.Err() != nil {
 					return
@@ -518,7 +703,7 @@ func startPolicyRefresher(ctx context.Context, deps cmdpkg.ServerDeps, interval 
 				deps.Logger.WithError(err).Warn("metadata search: cannot list the repositories for the companion-repository policies; retrying on the next refresh")
 				continue
 			}
-			inForce, err := refreshPolicies(ctx, deps.AuthService, dataRepositories, time.Now())
+			inForce, err := refreshPolicies(ctx, deps.AuthService, repositories, guardGroups, time.Now())
 			if err != nil {
 				if ctx.Err() != nil {
 					return
@@ -535,12 +720,12 @@ func startPolicyRefresher(ctx context.Context, deps cmdpkg.ServerDeps, interval 
 }
 
 // EnsurePrincipals makes the principals and policies of §8 exist, with exactly their built-in
-// statements, and attaches them:
+// statements, and attaches every policy of the set:
 //
 //	user   mds-indexer             member of MetadataSearchIndexers
-//	group  MetadataSearchIndexers  carries mds-indexer, never mds-metadata-repo-protect
-//	policy mds-indexer             allow, attached to MetadataSearchIndexers
-//	policy mds-metadata-repo-protect  deny, attached to guardGroups minus MetadataSearchIndexers
+//	group  MetadataSearchIndexers  carries mds-indexer and its chunks, never mds-metadata-repo-protect
+//	policies mds-indexer[-<n>]          allow, attached to MetadataSearchIndexers
+//	policies mds-metadata-repo-protect[-<n>]  deny, attached to guardGroups minus MetadataSearchIndexers
 //
 // guardGroups is the full list of groups that must carry the deny - the same list
 // iceberg-reserved-prefix-protect uses, which cmd/lakefs-sso computes once in guardGroups() as
@@ -549,11 +734,11 @@ func startPolicyRefresher(ctx context.Context, deps cmdpkg.ServerDeps, interval 
 // an operator's datasets.immutable_guard_groups once silently got no deny: the list must be the
 // catalog's list, not a second copy of it. A nil or empty list attaches the deny to no group.
 //
-// dataRepositories are the data repositories the server knows; both policies name their companion
-// repositories explicitly (§8, and the package comment explains why a "*-metadata" pattern is not
-// an option). A nil list is allowed and builds the read-only allow and an empty deny: it is what a
-// server that knows no repository yet - and is configured with none - has to offer until its
-// refresher learns about one.
+// repositories are the repositories the server knows, with their storage namespaces; every policy
+// names its companion repositories explicitly (§8, and the package comment explains why a
+// "*-metadata" pattern is not an option). A nil list is allowed and builds the read-only allow and
+// an empty deny: it is what a server that knows no repository yet - and is configured with none -
+// has to offer until its refresher learns about one.
 //
 // ts is the creation timestamp recorded on entities that have to be created (the caller passes
 // time.Now(), as the datasets and catalog bootstraps do).
@@ -568,7 +753,7 @@ func startPolicyRefresher(ctx context.Context, deps cmdpkg.ServerDeps, interval 
 // refusing to start it. That case is a warning naming the consequence and a nil error; every other
 // error is returned, so a genuine failure on a backend that does store policies still fails
 // startup. See icebergcatalog.EnsureReservedPrefixProtectPolicy for the same contract.
-func EnsurePrincipals(ctx context.Context, authService auth.Service, ts time.Time, guardGroups, dataRepositories []string) (bool, error) {
+func EnsurePrincipals(ctx context.Context, authService auth.Service, ts time.Time, guardGroups []string, repositories []repositoryInfo) (bool, error) {
 	if authService == nil {
 		return false, ErrNoAuthorizer
 	}
@@ -595,59 +780,129 @@ func EnsurePrincipals(ctx context.Context, authService auth.Service, ts time.Tim
 		return false, fmt.Errorf("mds bootstrap: add user %s to group %s: %w", UserName, GroupName, err)
 	}
 
-	// Create or repair both policies before attaching them, so an attachment never points at a
-	// policy that does not exist yet.
-	inForce, err := refreshPolicies(ctx, authService, dataRepositories, ts)
+	// Create or repair the whole policy set, attach every policy to the groups it belongs to, and
+	// remove chunks that are no longer needed. Attaching inside the same repair is what lets the
+	// refresher attach a new chunk when the repository set grows past a chunk boundary.
+	inForce, err := refreshPolicies(ctx, authService, repositories, guardGroups, ts)
 	if err != nil || !inForce {
 		return false, err
 	}
+	return true, nil
+}
 
-	// The indexer policy goes to its own group only: attaching it to a base group would grant every
-	// member of that group the companion repositories' write path.
-	if err := authService.AttachPolicyToGroup(ctx, IndexerPolicyName, GroupName); err != nil && !errors.Is(err, auth.ErrAlreadyExists) {
-		if policyBackendUnavailable(err) {
-			logPrincipalsNotCreated(ctx, err)
-			return false, nil
-		}
-		return false, fmt.Errorf("mds bootstrap: attach policy %s to group %s: %w", IndexerPolicyName, GroupName, err)
+// policySet is the complete set of policies EnsurePrincipals writes for one repository list: the
+// indexer allow policies and the metadata-repo deny policies, each a base policy plus zero or more
+// numbered chunks.
+type policySet struct {
+	indexer []*model.Policy
+	protect []*model.Policy
+}
+
+// refreshPolicies creates or repairs the policy set of §8 for repositories, removes chunk policies
+// that are no longer needed, and reports whether the set is in force. It is the part of
+// EnsurePrincipals that the refresher repeats while the server runs (startPolicyRefresher): the
+// user, the group and the attachments do not depend on the repository list, but the statements do,
+// so a repository that appears after startup only needs the statements rewritten - and ensurePolicy
+// rewrites them only when they actually differ, which is why an unchanged repository set costs a
+// handful of reads and no write.
+func refreshPolicies(ctx context.Context, authService auth.Service, repositories []repositoryInfo, guardGroups []string, ts time.Time) (bool, error) {
+	policies := &policySet{
+		indexer: IndexerPolicies(repositories, ts),
+		protect: MetadataRepoProtectPolicies(repositories, ts),
 	}
+	desired := make(map[string]struct{}, len(policies.indexer)+len(policies.protect))
+	for _, policy := range append(append([]*model.Policy(nil), policies.indexer...), policies.protect...) {
+		inForce, err := ensurePolicy(ctx, authService, policy)
+		if err != nil || !inForce {
+			return false, err
+		}
+		desired[policy.DisplayName] = struct{}{}
+	}
+	for _, base := range []string{IndexerPolicyName, MetadataRepoProtectPolicyName} {
+		if err := removeStalePolicyChunks(ctx, authService, base, desired); err != nil {
+			if policyBackendUnavailable(err) {
+				logPrincipalsNotCreated(ctx, err)
+				return false, nil
+			}
+			return false, err
+		}
+	}
+	inForce, err := attachPolicies(ctx, authService, policies, guardGroups)
+	if err != nil || !inForce {
+		return false, err
+	}
+	return true, nil
+}
 
-	// The deny goes to the guard list the caller supplied - the same base groups plus
-	// datasets.immutable_guard_groups that datasets-pins-protect and iceberg-reserved-prefix-protect
-	// cover (§8) - minus MetadataSearchIndexers: the indexer is the one principal that must be able
-	// to write a companion repository, so the deny must never reach it.
+// attachPolicies attaches every indexer policy to MetadataSearchIndexers and every deny policy to
+// the caller's guard groups. It is idempotent (auth.ErrAlreadyExists is success), so the refresher
+// can use it to attach a chunk created after a repository set grew past a chunk boundary. The
+// indexer policies go to their own group only: attaching them to a base group would grant every
+// member of that group the companion repositories' write path. The deny policies go to the guard
+// list the caller supplied - the same base groups plus datasets.immutable_guard_groups that
+// datasets-pins-protect and iceberg-reserved-prefix-protect cover (§8) - minus
+// MetadataSearchIndexers: the indexer is the one principal that must be able to write a companion
+// repository, so the deny must never reach it.
+func attachPolicies(ctx context.Context, authService auth.Service, policies *policySet, guardGroups []string) (bool, error) {
+	for _, policy := range policies.indexer {
+		if err := authService.AttachPolicyToGroup(ctx, policy.DisplayName, GroupName); err != nil && !errors.Is(err, auth.ErrAlreadyExists) {
+			if policyBackendUnavailable(err) {
+				logPrincipalsNotCreated(ctx, err)
+				return false, nil
+			}
+			return false, fmt.Errorf("mds bootstrap: attach policy %s to group %s: %w", policy.DisplayName, GroupName, err)
+		}
+	}
 	for _, group := range metadataRepoProtectGroups(ctx, guardGroups) {
-		err := authService.AttachPolicyToGroup(ctx, MetadataRepoProtectPolicyName, group)
-		switch {
-		case err == nil, errors.Is(err, auth.ErrAlreadyExists):
-		case errors.Is(err, auth.ErrNotFound):
-			logging.FromContext(ctx).WithField("group", group).
-				Debug("mds bootstrap: group is not part of this installation's template; skipping metadata-repo deny attachment")
-		case policyBackendUnavailable(err):
-			logPrincipalsNotCreated(ctx, err)
-			return false, nil
-		default:
-			return false, fmt.Errorf("mds bootstrap: attach policy %s to group %s: %w",
-				MetadataRepoProtectPolicyName, group, err)
+		for _, policy := range policies.protect {
+			err := authService.AttachPolicyToGroup(ctx, policy.DisplayName, group)
+			switch {
+			case err == nil, errors.Is(err, auth.ErrAlreadyExists):
+			case errors.Is(err, auth.ErrNotFound):
+				logging.FromContext(ctx).WithField("group", group).
+					Debug("mds bootstrap: group is not part of this installation's template; skipping metadata-repo deny attachment")
+			case policyBackendUnavailable(err):
+				logPrincipalsNotCreated(ctx, err)
+				return false, nil
+			default:
+				return false, fmt.Errorf("mds bootstrap: attach policy %s to group %s: %w", policy.DisplayName, group, err)
+			}
 		}
 	}
 	return true, nil
 }
 
-// refreshPolicies creates or repairs both policies of §8 for dataRepositories and reports whether
-// they are in force. It is the part of EnsurePrincipals that the refresher repeats while the server
-// runs (startPolicyRefresher): the user, the group and the attachments do not depend on the
-// repository list, but the statements do, so a repository that appears after startup only needs the
-// statements rewritten - and ensurePolicy rewrites them only when they actually differ, which is why
-// an unchanged repository set costs two reads and no write.
-func refreshPolicies(ctx context.Context, authService auth.Service, dataRepositories []string, ts time.Time) (bool, error) {
-	for _, policy := range []*model.Policy{IndexerPolicy(dataRepositories, ts), MetadataRepoProtectPolicy(dataRepositories, ts)} {
-		inForce, err := ensurePolicy(ctx, authService, policy)
-		if err != nil || !inForce {
-			return false, err
+// removeStalePolicyChunks deletes the numbered chunk policies of base that desired does not name.
+// The repository set can shrink (a repository is deleted, or a legacy *-metadata repository turns
+// out not to be a companion), and a chunk that still named a deleted companion would keep both its
+// grant and its deny alive. Only names isOwnedPolicyName accepts are considered: an operator policy
+// that merely shares the base prefix is never deleted.
+func removeStalePolicyChunks(ctx context.Context, authService auth.Service, base string, desired map[string]struct{}) error {
+	params := &model.PaginationParams{Prefix: base, Amount: -1}
+	for {
+		policies, paginator, err := authService.ListPolicies(ctx, params)
+		if err != nil {
+			return fmt.Errorf("mds bootstrap: list policies with prefix %s: %w", base, err)
 		}
+		for _, policy := range policies {
+			if !isOwnedPolicyName(base, policy.DisplayName) {
+				continue
+			}
+			if _, ok := desired[policy.DisplayName]; ok {
+				continue
+			}
+			if err := authService.DeletePolicy(ctx, policy.DisplayName); err != nil && !errors.Is(err, auth.ErrNotFound) {
+				return fmt.Errorf("mds bootstrap: delete stale policy %s: %w", policy.DisplayName, err)
+			}
+			purgePolicyCache(authService)
+			logging.FromContext(ctx).WithField("policy", policy.DisplayName).
+				Warn("mds bootstrap: removed a stale metadata search policy chunk")
+		}
+		if paginator == nil || paginator.NextPageToken == "" {
+			return nil
+		}
+		params.After = paginator.NextPageToken
 	}
-	return true, nil
 }
 
 // metadataRepoProtectGroups returns the groups the deny is attached to: guardGroups deduplicated,
@@ -724,6 +979,10 @@ func ensurePolicy(ctx context.Context, authService auth.Service, policy *model.P
 			}
 			return false, fmt.Errorf("mds bootstrap: rewrite policy %s: %w", policy.DisplayName, err)
 		}
+		// An external auth service (pkg/auth.APIAuthService) caches every user's effective
+		// policies and does not purge that cache in WritePolicy. Without this, the one-minute
+		// refresh window would really be one minute plus auth.cache.ttl (20s) and its jitter.
+		purgePolicyCache(authService)
 		logging.FromContext(ctx).WithField("policy", policy.DisplayName).
 			Warn("mds bootstrap: rewrote a metadata search policy whose statements did not match")
 		return true, nil
@@ -735,6 +994,7 @@ func ensurePolicy(ctx context.Context, authService auth.Service, policy *model.P
 			}
 			return false, fmt.Errorf("mds bootstrap: create policy %s: %w", policy.DisplayName, err)
 		}
+		purgePolicyCache(authService)
 		return true, nil
 	case policyBackendUnavailable(err):
 		logPrincipalsNotCreated(ctx, err)
@@ -742,6 +1002,17 @@ func ensurePolicy(ctx context.Context, authService auth.Service, policy *model.P
 	default:
 		return false, fmt.Errorf("mds bootstrap: read policy %s: %w", policy.DisplayName, err)
 	}
+}
+
+// purgePolicyCache clears the auth service's per-user effective-policy cache after a policy
+// changes, when the service has one. A service without a cache - a stub in a test, or a
+// BasicAuthService that never reaches this path - keeps working because a nil Cache is a no-op.
+func purgePolicyCache(authService auth.Service) {
+	policyCache := authService.Cache()
+	if policyCache == nil {
+		return
+	}
+	policyCache.PurgePolicies()
 }
 
 // policyBackendUnavailable reports whether err is the auth service saying it has no policy backend
@@ -758,7 +1029,7 @@ func policyBackendUnavailable(err error) bool {
 }
 
 // logPrincipalsNotCreated reports the one degraded startup EnsurePrincipals accepts: the auth
-// service cannot manage policies, so the mds-indexer user, its group and both policies were not
+// service cannot manage policies, so the mds-indexer user, its group and the policy set were not
 // created or attached. The message names the consequence rather than the error alone, because an
 // operator who reads only this line has to learn that the indexer cannot be authorized and that
 // companion repositories are not write-protected in this deployment.
