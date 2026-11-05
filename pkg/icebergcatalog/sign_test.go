@@ -588,6 +588,11 @@ func newSignResolverFixture(t *testing.T) *signResolverFixture {
 	metaStorageNamespace := fmt.Sprintf("s3://iceberg-sign-mds-%d-ns", seq)
 	_, err := base.catalog.CreateRepository(ctx, metaRepo, "", metaStorageNamespace, tablesTestRef, false)
 	require.NoError(t, err, "create the companion repository")
+	// The indexer's initialisation commit is the state a forger cannot write into metadata.json
+	// (MDS-SEC-3): the catalog serves the companion table only while the mirrored branch carries it.
+	// The fixture's catalog block adapter cannot write the s3:// namespace, so the commit is a
+	// commit record on the root's meta-range rather than a full commit; the history is the same.
+	addResolverInitCommitRecord(t, base.catalog, metaRepo, tablesTestRef, tablesTestRepo)
 	metaNamespaceAddr := Address{Repo: metaRepo, Ref: tablesTestRef, Namespace: Namespace{SystemNamespace}}
 	require.NoError(t, store.CreateNamespace(ctx, metaNamespaceAddr, map[string]string{"owner": "mds"}),
 		"create the system namespace of the companion repository")
