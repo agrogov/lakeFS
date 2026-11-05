@@ -46,9 +46,16 @@ const (
 	ColumnCreationDate = "creation_date"
 )
 
-// The fixed field IDs of §3.1. They are written into every data and delete file, so they are part
-// of the table's compatibility surface: an added column takes a new ID, and an existing ID never
-// changes meaning.
+// The fixed field IDs of §3.1. They are the IDs of the created table - the ones written into
+// every data and delete file - so they are part of the table's compatibility surface: an added
+// column takes a new ID, and an existing ID never changes meaning.
+//
+// The create request of Schema is built in the same pre-order as the created table, so these IDs
+// also appear in the request. The catalog still owns the numbering: iceberg-go's
+// NewMetadataWithUUID reassigns every ID in pre-order (AssignFreshSchemaIDs) when it applies the
+// request, and that pass is a no-op on a request in this order. Readers and the writer therefore
+// take the IDs from the loaded table (Table.Schema()), never from these constants; a test pins
+// that the two agree at creation.
 const (
 	FieldRepository   = 1
 	FieldPath         = 2
@@ -57,15 +64,20 @@ const (
 	FieldLastModified = 5
 	FieldETag         = 6
 	FieldUserMetadata = 7
-	FieldCommitter    = 8
-	FieldContentType  = 9
-	FieldCreationDate = 10
 
 	// FieldUserMetadataKey and FieldUserMetadataValue are the IDs of the map's key and value
-	// types of user_metadata (§3.1). The value is required, so an empty map - never a null - is
-	// how an object without user metadata is stored.
-	FieldUserMetadataKey   = 11
-	FieldUserMetadataValue = 12
+	// types of user_metadata (§3.1). They follow the map field in the catalog's pre-order
+	// renumbering: the key and value are user_metadata's children, so they take IDs 8 and 9 and
+	// the trailing columns continue at 10. The value is optional (§3.1); an empty map - never a
+	// null - is how an object without user metadata is stored.
+	FieldUserMetadataKey   = 8
+	FieldUserMetadataValue = 9
+
+	// The trailing optional columns. Their IDs skip the map's key and value, which come before
+	// them in the created table's pre-order numbering (§3.1).
+	FieldCommitter    = 10
+	FieldContentType  = 11
+	FieldCreationDate = 12
 )
 
 // The table property names of §3.1 and §4.3.
@@ -116,23 +128,23 @@ const (
 //	4  size_bytes     long              required
 //	5  last_modified  timestamptz       required
 //	6  etag           string            required
-//	7  user_metadata  map<string,string> required  (key 11, value 12)
-//	8  committer      string            optional
-//	9  content_type   string            optional
-//	10 creation_date  timestamptz       optional
+//	7  user_metadata  map<string,string> required  (key 8, value 9)
+//	10 committer      string            optional
+//	11 content_type   string            optional
+//	12 creation_date  timestamptz       optional
 //
 // The identifier is the path field alone, as §3.1 fixes it. The returned schema is a fresh value
 // on every call, so a caller may not rely on pointer identity.
 //
-// The IDs above are what the design asks for and what this schema carries *in the create
-// request*. The catalog assigns the IDs itself when it applies the request - iceberg-go's
-// NewMetadataWithUUID reassigns every ID in pre-order - so the created table's IDs are 1-7 for the
-// first seven columns, 8 and 9 for the map's key and value, and 10, 11, 12 for committer,
-// content_type and creation_date. The column set, the types, the requiredness and the identifier
-// field are the design's; only the numbers differ, and they are stable for the life of the table,
-// which is what schema evolution (new optional fields take new IDs) needs. Reading them back is a
-// one-time check: Schema() is the create request, Table.Schema() is the authority afterwards, and
-// the writer builds its Arrow schema from the table (ArrowSchema).
+// These are the IDs of the created table. The catalog assigns them itself when it applies the
+// request (iceberg-go's NewMetadataWithUUID calls AssignFreshSchemaIDs, which renumbers every ID in
+// pre-order), so this request is built in exactly that pre-order: the map's key and value are
+// user_metadata's children and take 8 and 9, and the trailing optional columns take 10, 11 and 12.
+// The result is that the renumbering leaves the request's IDs unchanged, and the constants above
+// are the IDs a reader and the writer find on the created table. They still take them from the
+// loaded table (Table.Schema()) rather than from the constants, because the catalog owns the
+// numbering; the constants are how the create request and the compatibility surface are written
+// down, and TestCreateTableFieldIDs pins that both agree.
 func Schema() *iceberg.Schema {
 	return iceberg.NewSchemaWithIdentifiers(0, []int{FieldPath},
 		iceberg.NestedField{
@@ -160,15 +172,11 @@ func Schema() *iceberg.Schema {
 				KeyType:   iceberg.StringType{},
 				ValueID:   FieldUserMetadataValue,
 				ValueType: iceberg.StringType{},
-				// Design §3.1 declares the map value required. The value is written as optional
-				// instead, and this is a deliberate, reported deviation: iceberg-go v0.7.0 reads a
-				// parquet map column with nullable items even when the Iceberg schema says the
-				// value is required, and its copy-on-write rewrite and compaction paths then
-				// refuse their own records ("record schema does not match writer's"). With a
-				// required value the merge-on-read delta works but the copy-on-write fallback
-				// (design §13) and compaction (§4.9) cannot. Rows are unaffected: this package
-				// always writes a value for every key and an empty map - never a null - for an
-				// object without user metadata.
+				// Design §3.1 declares the map value optional: iceberg-go v0.7.0 reads a parquet
+				// map column with nullable items, so a required value makes its own copy-on-write
+				// rewrite and compaction fail with "record schema does not match writer's". The
+				// indexer never writes a null value, and an object without user metadata gets an
+				// empty map - never a null - so rows are unaffected.
 				ValueRequired: false,
 			},
 		},

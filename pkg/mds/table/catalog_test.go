@@ -10,14 +10,8 @@ import (
 )
 
 // TestCreateTableSchema pins the table design of §3.1: the columns, their Iceberg types, their
-// requiredness, the identifier field and the sort order.
-//
-// The field IDs are not the literal ones of the design's table. This catalog assigns field IDs
-// itself when it applies a create request (iceberg-go's NewMetadataWithUUID reassigns every ID in
-// pre-order), so user_metadata's key and value take the IDs after the map field and the trailing
-// optional columns follow them. The column set, the types, the requiredness and the identifier
-// are exactly the design's, and once created the IDs are stable, which is what schema evolution
-// and the fixed schema require. See Schema's documentation.
+// requiredness, the identifier field and the sort order. The field IDs of the created table are
+// pinned separately, in TestCreateTableFieldIDs.
 func TestCreateTableSchema(t *testing.T) {
 	env := newTestEnv(t)
 	tbl := env.createTable(t)
@@ -55,9 +49,11 @@ func TestCreateTableSchema(t *testing.T) {
 	require.True(t, ok, "user_metadata is a map")
 	require.Equal(t, iceberg.StringType{}, mapType.KeyType)
 	require.Equal(t, iceberg.StringType{}, mapType.ValueType)
-	// Design §3.1 says the map value is required. It is optional here for the reason Schema
-	// documents: iceberg-go cannot rewrite a table whose map value it reads back as nullable.
-	require.False(t, mapType.ValueRequired, "the map value is optional; see Schema")
+	// Design §3.1 declares the map value optional: iceberg-go reads a parquet map column with
+	// nullable items, so a required value breaks its own copy-on-write rewrite and compaction.
+	// The indexer still never writes a null value, and an empty map - never a null - is an
+	// object without user metadata.
+	require.False(t, mapType.ValueRequired, "the map value is optional (§3.1)")
 	require.NotZero(t, mapType.KeyID, "the map key has an ID")
 	require.NotZero(t, mapType.ValueID, "the map value has an ID")
 
@@ -68,6 +64,71 @@ func TestCreateTableSchema(t *testing.T) {
 	field := order.Field(0)
 	require.Equal(t, path.ID, field.SourceID())
 	require.Equal(t, "asc", string(field.Direction))
+}
+
+// TestCreateTableFieldIDs pins every field ID of a created table (§3.1): 1-7 for the columns up to
+// and including user_metadata, 8 and 9 for the map's key and value (they sit inside user_metadata,
+// so the catalog's pre-order renumbering gives them the IDs right after the map field), and 10-12
+// for the trailing optional columns. The IDs are written into every data and delete file, so they
+// are part of the table's compatibility surface: a change to them is a schema change, not a
+// refactoring.
+//
+// The test also pins the two ways those numbers enter the code: the constants of schema.go, and
+// the create request Schema returns. The catalog renumbers the request in pre-order
+// (iceberg-go's NewMetadataWithUUID calls AssignFreshSchemaIDs), so a request built in the created
+// table's pre-order keeps its IDs. Readers and the writer still take them from the loaded table
+// (Table.Schema()), never from a constant; this test only says the two agree at creation.
+func TestCreateTableFieldIDs(t *testing.T) {
+	env := newTestEnv(t)
+	tbl := env.createTable(t)
+	schema := tbl.Schema()
+
+	want := []struct {
+		name string
+		id   int
+	}{
+		{table.ColumnRepository, table.FieldRepository},
+		{table.ColumnPath, table.FieldPath},
+		{table.ColumnCommitID, table.FieldCommitID},
+		{table.ColumnSizeBytes, table.FieldSizeBytes},
+		{table.ColumnLastModified, table.FieldLastModified},
+		{table.ColumnETag, table.FieldETag},
+		{table.ColumnUserMetadata, table.FieldUserMetadata},
+		{table.ColumnCommitter, table.FieldCommitter},
+		{table.ColumnContentType, table.FieldContentType},
+		{table.ColumnCreationDate, table.FieldCreationDate},
+	}
+	// The literal IDs of §3.1's table, spelled out so that the constants cannot drift silently.
+	literal := []int{1, 2, 3, 4, 5, 6, 7, 10, 11, 12}
+	require.Len(t, schema.Fields(), len(want))
+	for i, field := range schema.Fields() {
+		require.Equal(t, want[i].name, field.Name, "column %d", i)
+		require.Equal(t, literal[i], field.ID, "the created ID of column %s", field.Name)
+		require.Equal(t, want[i].id, field.ID, "the constant for column %s is the created ID", field.Name)
+	}
+
+	userMetadata, ok := schema.FindFieldByName(table.ColumnUserMetadata)
+	require.True(t, ok, "user_metadata is a column")
+	mapType, ok := userMetadata.Type.(*iceberg.MapType)
+	require.True(t, ok, "user_metadata is a map")
+	require.Equal(t, 8, mapType.KeyID, "the created ID of the map key")
+	require.Equal(t, 9, mapType.ValueID, "the created ID of the map value")
+	require.Equal(t, table.FieldUserMetadataKey, mapType.KeyID, "the constant FieldUserMetadataKey is the created key ID")
+	require.Equal(t, table.FieldUserMetadataValue, mapType.ValueID, "the constant FieldUserMetadataValue is the created value ID")
+
+	// The create request carries the created table's IDs, so the catalog's renumbering is a no-op.
+	request := table.Schema()
+	require.Len(t, request.Fields(), len(want))
+	for i, field := range request.Fields() {
+		require.Equal(t, schema.Fields()[i].ID, field.ID, "the create request ID of column %s", field.Name)
+	}
+	requestMap, ok := request.Fields()[6].Type.(*iceberg.MapType)
+	require.True(t, ok, "the create request's user_metadata is a map")
+	require.Equal(t, mapType.KeyID, requestMap.KeyID, "the create request's map key ID")
+	require.Equal(t, mapType.ValueID, requestMap.ValueID, "the create request's map value ID")
+
+	// Identifier ids are rewritten by the same pass; path keeps ID 2.
+	require.Equal(t, []int{2}, schema.IdentifierFieldIDs, "the identifier field is path (ID 2)")
 }
 
 // TestCreateTableProperties pins the table properties of §3.1.
