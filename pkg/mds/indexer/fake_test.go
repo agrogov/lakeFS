@@ -73,6 +73,18 @@ type fake struct {
 	applyCalls          int
 	rebuildCalls        int
 	compactCalls        int
+	// createTableCalls counts CreateTable requests, including the ones that answer ErrTableExists:
+	// an initialisation that re-enters itself calls it again (R2I-1).
+	createTableCalls int
+	// findMergeBaseCalls counts §4.2 step 4 reads, so a caught-up tick can assert zero (R2I-2).
+	findMergeBaseCalls int
+
+	// protectedCommit and protectedStagingWrite model branch protection: lakeFS refuses a commit
+	// to a COMMIT-blocked branch and any staging write (Set, Reset, a catalog staging write) to a
+	// STAGING_WRITE-blocked one with 403 (pkg/graveler/branch/protection_manager.go,
+	// pkg/graveler/graveler.go Commit/Reset/HardReset, pkg/api/controller.go handleApiErrorCallback).
+	protectedCommit       map[string]bool
+	protectedStagingWrite map[string]bool
 
 	// dataBranchHook, when set, is run for every head read that starts a branch tick of a data
 	// repository (indexer.runBranchOnce reads it with GetCommit). It receives the commit ID the
@@ -134,9 +146,12 @@ type tagCreation struct {
 // fakeState is the table state of one branch: what a snapshot of the table holds.
 type fakeState struct {
 	sourceCommit string
-	rows         map[string]table.Row
-	snapshots    int
-	deleteFiles  int
+	// repository is the table's lakefs.mds.repository property (§3.1): initialise refuses a staged
+	// table whose value is not the data repository it is initialising (R2I-4).
+	repository  string
+	rows        map[string]table.Row
+	snapshots   int
+	deleteFiles int
 }
 
 func newState() *fakeState { return &fakeState{rows: make(map[string]table.Row)} }
@@ -144,6 +159,7 @@ func newState() *fakeState { return &fakeState{rows: make(map[string]table.Row)}
 func (s *fakeState) clone() *fakeState {
 	clone := &fakeState{
 		sourceCommit: s.sourceCommit,
+		repository:   s.repository,
 		rows:         make(map[string]table.Row, len(s.rows)),
 		snapshots:    s.snapshots,
 		deleteFiles:  s.deleteFiles,
@@ -166,17 +182,19 @@ func (s *fakeState) paths() []string {
 
 func newFake() *fake {
 	return &fake{
-		now:          time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
-		repositories: make(map[string]client.Repository),
-		branches:     make(map[string]map[string]string),
-		commits:      make(map[string]map[string]client.Commit),
-		objects:      make(map[string]map[string][]client.ObjectStat),
-		diffs:        make(map[string]map[string][]client.Change),
-		tags:         make(map[string]map[string]string),
-		tableAt:      make(map[string]*fakeState),
-		staged:       make(map[string]*fakeState),
-		logCalls:     make(map[string]int),
-		logCommits:   make(map[string]int),
+		now:                   time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		repositories:          make(map[string]client.Repository),
+		branches:              make(map[string]map[string]string),
+		commits:               make(map[string]map[string]client.Commit),
+		objects:               make(map[string]map[string][]client.ObjectStat),
+		diffs:                 make(map[string]map[string][]client.Change),
+		tags:                  make(map[string]map[string]string),
+		tableAt:               make(map[string]*fakeState),
+		staged:                make(map[string]*fakeState),
+		logCalls:              make(map[string]int),
+		logCommits:            make(map[string]int),
+		protectedCommit:       make(map[string]bool),
+		protectedStagingWrite: make(map[string]bool),
 	}
 }
 
@@ -521,7 +539,7 @@ func (f *fake) ResetBranch(_ context.Context, repository, branch string) error {
 	// Real lakeFS resolves the branch first and answers 404 for one that does not exist, so a
 	// reset that "succeeds" on a missing branch would hide a metadata branch deleted under a
 	// tick (graveler.ErrBranchNotFound and ErrRepositoryNotFound are 404 in pkg/api/controller.go).
-	if err := f.requireWritableBranchLocked(repository, branch); err != nil {
+	if err := f.requireWritableBranchLocked(repository, branch, fakeProtectionStagingWrite); err != nil {
 		return err
 	}
 	delete(f.staged, branch)
@@ -533,7 +551,7 @@ func (f *fake) ResetBranch(_ context.Context, repository, branch string) error {
 func (f *fake) HardResetBranch(_ context.Context, repository, branch, ref string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.requireWritableBranchLocked(repository, branch); err != nil {
+	if err := f.requireWritableBranchLocked(repository, branch, fakeProtectionCommit, fakeProtectionStagingWrite); err != nil {
 		return err
 	}
 	commit, err := f.resolveLocked(repository, ref)
@@ -555,7 +573,14 @@ func (f *fake) HardResetBranch(_ context.Context, repository, branch, ref string
 // read-only repository (graveler.ErrReadOnlyRepository comes before the branch lookup in Commit,
 // Reset, ResetHard and DeleteBranch, and is http.StatusForbidden in pkg/api/controller.go). A branch
 // that exists but has no commit yet is not missing: lakeFS lets a root commit be written to it.
-func (f *fake) requireWritableBranchLocked(repository, branch string) error {
+//
+// The optional actions model branch protection: graveler.Commit/ResetHard check the COMMIT rule
+// before ReadOnly and the branch lookup, Reset/HardReset check STAGING_WRITE, and pkg/api maps
+// ErrProtectedBranch to 403 (pkg/graveler/graveler.go:2245-2257, :2577-2595, :2638-2650).
+func (f *fake) requireWritableBranchLocked(repository, branch string, actions ...string) error {
+	if err := f.protectionErrorLocked(repository, branch, actions...); err != nil {
+		return err
+	}
 	if _, ok := f.repositories[repository]; !ok {
 		return &client.NotFoundError{Operation: "get repository", Subject: repository}
 	}
@@ -568,8 +593,48 @@ func (f *fake) requireWritableBranchLocked(repository, branch string) error {
 	return nil
 }
 
+const (
+	fakeProtectionCommit       = "commit"
+	fakeProtectionStagingWrite = "staging_write"
+)
+
+// protectionErrorLocked answers a blocked action the way graveler does: the two messages are
+// graveler.ErrCommitToProtectedBranch and graveler.ErrWriteToProtectedBranch, both wrapping
+// ErrProtectedBranch, which pkg/api/controller.go maps to http.StatusForbidden.
+func (f *fake) protectionErrorLocked(repository, branch string, actions ...string) error {
+	key := repository + "@" + branch
+	for _, action := range actions {
+		switch action {
+		case fakeProtectionCommit:
+			if f.protectedCommit[key] {
+				return fmt.Errorf("commit to branch %q: cannot commit to protected branch: %w", branch, client.ErrForbidden)
+			}
+		case fakeProtectionStagingWrite:
+			if f.protectedStagingWrite[key] {
+				return fmt.Errorf("write to branch %q: cannot write to protected branch: %w", branch, client.ErrForbidden)
+			}
+		}
+	}
+	return nil
+}
+
+// protectBranch installs a branch protection rule for one branch: commit blocks COMMIT, staging
+// blocks STAGING_WRITE (a catalog staging write, Set, or Reset).
+func (f *fake) protectBranch(repository, branch string, commit, staging bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := repository + "@" + branch
+	if commit {
+		f.protectedCommit[key] = true
+	}
+	if staging {
+		f.protectedStagingWrite[key] = true
+	}
+}
+
 func (f *fake) FindMergeBase(_ context.Context, repository, sourceRef, destinationRef string) (string, error) {
 	f.mu.Lock()
+	f.findMergeBaseCalls++
 	if f.findMergeBaseErr != nil {
 		err := f.findMergeBaseErr
 		f.findMergeBaseErr = nil
@@ -780,7 +845,7 @@ func (f *fake) Commit(_ context.Context, repository, branch string, opts client.
 	// repository) is gone. Re-creating a branch under a commit instead produced a repository state
 	// lakeFS cannot have - a metadata branch whose root commit is an indexing commit - and hid the
 	// 404 a branch deleted under a tick must surface.
-	if err := f.requireWritableBranchLocked(repository, branch); err != nil {
+	if err := f.requireWritableBranchLocked(repository, branch, fakeProtectionCommit); err != nil {
 		return client.Commit{}, err
 	}
 	var state *fakeState
@@ -997,14 +1062,16 @@ func (f *fake) tableStateLocked(branch string) (*fakeState, bool) {
 	return state, ok
 }
 
-func (f *fake) CreateTable(_ context.Context, _, branch string) (indexer.Table, error) {
+func (f *fake) CreateTable(_ context.Context, dataRepository, branch string) (indexer.Table, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.createTableCalls++
 	if f.tableExists {
 		return nil, indexer.ErrTableExists
 	}
 	f.tableExists = true
 	state := newState()
+	state.repository = dataRepository
 	f.staged[branch] = state
 	return &fakeTable{f: f, branch: branch, state: state.clone()}, nil
 }
@@ -1054,6 +1121,7 @@ type fakeTable struct {
 }
 
 func (t *fakeTable) SourceCommit() string { return t.state.sourceCommit }
+func (t *fakeTable) Repository() string   { return t.state.repository }
 func (t *fakeTable) SnapshotCount() int   { return t.state.snapshots }
 func (t *fakeTable) DeleteFiles() int     { return t.state.deleteFiles }
 
@@ -1073,6 +1141,11 @@ func (t *fakeTable) Refresh(context.Context) error {
 func (t *fakeTable) ApplyDelta(_ context.Context, upserts []table.Row, deletes []string, sourceCommit string) error {
 	t.f.mu.Lock()
 	defer t.f.mu.Unlock()
+	// A catalog staging write on a STAGING_WRITE-blocked branch is refused with 403
+	// (pkg/icebergcatalog/tables.go maps graveler.ErrWriteToProtectedBranch to ForbiddenException).
+	if err := t.f.protectionErrorLocked(t.f.metadataRepo, t.branch, fakeProtectionStagingWrite); err != nil {
+		return err
+	}
 	t.f.applyCalls++
 	if len(t.f.applyErrors) > 0 {
 		err := t.f.applyErrors[0]
@@ -1103,6 +1176,10 @@ func (t *fakeTable) ApplyDelta(_ context.Context, upserts []table.Row, deletes [
 
 func (t *fakeTable) Rebuild(_ context.Context, rows table.Rows, sourceCommit string) error {
 	t.f.mu.Lock()
+	if err := t.f.protectionErrorLocked(t.f.metadataRepo, t.branch, fakeProtectionStagingWrite); err != nil {
+		t.f.mu.Unlock()
+		return err
+	}
 	t.f.rebuildCalls++
 	if t.f.rebuildErr != nil {
 		err := t.f.rebuildErr
@@ -1115,6 +1192,7 @@ func (t *fakeTable) Rebuild(_ context.Context, rows table.Rows, sourceCommit str
 	// The row source reads the fake's objects, so it runs without the lock: a rebuild streams its
 	// rows through the writer, and holding the lock here would deadlock the lakeFS it reads from.
 	next := newState()
+	next.repository = t.state.repository
 	for row, err := range rows {
 		if err != nil {
 			return err
@@ -1134,6 +1212,9 @@ func (t *fakeTable) Rebuild(_ context.Context, rows table.Rows, sourceCommit str
 func (t *fakeTable) Compact(_ context.Context, sourceCommit string) error {
 	t.f.mu.Lock()
 	defer t.f.mu.Unlock()
+	if err := t.f.protectionErrorLocked(t.f.metadataRepo, t.branch, fakeProtectionStagingWrite); err != nil {
+		return err
+	}
 	t.f.compactCalls++
 	if t.f.compactErr != nil {
 		err := t.f.compactErr

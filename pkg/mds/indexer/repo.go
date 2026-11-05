@@ -16,9 +16,11 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/apache/iceberg-go/catalog/rest"
 	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/mds/client"
+	"github.com/treeverse/lakefs/pkg/mds/table"
 )
 
 // automaticCreationCommitMessage is the message lakeFS gives the root commit of a non-bare
@@ -34,8 +36,59 @@ const automaticCreationCommitMessage = "Repository created"
 // branch would report the same error on every tick, /_health would stay 503 and tag retention would
 // never run. A branch-protection rule that blocks COMMIT on the companion's branches has the same
 // effect but is not visible in the repository record; the error names both causes, and the
-// repository is refused once per tick instead of failing every branch of it.
+// repository is refused once per tick instead of failing every branch of it. A protection rule is
+// detected at the first write lakeFS refuses (Commit, ResetBranch or HardResetBranch, or a catalog
+// write that stages on the branch), because the API does not report the rule on the repository.
 var ErrReadOnlyMetadataRepository = errors.New("the companion repository is read-only")
+
+// metadataBranchWriteError answers the 403 of a write to R-metadata with a repository-level error.
+// lakeFS refuses a write to a branch whose protection rule blocks COMMIT or STAGING_WRITE
+// (graveler.ErrCommitToProtectedBranch/ErrWriteToProtectedBranch, both wrapping ErrProtectedBranch)
+// and to a read-only repository (ErrReadOnlyRepository); pkg/api/controller.go maps both to
+// http.StatusForbidden. The write-sign path of the catalog answers the same status for a staging
+// write (pkg/icebergcatalog/tables.go), which iceberg-go reports as rest.ErrForbidden. Naming the
+// cause once per refused write is what an operator can act on; leaving the raw 403 made every tick
+// look like a transient failure (TS-4, R2I-3).
+func metadataBranchWriteError(metadata, branch string, err error) error {
+	if err == nil || errors.Is(err, ErrReadOnlyMetadataRepository) {
+		return err
+	}
+	if !errors.Is(err, client.ErrForbidden) && !errors.Is(err, rest.ErrForbidden) {
+		return err
+	}
+	return fmt.Errorf("%w: lakeFS refused a write to %q@%s: a branch protection rule blocks COMMIT or STAGING_WRITE on it, or the repository is read-only (%w); remove the rule or create the repository with read_only=false",
+		ErrReadOnlyMetadataRepository, metadata, branch, err)
+}
+
+// tableOwnership is the optional part of a Table handle that knows the table's
+// lakefs.mds.repository property. The Table seam predates the ownership check of §4.8; a store that
+// does not expose the property is left to the existing behaviour rather than refusing every
+// initialisation.
+type tableOwnership interface {
+	Repository() string
+}
+
+// verifyTableOwnership refuses a staged table that belongs to another data repository (R2I-4).
+// §4.8 refuses a companion repository the indexer did not create; the same rule has to cover the
+// table it did not create, because initialise commits whatever table is staged, with that table's
+// location, schema and properties.
+func verifyTableOwnership(tbl Table, repository string) error {
+	owner, ok := tbl.(tableOwnership)
+	if !ok {
+		return nil
+	}
+	if owner.Repository() == repository {
+		return nil
+	}
+	return fmt.Errorf("%w: the staged table records %s=%q, not %q",
+		ErrForeignRepository, table.PropertyRepository, owner.Repository(), repository)
+}
+
+// Repository implements tableOwnership for the production table handle. It lives here, next to the
+// check that consumes it, so the Table interface of tables.go stays the seam M3 defined.
+func (t *icebergTable) Repository() string {
+	return t.table.Properties()[table.PropertyRepository]
+}
 
 // ensureMetadataRepository makes sure R-metadata of a configured repository exists, is one this
 // indexer created, and is initialised (§3.3, §4.8). It returns the name of the companion
@@ -147,7 +200,7 @@ func (x *Indexer) ensureInitialised(ctx context.Context, repository, metadata, d
 	case err != nil:
 		return fmt.Errorf("head of %q@%s: %w", metadata, branch, err)
 	default:
-		state, err = x.verifyInitCommit(ctx, repository, metadata, branch)
+		state, err = x.verifyInitCommit(ctx, repository, metadata, branch, true)
 	}
 	if err != nil {
 		return err
@@ -183,7 +236,7 @@ func (x *Indexer) ensureInitialised(ctx context.Context, repository, metadata, d
 // calls is the same as before for a healthy repository - the run and the root sit at the bottom of
 // its history - but a refusal is decided at the commit that makes it one instead of after reading
 // the whole history into memory first.
-func (x *Indexer) verifyInitCommit(ctx context.Context, repository, metadata, branch string) (metadataState, error) {
+func (x *Indexer) verifyInitCommit(ctx context.Context, repository, metadata, branch string, completeInitialisation bool) (metadataState, error) {
 	scan := &initScan{}
 	if err := x.walkFirstParent(ctx, metadata, branch, scan.visit); err != nil {
 		return metadataState{}, err
@@ -194,6 +247,13 @@ func (x *Indexer) verifyInitCommit(ctx context.Context, repository, metadata, br
 	case scan.accepted():
 		return metadataState{defaultBranch: branch, initCommit: scan.initCommit.ID, initialised: true}, nil
 	case scan.freshAutomaticRoot():
+		if !completeInitialisation {
+			// initialise calls this after its own commit was refused with a 400. A branch that still
+			// shows only the automatic root has no other replica's initialisation to adopt, so the
+			// 400 was not a lost race: report it instead of entering initialise again, which would
+			// recurse without a bound (R2I-1).
+			return metadataState{}, nil
+		}
 		x.log.WithFields(logging.Fields{
 			"repository": repository,
 			"metadata":   metadata,
@@ -299,10 +359,16 @@ func (x *Indexer) initialise(ctx context.Context, repository, metadata, branch s
 	tbl, err := x.tables.CreateTable(ctx, repository, branch)
 	switch {
 	case errors.Is(err, ErrTableExists):
-		// The table of an interrupted initialisation: only the commit is missing.
+		// The table of an interrupted initialisation: only the commit is missing. The staged table
+		// must still be the one this data repository owns, or the initialisation would seal a
+		// foreign table (its location, schema and properties) with the mds: init marker (R2I-4).
 		tbl, err = x.tables.LoadTable(ctx, repository, branch)
 		if err != nil {
 			return metadataState{}, fmt.Errorf("load the metadata table of %q@%s: %w", metadata, branch, err)
+		}
+		if err := verifyTableOwnership(tbl, repository); err != nil {
+			x.closeTable(tbl, metadata, branch)
+			return metadataState{}, err
 		}
 	case err != nil:
 		return metadataState{}, fmt.Errorf("create the metadata table of %q@%s: %w", metadata, branch, err)
@@ -325,12 +391,17 @@ func (x *Indexer) initialise(ctx context.Context, repository, metadata, branch s
 		AllowEmpty: false,
 	})
 	if errors.Is(err, client.ErrBadRequest) {
-		// Nothing was staged: a concurrent initialisation committed first. Adopt its commit, so
-		// both processes index the same repository instead of one refusing the other's work.
-		state, verifyErr := x.verifyInitCommit(ctx, repository, metadata, branch)
+		// A 400 is "lost the race" only when re-verification adopts another replica's init commit.
+		// A branch that still shows only the automatic root has nothing to adopt, so the 400 is a
+		// real refusal (block.ErrWriteFailed, a validation error, an HTTP intermediary): return it
+		// instead of entering initialise again, which recursed without a bound (R2I-1).
+		state, verifyErr := x.verifyInitCommit(ctx, repository, metadata, branch, false)
 		if verifyErr != nil {
 			return metadataState{}, fmt.Errorf("commit the initialisation of %q@%s: %w; the branch is not initialised either: %w",
 				metadata, branch, err, verifyErr)
+		}
+		if !state.initialised {
+			return metadataState{}, fmt.Errorf("commit the initialisation of %q@%s: %w", metadata, branch, err)
 		}
 		x.log.WithFields(logging.Fields{
 			"repository": repository,
@@ -340,7 +411,8 @@ func (x *Indexer) initialise(ctx context.Context, repository, metadata, branch s
 		return state, nil
 	}
 	if err != nil {
-		return metadataState{}, fmt.Errorf("commit the initialisation of %q@%s: %w", metadata, branch, err)
+		return metadataState{}, metadataBranchWriteError(metadata, branch,
+			fmt.Errorf("commit the initialisation of %q@%s: %w", metadata, branch, err))
 	}
 	x.log.WithFields(logging.Fields{
 		"repository": repository,

@@ -919,6 +919,32 @@ func TestCollectedPositionDuringTheWalkIsRebuilt(t *testing.T) {
 	require.True(t, ok)
 }
 
+// TestCaughtUpBranchDoesNotReadTheMergeBase pins R2I-2: a branch whose recorded position is its head
+// has nothing to apply, and last is trivially an ancestor of head. The guard that used to skip the
+// step-4 FindMergeBase was dropped when the block moved into continueFrom, so every caught-up branch
+// paid one request per tick and a transient 404 on it failed a branch that had no work.
+func TestCaughtUpBranchDoesNotReadTheMergeBase(t *testing.T) {
+	e := newEnv(t)
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.tick()
+	require.NoError(t, e.health.branch("repo", "main").err)
+
+	e.fake.findMergeBaseCalls = 0
+	e.tick()
+	require.NoError(t, e.health.branch("repo", "main").err)
+	require.Zero(t, e.fake.findMergeBaseCalls, "a branch at its head makes no merge-base read")
+
+	// A transient 404 on the merge base does not touch a branch that is already caught up.
+	e.fake.findMergeBaseErr = &client.NotFoundError{Operation: "find merge base", Subject: "s1"}
+	e.tick()
+	rec := e.health.branch("repo", "main")
+	require.NoError(t, rec.err)
+	require.Zero(t, e.fake.findMergeBaseCalls)
+	require.Equal(t, "s1", rec.lastIndexed)
+	require.Equal(t, "s1", rec.head)
+	require.Zero(t, rec.lag)
+}
+
 // TestNotFoundThatIsNotThePositionIsAFailure pins the other half of the rule: only a 404 about the
 // recorded position means it is gone. A 404 about anything else - the head, most of all, which the
 // branch listing promised - is a transient server answer and must fail this tick, not reset the

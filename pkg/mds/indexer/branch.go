@@ -161,7 +161,8 @@ func (x *Indexer) runBranchOnce(ctx context.Context, repository, branch string, 
 	}
 
 	// §4.9: compaction is a property of the branch's table, so it runs after the commits.
-	return x.compactIfNeeded(ctx, repository, branch, handle.table, last)
+	return metadataBranchWriteError(metadataRepository(repository), branch,
+		x.compactIfNeeded(ctx, repository, branch, handle.table, last))
 }
 
 // continueFrom is §4.2 step 4: the recorded position has to be on the branch, and it has to be
@@ -170,6 +171,12 @@ func (x *Indexer) runBranchOnce(ctx context.Context, repository, branch string, 
 // initialisation commit followed by a full listing at head - and returns the position the tick
 // continues from. It returns last unchanged when the position is on the branch.
 func (x *Indexer) continueFrom(ctx context.Context, repository, branch string, handle *tableHandle, head client.Commit, last string) (string, error) {
+	if last == head.ID {
+		// §4.2 step 3: the branch is already at its head, so there is nothing to apply and last is
+		// trivially an ancestor of head. Asking lakeFS anyway cost one FindMergeBase per branch per
+		// tick in the steady state and let a transient 404 fail a branch that had no work (R2I-2).
+		return last, nil
+	}
 	base, err := x.lakeFS.FindMergeBase(ctx, repository, last, head.ID)
 	switch {
 	case errors.Is(err, client.ErrNoMergeBase):
@@ -371,7 +378,7 @@ func (x *Indexer) startBranch(ctx context.Context, repository, branch string, ha
 	}
 
 	var written int64
-	if err := x.rebuild(ctx, repository, handle.table, source, &written); err != nil {
+	if err := x.rebuild(ctx, repository, branch, handle.table, source, &written); err != nil {
 		return "", err
 	}
 	x.metrics.RowsWritten(written)
@@ -393,7 +400,8 @@ func (x *Indexer) startBranch(ctx context.Context, repository, branch string, ha
 // table handle from the committed state.
 func (x *Indexer) resetStaging(ctx context.Context, repository, branch string, handle *tableHandle) error {
 	if err := x.lakeFS.ResetBranch(ctx, metadataRepository(repository), branch); err != nil {
-		return fmt.Errorf("discard the staging of %q@%s: %w", metadataRepository(repository), branch, err)
+		return metadataBranchWriteError(metadataRepository(repository), branch,
+			fmt.Errorf("discard the staging of %q@%s: %w", metadataRepository(repository), branch, err))
 	}
 	if err := handle.refresh(ctx); err != nil {
 		return fmt.Errorf("reload the metadata table of %s@%s after a reset: %w", repository, branch, err)
@@ -617,7 +625,8 @@ func (x *Indexer) rewrite(ctx context.Context, repository, branch string, handle
 		switch {
 		case err == nil:
 			if err := x.lakeFS.HardResetBranch(ctx, metadata, branch, tag); err != nil {
-				return "", fmt.Errorf("hard reset %q@%s to %q: %w", metadata, branch, tag, err)
+				return "", metadataBranchWriteError(metadata, branch,
+					fmt.Errorf("hard reset %q@%s to %q: %w", metadata, branch, tag, err))
 			}
 			if err := handle.refresh(ctx); err != nil {
 				return "", fmt.Errorf("reload the metadata table of %s@%s after a hard reset: %w", repository, branch, err)
@@ -638,14 +647,15 @@ func (x *Indexer) rewrite(ctx context.Context, repository, branch string, handle
 		return "", err
 	}
 	if err := x.lakeFS.HardResetBranch(ctx, metadata, branch, init); err != nil {
-		return "", fmt.Errorf("hard reset %q@%s to the initialisation commit: %w", metadata, branch, err)
+		return "", metadataBranchWriteError(metadata, branch,
+			fmt.Errorf("hard reset %q@%s to the initialisation commit: %w", metadata, branch, err))
 	}
 	if err := handle.refresh(ctx); err != nil {
 		return "", fmt.Errorf("reload the metadata table of %s@%s after a hard reset: %w", repository, branch, err)
 	}
 
 	var written int64
-	if err := x.rebuild(ctx, repository, handle.table, head, &written); err != nil {
+	if err := x.rebuild(ctx, repository, branch, handle.table, head, &written); err != nil {
 		return "", err
 	}
 	x.metrics.RowsWritten(written)
@@ -685,7 +695,7 @@ func (x *Indexer) applyCommit(ctx context.Context, repository, branch string, ha
 		// bounds both the memory of the delta and the size of its delete predicate. changeSet
 		// stops reading the diff as soon as it knows this, so the change set is incomplete and
 		// is not touched here.
-		if err := x.rebuild(ctx, repository, tbl, commit, &written); err != nil {
+		if err := x.rebuild(ctx, repository, branch, tbl, commit, &written); err != nil {
 			return err
 		}
 		x.metrics.Rebuild()
@@ -699,7 +709,8 @@ func (x *Indexer) applyCommit(ctx context.Context, repository, branch string, ha
 	} else if tbl.SourceCommit() != commit.ID {
 		// §4.4: a staged table that already records this commit only misses its lakeFS commit.
 		if err := tbl.ApplyDelta(ctx, changes.upserts, changes.deletes, commit.ID); err != nil {
-			return fmt.Errorf("apply %s@%s: %w", repository, commit.ID, err)
+			return metadataBranchWriteError(metadataRepository(repository), branch,
+				fmt.Errorf("apply %s@%s: %w", repository, commit.ID, err))
 		}
 		written = int64(len(changes.upserts))
 	}
@@ -715,13 +726,14 @@ func (x *Indexer) applyCommit(ctx context.Context, repository, branch string, ha
 // rebuild writes the full listing of R@commit into the branch's table (§4.3 step 2). A table that
 // already records the commit is left alone (§4.4): the write happened, only its lakeFS commit did
 // not.
-func (x *Indexer) rebuild(ctx context.Context, repository string, tbl Table, commit client.Commit, written *int64) error {
+func (x *Indexer) rebuild(ctx context.Context, repository, branch string, tbl Table, commit client.Commit, written *int64) error {
 	if tbl.SourceCommit() == commit.ID {
 		return nil
 	}
 	var rows int
 	if err := tbl.Rebuild(ctx, x.listingRows(ctx, repository, commit, &rows), commit.ID); err != nil {
-		return fmt.Errorf("rebuild %s@%s: %w", repository, commit.ID, err)
+		return metadataBranchWriteError(metadataRepository(repository), branch,
+			fmt.Errorf("rebuild %s@%s: %w", repository, commit.ID, err))
 	}
 	*written = int64(rows)
 	return nil
@@ -737,7 +749,8 @@ func (x *Indexer) finishCommit(ctx context.Context, repository, branch string, c
 		AllowEmpty: false,
 	})
 	if err != nil {
-		return fmt.Errorf("commit %q@%s for %s: %w", metadata, branch, commit.ID, err)
+		return metadataBranchWriteError(metadata, branch,
+			fmt.Errorf("commit %q@%s for %s: %w", metadata, branch, commit.ID, err))
 	}
 	if err := x.ensureTag(ctx, repository, branch, commit.ID, indexed.ID); err != nil {
 		return err

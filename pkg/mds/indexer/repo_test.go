@@ -14,6 +14,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/mds/client"
 	"github.com/treeverse/lakefs/pkg/mds/indexer"
+	"github.com/treeverse/lakefs/pkg/mds/table"
 )
 
 // TestMetadataNamespace pins the namespace rules of §3.3 through the effect they have on the
@@ -361,6 +362,82 @@ func TestMissingDataRepositoryIsReported(t *testing.T) {
 	require.Equal(t, 1, e.metrics.indexed["repo"])
 }
 
+// TestPersistentBadRequestOnTheInitialisationCommitDoesNotRecurse pins R2I-1: a 400 from the
+// initialisation commit is "lost the race" only when re-verification adopts another replica's
+// commit. A branch that still shows only lakeFS's automatic root has nothing to adopt, so the 400
+// must be returned as it is instead of re-entering initialise, which recursed without a bound and
+// re-wrapped the same error at every level.
+type persistentInitRejection struct {
+	client.LakeFS
+	attempts int
+}
+
+func (r *persistentInitRejection) Commit(ctx context.Context, repository, branch string, opts client.CommitOptions) (client.Commit, error) {
+	if repository == "repo-metadata" && opts.Message == indexer.InitCommitMessage {
+		r.attempts++
+		if r.attempts > 25 {
+			// Bound the probe so the pre-fix recursion ends with a visible failure instead of a
+			// stack or memory exhaustion.
+			return client.Commit{}, fmt.Errorf("probe: gave up after %d initialisation attempts", r.attempts)
+		}
+		return client.Commit{}, fmt.Errorf("commit %q@%s: block: write failed: %w", repository, branch, client.ErrBadRequest)
+	}
+	return r.LakeFS.Commit(ctx, repository, branch, opts)
+}
+
+func TestPersistentBadRequestOnTheInitialisationCommitDoesNotRecurse(t *testing.T) {
+	var rejecter *persistentInitRejection
+	e := newEnv(t, func(opts *indexer.Options) {
+		rejecter = &persistentInitRejection{LakeFS: opts.LakeFS}
+		opts.LakeFS = rejecter
+	})
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+
+	e.tick()
+
+	err := e.health.repositoryError("repo")
+	require.ErrorIs(t, err, client.ErrBadRequest)
+	require.Contains(t, err.Error(), "block: write failed", "the original 400 is reported")
+	require.Equal(t, 1, rejecter.attempts, "a 400 with nothing to adopt is not retried")
+	require.Equal(t, 1, e.fake.createTableCalls, "initialise does not re-enter CreateTable")
+	require.Empty(t, initCommits(e.fake), "no initialisation commit is written")
+}
+
+// TestInitialisationRefusesAForeignStagedTable pins R2I-4: the ErrTableExists arm used to commit
+// whatever table was staged, so a principal that staged system.object_metadata on a fresh
+// R-metadata supplied the location, schema and properties the indexer then sealed with mds: init.
+// The staged table must record lakefs.mds.repository = R (or it is refused as a foreign
+// repository, exactly as a foreign history is, §4.8).
+func TestInitialisationRefusesAForeignStagedTable(t *testing.T) {
+	tests := []struct {
+		name       string
+		repository string
+	}{
+		{name: "another data repository", repository: "someone-else"},
+		{name: "no repository property", repository: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.fake.addNonBareMetadataRepository()
+			// The table is staged, which is what ErrTableExists reports: CreateTable finds it and the
+			// initialisation must load and inspect it instead of replacing it.
+			e.fake.tableExists = true
+			foreign := newState()
+			foreign.repository = test.repository
+			foreign.rows["planted"] = table.Row{Repository: test.repository, Path: "planted", CommitID: "planted"}
+			e.fake.stage("main", foreign)
+			e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+
+			e.tick()
+
+			require.ErrorIs(t, e.health.repositoryError("repo"), indexer.ErrForeignRepository)
+			require.Empty(t, initCommits(e.fake), "the mds: init marker is not sealed on a foreign table")
+			require.Empty(t, e.fake.madeCommits(), "nothing is committed for a foreign table")
+		})
+	}
+}
+
 // TestConcurrentInitialisationCommitsOnce pins IO-1: two indexer processes that meet on a freshly
 // created R-metadata must both end up with an initialised repository. Before the fix both committed
 // `mds: init` (AllowEmpty: true), the loser on top of the winner, and the next verifyInitCommit
@@ -671,7 +748,9 @@ func (f *fake) addInitCommit(id, parent string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.tableExists = true
-	f.tableAt[id] = newState()
+	state := newState()
+	state.repository = "repo"
+	f.tableAt[id] = state
 	return id
 }
 
@@ -698,8 +777,74 @@ func (f *fake) addBareMetadataRepository(namespace string) string {
 	defer f.mu.Unlock()
 	// The initialisation commit created the table: it exists on the branch and holds no rows (§4.8).
 	f.tableExists = true
-	f.tableAt[init.ID] = newState()
+	state := newState()
+	state.repository = "repo"
+	f.tableAt[init.ID] = state
 	return init.ID
+}
+
+// TestProtectedMetadataBranchFailsTheRepository pins R2I-3: a COMMIT- or STAGING_WRITE-protected
+// companion branch is refused like a read-only companion repository. The repository record does not
+// carry the rule, so the refusal is detected at the first write lakeFS rejects and answered with
+// the ErrReadOnlyMetadataRepository family, naming branch protection instead of leaving the raw 403
+// on every tick (design §3.3, §7, TS-4).
+func TestProtectedMetadataBranchFailsTheRepository(t *testing.T) {
+	t.Run("commit protection", func(t *testing.T) {
+		e := newEnv(t)
+		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.tick()
+		require.NoError(t, e.health.repositoryError("repo"))
+
+		e.fake.protectBranch("repo-metadata", "main", true, false)
+		e.fake.addCommit("repo", "main", "s2", []string{"s1"},
+			[]client.ObjectStat{object("a", 10), object("b", 20)})
+		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+		made := len(e.fake.madeCommits())
+
+		e.tick()
+
+		err := e.health.branch("repo", "main").err
+		require.ErrorIs(t, err, indexer.ErrReadOnlyMetadataRepository)
+		require.Contains(t, err.Error(), "branch protection")
+		require.Contains(t, err.Error(), "COMMIT")
+		require.Contains(t, err.Error(), "cannot commit to protected branch", "the 403 stays in the chain")
+		require.Len(t, e.fake.madeCommits(), made, "the protected branch takes no indexing commit")
+	})
+
+	t.Run("staging write protection", func(t *testing.T) {
+		e := newEnv(t)
+		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.tick()
+		require.NoError(t, e.health.repositoryError("repo"))
+
+		e.fake.protectBranch("repo-metadata", "main", false, true)
+		e.fake.addCommit("repo", "main", "s2", []string{"s1"},
+			[]client.ObjectStat{object("a", 10), object("b", 20)})
+		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+
+		e.tick()
+
+		err := e.health.branch("repo", "main").err
+		require.ErrorIs(t, err, indexer.ErrReadOnlyMetadataRepository)
+		require.Contains(t, err.Error(), "branch protection")
+		require.Contains(t, err.Error(), "STAGING_WRITE")
+		require.Contains(t, err.Error(), "cannot write to protected branch", "the 403 stays in the chain")
+	})
+
+	t.Run("before the initialisation commit", func(t *testing.T) {
+		e := newEnv(t)
+		e.fake.addNonBareMetadataRepository()
+		e.fake.protectBranch("repo-metadata", "main", true, false)
+		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+
+		e.tick()
+
+		err := e.health.repositoryError("repo")
+		require.ErrorIs(t, err, indexer.ErrReadOnlyMetadataRepository)
+		require.Contains(t, err.Error(), "branch protection")
+		require.Empty(t, e.fake.madeCommits(), "a protected repository is refused before a commit")
+		require.Empty(t, e.health.branch("repo", "main").head, "no branch of the repository is touched")
+	})
 }
 
 // TestReadOnlyMetadataRepositoryFailsTheRepository pins TS-4: a companion repository lakeFS reports
