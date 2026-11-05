@@ -215,6 +215,167 @@ func TestMaxCommitsBoundsATick(t *testing.T) {
 	require.Zero(t, e.health.branch("repo", "main").lag)
 }
 
+// TestPendingPagesTheLog pins the paged pending walk of §4.2 step 5, which no other case exercises:
+// the fake answered every log read in one page until now (a real lakeFS pages at page_size), so the
+// cursor handling, the "met the position" check across pages and the inclusive stop_at rule were
+// unverified (IX-5). The window a page walk keeps is asserted through the requests it makes and the
+// commits it reads: the todo is the oldest commits after the position, so a bounded walk reads
+// towards the position and never past it.
+func TestPendingPagesTheLog(t *testing.T) {
+	t.Run("every commit of the backlog is applied", func(t *testing.T) {
+		e := newEnv(t)
+		e.fake.pageSize = 2
+		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.tick()
+		calls, read := e.fake.logCommitsCalls("repo"), e.fake.logCommitsRead("repo")
+
+		// Five pending commits on top of s1, one page of two at a time.
+		parent := "s1"
+		for i := 2; i <= 6; i++ {
+			id, path := fmt.Sprintf("s%d", i), fmt.Sprintf("p%d", i)
+			e.fake.addCommit("repo", "main", id, []string{parent}, nil)
+			e.fake.setDiff("repo", parent, id, []client.Change{added(path, int64(10*i))})
+			parent = id
+		}
+
+		e.tick()
+
+		require.NoError(t, e.health.branch("repo", "main").err)
+		require.Equal(t, 3, e.fake.logCommitsCalls("repo")-calls,
+			"five pending commits plus the stop commit are three pages of two")
+		require.Equal(t, 6, e.fake.logCommitsRead("repo")-read, "no page is read twice")
+		require.Equal(t, []string{"a", "p2", "p3", "p4", "p5", "p6"}, e.paths("main"))
+		health := e.health.branch("repo", "main")
+		require.Equal(t, "s6", health.lastIndexed)
+		require.Zero(t, health.lag, "the walk met the position, so the lag is exact and 0")
+	})
+
+	t.Run("max_commits applies the oldest pending commit", func(t *testing.T) {
+		e := newEnv(t, func(opts *indexer.Options) {
+			opts.MaxCommits = 1
+		})
+		e.fake.pageSize = 2
+		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.tick()
+		e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
+		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+		e.fake.addCommit("repo", "main", "s3", []string{"s2"}, nil)
+		e.fake.setDiff("repo", "s2", "s3", []client.Change{added("c", 30)})
+		calls := e.fake.logCommitsCalls("repo")
+
+		e.tick()
+
+		require.NoError(t, e.health.branch("repo", "main").err)
+		require.Equal(t, 2, e.fake.logCommitsCalls("repo")-calls,
+			"the position is on the second page, and the walk stops there")
+		require.Equal(t, []string{"a", "b"}, e.paths("main"), "the oldest pending commit, not the newest")
+		health := e.health.branch("repo", "main")
+		require.Equal(t, "s2", health.lastIndexed)
+		require.EqualValues(t, 1, health.lag)
+
+		e.tick()
+		require.Equal(t, []string{"a", "b", "c"}, e.paths("main"))
+		require.Zero(t, e.health.branch("repo", "main").lag)
+	})
+
+	t.Run("a position off the first-parent chain is found across pages", func(t *testing.T) {
+		e := newEnv(t, func(opts *indexer.Options) {
+			opts.Backfill = indexer.BackfillHistory
+			opts.Repositories[0].Branches = []string{"main", "side"}
+		})
+		e.fake.pageSize = 1
+		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
+		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+		// side1 is reachable from the merge only through its second parent.
+		e.fake.addCommit("repo", "side", "side1", []string{"s1"}, nil)
+		e.fake.setDiff("repo", "s1", "side1", []client.Change{added("x", 99)})
+		e.fake.addCommit("repo", "main", "m", []string{"s2", "side1"},
+			[]client.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
+		e.fake.setDiff("repo", "s2", "m", []client.Change{added("c", 30)})
+		e.tick()
+		require.Equal(t, []string{"a", "b", "c"}, e.paths("main"))
+
+		// Record the side commit as main's position, as an indexed branch that was then
+		// force-moved onto the merge would have.
+		e.fake.branches["repo-metadata"]["main"] = e.fake.branches["repo-metadata"]["side"]
+		initCommit := e.fake.initCommitID()
+		require.NotEmpty(t, initCommit)
+		calls := e.fake.logCommitsCalls("repo")
+
+		e.tick()
+
+		require.NoError(t, e.health.branch("repo", "main").err)
+		require.Equal(t, 3, e.fake.logCommitsCalls("repo")-calls,
+			"one page per commit: m, s2, and s1 where the walk runs out of first-parent history")
+		require.Contains(t, e.fake.hardResets, hardReset{repository: "repo-metadata", branch: "main", ref: initCommit},
+			"the position is not on the chain across pages either, so the branch is rebuilt at head")
+		require.Equal(t, []string{"a", "b", "c"}, e.paths("main"))
+	})
+}
+
+// TestFarBehindBranchIsRebuiltInsteadOfWalked pins the bound §4.2 step 5 puts on one tick: the
+// commits to apply are the oldest ones after the recorded position, so catching up used to read the
+// whole remaining log on every tick, hold it in memory and do it again next tick (O(lag) memory and
+// O(lag/page) requests for max_commits applied commits). A tick now reads at most max_commits plus
+// one page of the log; a position deeper than that is not continued from but rebuilt at the head
+// from a full listing (§4.7), which costs the listing once instead of the backlog every tick.
+func TestFarBehindBranchIsRebuiltInsteadOfWalked(t *testing.T) {
+	e := newEnv(t, func(opts *indexer.Options) {
+		opts.MaxCommits = 1
+	})
+	e.fake.pageSize = 2
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.tick()
+	require.Equal(t, 1, e.fake.rebuildCalls)
+	initCommit := e.fake.initCommitID()
+	require.NotEmpty(t, initCommit)
+
+	// 40 pending commits: far deeper than the commits one tick may read.
+	objects := []client.ObjectStat{object("a", 10)}
+	parent := "s1"
+	for i := 2; i <= 41; i++ {
+		id, path := fmt.Sprintf("s%02d", i), fmt.Sprintf("p%02d", i)
+		e.fake.addCommit("repo", "main", id, []string{parent}, nil)
+		e.fake.setDiff("repo", parent, id, []client.Change{added(path, int64(i))})
+		objects = append(objects, object(path, int64(i)))
+		parent = id
+	}
+	e.fake.setObjects("repo", parent, objects)
+	calls, read := e.fake.logCommitsCalls("repo"), e.fake.logCommitsRead("repo")
+
+	e.tick()
+
+	require.NoError(t, e.health.repositoryError("repo"))
+	require.NoError(t, e.health.branch("repo", "main").err)
+	require.Equal(t, 2, e.fake.logCommitsCalls("repo")-calls,
+		"one page more than max_commits: two requests, not the 21 a walk to the position costs")
+	require.Equal(t, 4, e.fake.logCommitsRead("repo")-read,
+		"and four commits read in total, so a tick cannot retain more than one page of them")
+
+	require.Equal(t, 2, e.fake.rebuildCalls, "the branch it cannot walk to is rebuilt at the head")
+	require.Contains(t, e.fake.hardResets, hardReset{repository: "repo-metadata", branch: "main", ref: initCommit})
+	state, ok := e.fake.tableState("main")
+	require.True(t, ok)
+	require.Equal(t, "s41", state.sourceCommit, "the position is the head that was just rebuilt")
+	require.Len(t, state.rows, len(objects))
+	health := e.health.branch("repo", "main")
+	require.Equal(t, "s41", health.lastIndexed)
+	require.Zero(t, health.lag, "the lag of a rebuilt branch is 0, exact, and not a lower bound")
+	_, ok = e.fake.tagCommit("repo-metadata", "mds-s41")
+	require.True(t, ok, "the rebuilt position is tagged like any other (§4.3 step 5)")
+
+	// A second tick has nothing left behind it: it reads no log for R and writes no commit.
+	calls, read = e.fake.logCommitsCalls("repo"), e.fake.logCommitsRead("repo")
+	made := len(e.fake.madeCommits())
+	e.tick()
+	require.Zero(t, e.fake.logCommitsCalls("repo")-calls)
+	require.Zero(t, e.fake.logCommitsRead("repo")-read)
+	require.Len(t, e.fake.madeCommits(), made)
+	require.Equal(t, 2, e.fake.rebuildCalls)
+	require.Zero(t, e.health.branch("repo", "main").lag)
+}
+
 // TestMergeUsesTheFirstParent pins §3.2: commits are walked along the first-parent chain, so a
 // merge commit is diffed against its first parent and the objects it brings in get the merge
 // commit's ID, committer and date. The second parent's commits are not indexed.
@@ -627,6 +788,116 @@ func TestPositionReachableOnlyThroughSecondParent(t *testing.T) {
 	require.Equal(t, "m", state.sourceCommit)
 	require.Equal(t, []string{"a", "b", "c"}, state.paths(), "the side row x is not on main's first-parent chain")
 	e.requireRow("main", "c", "m", 30)
+}
+
+// TestCollectedPositionIsRebuilt pins §4.7 for a recorded position that no longer exists in R: a
+// force-moved branch whose old commits committed GC collected while the indexer was down, or R
+// deleted and created again under the same name (§4.8). Nothing keeps the source commit of a
+// position alive in R, so findMergeBase dereferences it and answers 404. Returning that error failed
+// the branch on every tick forever: /_health stayed 503 and the lag never cleared. The 404 is a
+// position that is gone, so the tick takes the full-rebuild fallback §4.7 already has.
+func TestCollectedPositionIsRebuilt(t *testing.T) {
+	e := newEnv(t)
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, []client.ObjectStat{object("a", 10), object("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.tick()
+	require.Equal(t, []string{"a", "b"}, e.paths("main"))
+	require.Equal(t, "s2", e.health.branch("repo", "main").lastIndexed)
+
+	// Committed GC collects s2 (no branch refers to it any more) and R@main is re-created on an
+	// unrelated root, which is what deleting and re-creating R looks like to the indexer.
+	e.fake.deleteCommit("repo", "s2")
+	e.fake.addCommit("repo", "", "fresh", nil, []client.ObjectStat{object("z", 99)})
+	e.fake.setBranchHead("repo", "main", "fresh")
+	initCommit := e.fake.initCommitID()
+	require.NotEmpty(t, initCommit)
+	rebuilds := e.fake.rebuildCalls
+
+	e.tick()
+
+	require.NoError(t, e.health.repositoryError("repo"))
+	require.NoError(t, e.health.branch("repo", "main").err, "a collected position is a rewrite, not a failure")
+	require.Equal(t, rebuilds+1, e.fake.rebuildCalls, "the branch is rebuilt from a full listing at the head")
+	require.Contains(t, e.fake.hardResets, hardReset{repository: "repo-metadata", branch: "main", ref: initCommit})
+	state, ok := e.fake.tableState("main")
+	require.True(t, ok)
+	require.Equal(t, "fresh", state.sourceCommit)
+	require.Equal(t, []string{"z"}, state.paths(), "the rows of the re-created repository, not the old ones")
+	_, ok = e.fake.tagCommit("repo-metadata", "mds-fresh")
+	require.True(t, ok, "the rebuilt position is tagged")
+	health := e.health.branch("repo", "main")
+	require.Equal(t, "fresh", health.lastIndexed)
+	require.Zero(t, health.lag)
+
+	// The next tick has nothing to do, and above all no error of the same kind.
+	made := len(e.fake.madeCommits())
+	e.tick()
+	require.NoError(t, e.health.repositoryError("repo"))
+	require.NoError(t, e.health.branch("repo", "main").err)
+	require.Len(t, e.fake.madeCommits(), made)
+}
+
+// TestCollectedPositionDuringTheWalkIsRebuilt pins the same rule for the stop_at dereference of the
+// pending walk. The position can be collected between §4.2 step 4 and step 5, and pkg/catalog
+// dereferences stop_at before it walks, so the log answers 404 there too (the fake models that).
+func TestCollectedPositionDuringTheWalkIsRebuilt(t *testing.T) {
+	e := newEnv(t)
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.tick()
+	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
+	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.fake.addCommit("repo", "main", "s3", []string{"s2"},
+		[]client.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
+	e.fake.setDiff("repo", "s2", "s3", []client.Change{added("c", 30)})
+	initCommit := e.fake.initCommitID()
+	require.NotEmpty(t, initCommit)
+	rebuilds := e.fake.rebuildCalls
+
+	// The recorded position is collected after the merge-base answer and before the pending walk.
+	e.fake.afterFindMergeBase = func() { e.fake.deleteCommit("repo", "s1") }
+
+	e.tick()
+
+	require.NoError(t, e.health.repositoryError("repo"))
+	require.NoError(t, e.health.branch("repo", "main").err)
+	require.Equal(t, rebuilds+1, e.fake.rebuildCalls)
+	require.Contains(t, e.fake.hardResets, hardReset{repository: "repo-metadata", branch: "main", ref: initCommit})
+	state, ok := e.fake.tableState("main")
+	require.True(t, ok)
+	require.Equal(t, "s3", state.sourceCommit)
+	require.Equal(t, []string{"a", "b", "c"}, state.paths())
+	_, ok = e.fake.tagCommit("repo-metadata", "mds-s3")
+	require.True(t, ok)
+}
+
+// TestNotFoundThatIsNotThePositionIsAFailure pins the other half of the rule: only a 404 about the
+// recorded position means it is gone. A 404 about anything else - the head, most of all, which the
+// branch listing promised - is a transient server answer and must fail this tick, not reset the
+// branch to the initialisation commit and rebuild it.
+func TestNotFoundThatIsNotThePositionIsAFailure(t *testing.T) {
+	e := newEnv(t)
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.tick()
+	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, []client.ObjectStat{object("a", 10), object("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	rebuilds := e.fake.rebuildCalls
+	e.fake.findMergeBaseErr = &client.NotFoundError{Operation: "find merge base", Subject: "s2"}
+
+	e.tick()
+
+	err := e.health.branch("repo", "main").err
+	require.Error(t, err, "a 404 that is not about the recorded position is still an error")
+	require.ErrorIs(t, err, client.ErrNotFound, "and it is not swallowed")
+	require.Empty(t, e.fake.hardResets, "the recorded position exists, so nothing is rebuilt")
+	require.Equal(t, rebuilds, e.fake.rebuildCalls)
+	require.Equal(t, []string{"a"}, e.paths("main"), "the table is left at the recorded position")
+
+	// The next tick, with the transient answer gone, catches up normally.
+	e.tick()
+	require.NoError(t, e.health.branch("repo", "main").err)
+	require.Equal(t, []string{"a", "b"}, e.paths("main"))
+	require.Equal(t, "s2", e.health.branch("repo", "main").lastIndexed)
 }
 
 // TestBranchDelete pins §4.8: deleting a matching branch deletes its metadata branch (its tags stay),

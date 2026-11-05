@@ -19,6 +19,22 @@ import (
 	"github.com/treeverse/lakefs/pkg/mds/client"
 )
 
+// The errors of the bounded pending walk of §4.2 step 5. Both mean "the recorded position cannot be
+// continued from by walking the log a tick may read", and both are answered by the §4.7 full-listing
+// fallback (rewrite with an empty merge base), which records the head as the position instead of
+// failing the branch on every tick.
+var (
+	// errPositionGone reports a recorded position that no longer exists in R: committed GC
+	// collected it after a branch was force-moved while the indexer was down, or R was deleted and
+	// created again under the same name (§4.8).
+	errPositionGone = errors.New("the recorded position no longer exists in the data repository")
+
+	// errTooFarBehind reports a recorded position deeper than the commits one tick may read: the
+	// todo of §4.2 step 5 is the oldest commits after the position, so reaching it costs one log
+	// request per page of the whole backlog, on every tick, for every max_commits commits applied.
+	errTooFarBehind = errors.New("the recorded position is more than max_commits behind the head")
+)
+
 // runBranch indexes one branch of one repository (§4.2), restarting the branch when another writer
 // moved the table during the tick (§4.4). A restart re-reads the position, so it is the same code
 // path a crash recovery takes.
@@ -83,23 +99,8 @@ func (x *Indexer) runBranchOnce(ctx context.Context, repository, branch string, 
 			return err
 		}
 		// §4.2 step 4, §4.7: is the recorded position still on the branch?
-		if last != head.ID {
-			base, err := x.lakeFS.FindMergeBase(ctx, repository, last, head.ID)
-			switch {
-			case errors.Is(err, client.ErrNoMergeBase):
-				// §4.7: a force-moved branch with an unrelated history has no merge base, so no
-				// mds-<merge base> tag can exist. Reset to the initialisation commit and rebuild
-				// at the head instead of failing the branch on the server's 500.
-				if last, err = x.rewrite(ctx, repository, branch, handle, head, ""); err != nil {
-					return err
-				}
-			case err != nil:
-				return fmt.Errorf("merge base of %s@%s..%s: %w", repository, last, head.ID, err)
-			case base != last:
-				if last, err = x.rewrite(ctx, repository, branch, handle, head, base); err != nil {
-					return err
-				}
-			}
+		if last, err = x.continueFrom(ctx, repository, branch, handle, head, last); err != nil {
+			return err
 		}
 	}
 	state.last = last
@@ -110,20 +111,28 @@ func (x *Indexer) runBranchOnce(ctx context.Context, repository, branch string, 
 	if last != head.ID {
 		var onFirstParent bool
 		todo, total, onFirstParent, err = x.pending(ctx, repository, head, last, x.maxCommits)
-		if err != nil {
+		switch {
+		case errors.Is(err, errPositionGone), errors.Is(err, errTooFarBehind):
+			// §4.7: the position cannot be continued from - it is gone from R, or it is deeper
+			// than the commits one tick may read. Either way the incremental path would re-read
+			// the whole remaining log on every tick, so the branch is rebuilt from a full listing
+			// at the head: same rows, the head as the position, and no lag left behind.
+			if last, err = x.rebuildAtHead(ctx, repository, branch, handle, head, err.Error()); err != nil {
+				return err
+			}
+			state.last, todo, total = last, nil, 0
+		case err != nil:
 			return err
-		}
-		if !onFirstParent {
+		case !onFirstParent:
 			// §4.7: last is an ancestor of head only through a merge's second parent, so the
 			// first-parent walk never meets it. Continuing from it would replay the whole chain
 			// from the root on top of the table at last. The merge base here is last itself and
 			// cannot start a first-parent walk, so fall back to a full listing at head.
-			if last, err = x.rewrite(ctx, repository, branch, handle, head, ""); err != nil {
+			if last, err = x.rebuildAtHead(ctx, repository, branch, handle, head,
+				"the recorded position is not on the first-parent chain"); err != nil {
 				return err
 			}
-			state.last = last
-			todo = nil
-			total = 0
+			state.last, todo, total = last, nil, 0
 		}
 	}
 	state.lag = int64(total)
@@ -153,6 +162,43 @@ func (x *Indexer) runBranchOnce(ctx context.Context, repository, branch string, 
 
 	// §4.9: compaction is a property of the branch's table, so it runs after the commits.
 	return x.compactIfNeeded(ctx, repository, branch, handle.table, last)
+}
+
+// continueFrom is §4.2 step 4: the recorded position has to be on the branch, and it has to be
+// reachable by the first-parent walk. A position that is not is a history rewrite (§4.7), and
+// continueFrom moves the metadata branch for it - back to the tag of the merge base, or to the
+// initialisation commit followed by a full listing at head - and returns the position the tick
+// continues from. It returns last unchanged when the position is on the branch.
+func (x *Indexer) continueFrom(ctx context.Context, repository, branch string, handle *tableHandle, head client.Commit, last string) (string, error) {
+	base, err := x.lakeFS.FindMergeBase(ctx, repository, last, head.ID)
+	switch {
+	case errors.Is(err, client.ErrNoMergeBase):
+		// §4.7: a force-moved branch with an unrelated history has no merge base, so no
+		// mds-<merge base> tag can exist. Reset to the initialisation commit and rebuild
+		// at the head instead of failing the branch on the server's 500.
+		return x.rebuildAtHead(ctx, repository, branch, handle, head, "the histories have no merge base")
+	case errors.Is(err, client.ErrNotFound):
+		// §4.7: a recorded position can disappear from R while the indexer is down - committed
+		// GC of a force-moved branch, or R deleted and created again (§4.8). Nothing keeps a
+		// position alive in R, so a 404 here is not an outage: it is a position that is gone,
+		// and returning it would fail this branch on every tick forever. Ask for the position
+		// itself first, so that a 404 about the head - a transient one, or a branch deleted
+		// between the listing and this tick - is not mistaken for a collected position.
+		gone, checkErr := x.positionGone(ctx, repository, last)
+		if checkErr != nil {
+			return "", checkErr
+		}
+		if !gone {
+			return "", fmt.Errorf("merge base of %s@%s..%s: %w", repository, last, head.ID, err)
+		}
+		return x.rebuildAtHead(ctx, repository, branch, handle, head,
+			fmt.Sprintf("the recorded position %s no longer exists in %s", last, repository))
+	case err != nil:
+		return "", fmt.Errorf("merge base of %s@%s..%s: %w", repository, last, head.ID, err)
+	case base != last:
+		return x.rewrite(ctx, repository, branch, handle, head, base)
+	}
+	return last, nil
 }
 
 // lastIndexed returns the head commit of R-metadata@b and the source commit it records (§3.3).
@@ -215,6 +261,11 @@ func (x *Indexer) createBranch(ctx context.Context, repository, branch string, h
 // seedTag looks for an indexed ancestor of head (§4.5 step 1): the first commit of the first
 // seed_lookback commits of the branch whose tag exists in R-metadata. Seeding a new branch from it
 // makes a feature branch cheap, because the table it starts from is already written.
+//
+// The walk is bounded twice over, and neither bound is the size of the history: it holds one page of
+// commits at a time and never the commits it has passed (memory O(page)), it looks at most
+// seed_lookback commits (at most one GetTag per commit, so at most seed_lookback tag requests), and
+// it returns at the first tag it finds.
 func (x *Indexer) seedTag(ctx context.Context, repository string, head client.Commit) (string, bool, error) {
 	metadata := metadataRepository(repository)
 	var (
@@ -256,6 +307,11 @@ func (x *Indexer) seedTag(ctx context.Context, repository string, head client.Co
 // backfillStart returns the commit a first indexing of a branch starts at (§4.5 step 2): the head
 // (backfill: head, the default), the oldest first-parent commit (backfill: history), or the oldest
 // first-parent commit created at or after metadata_search.since.
+//
+// Only the answer is kept: the walk holds one page of commits at a time and one candidate commit,
+// never the history it has passed (memory O(page), not O(history)). The number of requests is the
+// walk itself - the oldest commit of a history, or the first commit before since, is only known
+// once it is reached - and it happens once per branch, on the tick that starts it.
 func (x *Indexer) backfillStart(ctx context.Context, repository string, head client.Commit) (client.Commit, error) {
 	if x.since == nil && x.backfill != BackfillHistory {
 		return head, nil
@@ -415,10 +471,34 @@ func (x *Indexer) hasUncommittedChanges(ctx context.Context, repository, branch 
 // is the lag /_health and the lag_commits metric report (§9), which max_commits must not hide. A
 // false onFirstParent means last is not on head's first-parent chain, even if it is an ancestor of
 // head through a merge's second parent.
+//
+// The walk is bounded. The commits to apply are the oldest ones after last and the log is walked
+// newest first, so the todo is the tail of the walk: the walk keeps a window of the oldest limit+1
+// commits read so far and drops the younger ones page by page, and it stops after max_commits plus
+// one page of commits. One tick therefore costs O(limit + one page) memory - not the whole backlog -
+// and at most O(max_commits/page + 1) log requests instead of one per page of the entire backlog.
+//
+// The count is incremented per page, so the lag of a walk that reaches last is exact. A position
+// deeper than the window is not reachable at all: telling which commits follow last means reading
+// to last, which is the unbounded read this bounds. That case reports errTooFarBehind, and the tick
+// rebuilds the branch at the head instead (§4.7), which leaves the lag at 0 - still exact, never an
+// estimate or a lower bound. An operator who would rather catch up commit by commit raises
+// max_commits until the backlog fits in one window.
+//
+// A position that no longer exists in R makes the log answer 404 for stop_at: pkg/catalog
+// dereferences stop_at before it walks (pkg/catalog/catalog.go ListCommits). That is a position
+// that is gone, not an outage, so it reports errPositionGone; a 404 about anything else is still an
+// error.
 func (x *Indexer) pending(ctx context.Context, repository string, head client.Commit, last string, limit int) ([]client.Commit, int, bool, error) {
-	var commits []client.Commit
-	metStop := last == ""
-	after := ""
+	var (
+		// window is the oldest commits read so far, at most limit+1 of them: the oldest one may
+		// be the recorded position itself, which is not work (§4.3 step 4).
+		window   []client.Commit
+		total    int
+		metStop  = last == ""
+		after    string
+		pageSize int
+	)
 	for {
 		page, hasMore, err := x.lakeFS.LogCommits(ctx, repository, head.ID, client.LogCommitsOptions{
 			FirstParent: true,
@@ -426,35 +506,90 @@ func (x *Indexer) pending(ctx context.Context, repository string, head client.Co
 			After:       after,
 		})
 		if err != nil {
+			if last != "" && errors.Is(err, client.ErrNotFound) {
+				gone, goneErr := x.positionGone(ctx, repository, last)
+				if goneErr != nil {
+					return nil, 0, false, goneErr
+				}
+				if gone {
+					return nil, 0, false, fmt.Errorf("%w: %s of %s", errPositionGone, last, repository)
+				}
+			}
 			return nil, 0, false, fmt.Errorf("log commits of %s@%s after %s: %w", repository, head.ID, last, err)
 		}
+		if pageSize == 0 {
+			// The size of the first page is the size of every full page: it is what the budget
+			// below counts in.
+			pageSize = len(page)
+		}
+		total += len(page)
 		for _, commit := range page {
 			if commit.ID == last {
 				metStop = true
 			}
 		}
-		commits = append(commits, page...)
-		if !hasMore {
+		window = append(window, page...)
+		if keep := limit + 1; len(window) > keep {
+			// The walk moves towards older commits, so only its tail can still be the todo.
+			copy(window, window[len(window)-keep:])
+			window = window[:keep]
+		}
+		if metStop || !hasMore {
 			break
 		}
 		after = lastNameOf(len(page), func(i int) string { return page[i].ID })
 		if after == "" {
 			return nil, 0, false, fmt.Errorf("%w: log commits of %s@%s: more results without a cursor", client.ErrBadPagination, repository, head.ID)
 		}
+		if total >= limit+pageSize {
+			// The position is deeper than the commits this tick may read: see the comment above.
+			return nil, total, false, fmt.Errorf("%w: %s@%s: %d commits read, max_commits is %d",
+				errTooFarBehind, repository, head.ID, total, limit)
+		}
 	}
-	slices.Reverse(commits)
+	slices.Reverse(window)
 	// The lakeFS API's stop_at is inclusive: it returns the stop commit as the last item of the
 	// last page. The oldest commit of a reversed page list is therefore the already-indexed
 	// position, not part of the work. Applying it again would write no table change and make the
 	// lakeFS commit fail with "commit: no changes" (§4.3 steps 3-4, §4.4).
-	if len(commits) > 0 && commits[0].ID == last {
-		commits = commits[1:]
+	if len(window) > 0 && window[0].ID == last {
+		window = window[1:]
+		total--
 	}
-	total := len(commits)
-	if len(commits) > limit {
-		commits = commits[:limit]
+	if len(window) > limit {
+		window = window[:limit]
 	}
-	return commits, total, metStop, nil
+	return window, total, metStop, nil
+}
+
+// positionGone reports whether the recorded position is missing from R (§4.7): the commit was
+// collected by committed GC after a branch was force-moved while the indexer was down, or R was
+// deleted and created again under the same name (§4.8). It asks R for the position itself, so an
+// answer about any other ref - the head, most of all - is never mistaken for a lost position.
+func (x *Indexer) positionGone(ctx context.Context, repository, position string) (bool, error) {
+	_, err := x.lakeFS.GetCommit(ctx, repository, position)
+	switch {
+	case err == nil:
+		return false, nil
+	case errors.Is(err, client.ErrNotFound):
+		return true, nil
+	}
+	return false, fmt.Errorf("commit %s of %s: %w", position, repository, err)
+}
+
+// rebuildAtHead is §4.7's fallback for a recorded position the incremental path cannot continue
+// from: discard the staging, reset R-metadata@b to the initialisation commit and write a full
+// listing of head there (§4.3 step 2), which becomes the new position and is tagged. reason names
+// the state that made the incremental path unusable, so that an operator reading the log can tell
+// a rewrite from an ordinary tick (§9).
+func (x *Indexer) rebuildAtHead(ctx context.Context, repository, branch string, handle *tableHandle, head client.Commit, reason string) (string, error) {
+	x.log.WithFields(logging.Fields{
+		"repository": repository,
+		"branch":     branch,
+		"head":       head.ID,
+		"reason":     reason,
+	}).Warn("mds: rebuilding the metadata branch at the data branch head")
+	return x.rewrite(ctx, repository, branch, handle, head, "")
 }
 
 // rewrite handles a recorded position that is not an ancestor of the branch head (§4.7): a hard

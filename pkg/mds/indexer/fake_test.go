@@ -85,6 +85,21 @@ type fake struct {
 	rebuildErr  error
 	compactErr  error
 
+	// findMergeBaseErr, when set, is returned by the next FindMergeBase call instead of an answer:
+	// it is how a test injects a 404 that is not about the recorded position - a transient answer
+	// about the head, most of all.
+	findMergeBaseErr error
+
+	// afterFindMergeBase, when set, runs once after the next successful FindMergeBase call, outside
+	// the lock: it is how a test models a position that is collected between §4.2 step 4 and the
+	// pending walk of step 5.
+	afterFindMergeBase func()
+
+	// logCalls and logCommits count the LogCommits answers per repository: the requests a walk
+	// costs and the commits it reads, which is what the bounds of §4.2 step 5 are about.
+	logCalls   map[string]int
+	logCommits map[string]int
+
 	index int
 }
 
@@ -150,6 +165,8 @@ func newFake() *fake {
 		tags:         make(map[string]map[string]string),
 		tableAt:      make(map[string]*fakeState),
 		staged:       make(map[string]*fakeState),
+		logCalls:     make(map[string]int),
+		logCommits:   make(map[string]int),
 	}
 }
 
@@ -205,6 +222,16 @@ func (f *fake) setCommit(repository string, commit client.Commit) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.commits[repository][commit.ID] = commit
+}
+
+// deleteCommit removes a commit from a repository and leaves the rest of the history alone: it is
+// how a test models committed GC collecting a position that no branch refers to any more (design
+// §4.7), or a repository that was deleted and created again under the same name (design §4.8).
+func (f *fake) deleteCommit(repository, commit string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.commits[repository], commit)
+	delete(f.objects[repository], commit)
 }
 
 // setObjects sets the objects of one ref (a commit ID in every test here).
@@ -356,6 +383,21 @@ func (f *fake) listObjectCalls() int {
 	return f.listCalls
 }
 
+// logCommitsCalls returns how many LogCommits requests the indexer made for a repository.
+func (f *fake) logCommitsCalls(repository string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.logCalls[repository]
+}
+
+// logCommitsRead returns how many commits the LogCommits answers of a repository returned in total,
+// which bounds what a walk of that log can hold.
+func (f *fake) logCommitsRead(repository string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.logCommits[repository]
+}
+
 // madeCommits returns the lakeFS commits the indexer made.
 func (f *fake) madeCommits() []client.CommitOptions {
 	f.mu.Lock()
@@ -478,7 +520,28 @@ func (f *fake) HardResetBranch(_ context.Context, repository, branch, ref string
 
 func (f *fake) FindMergeBase(_ context.Context, repository, sourceRef, destinationRef string) (string, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	if f.findMergeBaseErr != nil {
+		err := f.findMergeBaseErr
+		f.findMergeBaseErr = nil
+		f.mu.Unlock()
+		return "", err
+	}
+	base, err := f.findMergeBaseLocked(repository, sourceRef, destinationRef)
+	// The hook runs after the answer and outside the lock: it models the recorded position being
+	// collected between step 4 of §4.2 and the pending walk of step 5.
+	hook := f.afterFindMergeBase
+	f.afterFindMergeBase = nil
+	f.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	if hook != nil {
+		hook()
+	}
+	return base, nil
+}
+
+func (f *fake) findMergeBaseLocked(repository, sourceRef, destinationRef string) (string, error) {
 	source, err := f.resolveLocked(repository, sourceRef)
 	if err != nil {
 		return "", err
@@ -527,9 +590,18 @@ func (f *fake) ancestorsLocked(repository, commit string) map[string]bool {
 func (f *fake) LogCommits(_ context.Context, repository, ref string, opts client.LogCommitsOptions) ([]client.Commit, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.logCalls[repository]++
 	head, err := f.resolveLocked(repository, ref)
 	if err != nil {
 		return nil, false, err
+	}
+	// pkg/catalog dereferences stop_at before it walks (pkg/catalog/catalog.go, ListCommits), so a
+	// stop_at that no longer exists answers 404 - a position collected by committed GC, or a
+	// repository that was deleted and created again - and never a short log.
+	if opts.StopAt != "" {
+		if _, err := f.resolveLocked(repository, opts.StopAt); err != nil {
+			return nil, false, err
+		}
 	}
 	var chain []client.Commit
 	for current := head; current != ""; {
@@ -555,8 +627,10 @@ func (f *fake) LogCommits(_ context.Context, repository, ref string, opts client
 			}
 		}
 	}
-	return pageOf(chain, "", f.pageSize, func(commit client.Commit) string { return commit.ID },
+	page, hasMore, err := pageOf(chain, "", f.pageSize, func(commit client.Commit) string { return commit.ID },
 		func(commit client.Commit) client.Commit { return commit })
+	f.logCommits[repository] += len(page)
+	return page, hasMore, err
 }
 
 func (f *fake) GetCommit(_ context.Context, repository, commitID string) (client.Commit, error) {
