@@ -6,6 +6,7 @@ package indexer_test
 // over the same lakeFS and expect the same commit to trigger it.
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -179,6 +180,54 @@ func restart(t *testing.T, e *env, configure ...func(*indexer.Options)) *indexer
 	idx, err := indexer.New(opts)
 	require.NoError(t, err)
 	return idx
+}
+
+// TestCompactionDisabledByZero pins the other half of IO-6: a threshold of 0 turns its trigger
+// off for good. Before the fix indexer.applyDefaults rewrote 0 to the documented default, so an
+// operator could not express "never compact" at all, although the sample configuration and
+// docs/metadata-search.md document 0 as exactly that.
+func TestCompactionDisabledByZero(t *testing.T) {
+	// indexCommits indexes a branch of n + 1 commits that each delete the object "a", so the
+	// branch ends with n delete files and n indexed commits: each threshold is crossed by a wide
+	// margin, and neither default would leave it alone.
+	indexCommits := func(t *testing.T, e *env, n int) {
+		t.Helper()
+		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		parent := "s1"
+		for i := 2; i <= n+1; i++ {
+			commit := fmt.Sprintf("s%d", i)
+			e.fake.addCommit("repo", "main", commit, []string{parent}, nil)
+			e.fake.setDiff("repo", parent, commit, []client.Change{removed("a")})
+			parent = commit
+		}
+		e.tick()
+		require.NoError(t, e.health.repositoryError("repo"))
+		require.NoError(t, e.health.branch("repo", "main").err)
+	}
+
+	t.Run("max_delete_files: 0", func(t *testing.T) {
+		e := newEnv(t, func(opts *indexer.Options) {
+			opts.Backfill = indexer.BackfillHistory
+			opts.Compaction = indexer.Compaction{MaxDeleteFiles: 0, EveryCommits: 1000}
+		})
+		indexCommits(t, e, 201) // one more than the default of 200 that used to replace the 0
+
+		state, _ := e.fake.tableState("main")
+		require.Equal(t, 201, state.deleteFiles, "the branch is above every delete-file limit")
+		require.Zero(t, e.fake.compactCalls, "max_delete_files: 0 disables the delete-file trigger")
+		require.Zero(t, e.metrics.compactions)
+	})
+
+	t.Run("every_commits: 0", func(t *testing.T) {
+		e := newEnv(t, func(opts *indexer.Options) {
+			opts.Backfill = indexer.BackfillHistory
+			opts.Compaction = indexer.Compaction{MaxDeleteFiles: 1000, EveryCommits: 0}
+		})
+		indexCommits(t, e, 501) // one more than the default of 500 that used to replace the 0
+
+		require.Zero(t, e.fake.compactCalls, "every_commits: 0 disables the commit-count trigger")
+		require.Zero(t, e.metrics.compactions)
+	})
 }
 
 // TestTagRetention pins §4.9's tag_retention: mds-* tags whose source commit is older than the

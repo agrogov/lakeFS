@@ -17,6 +17,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	"github.com/treeverse/lakefs/pkg/mds/indexer"
 )
 
 // testConfig returns a validated configuration with every default of §7, so a test can change
@@ -30,8 +31,8 @@ func testConfig(t *testing.T) *Config {
 }
 
 // TestHealthReport pins the health state machine of §9: a repository is healthy while its last
-// tick succeeded or is in progress, and one failing repository or branch makes the whole report
-// unhealthy.
+// tick succeeded, a tick in progress does not clear a previous failure (IO-5), and one failing
+// repository or branch makes the whole report unhealthy.
 func TestHealthReport(t *testing.T) {
 	health := NewHealth([]string{"acme", "globex"})
 
@@ -42,24 +43,20 @@ func TestHealthReport(t *testing.T) {
 	health.BeginTick("acme")
 	report = health.Report()
 	require.True(t, report.Healthy)
-	require.True(t, report.Repositories["acme"].InProgress, "in progress is healthy")
+	require.True(t, report.Repositories["acme"].InProgress, "in progress with nothing to report is healthy")
 
 	health.FinishTick("acme", nil)
 	report = health.Report()
 	require.True(t, report.Healthy)
 	require.False(t, report.Repositories["acme"].InProgress)
 
-	health.SetBranch("acme", "main", BranchHealth{
-		LastIndexed: "aaa",
-		Head:        "bbb",
-		LagCommits:  1,
-	})
+	health.SetBranchState("acme", "main", "aaa", "bbb", 1, nil)
 	report = health.Report()
 	require.True(t, report.Healthy)
 	require.Equal(t, BranchHealth{LastIndexed: "aaa", Head: "bbb", LagCommits: 1},
 		report.Repositories["acme"].Branches["main"])
 
-	health.SetBranchError("acme", "main", errors.New("position delete failed"))
+	health.SetBranchState("acme", "main", "aaa", "bbb", 1, errors.New("position delete failed"))
 	report = health.Report()
 	require.False(t, report.Healthy)
 	require.Equal(t, "aaa", report.Repositories["acme"].Branches["main"].LastIndexed,
@@ -67,7 +64,7 @@ func TestHealthReport(t *testing.T) {
 	require.Equal(t, "position delete failed", report.Repositories["acme"].Branches["main"].LastError)
 
 	// A later successful tick of the branch clears that error again.
-	health.SetBranch("acme", "main", BranchHealth{LastIndexed: "bbb", Head: "bbb"})
+	health.SetBranchState("acme", "main", "bbb", "bbb", 0, nil)
 	require.True(t, health.Report().Healthy)
 
 	health.FinishTick("acme", errors.New("repository is missing"))
@@ -89,7 +86,7 @@ func TestHealthReport(t *testing.T) {
 // per-repository and per-branch body.
 func TestHealthServeHTTP(t *testing.T) {
 	health := NewHealth([]string{"acme"})
-	health.SetBranch("acme", "main", BranchHealth{LastIndexed: "last", Head: "head", LagCommits: 7})
+	health.SetBranchState("acme", "main", "last", "head", 7, nil)
 
 	recorder := httptest.NewRecorder()
 	health.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, HealthPath, nil))
@@ -135,6 +132,31 @@ func TestHealthRemoveBranch(t *testing.T) {
 	require.True(t, health.Report().Healthy)
 }
 
+// TestHealthInProgressVersusPreviousError pins the precedence IO-5 asks for: a tick in progress
+// never masks the outcome of the previous one, so a failed repository stays 503 while its retry
+// runs, and a cancelled tick ends the in-progress flag without touching that outcome.
+func TestHealthInProgressVersusPreviousError(t *testing.T) {
+	health := NewHealth([]string{"acme"})
+	health.FinishTick("acme", errors.New("repository is missing"))
+	require.False(t, health.Report().Healthy)
+
+	health.BeginTick("acme")
+	report := health.Report()
+	require.True(t, report.Repositories["acme"].InProgress, "the retry is in progress")
+	require.False(t, report.Healthy, "a retry in progress does not clear the failure of the previous tick")
+	require.Equal(t, "repository is missing", report.Repositories["acme"].LastError)
+
+	health.CancelTick("acme")
+	report = health.Report()
+	require.False(t, report.Repositories["acme"].InProgress, "a cancelled tick is not in progress any more")
+	require.Equal(t, "repository is missing", report.Repositories["acme"].LastError,
+		"a cancelled tick is not an outcome, so it keeps the previous one")
+	require.False(t, report.Healthy)
+
+	health.FinishTick("acme", nil)
+	require.True(t, health.Report().Healthy, "only a tick that succeeded clears the error")
+}
+
 func TestHealthServeHTTPRejectsOtherMethods(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	NewHealth(nil).ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, HealthPath, nil))
@@ -151,7 +173,7 @@ func TestServiceHandler(t *testing.T) {
 	var recorder Recorder
 	recorder.IndexedCommit("my-repo")
 	recorder.SetLag("my-repo", "main", 3)
-	recorder.Error("my-repo", StageBranch)
+	recorder.Error("my-repo", indexer.StageBranch)
 	recorder.TickDuration(time.Second)
 	recorder.RowsWritten(10)
 	recorder.Rebuild()

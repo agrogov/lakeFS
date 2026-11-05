@@ -35,15 +35,11 @@ const (
 	AllRepositories = "*"
 
 	// StageTick is the stage label of a failure of a whole tick (§9).
+	//
+	// The per-repository and per-branch stages are not declared here: the indexer spells them
+	// (indexer.StageRepository, indexer.StageBranch) and this package may not import it, so a copy
+	// would be a second vocabulary that could drift from the one actually recorded (IO-7).
 	StageTick = "tick"
-
-	// StageRepository is the stage label of a repository-level failure (§9): the repository is
-	// missing, R-metadata cannot be created, its storage namespace cannot be derived or overlaps
-	// the data repository's.
-	StageRepository = "repository"
-
-	// StageBranch is the stage label of a failure while indexing one branch (§9).
-	StageBranch = "branch"
 )
 
 // tickDurationBuckets cover a tick from an empty repository to a large backfill; the longest
@@ -129,7 +125,8 @@ func (Recorder) IndexedCommit(repository string) {
 	indexedCommitsTotal.WithLabelValues(repository).Inc()
 }
 
-// SetLag records how many source commits of a branch are not indexed yet.
+// SetLag records how many source commits of a branch are not indexed yet, or indexer.LagUnknown
+// (-1) when the last attempt failed before it counted them.
 func (Recorder) SetLag(repository, branch string, commits int64) {
 	lagCommits.WithLabelValues(repository, branch).Set(float64(commits))
 }

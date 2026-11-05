@@ -93,6 +93,13 @@ const (
 	StageBranch = "branch"
 )
 
+// LagUnknown is the lag a branch reports when its tick failed before it counted the pending
+// commits (§9): the mirror is behind the head by an unknown number of them, and reporting 0 would
+// say the opposite of the truth. mds.Health publishes it on /_health as lag_commits, and mds's
+// Recorder sets lakefs_mds_lag_commits to it, so an alert can tell "caught up" (0) from "unknown"
+// (-1) from "behind" (> 0).
+const LagUnknown int64 = -1
+
 // The defaults of an Options field that is left zero. They are the documented defaults of
 // metadata_search (§7); *mds.Service always passes the validated configuration, so these only
 // matter to a caller that builds an Indexer directly.
@@ -101,8 +108,6 @@ const (
 	DefaultMaxCommits       = 1000
 	DefaultSeedLookback     = 1000
 	DefaultRebuildThreshold = 100_000
-	DefaultMaxDeleteFiles   = 200
-	DefaultEveryCommits     = 500
 
 	// DefaultRequestTimeout is how long one HTTP request of either client may take before it is
 	// abandoned (metadata_search.request_timeout, §7). Without it a connection that neither
@@ -184,6 +189,16 @@ type Health interface {
 	RemoveBranch(repository, branch string)
 }
 
+// TickCanceller is the optional part of a Health sink that knows how to end a tick which was
+// cancelled before it had an outcome - the in-flight work of a graceful stop (§4.1, §9). The
+// repository keeps the outcome of its previous tick, but it must not stay in progress forever;
+// *mds.Health implements this. It is optional so that a sink which models no in-progress state
+// needs no no-op method: such a sink is simply not told, because a cancellation is not an outcome
+// that could be recorded.
+type TickCanceller interface {
+	CancelTick(repository string)
+}
+
 // Repository is one configured data repository (§7): its name, the branch selectors to index and
 // the optional storage namespace override of R-metadata (§3.3).
 type Repository struct {
@@ -201,15 +216,18 @@ type Repository struct {
 // Compaction is the maintenance configuration of metadata_search.compaction (§4.9).
 type Compaction struct {
 	// MaxDeleteFiles is the number of position-delete files of a branch's table above which the
-	// table is compacted.
+	// table is compacted. 0 disables the trigger.
 	MaxDeleteFiles int
 
 	// EveryCommits is the number of indexed commits after which a branch's table is compacted.
+	// 0 disables the trigger.
 	EveryCommits int
 }
 
 // Options configures an Indexer. The zero value of every optional field means the documented
-// default of §7.
+// default of §7, with one exception: the two Compaction thresholds treat 0 as "disabled", the
+// documented way to turn a trigger off (§4.9), so their defaults belong to whoever builds the
+// configuration - pkg/mds applies 200 and 500 when the key is absent.
 type Options struct {
 	// LakeFS is the lakeFS client of the indexer (§4.2–§4.9). When nil, New builds one from
 	// Endpoint, AccessKeyID and SecretKey.
@@ -322,6 +340,7 @@ type Indexer struct {
 	mu                sync.Mutex
 	metadata          map[string]metadataState
 	defaultBranchKept map[string]bool
+	followed          map[string]map[string]struct{}
 }
 
 // New returns an Indexer for opts. When opts.LakeFS or opts.Tables is nil it builds the production
@@ -346,6 +365,7 @@ func New(opts Options) (*Indexer, error) {
 		repositories:      append([]Repository(nil), opts.Repositories...),
 		metadata:          make(map[string]metadataState, len(opts.Repositories)),
 		defaultBranchKept: make(map[string]bool),
+		followed:          make(map[string]map[string]struct{}, len(opts.Repositories)),
 	}
 	x.applyDefaults()
 
@@ -411,12 +431,10 @@ func (x *Indexer) applyDefaults() {
 	if x.rebuildThreshold <= 0 {
 		x.rebuildThreshold = DefaultRebuildThreshold
 	}
-	if x.compaction.MaxDeleteFiles <= 0 {
-		x.compaction.MaxDeleteFiles = DefaultMaxDeleteFiles
-	}
-	if x.compaction.EveryCommits <= 0 {
-		x.compaction.EveryCommits = DefaultEveryCommits
-	}
+	// The compaction thresholds are deliberately not defaulted: 0 is the documented "disabled"
+	// (§4.9), so overwriting it here would make the triggers impossible to turn off (IO-6). The
+	// documented defaults of 200 and 500 commits belong to the configuration layer, which applies
+	// them only when the operator wrote no value at all.
 	if x.backfill == "" {
 		x.backfill = BackfillHead
 	}
@@ -447,7 +465,12 @@ func (x *Indexer) tickRepository(ctx context.Context, repository Repository) {
 	err := x.indexRepository(ctx, repository)
 	if ctx.Err() != nil {
 		// The in-flight work of a graceful stop is not a failure (§4.1): the next process starts
-		// from the position the last lakeFS commit recorded.
+		// from the position the last lakeFS commit recorded. It is not an outcome either, so the
+		// repository keeps the one of its previous tick - but the tick does end here, or /_health
+		// would report the repository as in progress for as long as the process lives (IO-5, §9).
+		if canceller, ok := x.health.(TickCanceller); ok {
+			canceller.CancelTick(repository.Name)
+		}
 		return
 	}
 	if err != nil {
@@ -480,8 +503,9 @@ func (x *Indexer) indexRepository(ctx context.Context, repository Repository) er
 			continue
 		}
 		// §4.8 leaves the table of a branch that stops matching the configuration as it is, but
-		// /_health must not keep reporting a branch this indexer no longer follows.
-		x.health.RemoveBranch(repository.Name, branch)
+		// /_health must not keep reporting a branch this indexer no longer follows, and its lag
+		// gauge must not keep its last value (IO-3).
+		x.retireBranchState(repository.Name, branch)
 	}
 
 	var wg sync.WaitGroup
@@ -499,6 +523,11 @@ func (x *Indexer) indexRepository(ctx context.Context, repository Repository) er
 		}(branch)
 	}
 	wg.Wait()
+	// §4.8: a matching branch of R that was deleted cannot be enumerated from R any more, so the
+	// state of every branch the previous tick followed and this one does not is cleared here. It
+	// runs whichever delete_branches says: only the deletion of the metadata branch depends on
+	// that flag, never the /_health entry and the lag gauge (IO-3).
+	x.retireUnfollowedBranches(repository.Name, matching)
 
 	if x.deleteBranches {
 		if err := x.retireDeletedBranches(ctx, repository.Name, metadata, branches, x.metaInfo(repository.Name).defaultBranch); err != nil {
@@ -511,10 +540,35 @@ func (x *Indexer) indexRepository(ctx context.Context, repository Repository) er
 // indexBranch indexes one branch and reports its state on /_health and /metrics (§9). Branch
 // failures stay inside the branch: the next tick resumes from the recorded position (§4.2 step 6).
 func (x *Indexer) indexBranch(ctx context.Context, repository, branch string) {
-	state := branchState{}
+	// The lag starts at LagUnknown, not 0: a tick that fails before it counted the pending commits
+	// does not know how far behind the mirror is, and 0 would report exactly the state the alert on
+	// lag_commits exists for as healthy (IO-4, §9).
+	state := branchState{lag: LagUnknown}
 	err := x.runBranch(ctx, repository, branch, &state, conflictRetries)
 	if ctx.Err() != nil {
 		return
+	}
+	if err != nil && state.last == "" && state.head != "" {
+		// The pass failed before it recorded a position: §4.2 reads the recorded one after it has
+		// loaded the table, so a failure at the tag repair, at the merge base or at a §4.7 reset
+		// leaves the state without it. Read the durable position back from the head of
+		// R-metadata@b - it is what the table is at, whether or not this tick got that far - so
+		// /_health reports where the mirror stopped instead of forgetting it (IO-4).
+		if _, last, lookupErr := x.lastIndexed(ctx, repository, branch); lookupErr == nil {
+			state.last = last
+		} else {
+			x.log.WithError(lookupErr).WithFields(logging.Fields{
+				"repository": repository,
+				"branch":     branch,
+			}).Debug("mds: cannot read back the recorded position of a failed branch")
+		}
+	}
+	if err == nil && state.lag == LagUnknown {
+		// The branch was deleted between the listing of R and its own tick (§4.8), so the pass
+		// returned without an error and without counting anything: there is no backlog to be
+		// behind, and a healthy branch does not report an unknown lag. The next tick drops the
+		// entry, because the branch is no longer followed.
+		state.lag = 0
 	}
 	if err != nil {
 		x.metrics.Error(repository, StageBranch)
@@ -523,6 +577,7 @@ func (x *Indexer) indexBranch(ctx context.Context, repository, branch string) {
 			"branch":     branch,
 			"last":       state.last,
 			"head":       state.head,
+			"lag":        state.lag,
 		}).Warn("mds: branch not indexed")
 	}
 	x.metrics.SetLag(repository, branch, state.lag)
@@ -537,8 +592,44 @@ type branchState struct {
 	// head is the source commit the tick saw as the branch head.
 	head string
 
-	// lag is the number of first-parent commits of R@b that are not indexed yet.
+	// lag is the number of first-parent commits of R@b that are not indexed yet, or LagUnknown
+	// when the tick failed before it counted them.
 	lag int64
+}
+
+// retireUnfollowedBranches records the branches this tick follows and drops the state of the
+// branches the previous tick followed and this one does not (§4.8): a branch of R that was
+// deleted, or one that stopped matching the configuration. A branch that failed before its
+// metadata branch existed is only reachable this way - R no longer lists it and R-metadata never
+// had it - so the previous set, not a listing of R-metadata, is what the cleanup is derived from.
+func (x *Indexer) retireUnfollowedBranches(repository string, matching []string) {
+	current := make(map[string]struct{}, len(matching))
+	for _, branch := range matching {
+		current[branch] = struct{}{}
+	}
+	x.mu.Lock()
+	previous := x.followed[repository]
+	x.followed[repository] = current
+	x.mu.Unlock()
+	for branch := range previous {
+		if _, ok := current[branch]; ok {
+			continue
+		}
+		x.retireBranchState(repository, branch)
+		x.log.WithFields(logging.Fields{
+			"repository": repository,
+			"branch":     branch,
+		}).Info("mds: stopped following a branch of the data repository")
+	}
+}
+
+// retireBranchState drops everything /_health and /metrics report about a branch this indexer no
+// longer follows (§4.8): keeping either would leave the last error in the report, so one failed
+// attempt of a deleted branch keeps /_health at 503 until the process restarts, and the lag gauge
+// would keep a value no tick can ever clear.
+func (x *Indexer) retireBranchState(repository, branch string) {
+	x.metrics.ClearLag(repository, branch)
+	x.health.RemoveBranch(repository, branch)
 }
 
 // listBranches pages through every branch of a repository.

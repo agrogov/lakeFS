@@ -108,11 +108,17 @@ var (
 
 // CompactionConfig is the metadata_search.compaction section (§4.9): when a branch's table is
 // rewritten to drop the position-delete files that the merge-on-read delta writes accumulate.
+//
+// A threshold of 0 disables its trigger and a negative value is refused by Validate: 0 is the
+// documented way to turn a trigger off, so it is never replaced by the default here (IO-6). The
+// defaults apply only when the key is absent from the configuration.
 type CompactionConfig struct {
-	// MaxDeleteFiles is the number of delete files that triggers a compaction (default 200).
+	// MaxDeleteFiles is the number of delete files that triggers a compaction; 0 disables the
+	// trigger, the default when the key is absent is 200.
 	MaxDeleteFiles int `mapstructure:"max_delete_files"`
 
-	// EveryCommits is the number of indexed commits after which a compaction runs (default 500).
+	// EveryCommits is the number of indexed commits after which a compaction runs; 0 disables the
+	// trigger, the default when the key is absent is 500.
 	EveryCommits int `mapstructure:"every_commits"`
 }
 
@@ -185,7 +191,8 @@ type Config struct {
 	// true.
 	DeleteBranches bool `mapstructure:"delete_branches"`
 
-	// TagRetention is how long mds-* tags are kept, 0 keeping them forever (§4.9).
+	// TagRetention is how long mds-* tags are kept, 0 keeping them forever (§4.9). A negative
+	// duration is refused by Validate.
 	TagRetention time.Duration `mapstructure:"tag_retention"`
 
 	// Compaction configures the table maintenance of §4.9.
@@ -354,6 +361,19 @@ func (c *Config) Validate() error {
 	}
 	if c.RebuildThreshold <= 0 {
 		invalid("%s.rebuild_threshold must be positive, got %d", ConfigKey, c.RebuildThreshold)
+	}
+	// The maintenance settings are the two places where 0 is a documented value: it turns a
+	// compaction trigger off, and it keeps every mds-* tag (§4.9). Negative values are not.
+	if c.TagRetention < 0 {
+		invalid("%s.tag_retention must not be negative, got %s; 0 keeps every mds-* tag", ConfigKey, c.TagRetention)
+	}
+	if c.Compaction.MaxDeleteFiles < 0 {
+		invalid("%s.compaction.max_delete_files must not be negative, got %d; 0 disables the trigger",
+			ConfigKey, c.Compaction.MaxDeleteFiles)
+	}
+	if c.Compaction.EveryCommits < 0 {
+		invalid("%s.compaction.every_commits must not be negative, got %d; 0 disables the trigger",
+			ConfigKey, c.Compaction.EveryCommits)
 	}
 	switch c.Backfill {
 	case BackfillHead, BackfillHistory:

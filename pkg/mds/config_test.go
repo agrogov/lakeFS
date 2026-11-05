@@ -269,6 +269,24 @@ func TestLoadConfigValidationRules(t *testing.T) {
 				"  since: 2026-01-01T00:00:00Z", "  since: \"yesterday\"", 1),
 			wantErr: `metadata_search.since "yesterday" is not an RFC 3339 timestamp`,
 		},
+		{
+			name: "tag_retention must not be negative",
+			document: strings.Replace(fullConfigYAML,
+				"tag_retention: 0s", "tag_retention: -1h", 1),
+			wantErr: "metadata_search.tag_retention must not be negative, got -1h0m0s; 0 keeps every mds-* tag",
+		},
+		{
+			name: "max_delete_files must not be negative",
+			document: strings.Replace(fullConfigYAML,
+				"max_delete_files: 200", "max_delete_files: -1", 1),
+			wantErr: "metadata_search.compaction.max_delete_files must not be negative, got -1; 0 disables the trigger",
+		},
+		{
+			name: "every_commits must not be negative",
+			document: strings.Replace(fullConfigYAML,
+				"every_commits: 500", "every_commits: -2", 1),
+			wantErr: "metadata_search.compaction.every_commits must not be negative, got -2; 0 disables the trigger",
+		},
 	}
 
 	for _, tt := range tests {
@@ -281,6 +299,26 @@ func TestLoadConfigValidationRules(t *testing.T) {
 			require.ErrorContains(t, err, tt.wantErr)
 		})
 	}
+}
+
+// TestLoadConfigMaintenanceDisabledByZero pins the IO-6 rule that matches the sample config and
+// docs/metadata-search.md: an explicit 0 is the documented way to turn a compaction trigger off
+// (and to keep every mds-* tag forever), so it survives validation, reaches the indexer as 0, and
+// is not replaced by the documented default - which applies only to an absent key.
+func TestLoadConfigMaintenanceDisabledByZero(t *testing.T) {
+	document := strings.Replace(fullConfigYAML, "max_delete_files: 200", "max_delete_files: 0", 1)
+	document = strings.Replace(document, "every_commits: 500", "every_commits: 0", 1)
+	useConfig(t, document)
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err, "0 is a valid value, not a problem to report")
+	require.Zero(t, cfg.Compaction.MaxDeleteFiles)
+	require.Zero(t, cfg.Compaction.EveryCommits)
+	require.Zero(t, cfg.TagRetention)
+
+	opts := indexerOptions(cfg, NewHealth(cfg.RepositoryNames()), Recorder{}, nil)
+	require.Zero(t, opts.Compaction.MaxDeleteFiles, `0 reaches the indexer as "disabled", not as the default`)
+	require.Zero(t, opts.Compaction.EveryCommits, `0 reaches the indexer as "disabled", not as the default`)
 }
 
 // TestLoadConfigReportsEveryProblem pins "one error per problem": an operator fixes the whole

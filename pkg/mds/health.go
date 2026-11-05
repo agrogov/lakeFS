@@ -13,6 +13,16 @@ import (
 	"encoding/json"
 	"net/http"
 	"sync"
+
+	"github.com/treeverse/lakefs/pkg/mds/indexer"
+)
+
+// Health is both sinks the indexer needs: the required tick lifecycle of §9 and the optional
+// cancellation hook, which is what keeps a tick cancelled by a graceful stop from leaving its
+// repository in progress forever (IO-5).
+var (
+	_ indexer.Health        = (*Health)(nil)
+	_ indexer.TickCanceller = (*Health)(nil)
 )
 
 const (
@@ -38,7 +48,9 @@ type BranchHealth struct {
 	// Head is the full ID of the source branch head the last tick saw.
 	Head string `json:"head"`
 
-	// LagCommits is the number of first-parent commits between LastIndexed and Head.
+	// LagCommits is the number of first-parent commits between LastIndexed and Head, or -1
+	// (indexer.LagUnknown) when the last attempt failed before it counted them: the mirror is
+	// behind by an unknown number of commits, which is not the same answer as 0.
 	LagCommits int64 `json:"lag_commits"`
 
 	// LastError is the error of the last indexing attempt of this branch, empty when it
@@ -100,6 +112,11 @@ func newRepositoryHealth() *repositoryHealth {
 
 // BeginTick marks the tick of one repository as in progress. It keeps the previous outcome: a
 // probe that arrives mid-tick sees the state of the previous tick plus in_progress.
+//
+// A tick in progress never clears the outcome of the previous one, and an error of the previous
+// tick therefore keeps the report unhealthy for the whole of the retry: a retry is not an outcome,
+// and a probe must not turn 200 because the indexer started another attempt at the work that
+// failed (IO-5). Only a tick that succeeds clears the error - see FinishTick.
 func (h *Health) BeginTick(repository string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -116,15 +133,20 @@ func (h *Health) FinishTick(repository string, err error) {
 	repo.lastError = errorString(err)
 }
 
-// SetBranch records the state of one mirrored branch.
-func (h *Health) SetBranch(repository, branch string, health BranchHealth) {
+// CancelTick ends a tick that was cancelled before it had an outcome, which is the in-flight work
+// of a graceful stop (§4.1, §9): the repository is no longer in progress, and the outcome of the
+// previous tick stays as it was, so a cancelled tick neither hides a failure nor invents one. It
+// exists because a tick that returned early used to leave in_progress set for the life of the
+// process (IO-5).
+func (h *Health) CancelTick(repository string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.repositoryLocked(repository).branches[branch] = health
+	h.repositoryLocked(repository).inProgress = false
 }
 
 // SetBranchState records the whole state of one mirrored branch (§9): the commit its table is at,
-// the head the tick saw, how many commits are still to apply, and the error of the attempt.
+// the head the tick saw, how many commits are still to apply (or -1 for unknown), and the error of
+// the attempt.
 //
 // It takes the fields rather than a BranchHealth so that the indexer (pkg/mds/indexer) can report
 // through an interface without importing this package: the indexer is a client of the indexer
@@ -149,17 +171,6 @@ func (h *Health) RemoveBranch(repository, branch string) {
 	delete(h.repositoryLocked(repository).branches, branch)
 }
 
-// SetBranchError records that indexing one branch failed, leaving the rest of its state as it
-// was.
-func (h *Health) SetBranchError(repository, branch string, err error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	repo := h.repositoryLocked(repository)
-	branchHealth := repo.branches[branch]
-	branchHealth.LastError = errorString(err)
-	repo.branches[branch] = branchHealth
-}
-
 // FailAll marks every repository failed with the same error. It is what the service records when
 // a tick fails as a whole, before it could attribute the failure to one repository.
 func (h *Health) FailAll(err error) {
@@ -171,7 +182,9 @@ func (h *Health) FailAll(err error) {
 	}
 }
 
-// Report returns a consistent snapshot of the health of every repository (§9).
+// Report returns a consistent snapshot of the health of every repository (§9). A repository is
+// healthy when neither it nor one of its branches carries an error; in_progress is reported as it
+// is and never turns an error into a healthy answer (IO-5).
 func (h *Health) Report() HealthReport {
 	h.mu.Lock()
 	defer h.mu.Unlock()
