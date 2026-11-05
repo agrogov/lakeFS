@@ -2,12 +2,16 @@ package table
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
+	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
@@ -48,6 +52,13 @@ var (
 	ErrNoCatalog = errors.New("no catalog")
 )
 
+// DefaultRequestTimeout is how long one HTTP request of a catalog client may take when
+// CatalogConfig.RequestTimeout is zero. iceberg-go builds its own http.Client with no Timeout
+// (catalog/rest/rest.go createSession), so without this bound a connection that neither answers
+// nor resets blocks the caller forever: for the indexer that is one branch tick holding the whole
+// tick loop, while /_health keeps reporting the tick as merely in progress (§4.1, §9).
+const DefaultRequestTimeout = 60 * time.Second
+
 // CatalogConfig is what the indexer needs to reach the Iceberg REST catalog of one branch of a
 // companion repository (design §4.3 step 3, §4.6).
 type CatalogConfig struct {
@@ -69,6 +80,10 @@ type CatalogConfig struct {
 	// when the catalog does not vend write credentials. Empty means "the catalog vends, or the
 	// client's own environment is enough".
 	Storage iceberg.Properties
+	// RequestTimeout bounds every HTTP request of the client this configuration builds (§4.1,
+	// §7). Zero means DefaultRequestTimeout; it does not mean "no timeout". It is the transport's
+	// bound, not the caller's context's, so it survives a call that passes the process context.
+	RequestTimeout time.Duration
 }
 
 // Validate reports whether the configuration can address a catalog.
@@ -138,13 +153,62 @@ func NewCatalog(ctx context.Context, cfg CatalogConfig) (*rest.Catalog, error) {
 	if err != nil {
 		return nil, err
 	}
+	timeout := cfg.RequestTimeout
+	if timeout <= 0 {
+		timeout = DefaultRequestTimeout
+	}
 	// iceberg-go keeps the map it is given and writes the server's /v1/config properties into it,
 	// while the indexer builds one catalog per branch concurrently from the same Storage map, so
 	// each catalog gets its own copy (a shared map is a fatal "concurrent map writes").
 	return rest.NewCatalog(ctx, CatalogName, uri,
 		rest.WithHeaders(map[string]string{"Authorization": cfg.Authorization()}),
 		rest.WithAdditionalProps(maps.Clone(cfg.Storage)),
+		// iceberg-go builds the transport of its session from this factory
+		// (rest.WithTransportFactory) and runs the returned cleanup on Close, so the client owns no
+		// transport the caller cannot release. The bound is per request, so the /v1/config
+		// exchange of NewCatalog is covered as well as every later table call.
+		rest.WithTransportFactory(func(tlsConfig *tls.Config) (http.RoundTripper, func()) {
+			transport := &http.Transport{Proxy: http.ProxyFromEnvironment, TLSClientConfig: tlsConfig}
+			return &timeoutTransport{base: transport, timeout: timeout}, transport.CloseIdleConnections
+		}),
 	)
+}
+
+// timeoutTransport bounds every request sent through it, including reading the response body.
+//
+// A context deadline is what carries the bound instead of http.Client.Timeout, because iceberg-go
+// builds the *http.Client itself and offers no option for its Timeout. Cancelling the request
+// context closes the connection, so a body read that stalls after the headers arrived fails too.
+// The deadline lives until the body is closed, which the catalog always does (catalog/rest/rest.go
+// do()).
+type timeoutTransport struct {
+	base    http.RoundTripper
+	timeout time.Duration
+}
+
+func (t *timeoutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx, cancel := context.WithTimeout(req.Context(), t.timeout)
+	resp, err := t.base.RoundTrip(req.WithContext(ctx))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	resp.Body = &timeoutBody{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
+}
+
+var _ http.RoundTripper = (*timeoutTransport)(nil)
+
+// timeoutBody releases the deadline of timeoutTransport when the response is closed.
+type timeoutBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *timeoutBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }
 
 // Identifier returns the identifier of system.object_metadata (§3.1).

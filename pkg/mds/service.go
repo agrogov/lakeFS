@@ -257,6 +257,7 @@ func indexerOptions(cfg *Config, health *Health, metrics Recorder, log logging.L
 		AccessKeyID:      cfg.AccessKeyID,
 		SecretKey:        cfg.SecretKey,
 		Storage:          cfg.Storage,
+		RequestTimeout:   cfg.RequestTimeout,
 		Concurrency:      cfg.Concurrency,
 		MaxCommits:       cfg.MaxCommits,
 		Backfill:         cfg.Backfill,

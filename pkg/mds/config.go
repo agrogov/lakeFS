@@ -55,6 +55,10 @@ const (
 	// DefaultPeriod is the interval between two ticks of the indexer (§4.1).
 	DefaultPeriod = 60 * time.Second
 
+	// DefaultRequestTimeout bounds one HTTP request of the indexer's lakeFS API client and of its
+	// Iceberg REST catalog client (§4.1, §7).
+	DefaultRequestTimeout = 60 * time.Second
+
 	// DefaultConcurrency is how many branches an indexer processes in parallel (§4.1).
 	DefaultConcurrency = 25
 
@@ -146,6 +150,12 @@ type Config struct {
 	// Period is the interval between two ticks (§4.1). Must be positive.
 	Period time.Duration `mapstructure:"period"`
 
+	// RequestTimeout bounds every HTTP request the indexer sends, on the lakeFS API client and on
+	// the Iceberg REST catalog client alike (§4.1). It is what keeps one connection that neither
+	// answers nor resets from stalling the tick loop while /_health stays 200 (§9). Must be
+	// positive.
+	RequestTimeout time.Duration `mapstructure:"request_timeout"`
+
 	// Concurrency is how many branches one tick processes in parallel (§4.1). Must be positive.
 	Concurrency int `mapstructure:"concurrency"`
 
@@ -230,6 +240,9 @@ func (c *Config) applyViperOverrides() {
 	if viper.IsSet(ConfigKey + ".period") {
 		c.Period = viper.GetDuration(ConfigKey + ".period")
 	}
+	if viper.IsSet(ConfigKey + ".request_timeout") {
+		c.RequestTimeout = viper.GetDuration(ConfigKey + ".request_timeout")
+	}
 	if viper.IsSet(ConfigKey + ".concurrency") {
 		c.Concurrency = viper.GetInt(ConfigKey + ".concurrency")
 	}
@@ -272,6 +285,9 @@ func (c *Config) setDefaults() {
 	}
 	if !set("period") {
 		c.Period = DefaultPeriod
+	}
+	if !set("request_timeout") {
+		c.RequestTimeout = DefaultRequestTimeout
 	}
 	if !set("concurrency") {
 		c.Concurrency = DefaultConcurrency
@@ -323,6 +339,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Period <= 0 {
 		invalid("%s.period must be positive, got %s", ConfigKey, c.Period)
+	}
+	if c.RequestTimeout <= 0 {
+		invalid("%s.request_timeout must be positive, got %s", ConfigKey, c.RequestTimeout)
 	}
 	if c.Concurrency <= 0 {
 		invalid("%s.concurrency must be positive, got %d", ConfigKey, c.Concurrency)

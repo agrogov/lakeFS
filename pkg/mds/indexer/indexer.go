@@ -103,6 +103,13 @@ const (
 	DefaultRebuildThreshold = 100_000
 	DefaultMaxDeleteFiles   = 200
 	DefaultEveryCommits     = 500
+
+	// DefaultRequestTimeout is how long one HTTP request of either client may take before it is
+	// abandoned (metadata_search.request_timeout, §7). Without it a connection that neither
+	// answers nor resets - a wedged load balancer, a dropped NAT entry, a blackholed replica -
+	// blocks the whole tick loop while /_health still reports the tick as merely in progress
+	// (§4.1, §9). pkg/mds/table applies the same default to a catalog built without one.
+	DefaultRequestTimeout = 60 * time.Second
 )
 
 // conflictRetries bounds how often one branch tick restarts after the Iceberg commit answered 409
@@ -225,6 +232,12 @@ type Options struct {
 	// credentials (§4.6), e.g. s3.endpoint and s3.access-key-id.
 	Storage map[string]string
 
+	// RequestTimeout bounds every HTTP request of the lakeFS API client and of the Iceberg REST
+	// catalog (§4.1, §7): a request that has not completed within it fails, so the branch (or
+	// the repository) is reported failed instead of stalling the tick loop. Zero means
+	// DefaultRequestTimeout; it does not mean "no timeout".
+	RequestTimeout time.Duration
+
 	// Concurrency is how many branches one repository tick processes in parallel (§4.1).
 	Concurrency int
 
@@ -295,6 +308,7 @@ type Indexer struct {
 	log     logging.Logger
 
 	concurrency      int
+	requestTimeout   time.Duration
 	maxCommits       int
 	since            *time.Time
 	backfill         string
@@ -320,6 +334,7 @@ func New(opts Options) (*Indexer, error) {
 		metrics:           opts.Metrics,
 		log:               opts.Log,
 		concurrency:       opts.Concurrency,
+		requestTimeout:    opts.RequestTimeout,
 		maxCommits:        opts.MaxCommits,
 		since:             opts.Since,
 		backfill:          opts.Backfill,
@@ -360,7 +375,7 @@ func New(opts Options) (*Indexer, error) {
 			return nil, err
 		}
 		if x.lakeFS == nil {
-			lakeFS, err := newLakeFSClient(base, opts.AccessKeyID, opts.SecretKey)
+			lakeFS, err := newLakeFSClient(base, opts.AccessKeyID, opts.SecretKey, x.requestTimeout)
 			if err != nil {
 				return nil, err
 			}
@@ -372,6 +387,7 @@ func New(opts Options) (*Indexer, error) {
 				AccessKeyID:     opts.AccessKeyID,
 				SecretAccessKey: opts.SecretKey,
 				Storage:         iceberg.Properties(opts.Storage),
+				RequestTimeout:  x.requestTimeout,
 			}
 		}
 	}
@@ -382,6 +398,9 @@ func New(opts Options) (*Indexer, error) {
 func (x *Indexer) applyDefaults() {
 	if x.concurrency <= 0 {
 		x.concurrency = DefaultConcurrency
+	}
+	if x.requestTimeout <= 0 {
+		x.requestTimeout = DefaultRequestTimeout
 	}
 	if x.maxCommits <= 0 {
 		x.maxCommits = DefaultMaxCommits
@@ -609,9 +628,17 @@ func apiBaseURL(endpoint string) (string, error) {
 
 // newLakeFSClient builds the typed lakeFS client of pkg/mds/client over the generated client,
 // authenticated as the indexer principal with HTTP basic (§8).
-func newLakeFSClient(baseURL, accessKeyID, secretKey string) (client.LakeFS, error) {
-	api, err := apigen.NewClientWithResponses(baseURL, apigen.WithRequestEditorFn(
-		func(_ context.Context, req *http.Request) error {
+//
+// The client carries requestTimeout: without it the generated client would fall back to
+// http.DefaultClient, which has no Timeout, and one connection that neither answers nor resets
+// would stall every repository of the tick loop (§4.1, §9). http.Client.Timeout covers the whole
+// exchange, including reading the response body, which is what the generated client does with
+// io.ReadAll.
+func newLakeFSClient(baseURL, accessKeyID, secretKey string, requestTimeout time.Duration) (client.LakeFS, error) {
+	httpClient := &http.Client{Timeout: requestTimeout}
+	api, err := apigen.NewClientWithResponses(baseURL,
+		apigen.WithHTTPClient(httpClient),
+		apigen.WithRequestEditorFn(func(_ context.Context, req *http.Request) error {
 			req.SetBasicAuth(accessKeyID, secretKey)
 			return nil
 		}))

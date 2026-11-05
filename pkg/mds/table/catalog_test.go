@@ -1,8 +1,14 @@
 package table_test
 
 import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/apache/iceberg-go"
 	"github.com/stretchr/testify/require"
@@ -242,4 +248,70 @@ func TestNewCatalogConcurrentSharedStorage(t *testing.T) {
 func TestCatalogConfigAuthorization(t *testing.T) {
 	cfg := table.CatalogConfig{AccessKeyID: "AKIA", SecretAccessKey: "secret"}
 	require.Equal(t, "Basic QUtJQTpzZWNyZXQ=", cfg.Authorization())
+}
+
+// TestNewCatalogRequestTimeout pins the bound of design §4.1 that iceberg-go does not have: it
+// builds its own http.Client with no Timeout (catalog/rest/rest.go createSession), so a connection
+// that accepts the request and never answers must fail on CatalogConfig.RequestTimeout instead of
+// blocking the caller - for the indexer that caller is a branch tick that holds the whole tick
+// loop (MDS_REVIEW.md IX-2, TB-3).
+//
+// Both exchanges are covered because they run on differently built clients in iceberg-go: the
+// GET /v1/config of NewCatalog (fetchConfig) and every later table call (createSession).
+func TestNewCatalogRequestTimeout(t *testing.T) {
+	const requestTimeout = 200 * time.Millisecond
+
+	// hangingCatalog answers GET /v1/config and never answers anything else, so a subtest can
+	// choose the exchange it stalls. The handler returns when the client gives up, so closing the
+	// server cannot block.
+	hangingCatalog := func(t *testing.T, answerConfig bool) *httptest.Server {
+		t.Helper()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if answerConfig && strings.HasSuffix(r.URL.Path, "/v1/config") {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{}`))
+				return
+			}
+			<-r.Context().Done()
+		}))
+		t.Cleanup(server.Close)
+		return server
+	}
+
+	catalogConfig := func(endpoint string) table.CatalogConfig {
+		return table.CatalogConfig{
+			Endpoint:        endpoint,
+			Repository:      "data-repo-metadata",
+			Branch:          "main",
+			AccessKeyID:     "AKIAEXAMPLE",
+			SecretAccessKey: "secret",
+			RequestTimeout:  requestTimeout,
+		}
+	}
+
+	t.Run("config exchange", func(t *testing.T) {
+		server := hangingCatalog(t, false)
+		start := time.Now()
+		cat, err := table.NewCatalog(t.Context(), catalogConfig(server.URL))
+		elapsed := time.Since(start)
+		require.Error(t, err, "NewCatalog must not hang on GET /v1/config")
+		require.Nil(t, cat)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.GreaterOrEqual(t, elapsed, requestTimeout,
+			"the failure waited for the request bound, so it is the timeout and not a refused connection")
+	})
+
+	t.Run("table call", func(t *testing.T) {
+		server := hangingCatalog(t, true)
+		cat, err := table.NewCatalog(t.Context(), catalogConfig(server.URL))
+		require.NoError(t, err, "GET /v1/config answers")
+		t.Cleanup(func() { _ = cat.Close() })
+
+		start := time.Now()
+		_, err = cat.LoadTable(t.Context(), table.Identifier())
+		elapsed := time.Since(start)
+		require.Error(t, err, "LoadTable must not hang on a catalog that never answers")
+		require.True(t, errors.Is(err, context.DeadlineExceeded), "the error is the request timeout, got %v", err)
+		require.GreaterOrEqual(t, elapsed, requestTimeout)
+	})
 }

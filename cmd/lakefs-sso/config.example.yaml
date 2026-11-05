@@ -226,6 +226,11 @@ sso:
 #   listen_address: "0.0.0.0:8080"
 #   # Interval between ticks; must be positive. Default 60s.
 #   period: 60s
+#   # Bound on every HTTP request the indexer sends, to the lakeFS API and to the Iceberg REST
+#   # catalog alike; must be positive. A request that does not complete within it fails, so the
+#   # branch (or repository) is reported on /_health instead of one wedged connection stalling the
+#   # tick loop. Default 60s.
+#   request_timeout: 60s
 #   # Branches one tick processes in parallel; must be positive. Default 25.
 #   concurrency: 25
 #   # First-parent source commits one branch applies per tick; must be positive. Default 1000.

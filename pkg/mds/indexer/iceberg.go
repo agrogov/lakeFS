@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
@@ -41,6 +42,12 @@ type IcebergStore struct {
 	// Storage holds the iceberg-go IO properties used when the catalog does not vend write
 	// credentials (§4.6).
 	Storage iceberg.Properties
+
+	// RequestTimeout bounds every HTTP request this store's catalog client sends (§4.1, §7). It is
+	// the same bound the lakeFS API client of the indexer uses; zero means the table package's
+	// default. Iceberg-go writes data, manifest and metadata files through its own IO, not
+	// through this client, so a long write does not race this timeout.
+	RequestTimeout time.Duration
 }
 
 var _ TableStore = (*IcebergStore)(nil)
@@ -99,6 +106,7 @@ func (s *IcebergStore) catalog(ctx context.Context, dataRepository, branch strin
 		AccessKeyID:     s.AccessKeyID,
 		SecretAccessKey: s.SecretAccessKey,
 		Storage:         s.Storage,
+		RequestTimeout:  s.RequestTimeout,
 	})
 }
 

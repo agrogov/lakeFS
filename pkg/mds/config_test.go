@@ -31,6 +31,7 @@ metadata_search:
   secret_key: secret
   listen_address: 0.0.0.0:8080
   period: 60s
+  request_timeout: 60s
   concurrency: 25
   max_commits: 1000
   since: 2026-01-01T00:00:00Z
@@ -80,6 +81,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 	// Every default of §7.
 	require.Equal(t, DefaultListenAddress, cfg.ListenAddress)
 	require.Equal(t, 60*time.Second, cfg.Period)
+	require.Equal(t, DefaultRequestTimeout, cfg.RequestTimeout, "a request of either client is bounded by default")
+	require.Equal(t, 60*time.Second, cfg.RequestTimeout)
 	require.Equal(t, 25, cfg.Concurrency)
 	require.Equal(t, 1000, cfg.MaxCommits)
 	require.Equal(t, BackfillHead, cfg.Backfill)
@@ -107,6 +110,7 @@ func TestLoadConfigDocumentedExample(t *testing.T) {
 	require.Equal(t, "secret", cfg.SecretKey)
 	require.Equal(t, "0.0.0.0:8080", cfg.ListenAddress)
 	require.Equal(t, 60*time.Second, cfg.Period)
+	require.Equal(t, 60*time.Second, cfg.RequestTimeout)
 	require.Equal(t, 25, cfg.Concurrency)
 	require.Equal(t, 1000, cfg.MaxCommits)
 	require.Equal(t, BackfillHead, cfg.Backfill)
@@ -175,6 +179,18 @@ func TestLoadConfigValidationRules(t *testing.T) {
 			document: strings.Replace(fullConfigYAML,
 				"period: 60s", "period: -1s", 1),
 			wantErr: "metadata_search.period must be positive, got -1s",
+		},
+		{
+			name: "request_timeout must be positive",
+			document: strings.Replace(fullConfigYAML,
+				"request_timeout: 60s", "request_timeout: 0s", 1),
+			wantErr: "metadata_search.request_timeout must be positive, got 0s",
+		},
+		{
+			name: "negative request_timeout must be positive",
+			document: strings.Replace(fullConfigYAML,
+				"request_timeout: 60s", "request_timeout: -1m", 1),
+			wantErr: "metadata_search.request_timeout must be positive, got -1m0s",
 		},
 		{
 			name: "concurrency must be positive",
@@ -296,6 +312,7 @@ func TestLoadConfigEnvironmentOverrides(t *testing.T) {
 	useConfig(t, minimalConfigYAML)
 	// §7: environment overrides follow lakeFS conventions.
 	t.Setenv("LAKEFS_METADATA_SEARCH_PERIOD", "5s")
+	t.Setenv("LAKEFS_METADATA_SEARCH_REQUEST_TIMEOUT", "7s")
 	t.Setenv("LAKEFS_METADATA_SEARCH_SECRET_KEY", "from-the-environment")
 	t.Setenv("LAKEFS_METADATA_SEARCH_DELETE_BRANCHES", "false")
 	t.Setenv("LAKEFS_METADATA_SEARCH_SINCE", "2027-02-03T04:05:06Z")
@@ -303,6 +320,7 @@ func TestLoadConfigEnvironmentOverrides(t *testing.T) {
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
 	require.Equal(t, 5*time.Second, cfg.Period)
+	require.Equal(t, 7*time.Second, cfg.RequestTimeout)
 	require.Equal(t, "from-the-environment", cfg.SecretKey)
 	require.False(t, cfg.DeleteBranches, "an explicit env override wins over the true default")
 	since, ok := cfg.SinceTime()
@@ -361,4 +379,19 @@ func TestRepositoryNamesSorted(t *testing.T) {
 
 	var nilConfig *Config
 	require.Nil(t, nilConfig.RepositoryNames())
+}
+
+// TestRequestTimeoutReachesTheIndexer pins the wiring of the bound: indexerOptions is the one place
+// where the metadata_search section and the indexer meet, so the value an operator writes must be
+// the value the indexer's clients carry (METADATA_SEARCH_DESIGN.md §4.1, §7).
+func TestRequestTimeoutReachesTheIndexer(t *testing.T) {
+	useConfig(t, strings.Replace(fullConfigYAML, "request_timeout: 60s", "request_timeout: 5s", 1))
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.Equal(t, 5*time.Second, cfg.RequestTimeout)
+
+	opts := indexerOptions(cfg, NewHealth(cfg.RepositoryNames()), Recorder{}, nil)
+	require.Equal(t, 5*time.Second, opts.RequestTimeout,
+		"the request bound of the configuration is the request bound of the indexer's clients")
 }
