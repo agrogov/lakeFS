@@ -111,6 +111,19 @@ const (
 	// repository R: R-metadata (§3.2). It is the one naming convention the catalog and the
 	// indexer share, so it is declared here, in the package both use.
 	MetadataRepositorySuffix = "-metadata"
+
+	// MetadataSearchRepositoryProperty is the table property that says which data repository a
+	// Metadata Search index describes (METADATA_SEARCH_DESIGN.md §3.1). The indexer writes it into
+	// every system.object_metadata table it creates, with the name of the data repository as the
+	// value; the catalog reads it before it serves a resolved virtual table, because the name
+	// R-metadata alone does not prove who wrote the table (MDS-SEC-3).
+	//
+	// The literal is restated here rather than imported: it is written by
+	// pkg/mds/table/schema.go (PropertyRepository) on the Metadata Search branch, and this package
+	// must not import pkg/mds - the dependency runs the other way (the indexer imports this
+	// package for MetadataRepository and Address). The two spellings are pinned together by the
+	// design §3.1, not by a Go identifier.
+	MetadataSearchRepositoryProperty = "lakefs.mds.repository"
 )
 
 // ErrInvalidResolution is returned when a registered TableResolver answers with a target that is
@@ -145,8 +158,29 @@ type ResolvedTable struct {
 // Resolve is called after the caller was authorized for the address it names, so it must not be
 // used to disclose anything the catalog itself would not. It may do I/O: the built-in resolver asks
 // the catalog whether a ref is a branch.
+//
+// A resolver whose redirect is only valid if the target table proves it belongs there implements
+// ResolvedTableVerifier as well; the built-in Metadata Search resolver does, because a repository
+// whose name ends in -metadata is not necessarily R's index (MDS-SEC-3).
 type TableResolver interface {
 	Resolve(ctx context.Context, addr Address) (ResolvedTable, bool, error)
+}
+
+// ResolvedTableVerifier is the optional half of a TableResolver whose target has to prove that it
+// is the table the resolver meant to serve. Store.Resolve loads the target and asks the verifier
+// before it hands the resolution to the read path; a resolver that does not implement it is
+// trusted with the target it answered (the hook's original contract).
+//
+// It is a separate interface because only a resolver that moves a read *across repositories* has a
+// question the address alone cannot answer. The built-in Metadata Search resolver answers R's
+// virtual table with R-metadata's system.object_metadata, and the repository name is the only
+// thing that connects the two: a repository someone else created under that name would otherwise
+// be served, with the server's own identity, to every reader of R (MDS-SEC-3).
+type ResolvedTableVerifier interface {
+	// VerifyResolved reports whether tbl, loaded from target, is the table the resolver serves for
+	// requested. A *NoSuchTableException hides it as a table that is not there, which is the
+	// answer the virtual address gives when its index does not exist.
+	VerifyResolved(ctx context.Context, requested, target Address, tbl *Table) error
 }
 
 // RefMapper maps a ref of a data repository to a ref of its companion repository
@@ -358,6 +392,30 @@ func (r *MetadataSearchResolver) metadataRef(ctx context.Context, addr Address) 
 	return mapped, nil
 }
 
+// VerifyResolved implements ResolvedTableVerifier: R-metadata is R's index only when its table says
+// it is (MDS-SEC-3). The indexer writes lakefs.mds.repository = R into every system.object_metadata
+// table it creates (§3.1), so a table that carries another repository's name, or no property at
+// all, was not written for R - R-metadata may be an ordinary repository someone created before the
+// indexer did, and serving it would show every reader of R attacker-chosen rows under the server's
+// own identity (§5.2). The indexer refuses such a repository permanently (§4.8), so the catalog has
+// to refuse it too: the state never heals by itself.
+//
+// The answer is NoSuchTableException for the address the caller named, which is the 404 the design
+// promises for an unindexed ref: from the caller's side there is no object_metadata table on that
+// ref of R, and there is nothing else it could mean.
+func (r *MetadataSearchResolver) VerifyResolved(_ context.Context, requested, _ Address, tbl *Table) error {
+	if tbl != nil && tbl.Metadata != nil &&
+		tbl.Metadata.Properties()[MetadataSearchRepositoryProperty] == requested.Repo {
+		return nil
+	}
+	return &NoSuchTableException{
+		Repo:      requested.Repo,
+		Ref:       requested.Ref,
+		Namespace: requested.Namespace,
+		Table:     requested.Table,
+	}
+}
+
 // VirtualNamespaces implements VirtualTableSource: a data repository ref lists system as its one
 // virtual child namespace (§5.4). The parent of a listing is an Address with a repository and a ref
 // and no namespace levels; a deeper parent lists what its markers say and nothing else.
@@ -416,6 +474,12 @@ func (s *Store) Resolver() TableResolver { return s.resolver }
 // resolution that does not name a repository, a ref, a namespace and a table could only be served
 // as a 404 for an address nobody asked for, so it is reported as the server-side misconfiguration
 // it is.
+//
+// A resolver that also implements ResolvedTableVerifier gets its target loaded and checked here
+// (MDS-SEC-3): a redirect is served only if the table it names proves it is the right one. The load
+// is the store's ordinary table read - the same pointer and metadata.json the read path would read
+// next - so the check cannot pass on a table the read would not get, and a failing check answers
+// before anything is served.
 func (s *Store) Resolve(ctx context.Context, addr Address) (ResolvedTable, error) {
 	identity := ResolvedTable{Target: addr, Authz: addr}
 	if s.resolver == nil {
@@ -437,6 +501,15 @@ func (s *Store) Resolve(ctx context.Context, addr Address) (ResolvedTable, error
 	if target.Repo == "" || target.Ref == "" || len(target.Namespace) == 0 || target.Table == "" || target.View != "" {
 		return ResolvedTable{}, fmt.Errorf("%w: the resolver returned an incomplete target for %s@%s",
 			ErrInvalidResolution, addr.Repo, addr.Ref)
+	}
+	if verifier, ok := s.resolver.(ResolvedTableVerifier); ok {
+		tbl, err := s.GetTable(ctx, target)
+		if err != nil {
+			return ResolvedTable{}, err
+		}
+		if err := verifier.VerifyResolved(ctx, addr, target, tbl); err != nil {
+			return ResolvedTable{}, err
+		}
 	}
 	return resolved, nil
 }

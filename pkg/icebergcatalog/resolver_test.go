@@ -127,14 +127,26 @@ type resolverFixture struct {
 	credentials map[string]resolverCredential
 
 	// metaStorageNamespace is the storage namespace of resolverMetaRepo and metaLocation the
-	// metadata.json of its object_metadata table.
+	// metadata.json of its object_metadata table. metaMetadataJSON is that document, with the
+	// properties the fixture gave it (MDS-SEC-3).
 	metaStorageNamespace string
 	metaLocation         string
+	metaMetadataJSON     string
 }
 
 // newResolverFixture builds the two-repository fixture and mounts the production catalog with
-// Metadata Search enabled.
+// Metadata Search enabled. The companion table carries the lakefs.mds.repository property the
+// indexer writes, so it is a genuine index of tablesTestRepo.
 func newResolverFixture(t *testing.T) *resolverFixture {
+	t.Helper()
+	return newResolverFixtureWithTableProperty(t, tablesTestRepo)
+}
+
+// newResolverFixtureWithTableProperty builds the same fixture with the lakefs.mds.repository
+// property of the companion table set to repositoryProperty, or with no such property at all when
+// repositoryProperty is empty: a genuine index, a table that names another repository, and a table
+// that names none (MDS-SEC-3).
+func newResolverFixtureWithTableProperty(t *testing.T, repositoryProperty string) *resolverFixture {
 	t.Helper()
 	base := newTablesFixture(t)
 	ctx := base.ctx
@@ -152,8 +164,13 @@ func newResolverFixture(t *testing.T) *resolverFixture {
 
 	metaLocation := strings.TrimRight(metaStorageNamespace, "/") + "/_iceberg/" +
 		resolverMetaUUID + "/metadata/00001.metadata.json"
-	putResolverObject(t, base.catalog, resolverMetaRepo, metaLocation,
-		tablesTestMetadata(resolverMetaUUID, strings.TrimRight(metaStorageNamespace, "/")+"/_iceberg/"+resolverMetaUUID))
+	properties := map[string]string{"owner": "data-team"}
+	if repositoryProperty != "" {
+		properties[MetadataSearchRepositoryProperty] = repositoryProperty
+	}
+	metaMetadataJSON := resolverMetadataWithProperties(t, resolverMetaUUID,
+		strings.TrimRight(metaStorageNamespace, "/")+"/_iceberg/"+resolverMetaUUID, properties)
+	putResolverObject(t, base.catalog, resolverMetaRepo, metaLocation, metaMetadataJSON)
 	tableAddr := metaNamespaceAddr
 	tableAddr.Table = resolverObjectMetadataTable
 	require.NoError(t, base.store.CreateTable(ctx, tableAddr, TablePointer{
@@ -209,6 +226,7 @@ func newResolverFixture(t *testing.T) *resolverFixture {
 		credentials:          credentials,
 		metaStorageNamespace: metaStorageNamespace,
 		metaLocation:         metaLocation,
+		metaMetadataJSON:     metaMetadataJSON,
 	}
 }
 
@@ -235,6 +253,22 @@ func (f *resolverFixture) request(t *testing.T, method, target, user, body strin
 	rec := httptest.NewRecorder()
 	f.mux.ServeHTTP(rec, req)
 	return rec
+}
+
+// resolverMetadataWithProperties renders the fixture's metadata document with its `properties`
+// object replaced, so a test can give the companion table the lakefs.mds.repository property the
+// indexer writes - or leave it out (MDS-SEC-3). The document is edited as raw JSON so that the
+// snapshot IDs, which do not fit a float64, are passed through unchanged.
+func resolverMetadataWithProperties(t *testing.T, tableUUID, tableLocation string, properties map[string]string) string {
+	t.Helper()
+	document := make(map[string]json.RawMessage)
+	require.NoError(t, json.Unmarshal([]byte(tablesTestMetadata(tableUUID, tableLocation)), &document))
+	rendered, err := json.Marshal(properties)
+	require.NoError(t, err)
+	document["properties"] = rendered
+	encoded, err := json.Marshal(document)
+	require.NoError(t, err)
+	return string(encoded)
 }
 
 // putResolverObject writes content at the full identifier location of repository, the way the
@@ -565,8 +599,7 @@ func TestMetadataSearchVirtualTableRead(t *testing.T) {
 			"the table is the one the indexer wrote into the companion repository")
 		require.True(t, strings.HasPrefix(body.MetadataLocation, strings.TrimRight(f.metaStorageNamespace, "/")+"/"),
 			"the metadata lives in the companion repository's storage namespace")
-		require.JSONEq(t, tablesTestMetadata(resolverMetaUUID,
-			strings.TrimRight(f.metaStorageNamespace, "/")+"/_iceberg/"+resolverMetaUUID), string(mustMarshalRaw(t, body.Metadata)))
+		require.JSONEq(t, f.metaMetadataJSON, string(mustMarshalRaw(t, body.Metadata)))
 
 		// HEAD is the same authorized read, so it cannot report a table the load would refuse.
 		require.Equal(t, http.StatusNoContent,
@@ -647,6 +680,42 @@ func TestMetadataSearchVirtualTableRead(t *testing.T) {
 		require.Equal(t, http.StatusNoContent, f.request(t, http.MethodPost,
 			tableMetricsTarget(nodes(tablesTestRepo, tablesTestRef, SystemNamespace), resolverObjectMetadataTable),
 			"carol", `{"report-type":"scan-report"}`).Code)
+	})
+}
+
+// TestMetadataSearchCompanionRepositoryProof is MDS-SEC-3: a companion repository is only R's
+// index when its table says so. The indexer writes lakefs.mds.repository = R into the
+// object_metadata table it creates (METADATA_SEARCH_DESIGN.md §3.1), and the catalog checks that
+// property before it serves the redirected table. Anything else - a table that names another
+// repository, or a table with no property at all - is the 404 NoSuchTableException an unindexed
+// ref answers: whoever created R-metadata before the indexer did must not be able to show every
+// reader of R attacker-chosen rows, because the redirected read runs with the server's identity.
+func TestMetadataSearchCompanionRepositoryProof(t *testing.T) {
+	t.Run("a companion table that names another repository is not served", func(t *testing.T) {
+		f := newResolverFixtureWithTableProperty(t, "another-repo")
+		requireEnvelope(t, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", ""),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+		requireEnvelope(t, f.request(t, http.MethodHead, virtualTarget(tablesTestRef), "alice", ""),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+		// The data-plane paths resolve the same table, so a vended session or a signature must not
+		// be scoped to a location the virtual table does not read.
+		_, err := newTableScopeResolver(f.store)(t.Context(), resolverVirtualAddress(tablesTestRef),
+			func(context.Context, Address) error { return nil })
+		var noTable *NoSuchTableException
+		require.ErrorAs(t, err, &noTable)
+	})
+
+	t.Run("a companion table with no repository property is not served", func(t *testing.T) {
+		f := newResolverFixtureWithTableProperty(t, "")
+		requireEnvelope(t, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", ""),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+		requireEnvelope(t, f.request(t, http.MethodHead, virtualTarget(tablesTestRef), "alice", ""),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+	})
+
+	t.Run("a companion table that names the data repository is served", func(t *testing.T) {
+		f := newResolverFixture(t)
+		require.Equal(t, http.StatusOK, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", "").Code)
 	})
 }
 

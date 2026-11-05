@@ -155,6 +155,16 @@ func TestLoadConfigValidationErrors(t *testing.T) {
 			wantErr: "max_staged_files must not be negative",
 		},
 		{
+			name:    "metadata_search without the catalog",
+			yaml:    "iceberg:\n  enabled: false\n  metadata_search:\n    enabled: true\n",
+			wantErr: "metadata_search.enabled requires enabled",
+		},
+		{
+			name:    "metadata_search without the catalog and without an explicit enabled",
+			yaml:    "iceberg:\n  metadata_search:\n    enabled: true\n",
+			wantErr: "metadata_search.enabled requires enabled",
+		},
+		{
 			name:    "malformed section",
 			yaml:    "iceberg: 3\n",
 			wantErr: "cannot parse",
