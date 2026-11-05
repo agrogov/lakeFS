@@ -7,14 +7,17 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-// notImplementedMounts are the URL prefixes reserved for services that the open-source build
-// does not serve. When no hook claimed a prefix, mounting a placeholder answers 501 there
+// notImplementedMounts are the URL prefixes reserved for services that this build may not
+// serve. When no hook claimed a prefix, mounting a placeholder answers 501 there
 // instead of letting the request reach the router's root handler, which serves the UI or an
 // S3-gateway error and so answers something other than the intended 501.
 var notImplementedMounts = []string{
 	"/iceberg/api/",         // Iceberg REST Catalog (ICEBERG_CATALOG_PLAN.md §4.1, I-1)
 	"/iceberg/relative_to/", // the same catalog, with the warehouse carried in the URL
-	"/mds/iceberg/api/",     // never implemented: this one stays a 501 in every build
+	// The upstream Metadata Search alias: lakefs-sso mounts the same catalog here while
+	// iceberg.metadata_search.enabled is true, so this prefix is a placeholder only when no
+	// hook claimed it (and a plain lakefs build then answers 501).
+	"/mds/iceberg/api/",
 }
 
 // MountNotImplementedServices registers placeholder routes that return HTTP 501 for
