@@ -57,27 +57,39 @@ namespace, operator-added statements, the auth cache window). The esti run on `d
 demonstrably live. **Verdict: fix R2I-1 and R2T-1, and this fragment is mergeable; the MINOR/NIT set
 can follow.** No BLOCKER was found.
 
+## Fix review
+
+All 17 findings are fixed, in five commits on top of the consolidated review `902839f67`; each finding below
+records the commit that fixes it, and `METADATA_SEARCH_PLAN.md` summarises the set. `da24d421f` is the indexer
+(R2I-1…R2I-4), `500a00a37` the two catalog findings (R2S-1, R2S-5; made on `feature/iceberg-catalog` and
+merged in `8df39cabd`), `26a66b633` the §8 policy findings (R2S-2…R2S-9), `d993d602e` the table findings
+(R2T-1…R2T-3) and `2af2532b7` the esti harness (R2T-4). The docs commit that follows updates
+`METADATA_SEARCH_DESIGN.md`, `docs/metadata-search.md` and `METADATA_SEARCH_PLAN.md` wherever a fix changed a
+described behaviour; it changes no code or test. On the merged head, `go build ./...` passes and
+`go test -count=1 -race -timeout 10m ./pkg/mds/... ./pkg/icebergcatalog/... ./cmd/lakefs-sso/...` passes
+(every package `ok`; `cmd/lakefs-sso` has no test files).
+
 ## Summary of findings
 
-| Key | Severity | Area | Title | File:line |
-|---|---|---|---|---|
-| R2I-1 | MAJOR | indexer | A 400 that is not "no changes" re-enters the whole initialisation recursively, without a bound | `pkg/mds/indexer/repo.go:327-339` |
-| R2T-1 | MAJOR | table | `Compact` panics the whole indexer process on a table whose schema has a column outside the ten `Row` fields | `pkg/mds/table/writer.go:357-362` |
-| R2I-2 | MINOR | indexer | Every caught-up branch now pays one `FindMergeBase` per tick, and a transient 404 on it fails the branch | `pkg/mds/indexer/branch.go:98-104` |
-| R2I-3 | MINOR | indexer | TS-4's fix does not see a COMMIT-protected companion branch — the review's claim that it does is wrong, and the state it was supposed to cure is unchanged | `pkg/mds/indexer/repo.go:70-74` |
-| R2I-4 | MINOR | indexer | The initialisation commits whatever table is already staged, so the marker is sealed on top of a table the indexer did not create | `pkg/mds/indexer/repo.go:303-306` |
-| R2S-1 | MINOR | security | The MDS-SEC-3 "proof" is a table property the attacker writes, so the finding it claims to fix still works | `pkg/icebergcatalog/resolver.go:406-419` |
-| R2S-2 | MINOR | security | The policies grow one statement group per repository; the deny exceeds DynamoDB's 400 KiB item limit at ~560 repositories and the server then refuses to start | `pkg/mds/bootstrap/bootstrap.go:158-181` |
-| R2S-3 | MINOR | security | The deny names repository ARNs but not the companion repositories' storage namespaces, so a guard-group member can create another repository on that namespace and sweep the index | `pkg/mds/bootstrap/bootstrap.go:233-241` |
-| R2S-4 | MINOR | security | A data repository whose name ends in `-metadata` becomes unwritable and undeletable for every base group, while `mds-indexer` gets `fs:*` on it — and the indexer refuses to index it | `pkg/mds/bootstrap/bootstrap.go:158-181` |
-| R2S-5 | MINOR | security | The vended-credentials write guard checks the requested address only, while the write-sign fix it is credited with also checks the resolved target | `pkg/icebergcatalog/creds.go:452-458` |
-| R2S-6 | MINOR | security | The documented "extra statement" for an explicit non-`-metadata` storage namespace is deleted again by the policy repair at the next startup | `pkg/mds/bootstrap/bootstrap.go:713-733` |
-| R2T-2 | MINOR | table | Compaction collects the whole table in memory; peak heap is ~1.5 KiB per row, and the design's bound is O(table), not a batch | `pkg/mds/table/writer.go:357-362` |
-| R2T-3 | MINOR | table | The rebuild/compaction "non-replayable" guarantee only holds when a delete file was removed | `pkg/mds/table/writer.go:389-403` |
-| R2T-4 | MINOR | esti | The new Spark row gate compares only the first `part-*` file and not the guide's snippet | `esti/ops/mds-engines/run-spark.sh:60-88` |
-| R2S-7 | NIT | security | The deny leaves `branches:SetBranchProtectionRules` (and `retention:*`) open, so a base-group member can stop the indexer permanently | `pkg/mds/bootstrap/bootstrap.go:233-241` |
-| R2S-8 | NIT | security | Nothing tests that `RoutesBuilder` starts the refresher, so the production half of the one-minute guarantee can be deleted unnoticed | `pkg/mds/bootstrap/bootstrap.go:426` |
-| R2S-9 | NIT | security | On an external auth service the accepted one-minute window is really one minute plus the auth cache TTL | `pkg/auth/service.go:612-655` |
+| Key | Severity | Area | Title | File:line | Status |
+|---|---|---|---|---|---|
+| R2I-1 | MAJOR | indexer | A 400 that is not "no changes" re-enters the whole initialisation recursively, without a bound | `pkg/mds/indexer/repo.go:327-339` | Fixed in `da24d421f` |
+| R2T-1 | MAJOR | table | `Compact` panics the whole indexer process on a table whose schema has a column outside the ten `Row` fields | `pkg/mds/table/writer.go:357-362` | Fixed in `d993d602e` |
+| R2I-2 | MINOR | indexer | Every caught-up branch now pays one `FindMergeBase` per tick, and a transient 404 on it fails the branch | `pkg/mds/indexer/branch.go:98-104` | Fixed in `da24d421f` |
+| R2I-3 | MINOR | indexer | TS-4's fix does not see a COMMIT-protected companion branch — the review's claim that it does is wrong, and the state it was supposed to cure is unchanged | `pkg/mds/indexer/repo.go:70-74` | Fixed in `da24d421f` |
+| R2I-4 | MINOR | indexer | The initialisation commits whatever table is already staged, so the marker is sealed on top of a table the indexer did not create | `pkg/mds/indexer/repo.go:303-306` | Fixed in `da24d421f` |
+| R2S-1 | MINOR | security | The MDS-SEC-3 "proof" is a table property the attacker writes, so the finding it claims to fix still works | `pkg/icebergcatalog/resolver.go:406-419` | Fixed in `500a00a37` |
+| R2S-2 | MINOR | security | The policies grow one statement group per repository; the deny exceeds DynamoDB's 400 KiB item limit at ~560 repositories and the server then refuses to start | `pkg/mds/bootstrap/bootstrap.go:158-181` | Fixed in `26a66b633` |
+| R2S-3 | MINOR | security | The deny names repository ARNs but not the companion repositories' storage namespaces, so a guard-group member can create another repository on that namespace and sweep the index | `pkg/mds/bootstrap/bootstrap.go:233-241` | Fixed in `26a66b633` |
+| R2S-4 | MINOR | security | A data repository whose name ends in `-metadata` becomes unwritable and undeletable for every base group, while `mds-indexer` gets `fs:*` on it — and the indexer refuses to index it | `pkg/mds/bootstrap/bootstrap.go:158-181` | Fixed in `26a66b633` |
+| R2S-5 | MINOR | security | The vended-credentials write guard checks the requested address only, while the write-sign fix it is credited with also checks the resolved target | `pkg/icebergcatalog/creds.go:452-458` | Fixed in `500a00a37` |
+| R2S-6 | MINOR | security | The documented "extra statement" for an explicit non-`-metadata` storage namespace is deleted again by the policy repair at the next startup | `pkg/mds/bootstrap/bootstrap.go:713-733` | Fixed in `26a66b633` |
+| R2T-2 | MINOR | table | Compaction collects the whole table in memory; peak heap is ~1.5 KiB per row, and the design's bound is O(table), not a batch | `pkg/mds/table/writer.go:357-362` | Fixed in `d993d602e` |
+| R2T-3 | MINOR | table | The rebuild/compaction "non-replayable" guarantee only holds when a delete file was removed | `pkg/mds/table/writer.go:389-403` | Fixed in `d993d602e` |
+| R2T-4 | MINOR | esti | The new Spark row gate compares only the first `part-*` file and not the guide's snippet | `esti/ops/mds-engines/run-spark.sh:60-88` | Fixed in `2af2532b7` |
+| R2S-7 | NIT | security | The deny leaves `branches:SetBranchProtectionRules` (and `retention:*`) open, so a base-group member can stop the indexer permanently | `pkg/mds/bootstrap/bootstrap.go:233-241` | Fixed in `26a66b633` |
+| R2S-8 | NIT | security | Nothing tests that `RoutesBuilder` starts the refresher, so the production half of the one-minute guarantee can be deleted unnoticed | `pkg/mds/bootstrap/bootstrap.go:426` | Fixed in `26a66b633` |
+| R2S-9 | NIT | security | On an external auth service the accepted one-minute window is really one minute plus the auth cache TTL | `pkg/auth/service.go:612-655` | Fixed in `26a66b633` |
 
 **Totals: 0 BLOCKER, 2 MAJOR, 12 MINOR, 3 NIT.** No finding was dropped, merged away or
 downgraded in consolidation; see "Duplicates" for the pairs that were examined and kept separate.
@@ -162,7 +174,7 @@ consistent with `period: 2s`.
 The guide's figures are from commit `59828bcd1` (`docs/metadata-search.md`:772-786):
 
 | Measure | 10k, guide | 10k, this run | 100k, guide | 100k, this run |
-|---|---|---|---|---|
+|---|---|---|---|---|---|
 | source commit setup | — | 18.174s | 5m46.159s | **2m49.911s** |
 | first indexed after indexer start | 2.7s | **2.711s** | 3.212s | **3.213s** |
 | throughput | — | 3,689 objects/s | 31,135 objects/s | **31,125 objects/s** |
@@ -329,6 +341,8 @@ None.
 
 #### R2I-1 - MAJOR: a 400 that is not "no changes" re-enters the whole initialisation recursively, without a bound
 
+**Fixed in `da24d421f`** - the `ErrBadRequest` arm re-verifies with `completeInitialisation=false` and returns the original 400 unless a contiguous `mds: init` run of another replica is there to adopt; the regression test pins one `CreateTable` and one commit attempt instead of 26.
+
 **Spot-check: CONFIRMED** — see the table above.
 
 **Where** `pkg/mds/indexer/repo.go:327-339` (`initialise`'s `errors.Is(err, client.ErrBadRequest)` arm),
@@ -380,6 +394,8 @@ probe above, asserting the repository error contains `block: write failed` and t
 once, not 26 times.
 
 #### R2T-1 - MAJOR: `Compact` panics the whole indexer process on a table whose schema has a column outside the ten `Row` fields
+
+**Fixed in `d993d602e`** - `Compact` merges the per-file streams and re-emits the scan's own Arrow columns - a group of consecutive rows of one source batch is a zero-copy slice, several are concatenated column by column - so a top-level column the writer does not know keeps its values, and every column has the batch's row count. A write that has to **build** rows (`ApplyDelta` with upserts, every `Rebuild`) refuses such a table with the new `ErrUnknownSchema` instead of panicking or nulling the column, a delete-only delta still applies, and an unexpected panic in the merge becomes `ErrMergeRows` rather than reaching iceberg-go's writer goroutine.
 
 **Spot-check: CONFIRMED** — see the table above.
 
@@ -441,6 +457,8 @@ an optional `extra` string column, append one row with `extra = "keep-me"` throu
 
 #### R2I-2 - MINOR: every caught-up branch now pays one `FindMergeBase` per tick, and a transient 404 on it fails the branch
 
+**Fixed in `da24d421f`** - `continueFrom` returns before `FindMergeBase` when `last == head.ID`; the tests pin zero merge-base calls on an idle tick and a healthy branch when that tick's `findMergeBase` answers 404.
+
 **Where** `pkg/mds/indexer/branch.go:98-104` (`runBranchOnce` calls `continueFrom` unconditionally) →
 `branch.go:172-174` (`FindMergeBase`). Introduced by `6440e2f13`: the guard `if last != head.ID` around the
 step-4 merge-base read was dropped when the block was extracted into `continueFrom`
@@ -481,6 +499,8 @@ with no new commits and a counting client, asserting zero `FindMergeBase` calls,
 
 #### R2I-3 - MINOR: TS-4's fix does not see a COMMIT-protected companion branch — the review's claim that it does is wrong, and the state it was supposed to cure is unchanged
 
+**Fixed in `da24d421f`** - `metadataBranchWriteError` answers a 403 from `Commit`, `ResetBranch`, `HardResetBranch` and the catalog's table writes with the `ErrReadOnlyMetadataRepository` family and a message naming branch protection; the fake now models `COMMIT` and `STAGING_WRITE` the way graveler and `pkg/api` answer them.
+
 **Where** `pkg/mds/indexer/repo.go:70-74` (`ensureMetadataRepository` reads only `meta.ReadOnly`), versus
 `MDS_REVIEW.md` TS-4 ("a read-only (or COMMIT-protected) `R-metadata` fails the repository once per tick, with a
 message naming both causes") and `METADATA_SEARCH_DESIGN.md` §7 ("Per-repository runtime errors (… companion
@@ -513,6 +533,8 @@ repository flagged protected whose `Commit`/`ResetBranch` answer
 403 on every tick.
 
 #### R2I-4 - MINOR: the initialisation commits whatever table is already staged, so the marker is sealed on top of a table the indexer did not create
+
+**Fixed in `da24d421f`** - the `ErrTableExists` arm loads the staged table and refuses it with `ErrForeignRepository` unless its `lakefs.mds.repository` is `R`; the check uses an optional `Repository()` accessor, so the `Table` seam is unchanged.
 
 **Where** `pkg/mds/indexer/repo.go:303-306` (`ErrTableExists` → `LoadTable`, no property check),
 `repo.go:325` (`AllowEmpty: false` commit of *that* staging), `pkg/mds/table/writer.go:118-125`
@@ -554,6 +576,8 @@ asserting `ErrForeignRepository` and no `mds: init` commit.
 
 #### R2S-1 - MINOR: the MDS-SEC-3 "proof" is a table property the attacker writes, so the finding it claims to fix still works
 
+**Fixed in `500a00a37`** - a companion table is served only when the property **and** the served ref's first-parent `mds: init` commit (`lakefs.mds.init=true`) both hold; the walk is newest-to-root, one 256-commit page at a time, cached per repository and served head commit, and a `BranchLister` that cannot read history fails closed.
+
 **Where**: `pkg/icebergcatalog/resolver.go:406-419` (`VerifyResolved` compares
 `tbl.Metadata.Properties()[MetadataSearchRepositoryProperty]` with `requested.Repo`),
 `pkg/icebergcatalog/resolver.go:483-510` (`Store.Resolve` calls it),
@@ -592,6 +616,8 @@ in addition to the property. Test: a companion table with `lakefs.mds.repository
 404 (it is 200 today); a genuine index is 200.
 
 #### R2S-2 - MINOR: the policies grow one statement group per repository; the deny exceeds DynamoDB's 400 KiB item limit at ~560 repositories and the server then refuses to start
+
+**Fixed in `26a66b633`** - both policies are a base policy plus numbered chunk policies of at most 64 companion repositories each (the first chunk is `<base>-1`); `MaxPolicyStoredBytes` is 160 KiB, and the 1000-repository test stores 34 policies, the largest 67,944 bytes.
 
 **Where**: `pkg/mds/bootstrap/bootstrap.go:158-181` (`companionRepositories`), `:280-333`
 (`IndexerPolicy`, six statements per companion), `:338-365` (`MetadataRepoProtectPolicy`, five per
@@ -633,6 +659,8 @@ companion repository. Test: with 1000 repositories every policy value stays unde
 
 #### R2S-3 - MINOR: the deny names repository ARNs but not the companion repositories' storage namespaces, so a guard-group member can create another repository on that namespace and sweep the index
 
+**Fixed in `26a66b633`** - the deny adds `fs:AttachStorageNamespace` on the exact storage namespace of every companion repository that exists in the catalog; the `namespace/*-metadata` pattern stays in the allow because a companion that does not exist yet has no namespace to name.
+
 **Where**: `pkg/mds/bootstrap/bootstrap.go:233-241` and `:338-365` (the deny's resources are
 `RepoArn(companion)`, `RepoArn(companion)+"/*"` and the three catalog ARNs; no
 `fs:AttachStorageNamespace` statement), `pkg/api/controller.go:2290-2305` (`CreateRepository` authorizes
@@ -668,6 +696,8 @@ needs to also read each companion's namespace, skip ones the caller cannot see, 
 allowed today) and on an ordinary namespace stays allowed.
 
 #### R2S-4 - MINOR: a data repository whose name ends in `-metadata` becomes unwritable and undeletable for every base group, while `mds-indexer` gets `fs:*` on it — and the indexer refuses to index it
+
+**Fixed in `26a66b633`** - chosen criterion: a name ending in `-metadata` is a companion only when its data repository `R` exists in the catalog or in `metadata_search.repositories` - the existence of `R`, not the `lakefs.mds.init` marker the finding suggested, because the bootstrap already has that repository list, does not otherwise read commits, and requiring the marker would walk the companion's history on every refresh and still race an indexer that created the repository before its init commit. An ordinary `x-metadata` repository stays writable for its users and gets no `mds-indexer` grant.
 
 **Where**: `pkg/mds/bootstrap/bootstrap.go:158-181` (`companionRepositories` keeps a name that
 `icebergcatalog.IsMetadataRepository` accepts instead of mapping it to `<name>-metadata`),
@@ -706,6 +736,8 @@ an unborn-ordinary repository named `x-metadata` stays writable for a guard grou
 
 #### R2S-5 - MINOR: the vended-credentials write guard checks the requested address only, while the write-sign fix it is credited with also checks the resolved target
 
+**Fixed in `500a00a37`** - a write `Vend` checks the namespace of the resolved target as well as the requested address; `TableCredentials` treats the `*ReservedNamespaceError` as a write refusal and falls back to the read session, so a redirect from an ordinary address vends read-only credentials and a direct write `Vend` is refused rather than downgraded.
+
 **Where**: `pkg/icebergcatalog/creds.go:452-458` (`TableCredentials` calls `s.writableNamespace(addr)` on
 the *requested* address), `:515-517` (`writableNamespace` = `RequireWritableNamespace(addr) == nil`),
 `:408-441` (`Vend` resolves through `s.tableScope` and never re-checks the target), `:820-853`
@@ -739,6 +771,8 @@ write-credentials case returns a read session (or no write actions) — it retur
 
 #### R2S-6 - MINOR: the documented "extra statement" for an explicit non-`-metadata` storage namespace is deleted again by the policy repair at the next startup
 
+**Fixed in `26a66b633`** - chosen option: the extra grant for an explicit non-`-metadata` namespace is an operator-owned policy attached to `MetadataSearchIndexers` (for example `mds-indexer-extra-storage-namespace`), and the refresher deletes only names this package owns - a base name or a numeric chunk suffix - so that policy survives every repair and restart.
+
 **Where**: `pkg/mds/bootstrap/bootstrap.go:713-733` (`ensurePolicy`: any statement difference triggers
 `WritePolicy(…, true)` and the warning "rewrote a metadata search policy whose statements did not match"),
 `:780-792` (`statementsEqual` compares the whole list), `:280-333` (`IndexerPolicy` has the single
@@ -769,6 +803,8 @@ generates). Test: add the documented statement, run `RoutesBuilder` again, asser
 is gone today).
 
 #### R2T-2 - MINOR: compaction collects the whole table in memory; peak heap is ~1.5 KiB per row, and the design's bound is O(table), not a batch
+
+**Fixed in `d993d602e`** - `Compact` merges the per-file sorted streams with `container/heap` instead of collecting the table: one read batch per file plus one output batch, the per-file batch being `compactMergeRowBudget / files` (2 x 64 Ki rows, floor 256) set with iceberg-go's `WithArrowBatchSize`. A file written before `2daeca114` need not be sorted; a path-column-only pass detects it and it is read whole, sorted on its own and merged as a materialised run, so the fallback costs that file and not the table.
 
 **Where.** `pkg/mds/table/writer.go:357-362` (`rows, err := rowsOfBatches(batches)`, `slices.SortFunc`,
 `rowSource`), `pkg/mds/table/writer.go:557-576` (`rowsOfBatches` keeps every row), doc claim at
@@ -808,6 +844,8 @@ count (today it grows by ~4×).
 
 #### R2T-3 - MINOR: the rebuild/compaction "non-replayable" guarantee only holds when a delete file was removed
 
+**Fixed in `d993d602e`** - `commit.retry.num-retries=0` is written at creation, re-asserted by every write's `SetProperties`, and repaired by `ensureNoReplay` with one metadata-only commit before the write (iceberg-go reads the budget from the metadata the transaction started on, not from the properties it stages). A write whose repair commit observed a moved branch returns the new `ErrStaleTable`, so the indexer reloads and retries instead of overwriting a commit it never read.
+
 **Where.** `METADATA_SEARCH_DESIGN.md:203-206` (and the `e3083e279` commit message): "The removal is
 snapshot-relative, so iceberg-go marks the commit non-replayable: a concurrent writer is refused with
 a conflict"; `pkg/mds/table/writer.go:389-403` (`replaceSnapshotFiles`), `pkg/mds/table/writer.go:363-374`
@@ -839,6 +877,8 @@ snapshot holds a delete file". Test: create the table, set the property to 1, co
 concurrently with a rebuild, and require either a conflict or no duplicated `path`.
 
 #### R2T-4 - MINOR: the new Spark row gate compares only the first `part-*` file and not the guide's snippet
+
+**Fixed in `2af2532b7`** - the Spark gate concatenates every `part-*` file (`concat_part_rows`, which fails when there is none) and compares the guide's own four projected columns, including `to_json(user_metadata)`; `run-spark.sh --self-test` proves the multi-file and extra-row paths (7/7) without docker.
 
 **Where.** `esti/ops/mds-engines/run-spark.sh:60-88` (`INSERT OVERWRITE DIRECTORY` at `:64`,
 `part=$(find "$rows_dir" -type f -name 'part-*' | head -n 1 || true)` at `:82`, gate at `:88`),
@@ -872,6 +912,8 @@ run with two part files, one carrying the expected rows and one an extra row, mu
 ### NIT (3)
 
 #### R2S-7 - NIT: the deny leaves `branches:SetBranchProtectionRules` (and `retention:*`) open, so a base-group member can stop the indexer permanently — the §3.3 promise that "user writes are blocked by a deny policy" does not cover it
+
+**Fixed in `26a66b633`** - `branches:SetBranchProtectionRules` is denied on a companion repository. `retention:SetGarbageCollectionRules` and `retention:PrepareGarbageCollectionCommits` stay allowed, as this finding itself recommended: they cannot remove the live index without `fs:DeleteBranch`, which is denied, and an operator may legitimately set a GC policy for a companion repository.
 
 **Where**: `pkg/mds/bootstrap/bootstrap.go:233-241` (deny actions are `fs:*`/`catalog:*` wildcards only),
 `pkg/api/controller.go:2633-2656` (`SetBranchProtectionRules` authorizes `branches:SetBranchProtectionRules`
@@ -910,6 +952,8 @@ destination branch, `controller.go:6179-6185`, which the deny covers.)
 
 #### R2S-8 - NIT: nothing tests that `RoutesBuilder` starts the refresher, so the production half of the one-minute guarantee can be deleted unnoticed
 
+**Fixed in `26a66b633`** - `TestRoutesBuilderStartsPolicyRefresher` creates a repository after `RoutesBuilder` returns and requires the refresher it started to add it to both policy sets within a shortened interval; the same card also covers a shrinking set (stale chunks are deleted) and attaching a new chunk when the set grows past a boundary.
+
 **Where**: `pkg/mds/bootstrap/bootstrap.go:426` (`startPolicyRefresher(ctx, deps, policyRefreshInterval)`);
 `pkg/mds/bootstrap/bootstrap_test.go:984-1020` (`TestPolicyRefresher` calls `startPolicyRefresher` directly).
 
@@ -930,6 +974,8 @@ name it, and requires the refresher to stop when the context is cancelled; plus 
 asserting the statements shrink, and a failing-`WritePolicy` case asserting the retry.
 
 #### R2S-9 - NIT: on an external auth service the accepted one-minute window is really one minute plus the auth cache TTL
+
+**Fixed in `26a66b633`** - `ensurePolicy` purges the auth service's cache after a rewrite and after a create, and stale-chunk deletion purges after each delete, so an external auth service does not extend the refresh window by `auth.cache.ttl`; a service whose `Cache()` is nil keeps working.
 
 **Where**: design §8 ("that window … is bounded by the refresher at one minute") vs
 `pkg/auth/service.go:612-655` (`APIAuthService.WritePolicy` never calls `PurgePolicies`, unlike

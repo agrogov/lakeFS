@@ -75,16 +75,25 @@ catalog, decides what is indexed.
 
 ### 2. Principals and credentials
 
-Enabling the feature also makes `lakefs-sso` bootstrap two principals and two policies on every
+Enabling the feature also makes `lakefs-sso` bootstrap two principals and their policy set on every
 startup (design §8). The bootstrap is idempotent: it creates what is missing, repairs a policy
 whose statements drifted from the built-in ones, and tolerates a rerun.
 
 | Principal | Created by | Purpose |
 |---|---|---|
 | user `mds-indexer`, member of group `MetadataSearchIndexers` | `lakefs-sso` bootstrap | the identity the indexer authenticates as |
-| group `MetadataSearchIndexers` | `lakefs-sso` bootstrap | carries the `mds-indexer` allow policy, and only that policy |
-| policy `mds-indexer` (allow) | `lakefs-sso` bootstrap | read on every data repository, full `fs:`/`catalog:` access on the companion repositories |
-| policy `mds-metadata-repo-protect` (deny) | `lakefs-sso` bootstrap | keeps ordinary principals from writing the companion repositories |
+| group `MetadataSearchIndexers` | `lakefs-sso` bootstrap | carries the `mds-indexer` allow policies (base and chunks), and no deny |
+| policy `mds-indexer` (allow), plus `mds-indexer-<n>` chunks | `lakefs-sso` bootstrap | read on every data repository, full `fs:`/`catalog:` access on the companion repositories |
+| policy `mds-metadata-repo-protect` (deny), plus `mds-metadata-repo-protect-<n>` chunks | `lakefs-sso` bootstrap | keeps ordinary principals from writing the companion repositories |
+
+Both policies are split so that no single stored policy grows without bound (design §8): the base policy
+holds the statements that do not depend on a repository, and the numbered chunks hold the per-companion
+statements, at most **64** companion repositories per chunk and starting at `<base>-1`. Every chunk is
+attached to the same group as its base. Do not hand-edit any of them: the bootstrap rewrites a policy whose
+statements differ from the built-in ones, and it deletes a chunk policy it no longer needs (a repository was
+deleted, or a `*-metadata` repository turned out not to be a companion). A policy of your own is safe as long
+as its name is neither a base name nor `<base>-<number>`; that is what makes the operator policy described
+under [`Limits`](#limits-and-known-deviations) survive a restart.
 
 The indexer's allow policy is deliberately narrow on data repositories: `fs:ReadRepository`,
 `fs:ListObjects`, `fs:ReadObject`, `fs:ListBranches`, `fs:ReadBranch`, `fs:ListCommits` and
@@ -94,11 +103,15 @@ ARNs, `fs:CreateRepository` on its repository ARN and `fs:AttachStorageNamespace
 `arn:lakefs:fs:::namespace/*-metadata` — which covers creating the companion repository, its branches,
 objects and tables. The set is every repository in the catalog plus the names in
 `metadata_search.repositories` (the server reads that list for this purpose), mapped `R` →
-`R-metadata`. A `*-metadata` wildcard is deliberately not used: lakeFS policy matching lets `*` span
-`/`, so `repository/*-metadata` would also match an object or branch of a data repository whose key
-ends in `-metadata`. A companion repository whose
-`metadata_search.repositories.<R>.storage_namespace` does not end in `-metadata` is outside the
-namespace grant and needs an extra statement (see [`Limits`](#limits-and-known-deviations)).
+`R-metadata`; a repository that already carries the `-metadata` suffix counts as a companion only when its data
+repository exists (see [`Limits`](#limits-and-known-deviations)). A `*-metadata` wildcard is deliberately
+not used: lakeFS policy matching lets `*` span `/`, so `repository/*-metadata` would also match an object
+or branch of a data repository whose key ends in `-metadata`. A companion repository whose
+`metadata_search.repositories.<R>.storage_namespace` does not end in `-metadata` is outside the namespace
+grant: give it a policy of your own - for example `mds-indexer-extra-storage-namespace`, holding the extra
+`fs:CreateRepository` and `fs:AttachStorageNamespace` statements - and attach it to
+`MetadataSearchIndexers`. A statement added to `mds-indexer` itself is deleted again at the next startup,
+because the bootstrap repairs that policy to its built-in statements (see [`Limits`](#limits-and-known-deviations)).
 
 The same exact set is used by the deny policy, and the server re-derives it every minute; a repository
 created after startup is therefore covered without a restart. Until the next refresh, the indexer fails
@@ -108,9 +121,14 @@ must name companion repositories exactly (a `*-metadata` wildcard would also mat
 objects, see below) and an exact ARN is a snapshot, so a repository created in the last minute is the
 price of the exact naming. The wait is bounded by the refresher and needs no operator action, and the
 uncovered state is loud — the new repository's first tick fails in `/_health` — rather than silent. The
-deny covers `fs:UpdateRepository`, which writes repository metadata, through `fs:Update*`, and the import
-pair (`fs:ImportFromStorage`, `fs:ImportCancel`) through `fs:Import*`; see
-[`Permissions`](#permissions) for what each of the two import actions is and is not denied on.
+refresher also purges the auth service's per-user effective-policy cache after every rewrite, so on an
+external auth backend the wait really is that one minute and not one minute plus `auth.cache.ttl`. The
+deny covers `fs:UpdateRepository`, which writes repository metadata, through `fs:Update*`, the import
+pair (`fs:ImportFromStorage`, `fs:ImportCancel`) through `fs:Import*`, `branches:SetBranchProtectionRules`,
+which decides whether the indexer may commit, and `fs:AttachStorageNamespace` on the exact storage
+namespace of every companion repository that already exists; see
+[`Permissions`](#permissions) for what each of the two import actions is and is not denied on and why the
+retention actions stay allowed.
 
 Credentials are **not** created by the bootstrap: an administrator creates them once and places
 them in the indexer configuration.
@@ -134,9 +152,15 @@ The deny policy is attached to the base groups of both lakeFS group templates �
 the reserved-prefix deny are attached to. It is never attached to `MetadataSearchIndexers`, and the
 bootstrap drops that group from the list with a warning even when
 `datasets.immutable_guard_groups` names it (design §8). It denies `fs:Write*`, `fs:Delete*`,
-`fs:Create*`, `fs:Revert*`, `fs:Update*`, `catalog:Create*`, `catalog:Update*`, `catalog:Delete*` and
-`catalog:WriteTableData` on the exact ARNs of the companion repositories, so an administrator's
-`fs:*` allow cannot make a companion repository a hand-edited second source of truth. The indexer
+`fs:Create*`, `fs:Revert*`, `fs:Update*`, `fs:Import*`, `branches:SetBranchProtectionRules`,
+`catalog:Create*`, `catalog:Update*`, `catalog:Delete*` and
+`catalog:WriteTableData` on the exact ARNs of the companion repositories, plus `fs:AttachStorageNamespace`
+on the exact storage namespace of every companion repository that exists (so a guard-group member cannot
+create a second repository on that namespace and sweep the index with its uncommitted GC). An
+administrator's `fs:*` allow therefore cannot make a companion repository a hand-edited second source of
+truth, and cannot stop the indexer by protecting its branches. The two `retention:` actions stay allowed
+deliberately: they cannot remove the live index without `fs:DeleteBranch`, which is denied, and an operator
+may legitimately set a GC policy for a companion repository. The indexer
 and the catalog are not in those groups and keep writing.
 
 **Auth backends without policies.** The default `auth.basic` service stores a single administrator
@@ -278,7 +302,12 @@ it and the other adopts it instead of failing the repository as foreign.
 What a first run does, in order (design §4.2, §4.5, §4.8):
 
 1. For every configured repository, ensure `R-metadata` exists, initialise it with the
-   `system` namespace, the table and an `mds: init` commit, and record its default branch.
+   `system` namespace, the table and an `mds: init` commit, and record its default branch. The
+   initialisation refuses to commit a table it did not create: a staged `system.object_metadata` whose
+   `lakefs.mds.repository` property is not `R` fails that repository for the tick instead of sealing the
+   marker on a foreign table. A `400` from the initialisation commit is treated as "another replica won"
+   only when that replica's `mds: init` commit is there to adopt; any other `400` is reported once, as that
+   repository's error, instead of being retried in a loop.
 2. For every branch of `R` that matches `branches`, create the mirrored branch in `R-metadata`.
    A new branch is seeded from the `mds-*` tag of the nearest already-indexed first-parent ancestor
    within `seed_lookback`; otherwise it is built from a full listing as described by `backfill` and
@@ -623,7 +652,11 @@ and Trino 484 (`trinodb/trino@sha256:2704eb53935af5e582d63d6033e9bf99d20c325e9b0
 Both `/mds/iceberg/api` and `/iceberg/relative_to` returned the same three rows for the same
 objects, with the same `commit_id`. The scripts capture the rows, require exactly those three and
 diff the two endpoints against each other, so the observation is repeatable rather than read off a
-log; the image defaults are the digests above. The scripts' README records the exact commands and
+log; the image defaults are the digests above. The Spark gate concatenates **every** `part-*` file of
+the `INSERT OVERWRITE DIRECTORY` result before comparing and requires the guide's own four projected
+columns - path, `size_bytes`, `commit_id` and `user_metadata` - so a row or a stale value that only some
+other part file carries cannot pass, and `run-spark.sh --self-test` proves the gate on fabricated
+multi-file layouts without docker. The scripts' README records the exact commands and
 the environment they expect.
 
 ## Columns and semantics
@@ -752,19 +785,20 @@ reports `lag_commits` per branch.
 | Limit | Detail |
 |---|---|
 | Repository name length | A data repository name is at most **54** characters. `R-metadata` must fit lakeFS's 63-character repository ID limit, and configuration validation rejects a longer name at startup. |
-| The `-metadata` suffix | A data repository whose name ends in `-metadata` cannot be indexed: `icebergcatalog.IsMetadataRepository` treats it as a companion repository. Validation rejects it. |
+| The `-metadata` suffix | A data repository whose name ends in `-metadata` cannot be indexed: `icebergcatalog.IsMetadataRepository` treats it as a companion repository. Validation rejects it. A repository that already exists under such a name is treated as a companion only when its data repository (the name without the suffix) exists; otherwise it stays an ordinary repository, and neither policy grants the indexer writes on it nor denies its users theirs (design §8). |
 | Bucket-root namespace | If `R`'s storage namespace is a bucket root (`s3://bucket`), the companion namespace cannot be derived. Set `metadata_search.repositories.<R>.storage_namespace` explicitly, for example `s3://bucket/metadata/my-repo`. |
 | Non-overlapping namespaces | `R-metadata`'s namespace must not be inside `R`'s namespace, nor `R`'s inside it. `R`'s uncommitted GC sweeps every unreferenced object under `R`'s prefix and would delete the metadata files. The indexer checks the pair on every tick, not only when it creates the companion repository, refuses such a configuration and marks the repository failed. |
 | First-parent only | Only first-parent history is indexed and addressable. A commit that exists only on a merged side branch has no `mds-*` tag. |
 | Indexed branches only | Branches that do not match `branches` have no rows and no virtual table. Adding a branch to the configuration later indexes it from its head (or history, per `backfill`/`since`). |
 | One row per object | No change history is stored in the table; `commit_id` is the last change. |
 | `commit_id` after backfill/rebuild | The starting (or rebuilding) commit, not the original change, as described in [`Deviations`](#deviations-from-the-commit-that-changed-the-object). |
+| Table with a column a newer version added | The indexer builds rows from the ten columns above. A table that already carries an extra top-level column — one a newer version appended, which the schema contract allows — is refused with `unknown table schema` by a delta that has upserts and by a rebuild, instead of being written with that column silently emptied; a delete-only delta still applies and a compaction keeps the column's values. Run an indexer at least as new as the table it writes. |
 | Rebuild memory | Above `rebuild_threshold` upserts plus deletes, the indexer stops reading the diff at the first entry over the threshold and rebuilds from a full listing rather than holding a huge delta in memory; a rebuilt commit makes no per-object stat call. A full listing still costs one page per `listObjects` page and one row per object. |
 | Per-tick work | One branch applies at most `max_commits` commits per tick, and the log walk reads at most `max_commits` plus one page; a backlog deeper than that is rebuilt from a full listing at the head (the lag drops to `0`) instead of being paged through. `concurrency` bounds parallel branches, not commits. |
 | Query scale | The table is unpartitioned and sorted by `path` within each file. There is no path-prefix partitioning and no server-side scan planning, so a filtered query is only as selective as the Iceberg expression the engine pushes down. Partitioning by prefix is a later version. |
 | Structured metadata only | There is no full-text, vector or JSON-path search. `user_metadata` is a map of strings, queryable with the engine's map functions. |
-| Companion table identity | The catalog serves `my-repo.<ref>.system.object_metadata` only when the companion table's `lakefs.mds.repository` property names `my-repo`. A repository named `my-repo-metadata` that the indexer did not create — the name is taken by an ordinary repository — answers `404 NoSuchTableException` on the virtual address instead of serving someone else's rows (design §5.1). |
-| Companion repository must be writable | `my-repo-metadata` must not be created with `read_only: true`, and a branch-protection rule must not block `COMMIT` on its branches. The indexer checks this every tick: a read-only companion repository fails at the repository level, once per tick, with a message naming both causes, instead of failing every branch forever (design §3.3). |
+| Companion table identity | The catalog serves `my-repo.<ref>.system.object_metadata` only when **both** proofs hold: the companion table's `lakefs.mds.repository` property names `my-repo`, and the served ref's first-parent history carries the indexer's `mds: init` commit (`lakefs.mds.init=true`). The property alone is a document anyone who can create `my-repo-metadata` can write; the initialisation commit is the state such a repository cannot reproduce. A repository named `my-repo-metadata` that the indexer did not create — the name is taken by an ordinary repository — answers `404 NoSuchTableException` on the virtual address instead of serving someone else's rows (design §5.1). The history check walks the first-parent log newest to root, one 256-commit page at a time (the initialisation commit is the oldest non-root commit), and caches its answer per companion repository and served head commit, so an unchanged branch pays for it once per server process, not once per query; the first query after a branch moves pays it again. |
+| Companion repository must be writable | `my-repo-metadata` must not be created with `read_only: true`, and a branch-protection rule must not block `COMMIT` or `STAGING_WRITE` on its branches. The indexer checks this every tick: a read-only companion repository fails at the repository level, once per tick, with a message naming both causes, instead of failing every branch forever (design §3.3). A protection rule is not reported on the repository record, so it is diagnosed at the first write the tick attempts — still as a repository-level error that names branch protection, not as a bare `403` on every branch; a rule that exists before the first tick fails the initialisation commit the same way. |
 | Azure and GCS | Out of scope for this version: no credential vending and no remote signing. Static `storage` properties may work; they are not tested. |
 | One indexer replica | Run exactly one. A second replica does duplicate work and gets `409` responses; it does not corrupt the table. |
 | No UI, no server-side SQL | OSS has no Metadata Search tab and no SQL endpoint. Queries run in the engine that connects to the catalog (PyIceberg, DuckDB, Spark, Trino). Option B is future work (see [`Option B`](#option-b-outlook)). |
@@ -797,6 +831,10 @@ The read path is designed so query users need nothing on the companion repositor
   namespace, an object path or a branch does not narrow this virtual table. Grant
   `catalog:ReadTable` on `my-repo` deliberately, and treat it as "may see the object inventory of
   the whole repository".
+- Vended credentials and remote signing for the virtual table are read-only in effect: a write that a
+  table resolver redirects into a reserved namespace is answered with the read session (or a `403` for a
+  remote-signature write), so an engine can read `object_metadata` but cannot use a `catalog:WriteTableData`
+  grant on `my-repo` to write the companion repository's files.
 
 Other permission facts:
 
@@ -823,9 +861,12 @@ Other permission facts:
   ForbiddenException`, and `GET`/`HEAD` of the namespace is `404`. Listings still show `system` and
   `object_metadata`. In `my-repo-metadata` it is an ordinary namespace.
 - An explicit `storage_namespace` that does not itself end in `-metadata` falls outside the
-  namespace grant of the bootstrap's `mds-indexer` policy and needs an extra
-  `fs:AttachStorageNamespace` statement (plus the matching `fs:CreateRepository`); the derived
-  `<R namespace>-metadata` form is covered.
+  namespace grant of the bootstrap's `mds-indexer` policy. Put the extra `fs:AttachStorageNamespace`
+  (and the matching `fs:CreateRepository`) in a policy of your own, for example
+  `mds-indexer-extra-storage-namespace`, attached to `MetadataSearchIndexers`: the bootstrap repairs
+  `mds-indexer` to its built-in statements on every startup, so a statement added there is deleted again,
+  while a policy whose name it does not own survives. The derived `<R namespace>-metadata` form is covered
+  out of the box.
 
 ## Maintenance
 
@@ -841,9 +882,14 @@ last compaction. A trigger set to `0` is off — it is not read as "use the defa
 only when the key is absent — and a negative value is refused at startup. A compaction scans the table
 at the current snapshot, replaces all data and delete
 files with rewritten data files in one transaction, keeps `lakefs.mds.source-commit`, and commits
-with `mds: compact <R>@<C>`. The rewritten rows are sorted by `path` before they are written, so the
-table's declared `path ASC` order keeps describing its files and their per-file path bounds stay
-narrow, which is what a later filtered scan prunes with. The delete files are taken from the snapshot's manifest list, not from the
+with `mds: compact <R>@<C>`. The rewritten rows keep the table's declared `path ASC` order without
+holding the whole table in memory: the compaction merges the per-file sorted streams, one read batch per
+file plus one batch of output, so its memory follows the number of files and not the number of rows. A
+file written before commit `2daeca114` need not be internally sorted; it is detected from its path column
+alone, then read whole and sorted on its own, so it costs that file's memory and not the table's. A
+top-level column a later schema version appends keeps its values through a compaction, because the
+compaction re-emits the scan's own Arrow columns instead of rebuilding rows. The delete files are taken
+from the snapshot's manifest list, not from the
 scan plan, so a delete file that no scan task carries any more — a rebuild replaces the data files it
 applied to — is removed too; `max_delete_files` therefore counts a number that a compaction actually
 drives to zero. It does not create a new tag; the existing `mds-*` tag still points at
@@ -929,6 +975,11 @@ keep `/_health` at `503`.
   back from the companion branch's commit log, not kept in process state. A rolling restart that
   overlaps two processes is safe even during the first initialisation of a companion repository:
   only one of them commits `mds: init`, and the other adopts it.
+- The table carries `commit.retry.num-retries: 0`, written at creation and re-asserted by every write.
+  It is what makes a lost optimistic-concurrency check a conflict the indexer retries instead of a replay
+  that could duplicate rows. Do not raise it: the next write of the indexer repairs it with a
+  metadata-only commit before writing, and a repair that finds the branch moved fails the write with a
+  stale-table error, so the tick reloads and retries.
 - If the recorded position no longer exists in `R` — committed GC after a force-move while the
   indexer was down, or `R` deleted and re-created under the same name — the indexer does not fail the
   branch forever. The next tick rebuilds the branch's table from a full listing at the head and logs
