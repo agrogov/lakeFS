@@ -300,6 +300,50 @@ func TestLogCommits(t *testing.T) {
 	requireQuery(t, call, "after", "cursor")
 }
 
+func TestLogCommitsPagination(t *testing.T) {
+	c, rec := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("after") {
+		case "":
+			writeJSON(w, http.StatusOK, listPage([]map[string]any{
+				{"id": "c3", "message": "third", "committer": "alice", "creation_date": 1700000002, "parents": []string{"c2"}},
+				{"id": "c2", "message": "second", "committer": "alice", "creation_date": 1700000001, "parents": []string{"c1"}},
+			}, true, "c2"))
+		case "c2":
+			writeJSON(w, http.StatusOK, listPage([]map[string]any{
+				{"id": "c1", "message": "first", "committer": "bob", "creation_date": 1700000000, "parents": []string{}},
+			}, false, ""))
+		default:
+			writeNotFound(w)
+		}
+	})
+
+	first, hasMore, err := c.LogCommits(context.Background(), testRepository, testBranch, LogCommitsOptions{FirstParent: true})
+	require.NoError(t, err)
+	require.True(t, hasMore)
+	require.Equal(t, []string{"c3", "c2"}, commitIDs(first))
+
+	second, hasMore, err := c.LogCommits(context.Background(), testRepository, testBranch, LogCommitsOptions{
+		FirstParent: true,
+		After:       first[len(first)-1].ID,
+	})
+	require.NoError(t, err)
+	require.False(t, hasMore)
+	require.Equal(t, []string{"c1"}, commitIDs(second))
+
+	calls := rec.snapshot()
+	require.Len(t, calls, 2)
+	requireQuery(t, calls[0], "after", "")
+	requireQuery(t, calls[1], "after", "c2")
+}
+
+func commitIDs(commits []Commit) []string {
+	ids := make([]string, 0, len(commits))
+	for _, commit := range commits {
+		ids = append(ids, commit.ID)
+	}
+	return ids
+}
+
 func TestDiffRefs(t *testing.T) {
 	c, rec := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, listPage([]map[string]any{
@@ -374,6 +418,39 @@ func TestDiffRefs(t *testing.T) {
 	requireQuery(t, call, "after", "")
 }
 
+func TestDiffRefsPagination(t *testing.T) {
+	c, rec := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("after") {
+		case "":
+			writeJSON(w, http.StatusOK, listPage([]map[string]any{
+				{"path": "data/a", "type": "added", "path_type": "object", "size_bytes": 1},
+				{"path": "data/b", "type": "changed", "path_type": "object", "size_bytes": 2},
+			}, true, "data/b"))
+		case "data/b":
+			writeJSON(w, http.StatusOK, listPage([]map[string]any{
+				{"path": "data/c", "type": "removed", "path_type": "object", "size_bytes": 3},
+			}, false, ""))
+		default:
+			writeNotFound(w)
+		}
+	})
+
+	first, hasMore, err := c.DiffRefs(context.Background(), testRepository, "main", "feature", "")
+	require.NoError(t, err)
+	require.True(t, hasMore)
+	require.Equal(t, []string{"data/a", "data/b"}, changePaths(first))
+
+	second, hasMore, err := c.DiffRefs(context.Background(), testRepository, "main", "feature", first[len(first)-1].Path)
+	require.NoError(t, err)
+	require.False(t, hasMore)
+	require.Equal(t, []string{"data/c"}, changePaths(second))
+
+	calls := rec.snapshot()
+	require.Len(t, calls, 2)
+	requireQuery(t, calls[0], "after", "")
+	requireQuery(t, calls[1], "after", "data/b")
+}
+
 func TestListObjects(t *testing.T) {
 	c, rec := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, listPage([]map[string]any{
@@ -422,6 +499,93 @@ func TestListObjects(t *testing.T) {
 	requireQuery(t, call, "amount", strconv.Itoa(testPageSize))
 	requireQuery(t, call, "user_metadata", "true")
 	requireQuery(t, call, "after", "data/a.parquet")
+}
+
+func TestListObjectsPagination(t *testing.T) {
+	c, rec := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("after") {
+		case "":
+			writeJSON(w, http.StatusOK, listPage([]map[string]any{
+				{"path": "data/a.parquet", "size_bytes": 10, "checksum": "etag-a", "path_type": "object"},
+				{"path": "data/b.parquet", "size_bytes": 20, "checksum": "etag-b", "path_type": "object"},
+			}, true, "data/b.parquet"))
+		case "data/b.parquet":
+			writeJSON(w, http.StatusOK, listPage([]map[string]any{
+				{"path": "data/c.parquet", "size_bytes": 30, "checksum": "etag-c", "path_type": "object"},
+			}, false, ""))
+		default:
+			writeNotFound(w)
+		}
+	})
+
+	first, hasMore, err := c.ListObjects(context.Background(), testRepository, testBranch, "")
+	require.NoError(t, err)
+	require.True(t, hasMore)
+	require.Equal(t, []string{"data/a.parquet", "data/b.parquet"}, objectPaths(first))
+
+	second, hasMore, err := c.ListObjects(context.Background(), testRepository, testBranch, first[len(first)-1].Path)
+	require.NoError(t, err)
+	require.False(t, hasMore)
+	require.Equal(t, []string{"data/c.parquet"}, objectPaths(second))
+
+	calls := rec.snapshot()
+	require.Len(t, calls, 2)
+	requireQuery(t, calls[0], "after", "")
+	requireQuery(t, calls[1], "after", "data/b.parquet")
+}
+
+func changePaths(changes []Change) []string {
+	paths := make([]string, 0, len(changes))
+	for _, change := range changes {
+		paths = append(paths, change.Path)
+	}
+	return paths
+}
+
+func objectPaths(objects []ObjectStat) []string {
+	paths := make([]string, 0, len(objects))
+	for _, object := range objects {
+		paths = append(paths, object.Path)
+	}
+	return paths
+}
+
+func TestDiffBranch(t *testing.T) {
+	c, rec := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("after") {
+		case "":
+			writeJSON(w, http.StatusOK, listPage([]map[string]any{
+				{"path": "_lakefs_iceberg/tables/system/object_metadata", "type": "changed", "path_type": "object", "size_bytes": 7},
+				{"path": "stale/object", "type": "added", "path_type": "object", "size_bytes": 9},
+			}, true, "stale/object"))
+		case "stale/object":
+			writeJSON(w, http.StatusOK, listPage([]map[string]any{
+				{"path": "stale/other", "type": "added", "path_type": "object", "size_bytes": 11},
+			}, false, ""))
+		default:
+			writeNotFound(w)
+		}
+	})
+
+	first, hasMore, err := c.DiffBranch(context.Background(), "repo-metadata", testBranch, "")
+	require.NoError(t, err)
+	require.True(t, hasMore)
+	require.Equal(t, []Change{
+		{Path: "_lakefs_iceberg/tables/system/object_metadata", Type: ChangeChanged, SizeBytes: 7},
+		{Path: "stale/object", Type: ChangeAdded, SizeBytes: 9},
+	}, first)
+
+	second, hasMore, err := c.DiffBranch(context.Background(), "repo-metadata", testBranch, first[len(first)-1].Path)
+	require.NoError(t, err)
+	require.False(t, hasMore)
+	require.Equal(t, []Change{{Path: "stale/other", Type: ChangeAdded, SizeBytes: 11}}, second)
+
+	calls := rec.snapshot()
+	require.Len(t, calls, 2)
+	require.Equal(t, apiPath("/repositories/repo-metadata/branches/main/diff"), calls[0].path)
+	requireQuery(t, calls[0], "amount", strconv.Itoa(testPageSize))
+	requireQuery(t, calls[0], "after", "")
+	requireQuery(t, calls[1], "after", "stale/object")
 }
 
 func TestStatObject(t *testing.T) {
@@ -651,6 +815,29 @@ func TestFindMergeBase(t *testing.T) {
 	require.Equal(t, apiPath("/repositories/repo/refs/last/merge/head"), call.path)
 }
 
+// TestFindMergeBaseNoMergeBase pins §4.7's unrelated-history fallback: graveler reports
+// ErrNoMergeBase, pkg/api leaves it unmapped as a 500, and the client has to turn the body back
+// into a typed error so the indexer can rewrite instead of failing the branch forever.
+func TestFindMergeBaseNoMergeBase(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "find merge base: no merge base"})
+	})
+
+	_, err := c.FindMergeBase(context.Background(), testRepository, "last", "head")
+	require.ErrorIs(t, err, ErrNoMergeBase)
+	require.NotErrorIs(t, err, ErrUnexpectedResponse)
+}
+
+func TestFindMergeBaseOtherServerError(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "database unavailable"})
+	})
+
+	_, err := c.FindMergeBase(context.Background(), testRepository, "last", "head")
+	require.ErrorIs(t, err, ErrUnexpectedResponse)
+	require.NotErrorIs(t, err, ErrNoMergeBase)
+}
+
 // TestNotFound maps a 404 of every method to *NotFoundError. §4.4 and §4.5 branch on
 // errors.Is(err, ErrNotFound) for a missing branch, tag or commit, so every call has to
 // answer that way rather than with a generic failure.
@@ -717,6 +904,10 @@ func TestNotFound(t *testing.T) {
 		}},
 		{"diff refs", func(c *Client) error {
 			_, _, err := c.DiffRefs(ctx, testRepository, "main", "feature", "")
+			return err
+		}},
+		{"diff branch", func(c *Client) error {
+			_, _, err := c.DiffBranch(ctx, testRepository, testBranch, "")
 			return err
 		}},
 		{"list objects", func(c *Client) error {

@@ -6,6 +6,7 @@ package indexer_test
 // code through one or more ticks of indexer.Tick against the fakes of fake_test.go.
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -320,6 +321,30 @@ func TestRecovery(t *testing.T) {
 		require.True(t, ok)
 	})
 
+	t.Run("foreign staged changes with the recorded position", func(t *testing.T) {
+		e := indexed(t)
+		committed, ok := e.fake.tableState("main")
+		require.True(t, ok)
+		staged := committed.clone()
+		// The property still records the indexed position, so the old recovery could not tell
+		// this foreign staged write from an empty staging.
+		staged.sourceCommit = "s1"
+		staged.rows["stale"] = table.Row{
+			Repository: "repo",
+			Path:       "stale",
+			CommitID:   "s1",
+			SizeBytes:  999,
+			ETag:       "etag-stale",
+		}
+		e.fake.stage("main", staged)
+
+		e.tick()
+
+		require.Equal(t, []string{"main"}, e.fake.resetCalls(), "the staging is discarded despite the matching property")
+		require.Equal(t, []string{"a", "b"}, e.paths("main"))
+		require.NotContains(t, e.rows("main"), "stale")
+	})
+
 	t.Run("crashed after the lakefs commit", func(t *testing.T) {
 		e := indexedOnce(t)
 		delete(e.fake.tags["repo-metadata"], "mds-s1")
@@ -371,6 +396,20 @@ func TestRecovery(t *testing.T) {
 		require.Equal(t, "s2", state.sourceCommit)
 		require.Equal(t, []string{"a", "b"}, state.paths())
 		require.Equal(t, 2, e.metrics.indexed["repo"])
+	})
+
+	t.Run("two consecutive conflicts", func(t *testing.T) {
+		e := indexed(t)
+		conflict := fmt.Errorf("another writer: %w", indexer.ErrConflict)
+		e.fake.applyErrors = []error{conflict, conflict}
+
+		e.tick()
+
+		require.NoError(t, e.health.branch("repo", "main").err, "three retries absorb two consecutive 409s")
+		require.Equal(t, 3, e.fake.applyCalls)
+		state, _ := e.fake.tableState("main")
+		require.Equal(t, "s2", state.sourceCommit)
+		require.Equal(t, []string{"a", "b"}, state.paths())
 	})
 }
 
@@ -433,6 +472,160 @@ func TestHardResetRewriteWithoutTag(t *testing.T) {
 	require.Equal(t, []string{"a", "b"}, state.paths())
 	_, ok := e.fake.tagCommit("repo-metadata", "mds-s2")
 	require.True(t, ok, "the rebuilt position is tagged again")
+}
+
+// TestRewriteWithStagedChanges pins the §4.4 rule that a rewrite discards staging first. Real
+// lakeFS ResetHard keeps staging (pkg/graveler/graveler.go ResetHard has a TODO and only checks the
+// sealed tokens), so the old order - hard reset, then recovery - left a crashed step 3 pointer in
+// place and ran the rewrite on top of it. Both rewrite paths are covered: the tag of the merge base
+// and the initialisation-commit fallback.
+func TestRewriteWithStagedChanges(t *testing.T) {
+	setup := func(t *testing.T, withTag bool) *env {
+		t.Helper()
+		e := newEnv(t, func(opts *indexer.Options) {
+			opts.Backfill = indexer.BackfillHistory
+		})
+		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s2", []string{"s1"}, []client.ObjectStat{object("a", 10), object("b", 20)})
+		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+		e.fake.addCommit("repo", "main", "s3", []string{"s2"}, []client.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
+		e.fake.setDiff("repo", "s2", "s3", []client.Change{added("c", 30)})
+		e.tick()
+		require.Equal(t, []string{"a", "b", "c"}, e.paths("main"))
+
+		committed, ok := e.fake.tableState("main")
+		require.True(t, ok)
+		staged := committed.clone()
+		// The staged pointer records the commit the rewrite is about to move to, so recovery
+		// cannot tell it apart from an empty staging by the property alone.
+		staged.sourceCommit = "s2"
+		staged.rows["stale"] = table.Row{
+			Repository: "repo",
+			Path:       "stale",
+			CommitID:   "s3",
+			SizeBytes:  999,
+			ETag:       "etag-stale",
+		}
+		e.fake.stage("main", staged)
+		if !withTag {
+			delete(e.fake.tags["repo-metadata"], "mds-s2")
+		}
+		e.fake.setBranchHead("repo", "main", "s2")
+		return e
+	}
+	requireResetBeforeHardReset := func(t *testing.T, e *env) {
+		t.Helper()
+		reset, hardReset := -1, -1
+		for i, event := range e.fake.events {
+			if event == "reset:main" && reset == -1 {
+				reset = i
+			}
+			if len(event) >= len("hard-reset:main") && event[:len("hard-reset:main")] == "hard-reset:main" && hardReset == -1 {
+				hardReset = i
+			}
+		}
+		require.NotEqual(t, -1, reset, "the rewrite discards staging")
+		require.NotEqual(t, -1, hardReset, "the rewrite moves the branch")
+		require.Less(t, reset, hardReset, "staging is discarded before the history rewrite")
+	}
+
+	t.Run("tagged merge base", func(t *testing.T) {
+		e := setup(t, true)
+
+		e.tick()
+
+		require.NoError(t, e.health.repositoryError("repo"))
+		requireResetBeforeHardReset(t, e)
+		require.Contains(t, e.fake.hardResets, hardReset{repository: "repo-metadata", branch: "main", ref: "mds-s2"})
+		state, _ := e.fake.tableState("main")
+		require.Equal(t, "s2", state.sourceCommit)
+		require.Equal(t, []string{"a", "b"}, state.paths())
+		require.NotContains(t, e.rows("main"), "stale")
+	})
+
+	t.Run("fallback without a tag", func(t *testing.T) {
+		e := setup(t, false)
+		initCommit := e.fake.initCommitID()
+		require.NotEmpty(t, initCommit)
+
+		e.tick()
+
+		require.NoError(t, e.health.repositoryError("repo"))
+		requireResetBeforeHardReset(t, e)
+		require.Contains(t, e.fake.hardResets, hardReset{repository: "repo-metadata", branch: "main", ref: initCommit})
+		state, _ := e.fake.tableState("main")
+		require.Equal(t, "s2", state.sourceCommit)
+		require.Equal(t, []string{"a", "b"}, state.paths())
+		require.NotContains(t, e.rows("main"), "stale")
+	})
+}
+
+// TestUnrelatedHistoriesRewrite pins §4.7 when R@b is force-moved to a commit with no common
+// ancestor. graveler answers ErrNoMergeBase and pkg/api returns a 500; the client types it and the
+// indexer takes the fallback instead of failing the branch on every tick.
+func TestUnrelatedHistoriesRewrite(t *testing.T) {
+	e := newEnv(t, func(opts *indexer.Options) {
+		opts.Backfill = indexer.BackfillHistory
+	})
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.tick()
+
+	e.fake.addCommit("repo", "", "other", nil, []client.ObjectStat{object("z", 99)})
+	e.fake.setBranchHead("repo", "main", "other")
+	initCommit := e.fake.initCommitID()
+	require.NotEmpty(t, initCommit)
+
+	e.tick()
+
+	require.NoError(t, e.health.repositoryError("repo"))
+	require.NoError(t, e.health.branch("repo", "main").err)
+	require.Contains(t, e.fake.hardResets, hardReset{repository: "repo-metadata", branch: "main", ref: initCommit})
+	state, _ := e.fake.tableState("main")
+	require.Equal(t, "other", state.sourceCommit)
+	require.Equal(t, []string{"z"}, state.paths())
+	e.requireRow("main", "z", "other", 99)
+	_, ok := e.fake.tagCommit("repo-metadata", "mds-other")
+	require.True(t, ok, "the rebuilt position is tagged")
+}
+
+// TestPositionReachableOnlyThroughSecondParent pins §4.7 when last is an ancestor of head only
+// through a merge's second parent. findMergeBase(last, head) answers last, so the ancestry check
+// passes, but pending walks the first-parent chain and never meets it. Continuing from last used to
+// replay the whole chain from the root on top of its table and keep foreign rows; the fix detects
+// the absent stop commit and rebuilds from a full listing at head.
+func TestPositionReachableOnlyThroughSecondParent(t *testing.T) {
+	e := newEnv(t, func(opts *indexer.Options) {
+		opts.Backfill = indexer.BackfillHistory
+		opts.Repositories[0].Branches = []string{"main", "side"}
+	})
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
+	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	// The side commit is reachable from the merge only through its second parent.
+	e.fake.addCommit("repo", "side", "side1", []string{"s1"}, nil)
+	e.fake.setDiff("repo", "s1", "side1", []client.Change{added("x", 99)})
+	e.fake.addCommit("repo", "main", "m", []string{"s2", "side1"}, []client.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
+	e.fake.setDiff("repo", "s2", "m", []client.Change{added("c", 30)})
+	e.tick()
+	require.Equal(t, []string{"a", "b", "c"}, e.paths("main"))
+
+	// Record the side commit as the position of main, as a previously indexed branch that was
+	// then force-moved onto the merge would have.
+	e.fake.branches["repo-metadata"]["main"] = e.fake.branches["repo-metadata"]["side"]
+	initCommit := e.fake.initCommitID()
+	require.NotEmpty(t, initCommit)
+	rebuilds := e.fake.rebuildCalls
+
+	e.tick()
+
+	require.NoError(t, e.health.repositoryError("repo"))
+	require.NoError(t, e.health.branch("repo", "main").err)
+	require.Equal(t, rebuilds+1, e.fake.rebuildCalls, "the unfollowable position forces a full listing at head")
+	require.Contains(t, e.fake.hardResets, hardReset{repository: "repo-metadata", branch: "main", ref: initCommit})
+	state, _ := e.fake.tableState("main")
+	require.Equal(t, "m", state.sourceCommit)
+	require.Equal(t, []string{"a", "b", "c"}, state.paths(), "the side row x is not on main's first-parent chain")
+	e.requireRow("main", "c", "m", 30)
 }
 
 // TestBranchDelete pins §4.8: deleting a matching branch deletes its metadata branch (its tags stay),
@@ -499,4 +692,71 @@ func TestBranchStopsMatchingKeepsItsTable(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, before, after, "an unmatched branch is left where it is")
 	require.Empty(t, e.fake.deletedBranches, "and it is not deleted: it still exists in R")
+}
+
+// loadHookStore wraps the fake's table store and runs a hook around selected LoadTable calls, so a
+// test can act "between" two steps of one tick.
+type loadHookStore struct {
+	indexer.TableStore
+	calls  int
+	onLoad func(int)
+}
+
+func (s *loadHookStore) LoadTable(ctx context.Context, repository, branch string) (indexer.Table, error) {
+	s.calls++
+	if s.onLoad != nil {
+		s.onLoad(s.calls)
+	}
+	return s.TableStore.LoadTable(ctx, repository, branch)
+}
+
+// TestReloadTableBeforeApplyingCommit pins §4.4's "before step 3 the indexer reloads the table and
+// skips to step 4 if the source commit already equals C". The handle loaded at the top of the tick
+// is stale if another writer stages C before step 3; without the reload the indexer applies the
+// delta again instead of only committing the staged table.
+func TestReloadTableBeforeApplyingCommit(t *testing.T) {
+	e := newEnv(t)
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.tick()
+
+	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
+	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+
+	store := &loadHookStore{TableStore: e.fake}
+	store.onLoad = func(call int) {
+		if call != 2 {
+			return
+		}
+		// Another writer stages s2 after the tick's first LoadTable and before step 3.
+		state, ok := e.fake.tableState("main")
+		require.True(t, ok)
+		staged := state.clone()
+		staged.sourceCommit = "s2"
+		staged.rows["b"] = table.Row{
+			Repository:   "repo",
+			Path:         "b",
+			CommitID:     "s2",
+			SizeBytes:    20,
+			LastModified: time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC),
+			ETag:         "etag-b",
+			UserMetadata: map[string]string{"X-Amz-Meta-Owner": "alice"},
+		}
+		e.fake.stage("main", staged)
+	}
+	idx, err := indexer.New(indexer.Options{
+		LakeFS:       e.fake,
+		Tables:       store,
+		Repositories: []indexer.Repository{{Name: "repo", Branches: []string{"main"}}},
+		Health:       e.health,
+		Metrics:      e.metrics,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, idx.Tick(t.Context()))
+
+	require.Zero(t, e.fake.applyCalls, "the reloaded table already records s2, so step 3 is skipped")
+	state, ok := e.fake.tableState("main")
+	require.True(t, ok)
+	require.Equal(t, "s2", state.sourceCommit)
+	require.Equal(t, []string{"a", "b"}, state.paths())
 }

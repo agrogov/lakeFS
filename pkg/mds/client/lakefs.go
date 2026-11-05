@@ -76,6 +76,12 @@ var (
 	// cursor to reach it. Refusing that response is what keeps a listing from looping forever.
 	ErrBadPagination = errors.New("invalid pagination response")
 
+	// ErrNoMergeBase is reported when FindMergeBase finds no common ancestor (§4.7). A
+	// force-moved branch can have an unrelated history, and pkg/api answers that case with a
+	// 500. The indexer needs the typed error to take the rewrite fallback instead of failing
+	// the branch forever.
+	ErrNoMergeBase = errors.New("no merge base")
+
 	// ErrUnexpectedResponse is wrapped for a status or payload the client does not expect.
 	ErrUnexpectedResponse = errors.New("unexpected lakeFS response")
 )
@@ -300,6 +306,11 @@ type Tags interface {
 type ObjectLister interface {
 	ListObjects(ctx context.Context, repository, ref, after string) (objects []ObjectStat, hasMore bool, err error)
 	DiffRefs(ctx context.Context, repository, leftRef, rightRef, after string) (changes []Change, hasMore bool, err error)
+
+	// DiffBranch pages through the uncommitted changes of a branch. §4.4 recovery uses it to
+	// tell an empty staging from a foreign staged write whose property happens to equal the
+	// recorded position.
+	DiffBranch(ctx context.Context, repository, branch, after string) (changes []Change, hasMore bool, err error)
 }
 
 // ObjectStatter reads one object.
@@ -453,12 +464,20 @@ func (c *Client) HardResetBranch(ctx context.Context, repository, branch, ref st
 // FindMergeBase implements MergeBaseFinder and returns the base commit ID. §4.2 step 4 tests
 // whether the indexed position is still an ancestor of the head: findMergeBase(last, head)
 // answers last exactly when it is.
+//
+// A force-moved branch can have no common ancestor with its old position. graveler reports that
+// as ErrNoMergeBase, but pkg/api does not map it and answers 500 with "no merge base" in the
+// body. §4.7 still has a fallback for that state, so the body is recognised here and reported as
+// the typed ErrNoMergeBase rather than a generic server failure.
 func (c *Client) FindMergeBase(ctx context.Context, repository, sourceRef, destinationRef string) (string, error) {
 	resp, err := c.client.FindMergeBaseWithResponse(ctx, repository, sourceRef, destinationRef)
 	if err != nil {
 		return "", fmt.Errorf("find merge base of %q and %q in %q: %w", sourceRef, destinationRef, repository, err)
 	}
 	subject := repository + "@" + sourceRef + ".." + destinationRef
+	if resp.StatusCode() >= http.StatusInternalServerError && isNoMergeBase(resp.Body) {
+		return "", fmt.Errorf("find merge base %q: %w: %s", subject, ErrNoMergeBase, errorMessage(resp.Body))
+	}
 	if err := checkStatus(resp.StatusCode(), resp.JSON200 != nil, resp.Body, "find merge base", subject); err != nil {
 		return "", err
 	}
@@ -629,6 +648,37 @@ func (c *Client) DiffRefs(ctx context.Context, repository, leftRef, rightRef, af
 	return changes, hasMore, nil
 }
 
+// DiffBranch implements ObjectLister: it pages through the uncommitted changes of a branch
+// (GET /repositories/{repository}/branches/{branch}/diff). §4.4 uses the first page as the
+// authoritative answer to "is anything staged on R-metadata@b?", which the table's
+// lakefs.mds.source-commit property alone cannot answer. The cursor of the next page is the
+// Path of the last returned change.
+func (c *Client) DiffBranch(ctx context.Context, repository, branch, after string) ([]Change, bool, error) {
+	params := &apigen.DiffBranchParams{
+		Amount: apiutil.Ptr(apigen.PaginationAmount(c.pageSize)),
+	}
+	if after != "" {
+		params.After = apiutil.Ptr(apigen.PaginationAfter(after))
+	}
+	resp, err := c.client.DiffBranchWithResponse(ctx, repository, branch, params)
+	if err != nil {
+		return nil, false, fmt.Errorf("diff branch %q of %q: %w", branch, repository, err)
+	}
+	subject := repository + "@" + branch
+	if err := checkStatus(resp.StatusCode(), resp.JSON200 != nil, resp.Body, "diff branch", subject); err != nil {
+		return nil, false, err
+	}
+	changes := make([]Change, 0, len(resp.JSON200.Results))
+	for _, diff := range resp.JSON200.Results {
+		changes = append(changes, changeFromAPI(diff))
+	}
+	hasMore, err := morePage(resp.JSON200.Pagination, "diff branch", subject)
+	if err != nil {
+		return nil, false, err
+	}
+	return changes, hasMore, nil
+}
+
 // ListObjects implements ObjectLister. It asks for user metadata because every row of §3.1
 // carries it. The cursor of the next page is the Path of the last returned object.
 func (c *Client) ListObjects(ctx context.Context, repository, ref, after string) ([]ObjectStat, bool, error) {
@@ -775,6 +825,12 @@ func morePage(pagination apigen.Pagination, operation, subject string) (bool, er
 		return false, fmt.Errorf("%w: %s %q: more results without a next cursor", ErrBadPagination, operation, subject)
 	}
 	return true, nil
+}
+
+// isNoMergeBase reports whether an error body is graveler's ErrNoMergeBase. pkg/api leaves that
+// error unmapped, so it answers 500 with the message instead of a typed status (§4.7).
+func isNoMergeBase(body []byte) bool {
+	return strings.Contains(strings.ToLower(string(body)), "no merge base")
 }
 
 // checkStatus turns one generated response into an error. ok says whether the payload the

@@ -107,9 +107,9 @@ const (
 
 // conflictRetries bounds how often one branch tick restarts after the Iceberg commit answered 409
 // (§4.4: "A 409 from the Iceberg commit means another writer moved the table: reload, re-run
-// recovery, continue"). One restart is enough for the documented cause - a second indexer replica
-// that is one commit ahead - and a bounded number keeps a foreign writer from spinning a tick.
-const conflictRetries = 1
+// recovery, continue"). Three retries absorb a second indexer replica that is a few commits ahead
+// while still keeping a foreign writer from spinning a tick forever.
+const conflictRetries = 3
 
 // The errors of this package. They are static so that a caller can match them with errors.Is and
 // so that no message is built from a value the caller cannot see.

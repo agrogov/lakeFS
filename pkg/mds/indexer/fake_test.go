@@ -9,6 +9,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -66,14 +67,16 @@ type fake struct {
 	tagsMade            []tagCreation
 	deletedTags         []string
 	statCalls           []string
+	events              []string
 	applyCalls          int
 	rebuildCalls        int
 	compactCalls        int
 
 	// Injected failures. Each is one-shot unless documented otherwise.
-	applyErr   error
-	rebuildErr error
-	compactErr error
+	applyErr    error
+	applyErrors []error
+	rebuildErr  error
+	compactErr  error
 
 	index int
 }
@@ -405,6 +408,7 @@ func (f *fake) ResetBranch(_ context.Context, repository, branch string) error {
 	defer f.mu.Unlock()
 	delete(f.staged, branch)
 	f.resetBranches = append(f.resetBranches, branch)
+	f.events = append(f.events, "reset:"+branch)
 	return nil
 }
 
@@ -416,8 +420,11 @@ func (f *fake) HardResetBranch(_ context.Context, repository, branch, ref string
 		return err
 	}
 	f.branches[repository][branch] = commit
-	delete(f.staged, branch)
+	// Real lakeFS ResetHard does not discard staging: pkg/graveler/graveler.go ResetHard checks
+	// only the sealed tokens and leaves a TODO for the rest. Keeping f.staged here is what makes
+	// the fake model that, so an indexer that rewrites before discarding staging is caught.
 	f.hardResets = append(f.hardResets, hardReset{repository: repository, branch: branch, ref: ref})
+	f.events = append(f.events, "hard-reset:"+branch+":"+ref)
 	return nil
 }
 
@@ -447,7 +454,9 @@ func (f *fake) FindMergeBase(_ context.Context, repository, sourceRef, destinati
 		}
 		queue = append(queue, f.commits[repository][current].Parents...)
 	}
-	return "", &client.NotFoundError{Operation: "find merge base", Subject: source + ".." + destination}
+	// graveler.FindMergeBase returns ErrNoMergeBase for unrelated histories; pkg/api turns that
+	// into a 500. The fake reports the same typed error the client must produce.
+	return "", client.ErrNoMergeBase
 }
 
 func (f *fake) ancestorsLocked(repository, commit string) map[string]bool {
@@ -642,6 +651,55 @@ func (f *fake) DiffRefs(_ context.Context, repository, leftRef, rightRef, after 
 		func(change client.Change) client.Change { return change })
 }
 
+// DiffBranch reports the uncommitted changes of a metadata branch. A staged table pointer is
+// itself an object change on the branch, so any staged state is at least one change.
+func (f *fake) DiffBranch(_ context.Context, repository, branch, after string) ([]client.Change, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.branches[repository][branch]; !ok {
+		return nil, false, &client.NotFoundError{Operation: "diff branch", Subject: branch}
+	}
+	staged, ok := f.staged[branch]
+	if !ok {
+		return nil, false, nil
+	}
+	committed := f.tableAt[f.branches[repository][branch]]
+	var changes []client.Change
+	for path, row := range staged.rows {
+		old, ok := committedRow(committed, path)
+		switch {
+		case !ok:
+			changes = append(changes, client.Change{Path: path, Type: client.ChangeAdded, SizeBytes: row.SizeBytes})
+		case !reflect.DeepEqual(old, row):
+			changes = append(changes, client.Change{Path: path, Type: client.ChangeChanged, SizeBytes: row.SizeBytes})
+		}
+	}
+	if committed != nil {
+		for path := range committed.rows {
+			if _, ok := staged.rows[path]; !ok {
+				changes = append(changes, client.Change{Path: path, Type: client.ChangeRemoved})
+			}
+		}
+	}
+	if len(changes) == 0 {
+		changes = append(changes, client.Change{
+			Path: "_lakefs_iceberg/tables/system/object_metadata",
+			Type: client.ChangeChanged,
+		})
+	}
+	slices.SortFunc(changes, func(a, b client.Change) int { return cmp.Compare(a.Path, b.Path) })
+	return pageOf(changes, after, f.pageSize, func(change client.Change) string { return change.Path },
+		func(change client.Change) client.Change { return change })
+}
+
+func committedRow(state *fakeState, path string) (table.Row, bool) {
+	if state == nil {
+		return table.Row{}, false
+	}
+	row, ok := state.rows[path]
+	return row, ok
+}
+
 func (f *fake) StatObject(_ context.Context, repository, ref, path string) (client.ObjectStat, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -737,6 +795,11 @@ func (t *fakeTable) ApplyDelta(_ context.Context, upserts []table.Row, deletes [
 	t.f.mu.Lock()
 	defer t.f.mu.Unlock()
 	t.f.applyCalls++
+	if len(t.f.applyErrors) > 0 {
+		err := t.f.applyErrors[0]
+		t.f.applyErrors = t.f.applyErrors[1:]
+		return err
+	}
 	if t.f.applyErr != nil {
 		err := t.f.applyErr
 		t.f.applyErr = nil

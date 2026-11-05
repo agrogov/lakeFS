@@ -85,10 +85,17 @@ func (x *Indexer) runBranchOnce(ctx context.Context, repository, branch string, 
 		// §4.2 step 4, §4.7: is the recorded position still on the branch?
 		if last != head.ID {
 			base, err := x.lakeFS.FindMergeBase(ctx, repository, last, head.ID)
-			if err != nil {
+			switch {
+			case errors.Is(err, client.ErrNoMergeBase):
+				// §4.7: a force-moved branch with an unrelated history has no merge base, so no
+				// mds-<merge base> tag can exist. Reset to the initialisation commit and rebuild
+				// at the head instead of failing the branch on the server's 500.
+				if last, err = x.rewrite(ctx, repository, branch, handle, head, ""); err != nil {
+					return err
+				}
+			case err != nil:
 				return fmt.Errorf("merge base of %s@%s..%s: %w", repository, last, head.ID, err)
-			}
-			if base != last {
+			case base != last:
 				if last, err = x.rewrite(ctx, repository, branch, handle, head, base); err != nil {
 					return err
 				}
@@ -101,9 +108,22 @@ func (x *Indexer) runBranchOnce(ctx context.Context, repository, branch string, 
 	var todo []client.Commit
 	var total int
 	if last != head.ID {
-		todo, total, err = x.pending(ctx, repository, head, last, x.maxCommits)
+		var onFirstParent bool
+		todo, total, onFirstParent, err = x.pending(ctx, repository, head, last, x.maxCommits)
 		if err != nil {
 			return err
+		}
+		if !onFirstParent {
+			// §4.7: last is an ancestor of head only through a merge's second parent, so the
+			// first-parent walk never meets it. Continuing from it would replay the whole chain
+			// from the root on top of the table at last. The merge base here is last itself and
+			// cannot start a first-parent walk, so fall back to a full listing at head.
+			if last, err = x.rewrite(ctx, repository, branch, handle, head, ""); err != nil {
+				return err
+			}
+			state.last = last
+			todo = nil
+			total = 0
 		}
 	}
 	state.lag = int64(total)
@@ -123,7 +143,7 @@ func (x *Indexer) runBranchOnce(ctx context.Context, repository, branch string, 
 
 	// §4.2 step 6: apply one commit at a time; a failure stops this branch for this tick.
 	for _, commit := range todo {
-		if err := x.applyCommit(ctx, repository, branch, handle.table, commit); err != nil {
+		if err := x.applyCommit(ctx, repository, branch, handle, commit); err != nil {
 			return err
 		}
 		last = commit.ID
@@ -340,37 +360,64 @@ type recovery struct {
 
 // recoverStaging is step 1 of §4.2, the recovery table of §4.4:
 //
-//   - nothing staged (the staged property equals the recorded position): nothing to do. This is
-//     also the "crashed during step 3" row: data files without a staged pointer are unreferenced
-//     files that lakectl iceberg cleanup removes (§9);
 //   - the staged property is the next commit C after the recorded position: the Iceberg commit of
 //     C happened and its lakeFS commit did not, so steps 4-5 are done for C;
-//   - the staged property is anything else (a partial or foreign write): the staging is
-//     discarded, and the branch is indexed normally.
+//   - there are no uncommitted changes (the staged property equals the recorded position and the
+//     branch diff is empty), so there is nothing to do. This is also the "crashed during step 3"
+//     row: data files without a staged pointer are unreferenced files that lakectl iceberg cleanup
+//     removes (§9);
+//   - anything else staged (a partial or foreign write), including foreign changes whose property
+//     happens to equal the recorded position: the staging is discarded, and the branch is indexed
+//     normally.
 //
+// The table property alone cannot tell an empty staging from a foreign staged write that records
+// the same source commit, so the last case asks the branch for its uncommitted changes.
 // §4.4's "crashed after 4" row is handled before this, by ensureTag.
 func (x *Indexer) recoverStaging(ctx context.Context, repository, branch string, handle *tableHandle, last string, todo []client.Commit) (recovery, error) {
 	staged := handle.table.SourceCommit()
-	if staged == last {
-		return recovery{last: last, todo: todo}, nil
-	}
 	if len(todo) > 0 && todo[0].ID == staged {
 		if err := x.finishCommit(ctx, repository, branch, todo[0]); err != nil {
 			return recovery{}, err
 		}
 		return recovery{last: staged, todo: todo[1:], finished: true}, nil
 	}
-	if err := x.resetStaging(ctx, repository, branch, handle); err != nil {
+	if staged != last {
+		if err := x.resetStaging(ctx, repository, branch, handle); err != nil {
+			return recovery{}, err
+		}
+		return recovery{last: last, todo: todo}, nil
+	}
+	stagedChanges, err := x.hasUncommittedChanges(ctx, repository, branch)
+	if err != nil {
 		return recovery{}, err
+	}
+	if stagedChanges {
+		if err := x.resetStaging(ctx, repository, branch, handle); err != nil {
+			return recovery{}, err
+		}
 	}
 	return recovery{last: last, todo: todo}, nil
 }
 
+// hasUncommittedChanges reports whether R-metadata@b has anything staged. The first page of the
+// branch diff is enough: any staged table pointer is itself an object change on the branch.
+func (x *Indexer) hasUncommittedChanges(ctx context.Context, repository, branch string) (bool, error) {
+	metadata := metadataRepository(repository)
+	changes, _, err := x.lakeFS.DiffBranch(ctx, metadata, branch, "")
+	if err != nil {
+		return false, fmt.Errorf("diff %q@%s for uncommitted changes: %w", metadata, branch, err)
+	}
+	return len(changes) > 0, nil
+}
+
 // pending returns the first-parent commits of R@b after last, oldest first, at most limit of them,
-// and how many there are in total (§4.2 step 5). The total is the lag /_health and the lag_commits
-// metric report (§9), which max_commits must not hide.
-func (x *Indexer) pending(ctx context.Context, repository string, head client.Commit, last string, limit int) ([]client.Commit, int, error) {
+// how many there are in total, and whether the walk met last at all (§4.2 step 5, §4.7). The total
+// is the lag /_health and the lag_commits metric report (§9), which max_commits must not hide. A
+// false onFirstParent means last is not on head's first-parent chain, even if it is an ancestor of
+// head through a merge's second parent.
+func (x *Indexer) pending(ctx context.Context, repository string, head client.Commit, last string, limit int) ([]client.Commit, int, bool, error) {
 	var commits []client.Commit
+	metStop := last == ""
 	after := ""
 	for {
 		page, hasMore, err := x.lakeFS.LogCommits(ctx, repository, head.ID, client.LogCommitsOptions{
@@ -379,7 +426,12 @@ func (x *Indexer) pending(ctx context.Context, repository string, head client.Co
 			After:       after,
 		})
 		if err != nil {
-			return nil, 0, fmt.Errorf("log commits of %s@%s after %s: %w", repository, head.ID, last, err)
+			return nil, 0, false, fmt.Errorf("log commits of %s@%s after %s: %w", repository, head.ID, last, err)
+		}
+		for _, commit := range page {
+			if commit.ID == last {
+				metStop = true
+			}
 		}
 		commits = append(commits, page...)
 		if !hasMore {
@@ -387,8 +439,7 @@ func (x *Indexer) pending(ctx context.Context, repository string, head client.Co
 		}
 		after = lastNameOf(len(page), func(i int) string { return page[i].ID })
 		if after == "" {
-			return nil, 0, fmt.Errorf("%w: log commits of %s@%s: more results without a cursor",
-				client.ErrBadPagination, repository, head.ID)
+			return nil, 0, false, fmt.Errorf("%w: log commits of %s@%s: more results without a cursor", client.ErrBadPagination, repository, head.ID)
 		}
 	}
 	slices.Reverse(commits)
@@ -403,35 +454,46 @@ func (x *Indexer) pending(ctx context.Context, repository string, head client.Co
 	if len(commits) > limit {
 		commits = commits[:limit]
 	}
-	return commits, total, nil
+	return commits, total, metStop, nil
 }
 
 // rewrite handles a recorded position that is not an ancestor of the branch head (§4.7): a hard
 // reset, a revert by reset, or a force-moved branch. When the merge base has a tag the branch is
 // moved back to it and the commits after it are indexed normally; otherwise the branch is reset to
-// the initialisation commit and rebuilt from a full listing at the head.
+// the initialisation commit and rebuilt from a full listing at the head. An empty base means the
+// histories are unrelated, or the recorded position is not on the head's first-parent chain, so
+// there is no usable tag and the full listing is the only correct start.
 func (x *Indexer) rewrite(ctx context.Context, repository, branch string, handle *tableHandle, head client.Commit, base string) (string, error) {
 	metadata := metadataRepository(repository)
-	tag := tagName(base)
-	_, err := x.lakeFS.GetTag(ctx, metadata, tag)
-	switch {
-	case err == nil:
-		if err := x.lakeFS.HardResetBranch(ctx, metadata, branch, tag); err != nil {
-			return "", fmt.Errorf("hard reset %q@%s to %q: %w", metadata, branch, tag, err)
+	// §4.4: ResetHard does not discard staging in real lakeFS (pkg/graveler/graveler.go ResetHard
+	// has a TODO and only checks the sealed tokens), so a pointer staged by a crashed step 3 would
+	// survive the hard reset and the rewrite would run on top of the stale table. Discard it
+	// before moving the branch.
+	if err := x.resetStaging(ctx, repository, branch, handle); err != nil {
+		return "", err
+	}
+	if base != "" {
+		tag := tagName(base)
+		_, err := x.lakeFS.GetTag(ctx, metadata, tag)
+		switch {
+		case err == nil:
+			if err := x.lakeFS.HardResetBranch(ctx, metadata, branch, tag); err != nil {
+				return "", fmt.Errorf("hard reset %q@%s to %q: %w", metadata, branch, tag, err)
+			}
+			reloaded, err := x.tables.LoadTable(ctx, repository, branch)
+			if err != nil {
+				return "", fmt.Errorf("reload the metadata table of %s@%s after a hard reset: %w", branch, repository, err)
+			}
+			handle.swap(reloaded)
+			x.log.WithFields(logging.Fields{
+				"repository": repository,
+				"branch":     branch,
+				"merge_base": base,
+			}).Info("mds: history rewrite, moved the metadata branch back to the merge base")
+			return base, nil
+		case !errors.Is(err, client.ErrNotFound):
+			return "", fmt.Errorf("tag %q of %q: %w", tag, metadata, err)
 		}
-		reloaded, err := x.tables.LoadTable(ctx, repository, branch)
-		if err != nil {
-			return "", fmt.Errorf("reload the metadata table of %s@%s after a hard reset: %w", branch, repository, err)
-		}
-		handle.swap(reloaded)
-		x.log.WithFields(logging.Fields{
-			"repository": repository,
-			"branch":     branch,
-			"merge_base": base,
-		}).Info("mds: history rewrite, moved the metadata branch back to the merge base")
-		return base, nil
-	case !errors.Is(err, client.ErrNotFound):
-		return "", fmt.Errorf("tag %q of %q: %w", tag, metadata, err)
 	}
 
 	init, err := x.initCommit(repository)
@@ -467,11 +529,19 @@ func (x *Indexer) rewrite(ctx context.Context, repository, branch string, handle
 }
 
 // applyCommit applies one commit of R to the branch's table and records it (§4.3).
-func (x *Indexer) applyCommit(ctx context.Context, repository, branch string, tbl Table, commit client.Commit) error {
+func (x *Indexer) applyCommit(ctx context.Context, repository, branch string, handle *tableHandle, commit client.Commit) error {
 	changes, err := x.changeSet(ctx, repository, commit)
 	if err != nil {
 		return err
 	}
+
+	// §4.4: reload the table before step 3. The handle may have been loaded before another
+	// writer staged this commit, so its cached lakefs.mds.source-commit is not authoritative.
+	tbl, err := x.tables.LoadTable(ctx, repository, branch)
+	if err != nil {
+		return fmt.Errorf("reload the metadata table of %s@%s before applying %s: %w", branch, repository, commit.ID, err)
+	}
+	handle.swap(tbl)
 
 	var written int64
 	if changes.count() > x.rebuildThreshold {
