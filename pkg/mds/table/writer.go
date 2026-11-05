@@ -5,13 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"iter"
 	"slices"
 	"sort"
-	"time"
 
-	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/iceberg-go"
 	icebergio "github.com/apache/iceberg-go/io"
 	icebergtable "github.com/apache/iceberg-go/table"
@@ -45,6 +41,13 @@ var (
 	// ErrUnknownDeleteMode is returned for a write.delete.mode the writer does not implement.
 	ErrUnknownDeleteMode = errors.New("unknown write.delete.mode")
 
+	// ErrMergeRows is returned when a compaction cannot merge the rows of the table: a scan row has
+	// no path (the identifier and the sort key), a scan column the path is read from is not a string
+	// column, or the merge itself panicked. The merge runs inside iceberg-go's writer goroutine,
+	// where a panic would kill the process and no recover in the indexer could reach it, so it is
+	// reported as a commit error instead (R2T-1).
+	ErrMergeRows = errors.New("cannot merge the rows of the compaction")
+
 	// ErrRowsOutOfOrder is returned when a row source of a rebuild yields a path that does not
 	// come after the previous one. The table declares sort order path ASC (§3.1), and a rebuild
 	// streams its source instead of collecting it (design §4.3 step 2), so the order of the files
@@ -56,6 +59,18 @@ var (
 	// table from the catalog (design §4.2 step 2 and §4.4), so a nil table is a programming error
 	// and not a state a write can report to the catalog.
 	ErrNoTable = errors.New("no table")
+
+	// ErrStaleTable is returned when the table handle a write started from no longer names the
+	// branch's snapshot, and the writer cannot rebase the work it did against that snapshot.
+	//
+	// A write reads the snapshot (a rebuild's rows, a compaction's files and rows) and then commits
+	// removals relative to it, so replaying its transaction against a newer snapshot would keep the
+	// concurrent writer's file while re-adding the rows the rewrite read - a duplicate path (R2T-3).
+	// Every write pins commit.retry.num-retries to 0 so such a commit is refused, and the one
+	// commit that runs before the pin (the repair of a table created before the property existed)
+	// reports this error when it was itself replayed and moved the branch. The caller reloads the
+	// table and retries the tick (§4.4), which is the recovery the design documents.
+	ErrStaleTable = errors.New("the table moved since it was read")
 )
 
 // Option configures one write of this package. The zero set of options is the table's own
@@ -123,6 +138,68 @@ func repositoryOf(tbl *icebergtable.Table) (string, error) {
 	return repository, nil
 }
 
+// writeProperties returns the table properties every write of this package pins in its own
+// transaction: the source commit of the change set (§4.3 step 3) and commit.retry.num-retries = 0.
+//
+// A table created by this package already carries the retry property (Properties, §3.1), and
+// ensureNoReplay migrates a table created before the property existed. Re-asserting it on every
+// write keeps a concurrent or later writer of the same table - the catalog's metadata is what
+// iceberg-go reads its retry budget from - from making a whole-table rewrite replayable (R2T-3).
+func writeProperties(sourceCommit string) iceberg.Properties {
+	return iceberg.Properties{
+		PropertySourceCommit:  sourceCommit,
+		PropertyCommitRetries: CommitRetriesNone,
+	}
+}
+
+// ensureNoReplay returns a handle of tbl whose commit.retry.num-retries property is 0, so that the
+// commit the caller is about to make is never replayed against a newer snapshot.
+//
+// iceberg-go decides replayability from the properties of the metadata the transaction was started
+// on, not from the properties the transaction stages (table.doCommit reads t.metadata.Properties()),
+// so setting the property in the write's own transaction would protect the *next* write and not
+// this one. A table that already carries 0 - every table this package creates, and every table after
+// its first write - is returned as it is. A table created before the property existed, or one an
+// operator raised, is repaired with one metadata-only commit (no snapshot) and the returned handle
+// is used for the write.
+//
+// The repair's own commit still runs with the old replay budget, so it can be replayed onto a newer
+// parent. That is harmless for the repair itself (it only sets a property), but a replay means the
+// branch moved while this writer's rows were being read, and the write that follows must not
+// overwrite a commit it never read: it returns ErrStaleTable instead, and the caller reloads and
+// retries the tick (§4.4).
+func ensureNoReplay(ctx context.Context, tbl *icebergtable.Table) (*icebergtable.Table, error) {
+	if tbl.Properties().GetUInt64(PropertyCommitRetries, icebergtable.CommitNumRetriesDefault) == 0 {
+		return tbl, nil
+	}
+	txn := tbl.NewTransaction()
+	if err := txn.SetProperties(iceberg.Properties{PropertyCommitRetries: CommitRetriesNone}); err != nil {
+		return nil, fmt.Errorf("pin %s: %w", PropertyCommitRetries, err)
+	}
+	before := snapshotIDOf(tbl)
+	migrated, err := txn.Commit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("pin %s: %w", PropertyCommitRetries, err)
+	}
+	// The repair's own commit is the one commit of this package that runs while the replay budget of
+	// the loaded table is still non-zero, so it can be replayed onto a newer parent. The repair
+	// itself is idempotent and survives that, but the caller's work was read from the older
+	// snapshot: continuing would let a stale rewrite replace files it never read. Report the move
+	// instead, so the caller reloads and retries the tick (§4.4).
+	if after := snapshotIDOf(migrated); after != before {
+		return nil, fmt.Errorf("%w: snapshot %d is now %d", ErrStaleTable, before, after)
+	}
+	return migrated, nil
+}
+
+// snapshotIDOf returns the ID of the table's current snapshot, or 0 when the table has none.
+func snapshotIDOf(tbl *icebergtable.Table) int64 {
+	if snapshot := tbl.CurrentSnapshot(); snapshot != nil {
+		return snapshot.SnapshotID
+	}
+	return 0
+}
+
 // ApplyDelta applies one commit of a data repository to the table (design §4.3 step 3): the
 // upserts replace the rows of their paths, the deletes remove theirs, and the table property
 // lakefs.mds.source-commit records the commit that was applied.
@@ -145,6 +222,12 @@ func repositoryOf(tbl *icebergtable.Table) (string, error) {
 // The deletes are applied in merge-on-read mode by default, which writes position delete files;
 // WithDeleteMode(WriteModeCopyOnWrite) selects the fallback that rewrites the affected data files
 // instead (design §13 risk "Delete files and catalog staging").
+//
+// A delta with upserts refuses a table whose schema carries a column this writer does not know
+// (ErrUnknownSchema): the upserts are built from Row's ten fields, and a table with an optional
+// column a later schema version appended (§3.1) cannot be written that way (R2T-1). A delete-only
+// delta writes no row and is still applied. The write is never replayed: every write pins
+// commit.retry.num-retries to 0 and migrates a table created before the property existed (R2T-3).
 func ApplyDelta(ctx context.Context, tbl *icebergtable.Table, upserts []Row, deletes []string, sourceCommit string, opts ...Option) (*icebergtable.Table, error) {
 	if tbl == nil {
 		return nil, ErrNoTable
@@ -159,6 +242,18 @@ func ApplyDelta(ctx context.Context, tbl *icebergtable.Table, upserts []Row, del
 	o, err := resolve(tbl, opts)
 	if err != nil {
 		return nil, err
+	}
+	if len(upserts) > 0 {
+		// The upserts are rebuilt from Row's ten fields; a table with a column this writer does
+		// not know cannot be written that way, so it is refused instead of panicked on (R2T-1).
+		// A delete-only delta is still allowed: it writes no row.
+		if err := checkKnownSchema(tbl.Schema()); err != nil {
+			return nil, err
+		}
+	}
+	tbl, err = ensureNoReplay(ctx, tbl)
+	if err != nil {
+		return nil, fmt.Errorf("make the delta at %s non-replayable: %w", sourceCommit, err)
 	}
 	snapshotProps := SnapshotProperties(repository, sourceCommit)
 
@@ -215,7 +310,7 @@ func ApplyDelta(ctx context.Context, tbl *icebergtable.Table, upserts []Row, del
 		}
 	}
 
-	if err := txn.SetProperties(iceberg.Properties{PropertySourceCommit: sourceCommit}); err != nil {
+	if err := txn.SetProperties(writeProperties(sourceCommit)); err != nil {
 		return nil, fmt.Errorf("record the source commit: %w", err)
 	}
 	committed, err := txn.Commit(ctx)
@@ -247,6 +342,13 @@ func ApplyDelta(ctx context.Context, tbl *icebergtable.Table, upserts []Row, del
 // order (§3.1: path ASC): the source is streamed, so the writer cannot sort it without collecting
 // the branch in memory, and a source that breaks the order is refused with ErrRowsOutOfOrder
 // rather than written into files that contradict the declared order (MDS_REVIEW.md TB-2).
+//
+// The write is never replayed. Every write of this package pins commit.retry.num-retries to 0
+// (writeProperties), and ensureNoReplay migrates a table that was created before the property
+// existed, so a lost optimistic-concurrency check is a conflict the indexer retries rather than a
+// replayed rewrite that duplicates rows (R2T-3). A table whose schema carries a column this writer
+// does not know is refused with ErrUnknownSchema: a rebuild cannot fill a column it was not given
+// (R2T-1).
 func Rebuild(ctx context.Context, tbl *icebergtable.Table, rows Rows, sourceCommit string, opts ...Option) (*icebergtable.Table, error) {
 	if tbl == nil {
 		return nil, ErrNoTable
@@ -261,6 +363,16 @@ func Rebuild(ctx context.Context, tbl *icebergtable.Table, rows Rows, sourceComm
 	o, err := resolve(tbl, opts)
 	if err != nil {
 		return nil, err
+	}
+	// A rebuild writes rows it was given as Row's ten fields, and it replaces the whole table: a
+	// table with a column this writer does not know is refused rather than having that column
+	// emptied by a rebuild it cannot fill (R2T-1).
+	if err := checkKnownSchema(tbl.Schema()); err != nil {
+		return nil, err
+	}
+	tbl, err = ensureNoReplay(ctx, tbl)
+	if err != nil {
+		return nil, fmt.Errorf("make the rebuild at %s non-replayable: %w", sourceCommit, err)
 	}
 	snapshotProps := SnapshotProperties(repository, sourceCommit)
 
@@ -277,7 +389,7 @@ func Rebuild(ctx context.Context, tbl *icebergtable.Table, rows Rows, sourceComm
 	if err := txn.Append(ctx, reader, snapshotProps); err != nil {
 		return nil, fmt.Errorf("append the rows of the rebuild at %s: %w", sourceCommit, err)
 	}
-	if err := txn.SetProperties(iceberg.Properties{PropertySourceCommit: sourceCommit}); err != nil {
+	if err := txn.SetProperties(writeProperties(sourceCommit)); err != nil {
 		return nil, fmt.Errorf("record the source commit: %w", err)
 	}
 	committed, err := txn.Commit(ctx)
@@ -307,25 +419,37 @@ func Rebuild(ctx context.Context, tbl *icebergtable.Table, rows Rows, sourceComm
 // cleanup could reclaim it - and the snapshot summary's total-delete-files, which is exactly what
 // §4.9's delete-file trigger compares, would never fall back to zero (TB-1).
 //
-// The rows are read through a scan and re-sorted by path before they are written back: the scan
-// plans the table's data files in the order they were committed, not in the table's declared sort
-// order, and iceberg-go sorts each record batch it is handed on its own ("Sort each batch
-// independently before writing. This is per-batch, not per-file", table/rolling_data_writer.go),
-// so streaming the scan's batches straight back into Append writes files of [b d a c] for the data
-// files [a c] and [b d] - a table whose files no longer carry the `path ASC` order the table
-// metadata advertises (§3.1; the iceberg spec's sort order is what writers honour, MDS_REVIEW.md
-// TB-2). Sorting the rows first and batching them after makes every batch a contiguous slice of
-// the sorted table, so the batches the writer sorts are already in the declared order. Two commits
-// of interleaved paths compact into one file of [a b c d], and the per-file lower/upper bounds on
-// path stay narrow, which is what the next delta's IN (path ...) scan prunes with. Sorting needs
-// the rows, not the batches: they are collected as rows and handed to the writer one batch at a
-// time (rowBatches), so the peak memory is the table's rows plus one record batch. The caller
-// commits R-metadata afterwards with the "mds: compact" message and without a new tag (§4.9, M4's
-// maintenance task).
+// The rows come back out of a scan in the table's declared path order: the scan plans the table's
+// data files in the order they were committed, not in the table's declared sort order, and
+// iceberg-go sorts each record batch it is handed on its own ("Sort each batch independently
+// before writing. This is per-batch, not per-file", table/rolling_data_writer.go), so streaming
+// the scan's batches straight back into Append writes files of [b d a c] for the data files [a c]
+// and [b d] - a table whose files no longer carry the `path ASC` order the table metadata
+// advertises (§3.1; the iceberg spec's sort order is what writers honour, MDS_REVIEW.md TB-2).
+// The reader of compactReader merges the per-file sorted streams instead (a k-way merge, one
+// record batch per file and one of output), so every batch the writer sorts is already a
+// contiguous slice of the declared order, and two commits of interleaved paths compact into one
+// file of [a b c d] with narrow path bounds for the next delta's IN (path ...) scan to prune with
+// (R2T-2). A file written by a compaction before commit 2daeca114 may not be sorted: reading only
+// its path column detects that, and the file is then read whole and sorted on its own before it
+// is merged, so the memory of the fallback is that file and not the table.
+//
+// The rows are the scan's own Arrow columns, sliced and concatenated, never rebuilt from the ten
+// fields of Row: a column this writer does not know - an optional column a later schema version
+// appended with a new ID, which §3.1 allows - keeps its values through the rewrite (R2T-1).
+//
+// The compaction also never replays. Its own transaction pins commit.retry.num-retries to 0
+// (writeProperties) and ensureNoReplay migrates a table created before the property existed, so a
+// lost CAS is a conflict the indexer retries instead of a replay of the removals against a newer
+// snapshot - which would keep a concurrent writer's data file while re-adding the rows the
+// compaction read, and duplicate a path (R2T-3).
+//
+// The caller commits R-metadata afterwards with the "mds: compact" message and without a new tag
+// (§4.9, M4's maintenance task).
 //
 // Compact takes no Option: it removes and re-adds whole files and writes no delete predicate, so
 // the delete mode and the delete chunk size of a delta do not apply, and the batch size is the
-// one rowBatches uses (MDS_REVIEW.md TB-4).
+// one compactRecordBatchSize fixes (MDS_REVIEW.md TB-4).
 func Compact(ctx context.Context, tbl *icebergtable.Table, sourceCommit string) (*icebergtable.Table, error) {
 	if tbl == nil {
 		return nil, ErrNoTable
@@ -339,6 +463,10 @@ func Compact(ctx context.Context, tbl *icebergtable.Table, sourceCommit string) 
 	}
 	snapshotProps := SnapshotProperties(repository, sourceCommit)
 
+	tbl, err = ensureNoReplay(ctx, tbl)
+	if err != nil {
+		return nil, fmt.Errorf("make the compaction at %s non-replayable: %w", sourceCommit, err)
+	}
 	scan := tbl.Scan()
 	defer func() { _ = scan.Close() }()
 	tasks, err := scan.PlanFiles(ctx)
@@ -350,16 +478,10 @@ func Compact(ctx context.Context, tbl *icebergtable.Table, sourceCommit string) 
 	if err != nil {
 		return nil, fmt.Errorf("list the delete files of the table at %s: %w", sourceCommit, err)
 	}
-	schema, batches, err := scan.ReadTasks(ctx, tasks)
+	reader, err := compactReader(ctx, tbl, tasks)
 	if err != nil {
-		return nil, fmt.Errorf("scan the table at %s: %w", sourceCommit, err)
+		return nil, fmt.Errorf("read the table at %s: %w", sourceCommit, err)
 	}
-	rows, err := rowsOfBatches(batches)
-	if err != nil {
-		return nil, fmt.Errorf("read the rows of the table at %s: %w", sourceCommit, err)
-	}
-	slices.SortFunc(rows, func(a, b Row) int { return cmp.Compare(a.Path, b.Path) })
-	reader := NewBatchesRecordReader(schema, rowBatches(schema, rowSource(rows), compactRecordBatchSize))
 	defer reader.Release()
 
 	txn := tbl.NewTransaction()
@@ -373,7 +495,7 @@ func Compact(ctx context.Context, tbl *icebergtable.Table, sourceCommit string) 
 			return nil, fmt.Errorf("rewrite the table at %s: %w", sourceCommit, err)
 		}
 	}
-	if err := txn.SetProperties(iceberg.Properties{PropertySourceCommit: sourceCommit}); err != nil {
+	if err := txn.SetProperties(writeProperties(sourceCommit)); err != nil {
 		return nil, fmt.Errorf("record the source commit: %w", err)
 	}
 	committed, err := txn.Commit(ctx)
@@ -534,98 +656,4 @@ func orderedRows(rows Rows) Rows {
 			return yield(row, nil)
 		})
 	}
-}
-
-// rowSource turns rows into a row source, which is what rowBatches reads. Compact materialises
-// the table's rows to sort them and hands them back one batch at a time, so that the batch being
-// appended is not a second copy of the whole table.
-func rowSource(rows []Row) Rows {
-	return func(yield func(Row, error) bool) {
-		for _, row := range rows {
-			if !yield(row, nil) {
-				return
-			}
-		}
-	}
-}
-
-// rowsOfBatches decodes a scan's record batches into rows, in the order the batches and their rows
-// carry them. Compact uses it to re-sort the table before it writes it back.
-//
-// Every batch is released as soon as its rows are decoded: the sorted rows are the only copy
-// Compact keeps.
-func rowsOfBatches(batches iter.Seq2[arrow.RecordBatch, error]) ([]Row, error) {
-	var rows []Row
-	for batch, err := range batches {
-		if err != nil {
-			if batch != nil {
-				batch.Release()
-			}
-			return nil, err
-		}
-		for i := range int(batch.NumRows()) {
-			rows = append(rows, rowOfBatch(batch, i))
-		}
-		batch.Release()
-	}
-	return rows, nil
-}
-
-// rowOfBatch decodes row i of one record batch. The columns are addressed by the positions of the
-// fixed schema, the same ones appendRow writes (rows.go): the scan returns the table's columns in
-// schema order, and schema changes only append optional columns with new IDs (§3.1), so the first
-// ten positions stay the ones of that fixed schema.
-func rowOfBatch(batch arrow.RecordBatch, i int) Row {
-	return Row{
-		Repository:   batch.Column(columnRepository).(*array.String).Value(i),
-		Path:         batch.Column(columnPath).(*array.String).Value(i),
-		CommitID:     batch.Column(columnCommitID).(*array.String).Value(i),
-		SizeBytes:    batch.Column(columnSizeBytes).(*array.Int64).Value(i),
-		LastModified: timestampOf(batch.Column(columnLastModified).(*array.Timestamp), i),
-		ETag:         batch.Column(columnETag).(*array.String).Value(i),
-		UserMetadata: userMetadataOf(batch.Column(columnUserMetadata).(*array.Map), i),
-		Committer:    optionalStringOf(batch.Column(columnCommitter).(*array.String), i),
-		ContentType:  optionalStringOf(batch.Column(columnContentType).(*array.String), i),
-		CreationDate: optionalTimestampOf(batch.Column(columnCreationDate).(*array.Timestamp), i),
-	}
-}
-
-// timestampOf reads one timestamp cell as a time. appendRow writes it as Unix microseconds in UTC,
-// so the round trip through a scan gives the same value back.
-func timestampOf(values *array.Timestamp, i int) time.Time {
-	return time.UnixMicro(int64(values.Value(i))).UTC()
-}
-
-// userMetadataOf reads one user_metadata map cell. A null map becomes a nil map, which appendRow
-// writes back as the empty map the schema requires (§3.1).
-func userMetadataOf(values *array.Map, i int) map[string]string {
-	if values.IsNull(i) {
-		return nil
-	}
-	start, end := values.ValueOffsets(i)
-	keys := values.Keys().(*array.String)
-	items := values.Items().(*array.String)
-	metadata := make(map[string]string, end-start)
-	for j := start; j < end; j++ {
-		metadata[keys.Value(int(j))] = items.Value(int(j))
-	}
-	return metadata
-}
-
-// optionalStringOf reads one cell of an optional string column: null is the unset value.
-func optionalStringOf(values *array.String, i int) *string {
-	if values.IsNull(i) {
-		return nil
-	}
-	value := values.Value(i)
-	return &value
-}
-
-// optionalTimestampOf reads one cell of an optional timestamp column: null is the unset value.
-func optionalTimestampOf(values *array.Timestamp, i int) *time.Time {
-	if values.IsNull(i) {
-		return nil
-	}
-	value := timestampOf(values, i)
-	return &value
 }

@@ -21,6 +21,9 @@
 package table
 
 import (
+	"errors"
+	"fmt"
+
 	"github.com/apache/iceberg-go"
 	icebergtable "github.com/apache/iceberg-go/table"
 )
@@ -120,6 +123,81 @@ const (
 	WriteCompressionCodecZSTD     = "zstd"
 )
 
+// PropertyCommitRetries is iceberg-go's commit.retry.num-retries: how many times a commit that
+// lost its optimistic-concurrency check is replayed against the refreshed table. It is pinned to
+// CommitRetriesNone for every table this package creates, is re-asserted by every write, and is the
+// reason a whole-table rewrite (a rebuild or a compaction) can never be replayed (§4.3 step 2,
+// §4.9):
+//
+//   - iceberg-go marks a commit non-replayable only when it removes delete files, so a rebuild of a
+//     table that holds no delete file - a freshly built index, and the only state in which a
+//     compaction's every_commits trigger can fire without the delete-file trigger - used to be
+//     replayable. A replay re-adds the rewrite on top of a newer snapshot while the concurrent
+//     writer's new data file survives, so the same path appears twice.
+//   - With the property at 0 a lost CAS is terminal: the write returns the conflict, and the
+//     indexer reloads the table and retries the tick (§4.4), which is the documented recovery.
+//
+// The value is absolute, not a budget the indexer can relax: replaying a stale rewrite is never
+// safe, whatever the retry budget of a transient catalog failure.
+const (
+	PropertyCommitRetries = icebergtable.CommitNumRetriesKey
+
+	// CommitRetriesNone is the value of PropertyCommitRetries this package writes: no replay.
+	CommitRetriesNone = "0"
+)
+
+// ErrUnknownSchema is returned when the table's schema carries a top-level column this version of
+// the writer does not know.
+//
+// Design §3.1 allows a schema change to append optional columns with new IDs, and this writer
+// builds rows from the ten fields of Row (§3.1). A row it builds for such a table would leave the
+// unknown columns empty while the known ones carry a value, which arrow refuses (the record builder
+// panics); writing the unknown columns as null instead would silently drop data this writer does
+// not own. So a write that has to build rows - ApplyDelta's upserts and every Rebuild - refuses the
+// table with this error, and the indexer reports the branch instead of corrupting it (R2T-1).
+//
+// Compact is not refused: it never builds a row, it hands the scan's own record batches - unknown
+// columns included - to the transaction (see compactReader in rows.go), so a later schema version's
+// extra column keeps its values through a compaction.
+var ErrUnknownSchema = errors.New("unknown table schema")
+
+// knownColumns are the ten top-level columns of Schema, in their order and with their IDs: the
+// schema of every table this version of the writer builds rows for. The map's key and value (8 and
+// 9) are nested inside user_metadata and are not top-level columns.
+var knownColumns = []struct {
+	name string
+	id   int
+}{
+	{ColumnRepository, FieldRepository},
+	{ColumnPath, FieldPath},
+	{ColumnCommitID, FieldCommitID},
+	{ColumnSizeBytes, FieldSizeBytes},
+	{ColumnLastModified, FieldLastModified},
+	{ColumnETag, FieldETag},
+	{ColumnUserMetadata, FieldUserMetadata},
+	{ColumnCommitter, FieldCommitter},
+	{ColumnContentType, FieldContentType},
+	{ColumnCreationDate, FieldCreationDate},
+}
+
+// checkKnownSchema returns ErrUnknownSchema when sc has a top-level column this writer does not
+// know. It is the guard that keeps a row-building write from reaching arrow's record builder with
+// an unknown column and panicking there (R2T-1).
+func checkKnownSchema(sc *iceberg.Schema) error {
+	fields := sc.Fields()
+	if len(fields) != len(knownColumns) {
+		return fmt.Errorf("%w: %d columns, this writer knows %d", ErrUnknownSchema, len(fields), len(knownColumns))
+	}
+	for i, field := range fields {
+		known := knownColumns[i]
+		if field.ID != known.id || field.Name != known.name {
+			return fmt.Errorf("%w: column %d is %q (ID %d), this writer knows %q (ID %d)",
+				ErrUnknownSchema, i, field.Name, field.ID, known.name, known.id)
+		}
+	}
+	return nil
+}
+
 // Schema returns the fixed Iceberg schema of system.object_metadata (§3.1):
 //
 //	1  repository     string            required
@@ -206,7 +284,8 @@ func SortOrder() (icebergtable.SortOrder, error) {
 }
 
 // Properties returns the table properties of a new table of data repository repository (§3.1):
-// the merge-on-read write modes, zstd, the schema version and the data repository name.
+// the merge-on-read write modes, zstd, the schema version, the data repository name and
+// commit.retry.num-retries = 0.
 //
 // Every other property the table needs is written by the indexer as it commits: the
 // PropertySourceCommit property is updated on every indexed commit (§4.3 step 3), so it is not set
@@ -219,6 +298,10 @@ func Properties(repository string) iceberg.Properties {
 		PropertyWriteCompressionCodec: WriteCompressionCodecZSTD,
 		PropertySchemaVersion:         SchemaVersion,
 		PropertyRepository:            repository,
+		// Every table this package creates is non-replayable from its first write (§4.3 step 2);
+		// a table created before this property existed is migrated by ensureNoReplay, on its next
+		// write, and the property is re-asserted by every write (R2T-3).
+		PropertyCommitRetries: CommitRetriesNone,
 	}
 }
 

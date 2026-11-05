@@ -4,9 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/iceberg-go"
+	icebergcataloggo "github.com/apache/iceberg-go/catalog"
 	icebergtable "github.com/apache/iceberg-go/table"
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/mds/table"
@@ -583,4 +589,312 @@ func TestApplyDeltaSourceRepository(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, env.dataRepository(),
 		created.CurrentSnapshot().Summary.Properties[table.PropertySourceRepository])
+}
+
+// ---------------------------------------------------------------------------------------------
+// R2T-1, R2T-2 and R2T-3 of MDS_REVIEW_2.md
+// ---------------------------------------------------------------------------------------------
+
+// createTableWith creates system.object_metadata with the given schema and extra properties, the
+// way CreateTable does: the fixed properties of the package are written last.
+func (e *testEnv) createTableWith(t *testing.T, sc *iceberg.Schema, extra iceberg.Properties) *icebergtable.Table {
+	t.Helper()
+	order, err := table.SortOrder()
+	require.NoError(t, err)
+	props := iceberg.Properties{}
+	maps.Copy(props, extra)
+	maps.Copy(props, table.Properties(e.dataRepository()))
+	created, err := e.rest.CreateTable(t.Context(), table.Identifier(), sc,
+		icebergcataloggo.WithProperties(props), icebergcataloggo.WithSortOrder(order))
+	require.NoError(t, err, "create the object_metadata table")
+	return created
+}
+
+// evolvesWithExtraColumn appends the optional column a later schema version would add (design §3.1:
+// "schema changes only add optional fields with new IDs") and returns the evolved table.
+func evolvesWithExtraColumn(t *testing.T, tbl *icebergtable.Table) *icebergtable.Table {
+	t.Helper()
+	txn := tbl.NewTransaction()
+	require.NoError(t, txn.UpdateSchema(false, false).
+		AddColumn([]string{table.ExtraColumn}, iceberg.StringType{}, "a column this writer does not know", false, nil).
+		Commit())
+	evolved, err := txn.Commit(t.Context())
+	require.NoError(t, err, "append the extra column")
+	require.Len(t, evolved.Schema().Fields(), 11)
+	return evolved
+}
+
+// appendsWithExtraColumn appends rows through iceberg-go, with a value for the extra column of the
+// evolved schema: a writer that knows a column this package's Row does not.
+func appendsWithExtraColumn(t *testing.T, env *testEnv, tbl *icebergtable.Table, rows []table.Row, extra string, sourceCommit string) *icebergtable.Table {
+	t.Helper()
+	extras := make([]string, len(rows))
+	for i := range extras {
+		extras[i] = extra
+	}
+	reader, err := table.NewExtraColumnRecordReader(tbl.Schema(), rows, extras)
+	require.NoError(t, err)
+	defer reader.Release()
+	txn := tbl.NewTransaction()
+	require.NoError(t, txn.Append(t.Context(), reader, table.SnapshotProperties(env.dataRepository(), sourceCommit)))
+	require.NoError(t, txn.SetProperties(iceberg.Properties{table.PropertySourceCommit: sourceCommit}))
+	appended, err := txn.Commit(t.Context())
+	require.NoError(t, err, "append the row with the extra column")
+	return appended
+}
+
+// extraColumnValues reads the extra column of every row of the table, keyed by path. A nil value is
+// a null cell.
+func extraColumnValues(t *testing.T, tbl *icebergtable.Table) map[string]*string {
+	t.Helper()
+	scan := tbl.Scan(icebergtable.WithSelectedFields(table.ColumnPath, table.ExtraColumn))
+	defer func() { _ = scan.Close() }()
+	schema, batches, err := scan.ToArrowRecords(t.Context())
+	require.NoError(t, err, "scan the path and extra columns")
+	pathIndex := schema.FieldIndices(table.ColumnPath)
+	extraIndex := schema.FieldIndices(table.ExtraColumn)
+	require.NotEmpty(t, pathIndex)
+	require.NotEmpty(t, extraIndex)
+	values := map[string]*string{}
+	for batch, err := range batches {
+		require.NoError(t, err)
+		paths := batch.Column(pathIndex[0]).(*array.String)
+		extras := batch.Column(extraIndex[0]).(*array.String)
+		for i := range int(batch.NumRows()) {
+			path := paths.Value(i)
+			if extras.IsNull(i) {
+				values[path] = nil
+				continue
+			}
+			value := extras.Value(i)
+			values[path] = &value
+		}
+		batch.Release()
+	}
+	return values
+}
+
+// TestCompactKeepsAColumnTheWriterDoesNotKnow is the probe of MDS_REVIEW_2.md R2T-1. Design §3.1
+// allows a later schema version to append an optional column with a new ID, and a foreign writer
+// fills it. Compact used to decode every row into the ten fields of Row and rebuild them, so the
+// unknown column was appended no value while the others got one, and arrow's record builder raised
+// "some fields have excessive number of rows" inside iceberg-go's writer goroutine: no recover could
+// reach it, and the indexer process died. The compaction now re-emits the scan's own columns, so the
+// column keeps its value.
+func TestCompactKeepsAColumnTheWriterDoesNotKnow(t *testing.T) {
+	env := newTestEnv(t)
+	when := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	tbl := env.createTable(t)
+	seeded, err := table.ApplyDelta(t.Context(), tbl, []table.Row{
+		row(t, "a", "c1", 1, when, nil),
+		row(t, "c", "c1", 3, when, nil),
+	}, nil, "c1")
+	require.NoError(t, err)
+	seeded, err = table.ApplyDelta(t.Context(), seeded, []table.Row{
+		row(t, "b", "c2", 2, when, nil),
+		row(t, "d", "c2", 4, when, nil),
+	}, nil, "c2")
+	require.NoError(t, err)
+
+	evolved := evolvesWithExtraColumn(t, seeded)
+	appended := appendsWithExtraColumn(t, env, evolved, []table.Row{
+		row(t, "e", "c3", 5, when, nil),
+	}, "keep-me", "c3")
+
+	compacted, err := table.Compact(t.Context(), appended, "c3")
+	require.NoError(t, err, "a compaction must not panic on a column it does not know")
+
+	values := extraColumnValues(t, env.loadTable(t))
+	require.Len(t, values, 5)
+	require.NotNil(t, values["e"], "the extra column of the foreign writer's row survives")
+	require.Equal(t, "keep-me", *values["e"])
+	for _, path := range []string{"a", "b", "c", "d"} {
+		require.Nil(t, values[path], "path %s was written before the column existed", path)
+	}
+	requireScanRows(t, env.loadTable(t), []table.Row{
+		row(t, "a", "c1", 1, when, nil),
+		row(t, "b", "c2", 2, when, nil),
+		row(t, "c", "c1", 3, when, nil),
+		row(t, "d", "c2", 4, when, nil),
+		row(t, "e", "c3", 5, when, nil),
+	})
+	require.Equal(t, "c3", compacted.Properties()[table.PropertySourceCommit])
+}
+
+// TestWritesRefuseAColumnTheWriterDoesNotKnow is the other half of R2T-1: a write that has to build
+// rows from Row's ten fields cannot fill a column it was not given, so it refuses the table with
+// ErrUnknownSchema instead of panicking (or silently writing nulls over data another writer owns).
+// A delete-only delta writes no row and still applies.
+func TestWritesRefuseAColumnTheWriterDoesNotKnow(t *testing.T) {
+	when := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	// newTable builds the evolved table: two rows of this writer, then the extra column, then one
+	// row of a writer that fills it.
+	newTable := func(t *testing.T) (*testEnv, *icebergtable.Table) {
+		t.Helper()
+		env := newTestEnv(t)
+		tbl := env.createTable(t)
+		seeded, err := table.ApplyDelta(t.Context(), tbl, []table.Row{
+			row(t, "a", "c1", 1, when, nil),
+			row(t, "b", "c1", 2, when, nil),
+		}, nil, "c1")
+		require.NoError(t, err)
+		evolved := evolvesWithExtraColumn(t, seeded)
+		return env, appendsWithExtraColumn(t, env, evolved, []table.Row{
+			row(t, "e", "c2", 5, when, nil),
+		}, "keep-me", "c2")
+	}
+
+	t.Run("a rebuild refuses the table before it writes", func(t *testing.T) {
+		env, tbl := newTable(t)
+		before := snapshotCount(tbl)
+		_, err := table.Rebuild(t.Context(), tbl, rowSeq([]table.Row{row(t, "z", "c3", 6, when, nil)}), "c3")
+		require.ErrorIs(t, err, table.ErrUnknownSchema)
+		require.Equal(t, before, snapshotCount(env.loadTable(t)), "the refused rebuild committed nothing")
+	})
+
+	t.Run("an upsert delta refuses the table before it writes", func(t *testing.T) {
+		env, tbl := newTable(t)
+		before := snapshotCount(tbl)
+		_, err := table.ApplyDelta(t.Context(), tbl, []table.Row{row(t, "z", "c3", 6, when, nil)}, nil, "c3")
+		require.ErrorIs(t, err, table.ErrUnknownSchema)
+		require.Equal(t, before, snapshotCount(env.loadTable(t)), "the refused delta committed nothing")
+	})
+
+	t.Run("a delete-only delta still applies", func(t *testing.T) {
+		env, tbl := newTable(t)
+		updated, err := table.ApplyDelta(t.Context(), tbl, nil, []string{"a"}, "c3")
+		require.NoError(t, err, "a delta that writes no row does not need to build one")
+		require.Equal(t, "c3", updated.Properties()[table.PropertySourceCommit])
+		requireScanRows(t, env.loadTable(t), []table.Row{
+			row(t, "b", "c1", 2, when, nil),
+			row(t, "e", "c2", 5, when, nil),
+		})
+		values := extraColumnValues(t, env.loadTable(t))
+		require.NotNil(t, values["e"], "a delete must not touch the column it does not know")
+		require.Equal(t, "keep-me", *values["e"])
+	})
+}
+
+// TestCompactSortsAFileWrittenBeforeTheFix is R2T-2's legacy case. A compaction before commit
+// 2daeca114 streamed the scan's batches straight back into Append, and iceberg-go sorts each record
+// batch on its own, so one data file could carry [a c b d] for the rows [a b c d]. The k-way merge
+// treats each file as a sorted stream, so such a file must be detected and sorted on its own: the
+// compaction succeeds, keeps the declared order, and loses no row. (Streaming the file as a run
+// would fail its in-order check instead of writing the wrong order.)
+func TestCompactSortsAFileWrittenBeforeTheFix(t *testing.T) {
+	env := newTestEnv(t)
+	when := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	tbl := env.createTable(t)
+
+	arrowSchema, err := table.ArrowSchema(tbl.Schema())
+	require.NoError(t, err)
+	legacyFile := []arrow.RecordBatch{
+		rowBatchOf(t, tbl, 2, row(t, "c", "c1", 3, when, nil), row(t, "a", "c1", 1, when, nil)),
+		rowBatchOf(t, tbl, 2, row(t, "d", "c1", 4, when, nil), row(t, "b", "c1", 2, when, nil)),
+	}
+	txn := tbl.NewTransaction()
+	// iceberg-go sorts each batch on its own, so the file is [a c][b d]: ascending inside a batch,
+	// not across the file, which is exactly the shape the old compaction wrote.
+	require.NoError(t, txn.Append(t.Context(),
+		table.NewBatchesRecordReader(arrowSchema, batchesOf(legacyFile)),
+		table.SnapshotProperties(env.dataRepository(), "c1")))
+	require.NoError(t, txn.SetProperties(iceberg.Properties{table.PropertySourceCommit: "c1"}))
+	_, err = txn.Commit(t.Context())
+	require.NoError(t, err)
+
+	require.Equal(t, []string{"a", "c", "b", "d"}, pathsOf(scanRowsInWriteOrder(t, env.loadTable(t))),
+		"the data file is not in the table's declared order, as a file written before 2daeca114 was")
+
+	compacted, err := table.Compact(t.Context(), env.loadTable(t), "c1")
+	require.NoError(t, err, "a file written before the fix must be handled, not refused")
+	require.Equal(t, []string{"a", "b", "c", "d"}, pathsOf(scanRowsInWriteOrder(t, compacted)),
+		"the compaction writes the declared path ASC order")
+	requireScanRows(t, env.loadTable(t), []table.Row{
+		row(t, "a", "c1", 1, when, nil),
+		row(t, "b", "c1", 2, when, nil),
+		row(t, "c", "c1", 3, when, nil),
+		row(t, "d", "c1", 4, when, nil),
+	})
+}
+
+// rowBatchOf returns one record batch of the rows, in the order given, through NewRecordReader: the
+// batches are what a scan (or the writer of a pre-2daeca114 compaction) hands to a transaction.
+func rowBatchOf(t *testing.T, tbl *icebergtable.Table, batchSize int, rows ...table.Row) arrow.RecordBatch {
+	t.Helper()
+	reader, err := table.NewRecordReader(tbl.Schema(), rows, batchSize)
+	require.NoError(t, err)
+	defer reader.Release()
+	require.True(t, reader.Next())
+	batch := reader.RecordBatch()
+	batch.Retain()
+	return batch
+}
+
+// batchesOf is a batch source over a slice, the shape NewBatchesRecordReader reads.
+func batchesOf(batches []arrow.RecordBatch) func(yield func(arrow.RecordBatch, error) bool) {
+	return func(yield func(arrow.RecordBatch, error) bool) {
+		for _, batch := range batches {
+			if !yield(batch, nil) {
+				return
+			}
+		}
+	}
+}
+
+// TestCompactHoldsABoundedNumberOfRows is the probe of MDS_REVIEW_2.md R2T-2. The compaction used to
+// collect every row of the table (a Row plus its strings and maps, ~340 B, and ~1.5 KiB/row for the
+// whole scan+rows+write path) and hand them back one batch at a time, so its peak followed the size
+// of the table. The merge holds one read batch per data file and one batch of output, and the
+// per-file read batch is the merge's row budget divided by the number of files, so the number of
+// rows it holds is the same for a table of 2 000 rows and one of 20 000.
+func TestCompactHoldsABoundedNumberOfRows(t *testing.T) {
+	const (
+		mergeBudget  = 200
+		outputBatch  = 64
+		writeBatches = 200
+	)
+	restoreBudget := table.CompactMergeRowBudget(mergeBudget)
+	t.Cleanup(restoreBudget)
+	restoreBatch := table.CompactRecordBatchSize(outputBatch)
+	t.Cleanup(restoreBatch)
+
+	peak := func(rows int) int {
+		env := newTestEnv(t)
+		tbl := env.createTable(t)
+		when := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+		upserts := make([]table.Row, 0, rows)
+		for i := range rows {
+			upserts = append(upserts, row(t, fmt.Sprintf("path-%08d", i), "c1", int64(i), when, nil))
+		}
+		seeded, err := table.ApplyDelta(t.Context(), tbl, upserts, nil, "c1",
+			table.WithRecordBatchSize(writeBatches))
+		require.NoError(t, err)
+		scan := seeded.Scan()
+		tasks, err := scan.PlanFiles(t.Context())
+		require.NoError(t, err)
+		require.NoError(t, scan.Close())
+		require.Len(t, tasks, 1, "the table is one data file, so the merge holds one file's batch")
+
+		var highest atomic.Int64
+		unobserve := table.MergeRowsHeld(func(held int) {
+			for {
+				was := highest.Load()
+				if int64(held) <= was || highest.CompareAndSwap(was, int64(held)) {
+					return
+				}
+			}
+		})
+		defer unobserve()
+		_, err = table.Compact(t.Context(), seeded, "c1")
+		require.NoError(t, err)
+		return int(highest.Load())
+	}
+
+	small := peak(2_000)
+	large := peak(20_000)
+	require.Equal(t, small, large,
+		"the merge holds the same number of rows for 2 000 and 20 000 rows: %d", small)
+	require.LessOrEqual(t, large, mergeBudget+outputBatch,
+		"the merge holds one read batch of the one file plus one batch of output")
 }

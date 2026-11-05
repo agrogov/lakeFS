@@ -2,9 +2,13 @@ package table
 
 import (
 	"cmp"
+	"container/heap"
+	"context"
 	"fmt"
 	"iter"
 	"slices"
+	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -102,6 +106,9 @@ func NewRecordReader(sc *iceberg.Schema, rows []Row, batchSize int) (array.Recor
 	if batchSize <= 0 {
 		batchSize = DefaultRecordBatchSize
 	}
+	if err := checkKnownSchema(sc); err != nil {
+		return nil, err
+	}
 	schema, err := ArrowSchema(sc)
 	if err != nil {
 		return nil, err
@@ -142,6 +149,9 @@ func NewRowsRecordReader(sc *iceberg.Schema, rows Rows, batchSize int) (array.Re
 	if batchSize <= 0 {
 		batchSize = DefaultRecordBatchSize
 	}
+	if err := checkKnownSchema(sc); err != nil {
+		return nil, err
+	}
 	schema, err := ArrowSchema(sc)
 	if err != nil {
 		return nil, err
@@ -149,10 +159,13 @@ func NewRowsRecordReader(sc *iceberg.Schema, rows Rows, batchSize int) (array.Re
 	return newPullRecordReader(schema, rowBatches(schema, rows, batchSize)), nil
 }
 
-// NewBatchesRecordReader returns a streaming reader over an existing batch source. It is how a
-// scan's record batches are handed to a transaction without collecting them first (Compact).
+// NewBatchesRecordReader returns a streaming reader over an existing batch source: it is how a
+// caller that already holds record batches - a scan, or a test that needs to write a specific order
+// - hands them to a transaction without collecting them again.
 //
-// The caller owns the reader and must Release it.
+// The batches must carry schema, which becomes the reader's schema. The reader takes ownership of
+// every batch the source yields: it releases a batch when it moves to the next one and the batch it
+// holds when it is released. The caller owns the reader and must Release it.
 func NewBatchesRecordReader(schema *arrow.Schema, batches iter.Seq2[arrow.RecordBatch, error]) array.RecordReader {
 	return newPullRecordReader(schema, batches)
 }
@@ -315,4 +328,625 @@ func appendOptionalString(builder *array.StringBuilder, value *string) {
 		return
 	}
 	builder.Append(*value)
+}
+
+// compactMergeRowBudget is the number of rows the compaction's merge may hold across every data
+// file of the snapshot: the rows of one read batch per file. A file's read batch is
+// compactMergeRowBudget / files, so a table of many files does not multiply the bound, and
+// compactMergeMinFileRows keeps a batch large enough to decode parquet efficiently when a table has
+// very many files (R2T-2).
+//
+// compactMergeRowBudget is a variable, not a constant, only so that a test can set it to a size a
+// test table reaches (CompactMergeRowBudget in writer_internal_test.go). Production never changes
+// it.
+var compactMergeRowBudget = 2 * DefaultRecordBatchSize
+
+// compactMergeMinFileRows is the floor of one file's read batch (see compactMergeRowBudget).
+const compactMergeMinFileRows = 256
+
+// compactFileBatchRows returns the number of rows one read batch of a compaction's file may carry,
+// for a snapshot of files data files.
+func compactFileBatchRows(files int) int {
+	if files <= 0 {
+		return compactMergeRowBudget
+	}
+	return max(compactMergeMinFileRows, compactMergeRowBudget/files)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The compaction read path
+//
+// A compaction keeps the table's declared path ASC order (§3.1, §4.9) without collecting the
+// table: it merges the rows of the table's data files, one sorted stream per file, so the live set
+// of the merge is one record batch per file and one record batch of output instead of every row of
+// the table as a Row (R2T-2).
+//
+// The merge never decodes a row into the ten fields of Row and never builds a row field by field.
+// It keeps the scan's own Arrow columns and emits slices of them, so a column this version of the
+// writer does not know - an optional column a later schema version appended with a new ID, which
+// design §3.1 allows - keeps its value through a compaction instead of panicking arrow's record
+// builder with a column that has no values (R2T-1).
+// ---------------------------------------------------------------------------------------------
+
+// rowLoc is the position of one row: the record batch of a file that holds it and the row index
+// inside that batch.
+type rowLoc struct {
+	batch arrow.RecordBatch
+	row   int
+}
+
+// rowStream is one sorted stream of rows of a compaction: the live rows of one data file, in the
+// table's declared path order.
+type rowStream interface {
+	// index is the stream's position in the compaction's file list. It breaks a tie between two
+	// streams that carry the same path, so the merged order is deterministic.
+	index() int
+	// schema is the Arrow schema the stream's batches carry.
+	schema() *arrow.Schema
+	// currentPath is the path of the row the stream is positioned on.
+	currentPath() string
+	// currentRow is the location of that row.
+	currentRow() rowLoc
+	// held is how many rows of the stream the merge is holding: the rows of the record batch the
+	// stream is positioned on that are still to be merged. It is what mergeRowsHeld reports.
+	held() int
+	// advance moves to the next row and reports whether there is one.
+	advance() (bool, error)
+	// release frees the stream: its file, its scan, its batches and its goroutine.
+	release()
+}
+
+// compactReader returns a reader over the rows of tasks in the table's declared path order. It is
+// what Compact appends, and it is a pull reader: the merge runs as the transaction pulls batches.
+//
+// Every file the writer produces is an ascending contiguous slice of the declared order - a delta
+// sorts its upserts before writing them, a rebuild streams a sorted source and refuses an unsorted
+// one, and a compaction since commit 2daeca114 merges sorted files - so a file can be streamed as
+// one run of a k-way merge. The merge holds one read batch per file and one batch of output, and
+// the per-file read batch is compactMergeRowBudget / files, so the rows held follow the number of
+// files and not the number of rows of the table. A file written by a compaction before that commit
+// may be [b d a c] across its batches instead: reading only the path column detects that, and such a
+// file is read whole, sorted on its own and merged as a materialised run. The fallback costs the
+// memory of that one file, not of the table, and it will disappear once the legacy files have been
+// compacted away.
+//
+// The detection is a second read of every file, of its path column only, before the merge reads the
+// rows. That is the price of knowing a file is sorted without collecting it; a table whose files are
+// all sorted pays it too, and it is bounded by the same per-file read batch as the merge.
+//
+// The caller owns the reader and must Release it.
+func compactReader(ctx context.Context, tbl *icebergtable.Table, tasks []icebergtable.FileScanTask) (*pullRecordReader, error) {
+	streams, schema, err := openCompactionStreams(ctx, tbl, tasks)
+	if err != nil {
+		return nil, err
+	}
+	return newPullRecordReader(schema, mergedBatches(schema, streams, compactRecordBatchSize)), nil
+}
+
+// openCompactionStreams opens one run per scan task and returns the Arrow schema they carry. A
+// file whose live rows are in path order is streamed; any other file is materialised and sorted.
+func openCompactionStreams(ctx context.Context, tbl *icebergtable.Table, tasks []icebergtable.FileScanTask) ([]rowStream, *arrow.Schema, error) {
+	streams := make([]rowStream, 0, len(tasks))
+	release := func() {
+		for _, stream := range streams {
+			stream.release()
+		}
+	}
+	batchRows := compactFileBatchRows(len(tasks))
+	var schema *arrow.Schema
+	for i, task := range tasks {
+		ordered, err := taskRowsInPathOrder(ctx, tbl, task, batchRows)
+		if err != nil {
+			release()
+			return nil, nil, err
+		}
+		var stream rowStream
+		if ordered {
+			stream, err = newStreamedRun(ctx, tbl, task, i, batchRows)
+		} else {
+			stream, err = newMaterializedRun(ctx, tbl, task, i, batchRows)
+		}
+		if err != nil {
+			release()
+			return nil, nil, err
+		}
+		streams = append(streams, stream)
+		schema = stream.schema()
+	}
+	if schema == nil {
+		// No task, so no row: the caller appends nothing, and the schema of the reader is the
+		// table's own projection. It is still needed by a caller that asks for the reader's schema.
+		scan := tbl.Scan()
+		defer func() { _ = scan.Close() }()
+		projection, err := scan.Projection()
+		if err != nil {
+			return nil, nil, fmt.Errorf("project the columns of the compaction: %w", err)
+		}
+		schema, err = ArrowSchema(projection)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return streams, schema, nil
+}
+
+// taskRowsInPathOrder reports whether the live rows of one scan task ascend by path, reading only
+// the path column. It is the detection of design §4.9's legacy file: a file this writer produced
+// after commit 2daeca114 always answers true, and a file that answers false is materialised instead
+// of merged as a stream (see compactReader).
+//
+// Equal paths are in order: path is the identifier field, so a table that carries a duplicate is
+// invalid, but a compaction of it can still keep the table's declared order instead of refusing
+// the table forever.
+func taskRowsInPathOrder(ctx context.Context, tbl *icebergtable.Table, task icebergtable.FileScanTask, batchRows int) (bool, error) {
+	scan := tbl.Scan(icebergtable.WithSelectedFields(ColumnPath), icebergtable.WithArrowBatchSize(batchRows))
+	defer func() { _ = scan.Close() }()
+	schema, batches, err := scan.ReadTasks(ctx, []icebergtable.FileScanTask{task})
+	if err != nil {
+		return false, fmt.Errorf("read the path column of %s: %w", task.File.FilePath(), err)
+	}
+	column, err := pathColumn(schema)
+	if err != nil {
+		return false, err
+	}
+	last := ""
+	seen := false
+	total := int64(0)
+	ordered := true
+	for batch, err := range batches {
+		if err != nil {
+			if batch != nil {
+				batch.Release()
+			}
+			return false, fmt.Errorf("read the path column of %s: %w", task.File.FilePath(), err)
+		}
+		values := batch.Column(column)
+		for i := range int(batch.NumRows()) {
+			path, err := stringAt(values, i)
+			if err != nil {
+				batch.Release()
+				return false, fmt.Errorf("read row %d of %s: %w", total+int64(i), task.File.FilePath(), err)
+			}
+			if seen && path < last {
+				ordered = false
+			}
+			seen, last = true, path
+		}
+		total += batch.NumRows()
+		batch.Release()
+		if !ordered {
+			// The answer cannot change back, and the rest of the file is not needed.
+			break
+		}
+	}
+	return ordered, nil
+}
+
+// streamedRun is one data file whose live rows ascend by path, read lazily: it holds the file's
+// current record batch, not its rows.
+type streamedRun struct {
+	idx    int
+	file   string
+	scan   *icebergtable.Scan
+	batch  *recordCursor
+	column int
+	path   string
+	row    rowLoc
+}
+
+func newStreamedRun(ctx context.Context, tbl *icebergtable.Table, task icebergtable.FileScanTask, idx int, batchRows int) (*streamedRun, error) {
+	scan := tbl.Scan(icebergtable.WithArrowBatchSize(batchRows))
+	schema, batches, err := scan.ReadTasks(ctx, []icebergtable.FileScanTask{task})
+	if err != nil {
+		_ = scan.Close()
+		return nil, fmt.Errorf("read %s: %w", task.File.FilePath(), err)
+	}
+	column, err := pathColumn(schema)
+	if err != nil {
+		_ = scan.Close()
+		return nil, err
+	}
+	return &streamedRun{
+		idx:    idx,
+		file:   task.File.FilePath(),
+		scan:   scan,
+		batch:  newRecordCursor(batches),
+		column: column,
+	}, nil
+}
+
+func (r *streamedRun) index() int            { return r.idx }
+func (r *streamedRun) schema() *arrow.Schema { return r.batch.schema }
+func (r *streamedRun) currentPath() string   { return r.path }
+func (r *streamedRun) currentRow() rowLoc    { return r.row }
+func (r *streamedRun) release()              { r.batch.release(); _ = r.scan.Close() }
+func (r *streamedRun) held() int {
+	if r.batch.batch == nil {
+		return 0
+	}
+	return int(r.batch.batch.NumRows()) - r.batch.row
+}
+
+func (r *streamedRun) advance() (bool, error) {
+	if !r.batch.advance() {
+		if err := r.batch.err(); err != nil {
+			return false, fmt.Errorf("read %s: %w", r.file, err)
+		}
+		return false, nil
+	}
+	path, err := stringAt(r.batch.batch.Column(r.column), r.batch.row)
+	if err != nil {
+		return false, fmt.Errorf("read row %d of %s: %w", r.batch.row, r.file, err)
+	}
+	r.path = path
+	r.row = rowLoc{batch: r.batch.batch, row: r.batch.row}
+	return true, nil
+}
+
+// materializedRun is one data file whose live rows do not ascend by path: the whole file is read,
+// its rows are sorted by path, and the sorted rows are merged like any other run. Only a file
+// written before commit 2daeca114 can need this.
+type materializedRun struct {
+	idx         int
+	rows        []locatedRow
+	batches     []arrow.RecordBatch
+	next        int
+	arrowSchema *arrow.Schema
+}
+
+// locatedRow is one row of a materialised run together with the path it was sorted by.
+type locatedRow struct {
+	path string
+	row  rowLoc
+}
+
+func newMaterializedRun(ctx context.Context, tbl *icebergtable.Table, task icebergtable.FileScanTask, idx int, batchRows int) (*materializedRun, error) {
+	scan := tbl.Scan(icebergtable.WithArrowBatchSize(batchRows))
+	schema, batches, err := scan.ReadTasks(ctx, []icebergtable.FileScanTask{task})
+	if err != nil {
+		_ = scan.Close()
+		return nil, fmt.Errorf("read %s: %w", task.File.FilePath(), err)
+	}
+	column, err := pathColumn(schema)
+	if err != nil {
+		_ = scan.Close()
+		return nil, err
+	}
+	run := &materializedRun{idx: idx, arrowSchema: schema}
+	readErr := func() error {
+		row := 0
+		for batch, err := range batches {
+			if err != nil {
+				if batch != nil {
+					batch.Release()
+				}
+				return err
+			}
+			run.batches = append(run.batches, batch)
+			values := batch.Column(column)
+			for i := range int(batch.NumRows()) {
+				path, err := stringAt(values, i)
+				if err != nil {
+					return fmt.Errorf("read row %d of %s: %w", row+i, task.File.FilePath(), err)
+				}
+				run.rows = append(run.rows, locatedRow{path: path, row: rowLoc{batch: batch, row: i}})
+			}
+			row += int(batch.NumRows())
+		}
+		return nil
+	}()
+	if readErr != nil {
+		for _, batch := range run.batches {
+			batch.Release()
+		}
+		_ = scan.Close()
+		return nil, fmt.Errorf("read %s: %w", task.File.FilePath(), readErr)
+	}
+	if err := scan.Close(); err != nil {
+		run.release()
+		return nil, fmt.Errorf("close %s: %w", task.File.FilePath(), err)
+	}
+	sort.SliceStable(run.rows, func(i, j int) bool { return run.rows[i].path < run.rows[j].path })
+	return run, nil
+}
+
+func (r *materializedRun) index() int            { return r.idx }
+func (r *materializedRun) schema() *arrow.Schema { return r.arrowSchema }
+func (r *materializedRun) currentPath() string   { return r.rows[r.next-1].path }
+func (r *materializedRun) currentRow() rowLoc    { return r.rows[r.next-1].row }
+func (r *materializedRun) held() int             { return len(r.rows) - r.next }
+func (r *materializedRun) release() {
+	for _, batch := range r.batches {
+		batch.Release()
+	}
+	r.batches = nil
+	r.rows = nil
+}
+
+func (r *materializedRun) advance() (bool, error) {
+	if r.next >= len(r.rows) {
+		return false, nil
+	}
+	r.next++
+	return true, nil
+}
+
+// recordCursor walks the record batches of one stream, holding one batch at a time. It is the
+// streaming half of a rowStream and the only place that owns a file's batches while they are read.
+type recordCursor struct {
+	schema *arrow.Schema
+	next   func() (arrow.RecordBatch, error, bool)
+	stop   func()
+	batch  arrow.RecordBatch
+	row    int
+	fail   error
+	done   bool
+	freed  bool
+}
+
+func newRecordCursor(batches iter.Seq2[arrow.RecordBatch, error]) *recordCursor {
+	next, stop := iter.Pull2(batches)
+	return &recordCursor{next: next, stop: stop}
+}
+
+// advance positions the cursor on the next row, pulling the next batch when the current one is
+// exhausted, and reports whether there is one.
+func (c *recordCursor) advance() bool {
+	if c.done || c.freed {
+		return false
+	}
+	if c.batch != nil {
+		// Step past the row the caller was on; row numbers are 1-based between calls.
+		c.row++
+	}
+	for {
+		if c.batch != nil && c.row < int(c.batch.NumRows()) {
+			return true
+		}
+		if c.batch != nil {
+			c.batch.Release()
+			c.batch = nil
+		}
+		batch, err, ok := c.next()
+		if err != nil {
+			c.fail = err
+			c.done = true
+			return false
+		}
+		if !ok {
+			c.done = true
+			return false
+		}
+		if batch == nil {
+			continue
+		}
+		c.schema = batch.Schema()
+		c.batch, c.row = batch, 0
+	}
+}
+
+func (c *recordCursor) err() error { return c.fail }
+
+func (c *recordCursor) release() {
+	if c.freed {
+		return
+	}
+	c.freed = true
+	if c.stop != nil {
+		c.stop()
+		c.stop = nil
+	}
+	if c.batch != nil {
+		c.batch.Release()
+		c.batch = nil
+	}
+}
+
+// mergeRowsHeld is the test seam of the merge's memory bound: when it is not nil, mergedBatches
+// reports, before every batch it emits, how many rows it is holding - the rows waiting to be
+// written plus the rows of each stream's current record batch. Production leaves it nil, and the
+// check costs one atomic load per batch (TestCompactHoldsABoundedNumberOfRows).
+var mergeRowsHeld atomic.Pointer[func(held int)]
+
+// mergedBatches merges sorted runs into the table's declared path order, one record batch of at
+// most batchSize rows at a time. The k-way merge holds one record batch per file (K is the number
+// of files of the snapshot, not the number of rows) and one batch of output, so its memory does not
+// follow the size of the table (R2T-2).
+func mergedBatches(schema *arrow.Schema, streams []rowStream, batchSize int) iter.Seq2[arrow.RecordBatch, error] {
+	return func(yield func(arrow.RecordBatch, error) bool) {
+		defer func() {
+			for _, stream := range streams {
+				stream.release()
+			}
+		}()
+		// The writer this merge feeds runs on its own goroutine (iceberg-go pulls the reader inside
+		// the goroutine of unpartitionedWrite, where a panic cannot be recovered by the indexer).
+		// A merge must therefore never panic: anything unexpected is reported as the commit's error
+		// (R2T-1), and the caller's transaction is aborted.
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				yield(nil, fmt.Errorf("%w: %v", ErrMergeRows, recovered))
+			}
+		}()
+		if batchSize <= 0 {
+			batchSize = DefaultRecordBatchSize
+		}
+
+		pending := make([]rowLoc, 0, batchSize)
+		releasePending := func() {
+			for _, loc := range pending {
+				loc.batch.Release()
+			}
+			pending = pending[:0]
+		}
+		defer releasePending()
+		flush := func() bool {
+			if observe := mergeRowsHeld.Load(); observe != nil {
+				held := len(pending)
+				for _, stream := range streams {
+					held += stream.held()
+				}
+				(*observe)(held)
+			}
+			batch, err := buildMergedBatch(schema, pending)
+			releasePending()
+			if err != nil {
+				yield(nil, err)
+				return false
+			}
+			if !yield(batch, nil) {
+				batch.Release()
+				return false
+			}
+			return true
+		}
+
+		ordered := make(streamHeap, 0, len(streams))
+		for _, stream := range streams {
+			ok, err := stream.advance()
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			if ok {
+				heap.Push(&ordered, stream)
+			}
+		}
+
+		last := ""
+		seen := false
+		for ordered.Len() > 0 {
+			stream := heap.Pop(&ordered).(rowStream)
+			path := stream.currentPath()
+			if seen && path < last {
+				// Every run is sorted, so this cannot happen: report it instead of writing files
+				// that contradict the table's declared order (§3.1).
+				yield(nil, fmt.Errorf("%w: %q comes before %q", ErrRowsOutOfOrder, path, last))
+				return
+			}
+			seen, last = true, path
+			loc := stream.currentRow()
+			loc.batch.Retain()
+			pending = append(pending, loc)
+			if len(pending) >= batchSize && !flush() {
+				return
+			}
+			ok, err := stream.advance()
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			if ok {
+				heap.Push(&ordered, stream)
+			}
+		}
+		if len(pending) > 0 {
+			flush()
+		}
+	}
+}
+
+// streamHeap orders the runs of a merge by the path of the row each is positioned on. Two runs that
+// carry the same path (a table with a duplicate path, which the identifier forbids) are ordered by
+// the position of their file, so the output is deterministic.
+type streamHeap []rowStream
+
+func (h streamHeap) Len() int { return len(h) }
+func (h streamHeap) Less(i, j int) bool {
+	left, right := h[i].currentPath(), h[j].currentPath()
+	if left != right {
+		return left < right
+	}
+	return h[i].index() < h[j].index()
+}
+func (h streamHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *streamHeap) Push(x any)   { *h = append(*h, x.(rowStream)) }
+func (h *streamHeap) Pop() any {
+	old := *h
+	n := len(old)
+	last := old[n-1]
+	*h = old[:n-1]
+	return last
+}
+
+// buildMergedBatch builds one record batch of the merge out of the scan's own columns: a single run
+// of rows of one source batch is a zero-copy slice, and several runs are concatenated column by
+// column. Nothing is decoded field by field, so a column this writer does not know keeps its value
+// (R2T-1), and every column of the output has exactly len(rows) rows, which is the invariant arrow's
+// record builder used to panic on.
+func buildMergedBatch(schema *arrow.Schema, rows []rowLoc) (arrow.RecordBatch, error) {
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("%w: a batch with no rows", ErrMergeRows)
+	}
+	// Group consecutive rows that come from the same source batch: one slice per group.
+	type group struct {
+		batch      arrow.RecordBatch
+		start, end int
+	}
+	groups := make([]group, 0, len(rows))
+	for _, loc := range rows {
+		if n := len(groups); n > 0 && groups[n-1].batch == loc.batch && groups[n-1].end == loc.row {
+			groups[n-1].end = loc.row + 1
+			continue
+		}
+		groups = append(groups, group{batch: loc.batch, start: loc.row, end: loc.row + 1})
+	}
+	if len(groups) == 1 {
+		return groups[0].batch.NewSlice(int64(groups[0].start), int64(groups[0].end)), nil
+	}
+
+	columns := make([]arrow.Array, schema.NumFields())
+	for c := range columns {
+		parts := make([]arrow.Array, 0, len(groups))
+		for _, group := range groups {
+			parts = append(parts, array.NewSlice(group.batch.Column(c), int64(group.start), int64(group.end)))
+		}
+		merged, err := array.Concatenate(parts, memory.DefaultAllocator)
+		for _, part := range parts {
+			part.Release()
+		}
+		if err != nil {
+			for _, column := range columns[:c] {
+				column.Release()
+			}
+			return nil, fmt.Errorf("concatenate column %q of the compaction: %w", schema.Field(c).Name, err)
+		}
+		columns[c] = merged
+	}
+	batch := array.NewRecordBatch(schema, columns, int64(len(rows)))
+	for _, column := range columns {
+		column.Release()
+	}
+	return batch, nil
+}
+
+// pathColumn returns the position of the path column in an Arrow schema. The column is found by
+// name, not by position: a later schema version may append columns, and a table this writer does
+// not know how to build rows for is still one a compaction can read.
+func pathColumn(schema *arrow.Schema) (int, error) {
+	indices := schema.FieldIndices(ColumnPath)
+	if len(indices) == 0 {
+		return 0, fmt.Errorf("%w: no %q column", ErrUnknownSchema, ColumnPath)
+	}
+	return indices[0], nil
+}
+
+// stringAt reads one cell of a string column. A null path is an error: path is the identifier field
+// and the sort key, so a compaction cannot place a row that has none.
+func stringAt(values arrow.Array, i int) (string, error) {
+	if values.IsNull(i) {
+		return "", fmt.Errorf("%w: row %d has no path", ErrMergeRows, i)
+	}
+	switch column := values.(type) {
+	case *array.String:
+		return column.Value(i), nil
+	case *array.LargeString:
+		return column.Value(i), nil
+	case *array.StringView:
+		return column.Value(i), nil
+	case *array.Dictionary:
+		return column.Dictionary().ValueStr(column.GetValueIndex(i)), nil
+	default:
+		return "", fmt.Errorf("%w: the path column is %T, not a string column", ErrMergeRows, values)
+	}
 }

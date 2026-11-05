@@ -5,6 +5,9 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go"
 	"github.com/stretchr/testify/require"
 )
@@ -67,4 +70,59 @@ func CompactRecordBatchSize(size int) (restore func()) {
 	previous := compactRecordBatchSize
 	compactRecordBatchSize = size
 	return func() { compactRecordBatchSize = previous }
+}
+
+// MergeRowsHeld installs an observer of the number of rows the compaction's merge holds and
+// returns the function that removes it. The observer runs on the goroutine that feeds the
+// transaction, before every record batch the merge emits.
+//
+// It is the test half of R2T-2's memory bound: writer_test.go compacts two tables of very different
+// sizes and requires the observed number of held rows not to follow the row count.
+func MergeRowsHeld(observe func(held int)) (restore func()) {
+	mergeRowsHeld.Store(&observe)
+	return func() { mergeRowsHeld.Store(nil) }
+}
+
+// CompactMergeRowBudget sets the number of rows the compaction's merge may hold across the files of
+// a snapshot and returns the function that restores the previous value. It is the test half of
+// R2T-2's memory bound: writer_test.go sets it so that a table of a few thousand rows already
+// exceeds it, and requires the rows the merge holds not to follow the row count.
+func CompactMergeRowBudget(rows int) (restore func()) {
+	previous := compactMergeRowBudget
+	compactMergeRowBudget = rows
+	return func() { compactMergeRowBudget = previous }
+}
+
+// ExtraColumn is the name of the optional column SchemaWithExtraColumn appends.
+const ExtraColumn = extraColumn
+
+// SchemaWithExtraColumn returns Schema plus one optional string column with a new ID at the end -
+// the state design §3.1 allows a later schema version to create, and the state iceberg-go's record
+// builder used to panic on when a compaction rebuilt rows field by field (R2T-1).
+func SchemaWithExtraColumn() *iceberg.Schema {
+	fields := append(Schema().Fields(), iceberg.NestedField{
+		ID: FieldCreationDate + 1, Name: ExtraColumn, Type: iceberg.StringType{}, Required: false,
+	})
+	return iceberg.NewSchemaWithIdentifiers(0, []int{FieldPath}, fields...)
+}
+
+// NewExtraColumnRecordReader returns a reader over rows with extra as the value of the optional
+// column SchemaWithExtraColumn appends, i.e. a row written by a writer that knows the column this
+// writer does not. The caller owns the reader and must Release it.
+func NewExtraColumnRecordReader(sc *iceberg.Schema, rows []Row, extra []string) (array.RecordReader, error) {
+	arrowSchema, err := ArrowSchema(sc)
+	if err != nil {
+		return nil, err
+	}
+	builder := array.NewRecordBuilder(memory.DefaultAllocator, arrowSchema)
+	defer builder.Release()
+	values := builder.Field(arrowSchema.NumFields() - 1).(*array.StringBuilder)
+	for i, row := range rows {
+		appendRow(builder, row)
+		values.Append(extra[i])
+	}
+	batch := builder.NewRecordBatch()
+	reader, err := array.NewRecordReader(arrowSchema, []arrow.RecordBatch{batch})
+	batch.Release()
+	return reader, err
 }
