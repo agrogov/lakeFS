@@ -115,6 +115,95 @@ func TestMetadataNamespace(t *testing.T) {
 	}
 }
 
+// TestExistingMetadataNamespaceOverlapIsRefused pins §3.3's namespace rule on the path that never
+// creates R-metadata: the overlap check used to run only in createMetadataRepository, so an existing
+// companion repository whose namespace overlaps R's was used as it is. R's uncommitted GC tests
+// every object address against R's normalized namespace prefix
+// (pkg/catalog/gc_write_uncommitted.go) and would delete the table's files; the repository is now
+// refused on every tick, before anything is written, and marked failed as §7 and §4.8 say.
+func TestExistingMetadataNamespaceOverlapIsRefused(t *testing.T) {
+	tests := []struct {
+		name              string
+		dataNamespace     string
+		metadataNamespace string
+	}{
+		{
+			name:              "metadata namespace inside the data namespace",
+			dataNamespace:     "s3://bucket/data",
+			metadataNamespace: "s3://bucket/data/metadata",
+		},
+		{
+			name:              "metadata namespace is the data namespace",
+			dataNamespace:     "s3://bucket/data",
+			metadataNamespace: "s3://bucket/data",
+		},
+		{
+			name:              "metadata namespace contains the data namespace",
+			dataNamespace:     "s3://bucket/data/repo",
+			metadataNamespace: "s3://bucket/data",
+		},
+		{
+			name:              "data namespace moved on top of an existing metadata namespace",
+			dataNamespace:     "s3://bucket",
+			metadataNamespace: "s3://bucket/data-metadata",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.fake.repositories["repo"] = client.Repository{
+				Name:             "repo",
+				StorageNamespace: test.dataNamespace,
+				DefaultBranch:    "main",
+				StorageID:        "storage-repo",
+			}
+			e.fake.addBareMetadataRepository(test.metadataNamespace)
+			e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+
+			e.tick()
+
+			require.ErrorIs(t, e.health.repositoryError("repo"), indexer.ErrOverlappingNamespace)
+			require.Contains(t, e.metrics.errors, "repo/"+indexer.StageRepository,
+				"the repository is marked failed in metrics (§7, §9)")
+			require.Empty(t, e.fake.madeCommits(), "nothing is written into a repository R's uncommitted GC would sweep")
+			require.Zero(t, e.fake.applyCalls)
+			require.Zero(t, e.fake.rebuildCalls)
+		})
+	}
+}
+
+// TestExistingBareMetadataRepositoryIsAccepted pins the acceptance row of §4.8 that only a bare
+// companion repository produces: the lakefs.mds.init marker is on the root commit, not on the first
+// commit after lakeFS's automatic "Repository created" root. Such a repository is the indexer's, so
+// the tick takes its initialisation commit from it and writes nothing but the indexing commit.
+func TestExistingBareMetadataRepositoryIsAccepted(t *testing.T) {
+	e := newEnv(t)
+	init := e.fake.addBareMetadataRepository("s3://bucket/data-metadata")
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+
+	e.tick()
+
+	require.NoError(t, e.health.repositoryError("repo"))
+	require.Empty(t, e.fake.createdRepositories, "an existing initialised repository is reused")
+	require.Equal(t, init, e.fake.initCommitID(), "the root stays the initialisation commit")
+	commits := e.fake.madeCommits()
+	require.Len(t, commits, 1, "only the indexing commit is written")
+	require.Equal(t, "mds: index repo@s1", commits[0].Message)
+	head, _ := e.fake.branchHead("repo-metadata", "main")
+	require.Equal(t, []string{init}, e.fake.commits["repo-metadata"][head].Parents)
+	state, ok := e.fake.tableState("main")
+	require.True(t, ok)
+	require.Equal(t, []string{"a"}, state.paths())
+	_, ok = e.fake.tagCommit("repo-metadata", "mds-s1")
+	require.True(t, ok, "the indexed commit is tagged for the ref mapper (§6)")
+
+	// A second tick finds the repository initialised and writes nothing.
+	e.tick()
+	require.Len(t, e.fake.madeCommits(), 1)
+	require.Empty(t, e.fake.resetCalls())
+}
+
 // TestCreateMetadataRepository pins §3.3 and §4.8: R-metadata is created with R's default branch,
 // storage ID and not read-only; its namespace and table are created on that branch; and the
 // initialisation commit carries lakefs.mds.init before any indexing commit.
@@ -266,4 +355,31 @@ func TestMissingDataRepositoryIsReported(t *testing.T) {
 	require.ErrorIs(t, e.health.repositoryError("gone"), client.ErrNotFound)
 	require.NoError(t, e.health.repositoryError("repo"))
 	require.Equal(t, 1, e.metrics.indexed["repo"])
+}
+
+// addBareMetadataRepository makes R-metadata exist as an older indexer left it: created bare, so its
+// initialisation commit - message mds: init, metadata lakefs.mds.init=true - is the root of its
+// default branch and that commit carries the empty system.object_metadata table (§3.3, §4.8).
+//
+// The fake's CreateRepository cannot produce this shape because real lakeFS creates a non-bare
+// repository with the automatic "Repository created" root (pkg/catalog/catalog.go,
+// CreateBareRepository for the bare form), so the state is built here instead. It returns the
+// initialisation commit ID.
+func (f *fake) addBareMetadataRepository(namespace string) string {
+	// addRepository registers the name as the fake's companion repository, which is what its
+	// TableStore methods address.
+	f.addRepository("repo-metadata", namespace, "main")
+	init := f.addCommit("repo-metadata", "main", "init", nil, nil)
+	init.Message = indexer.InitCommitMessage
+	init.Metadata = map[string]string{
+		indexer.MetadataKeyInit:             indexer.MetadataKeyInitValue,
+		indexer.MetadataKeySourceRepository: "repo",
+	}
+	f.setCommit("repo-metadata", init)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// The initialisation commit created the table: it exists on the branch and holds no rows (§4.8).
+	f.tableExists = true
+	f.tableAt[init.ID] = newState()
+	return init.ID
 }

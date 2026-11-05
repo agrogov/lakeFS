@@ -55,6 +55,17 @@ func (x *Indexer) ensureMetadataRepository(ctx context.Context, repository Repos
 		return "", fmt.Errorf("companion repository %q: %w", metadata, err)
 	}
 
+	// §3.3's namespace rule, checked on every tick and not only when R-metadata is created. Both
+	// repository reads above happen anyway, so the check costs no API call, and it is what catches
+	// an existing companion repository whose namespace overlaps R's: one an earlier version or an
+	// operator created, one a concurrent replica created with a different namespace, or one whose
+	// data repository has since moved its namespace on top of it. R's uncommitted GC sweeps every
+	// unreferenced object under R's prefix (pkg/catalog/gc_write_uncommitted.go) and would delete
+	// the table's files.
+	if err := verifyMetadataNamespace(repository.Name, metadata, data.StorageNamespace, meta.StorageNamespace); err != nil {
+		return "", err
+	}
+
 	if err := x.ensureInitialised(ctx, repository.Name, metadata, meta.DefaultBranch); err != nil {
 		return "", err
 	}
@@ -283,6 +294,17 @@ func metadataNamespace(repository, dataNamespace, configured string) (string, er
 			ErrOverlappingNamespace, namespace, metadataRepository(repository), dataNamespace, repository)
 	}
 	return namespace, nil
+}
+
+// verifyMetadataNamespace refuses a companion repository whose existing storage namespace overlaps
+// R's (§3.3). metadataNamespace checks the namespace the indexer is about to create; this checks the
+// one an existing R-metadata already has, which the create path never sees.
+func verifyMetadataNamespace(repository, metadata, dataNamespace, metaNamespace string) error {
+	if !overlapsStorageNamespace(metaNamespace, dataNamespace) {
+		return nil
+	}
+	return fmt.Errorf("%w: %q of %q and %q of %q overlap",
+		ErrOverlappingNamespace, metaNamespace, metadata, dataNamespace, repository)
 }
 
 // namespaceHasPath reports whether a storage namespace has a path component after its bucket or
