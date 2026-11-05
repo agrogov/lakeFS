@@ -9,6 +9,7 @@ import (
 	"sort"
 
 	"github.com/apache/iceberg-go"
+	icebergio "github.com/apache/iceberg-go/io"
 	icebergtable "github.com/apache/iceberg-go/table"
 )
 
@@ -208,12 +209,22 @@ func ApplyDelta(ctx context.Context, tbl *icebergtable.Table, upserts []Row, del
 }
 
 // Rebuild replaces the whole table with rows at sourceCommit (design §4.3 step 2): the rows of a
-// full listing of the data repository at the commit, written with one Overwrite and no filter.
+// full listing of the data repository at the commit, written with one transaction that removes
+// every file of the current snapshot and appends them.
 //
 // It is the path taken when a change set is larger than rebuild_threshold (the caller decides
 // that; this function only writes), when a branch is first indexed (§4.5 step 2) and when a
 // history rewrite forces a fresh listing (§4.7). The rows are streamed: the source runs as the
 // batches are pulled, so memory is bounded by the batch size rather than by the branch.
+//
+// The removal is ReplaceFiles over every live data file and every live delete file of the current
+// snapshot, followed by an Append. A plain Overwrite with no filter is not enough: iceberg-go
+// drives its copy-on-write deletion from the filter, so it deletes and rewrites the data files
+// and leaves their position delete files in the snapshot. Those files would then be referenced by
+// the live snapshot, so no cleanup could reclaim them, and the snapshot summary's
+// total-delete-files - the counter of §4.9's compaction trigger - would never fall back to zero
+// (TB-1). The rows written are the same either way; a whole-table rewrite replaces the rows those
+// delete files applied to.
 func Rebuild(ctx context.Context, tbl *icebergtable.Table, rows Rows, sourceCommit string, opts ...Option) (*icebergtable.Table, error) {
 	if tbl == nil {
 		return nil, ErrNoTable
@@ -238,8 +249,11 @@ func Rebuild(ctx context.Context, tbl *icebergtable.Table, rows Rows, sourceComm
 	defer reader.Release()
 
 	txn := tbl.NewTransaction()
-	if err := txn.Overwrite(ctx, reader, snapshotProps); err != nil {
-		return nil, fmt.Errorf("overwrite the table at %s: %w", sourceCommit, err)
+	if err := replaceSnapshotFiles(ctx, txn, tbl, snapshotProps); err != nil {
+		return nil, fmt.Errorf("replace the files of the table at %s: %w", sourceCommit, err)
+	}
+	if err := txn.Append(ctx, reader, snapshotProps); err != nil {
+		return nil, fmt.Errorf("append the rows of the rebuild at %s: %w", sourceCommit, err)
 	}
 	if err := txn.SetProperties(iceberg.Properties{PropertySourceCommit: sourceCommit}); err != nil {
 		return nil, fmt.Errorf("record the source commit: %w", err)
@@ -255,13 +269,21 @@ func Rebuild(ctx context.Context, tbl *icebergtable.Table, rows Rows, sourceComm
 // the table keeps its logical contents under the same lakefs.mds.source-commit, and the position
 // delete files the delta path accumulated are removed.
 //
-// The transaction has two updates. ReplaceFiles removes every data file and every delete file of
-// the current snapshot without adding files - it is the compaction primitive of iceberg-go's
-// transaction, and the only one that removes delete files - and Append writes the scanned rows
-// back. A plain Overwrite (design §4.9's wording) rewrites the data files but leaves the delete
-// files in place: iceberg-go's overwrite producer removes only the files it matches, so the delete
-// files would keep accumulating and keep being read. The rows are identical either way, which is
-// what §4.9 asks the compaction to preserve; deleting the files is what makes it a compaction.
+// The transaction has two updates. ReplaceFiles removes every data file of the scan plan and every
+// delete file of the current snapshot without adding files - it is the compaction primitive of
+// iceberg-go's transaction, and the only one that removes delete files - and Append writes the
+// scanned rows back. A plain Overwrite (design §4.9's wording) rewrites the data files but leaves
+// the delete files in place: iceberg-go's overwrite producer removes only the files it matches, so
+// the delete files would keep accumulating and keep being read. The rows are identical either way,
+// which is what §4.9 asks the compaction to preserve; deleting the files is what makes it a
+// compaction.
+//
+// The delete files are enumerated from the snapshot's manifest list, not from the scan tasks: a
+// scan task carries only the delete files that apply to the data file it reads, so a delete file
+// whose data files were replaced by a Rebuild (§4.3 step 2, §4.5, §4.7) is carried by no task. It
+// would then stay in the manifest list forever - referenced by the live snapshot, so no file
+// cleanup could reclaim it - and the snapshot summary's total-delete-files, which is exactly what
+// §4.9's delete-file trigger compares, would never fall back to zero (TB-1).
 //
 // The rows are read through a scan and streamed back through the same transaction, so compaction
 // does not collect the table in memory. The caller commits R-metadata afterwards with the
@@ -288,7 +310,11 @@ func Compact(ctx context.Context, tbl *icebergtable.Table, sourceCommit string, 
 	if err != nil {
 		return nil, fmt.Errorf("plan the compaction of the table at %s: %w", sourceCommit, err)
 	}
-	dataFiles, deleteFiles := filesOf(tasks)
+	dataFiles := dataFilesOf(tasks)
+	deleteFiles, err := snapshotFilesOf(ctx, tbl, iceberg.ManifestContentDeletes)
+	if err != nil {
+		return nil, fmt.Errorf("list the delete files of the table at %s: %w", sourceCommit, err)
+	}
 	schema, batches, err := scan.ReadTasks(ctx, tasks)
 	if err != nil {
 		return nil, fmt.Errorf("scan the table at %s: %w", sourceCommit, err)
@@ -317,25 +343,92 @@ func Compact(ctx context.Context, tbl *icebergtable.Table, sourceCommit string, 
 	return committed, nil
 }
 
-// filesOf returns the data files and the delete files a set of scan tasks reads: the data file of
-// every task, and the position and equality delete files applied to them, each once.
-func filesOf(tasks []icebergtable.FileScanTask) (dataFiles, deleteFiles []iceberg.DataFile) {
+// replaceSnapshotFiles removes every live data file and every live delete file of the current
+// snapshot without adding files: the first update of a whole-table rewrite, which leaves the
+// transaction empty so that the caller appends the new rows into the same commit.
+func replaceSnapshotFiles(ctx context.Context, txn *icebergtable.Transaction, tbl *icebergtable.Table, snapshotProps iceberg.Properties) error {
+	dataFiles, err := snapshotFilesOf(ctx, tbl, iceberg.ManifestContentData)
+	if err != nil {
+		return err
+	}
+	deleteFiles, err := snapshotFilesOf(ctx, tbl, iceberg.ManifestContentDeletes)
+	if err != nil {
+		return err
+	}
+	if len(dataFiles) == 0 && len(deleteFiles) == 0 {
+		return nil
+	}
+	return txn.ReplaceFiles(ctx, dataFiles, nil, deleteFiles, snapshotProps)
+}
+
+// snapshotFilesOf returns the live files of one content type in the table's current snapshot,
+// read from the snapshot's manifest list and the manifests it references. Deleted manifest
+// entries are skipped and a path is returned once.
+//
+// A scan plan is not a substitute: it carries a delete file only through the data file it applies
+// to, so a delete file whose data files are gone (orphaned by a rebuild, or by a copy-on-write
+// rewrite that kept it) is invisible to it, while it is still referenced by the snapshot.
+func snapshotFilesOf(ctx context.Context, tbl *icebergtable.Table, content iceberg.ManifestContent) ([]iceberg.DataFile, error) {
+	snapshot := tbl.CurrentSnapshot()
+	if snapshot == nil {
+		return nil, nil
+	}
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get the file IO of the table: %w", err)
+	}
+	manifests, err := snapshot.Manifests(fs)
+	if err != nil {
+		return nil, fmt.Errorf("read the manifest list of snapshot %d: %w", snapshot.SnapshotID, err)
+	}
+	files := make([]iceberg.DataFile, 0)
 	seen := make(map[string]struct{})
-	dataFiles = make([]iceberg.DataFile, 0, len(tasks))
-	for _, task := range tasks {
-		dataFiles = append(dataFiles, task.File)
-		for _, group := range [][]iceberg.DataFile{task.DeleteFiles, task.EqualityDeleteFiles} {
-			for _, file := range group {
-				path := file.FilePath()
-				if _, ok := seen[path]; ok {
-					continue
-				}
-				seen[path] = struct{}{}
-				deleteFiles = append(deleteFiles, file)
+	for _, manifest := range manifests {
+		if manifest.ManifestContent() != content {
+			continue
+		}
+		entries, err := manifestEntriesOf(fs, manifest)
+		if err != nil {
+			return nil, err
+		}
+		for _, entry := range entries {
+			file := entry.DataFile()
+			if _, ok := seen[file.FilePath()]; ok {
+				continue
 			}
+			seen[file.FilePath()] = struct{}{}
+			files = append(files, file)
 		}
 	}
-	return dataFiles, deleteFiles
+	return files, nil
+}
+
+// manifestEntriesOf returns the live entries of one manifest: ReadManifest skips the entries whose
+// status is DELETED, which are files the snapshot no longer holds.
+func manifestEntriesOf(fs icebergio.IO, manifest iceberg.ManifestFile) ([]iceberg.ManifestEntry, error) {
+	file, err := fs.Open(manifest.FilePath())
+	if err != nil {
+		return nil, fmt.Errorf("open manifest %s: %w", manifest.FilePath(), err)
+	}
+	entries, readErr := iceberg.ReadManifest(manifest, file, true)
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("read manifest %s: %w", manifest.FilePath(), readErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close manifest %s: %w", manifest.FilePath(), closeErr)
+	}
+	return entries, nil
+}
+
+// dataFilesOf returns the data file of every scan task: a scan plans one task per live data file
+// of the snapshot, so this is the whole data side of a compaction.
+func dataFilesOf(tasks []icebergtable.FileScanTask) []iceberg.DataFile {
+	dataFiles := make([]iceberg.DataFile, 0, len(tasks))
+	for _, task := range tasks {
+		dataFiles = append(dataFiles, task.File)
+	}
+	return dataFiles
 }
 
 // changedPaths returns the paths one delta must replace or remove: the paths of the upserts and

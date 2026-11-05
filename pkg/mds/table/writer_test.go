@@ -225,15 +225,25 @@ func TestRebuild(t *testing.T) {
 	require.Equal(t, "c2", replaced.Properties()[table.PropertySourceCommit])
 	requireScanRows(t, env.loadTable(t), secondRows)
 
-	// A rebuild after a merge-on-read delta replaces a table that has delete files, too.
+	// A rebuild after merge-on-read deltas writes no delete file of its own: the two deletes below
+	// leave two position delete files, and a rebuild that keeps them would keep the snapshot
+	// summary's total-delete-files above zero forever (§4.9's delete-file trigger reads it).
 	deleted, err := table.ApplyDelta(t.Context(), replaced, nil, []string{"d"}, "c3")
 	require.NoError(t, err)
-	require.Positive(t, summaryInt(t, deleted, "total-delete-files"))
-	finalRows := []table.Row{row(t, "f", "c4", 6, when, nil)}
-	afterDeleteFiles, err := table.Rebuild(t.Context(), deleted, rowSeq(finalRows), "c4")
+	twiceDeleted, err := table.ApplyDelta(t.Context(), deleted, nil, []string{"e"}, "c4")
+	require.NoError(t, err)
+	require.Equal(t, 2, summaryInt(t, twiceDeleted, "total-delete-files"),
+		"two merge-on-read deletes write two position delete files")
+	finalRows := []table.Row{row(t, "f", "c5", 6, when, nil)}
+	afterDeleteFiles, err := table.Rebuild(t.Context(), twiceDeleted, rowSeq(finalRows), "c5")
 	require.NoError(t, err)
 	requireScanRows(t, env.loadTable(t), finalRows)
-	require.Equal(t, "c4", afterDeleteFiles.Properties()[table.PropertySourceCommit])
+	require.Equal(t, "c5", afterDeleteFiles.Properties()[table.PropertySourceCommit])
+	// A rebuild replaces the contents of the table, so no delete file can outlive it: the rows it
+	// replaces are the rows those delete files referred to, and a leftover file is referenced by
+	// the live snapshot (so no cleanup can reclaim it) and counted by the compaction trigger.
+	require.Zero(t, summaryInt(t, afterDeleteFiles, "total-delete-files"),
+		"a rebuild must leave no delete file behind")
 }
 
 // TestRebuildEmpty: a rebuild with no rows empties the table - the first indexing of a branch with
@@ -314,6 +324,60 @@ func TestCompact(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "c3", continued.Properties()[table.PropertySourceCommit])
 	requireScanRows(t, env.loadTable(t), []table.Row{row(t, "c", "c3", 30, next, nil)})
+
+	// Two merge-on-read deletes, a rebuild and then a compaction (TB-1), on a table of their own so
+	// that exactly two delete files are live: the delete files the rebuild orphaned must be gone -
+	// and stay gone - because compaction is what the indexer runs when the summary's
+	// total-delete-files crosses compaction.max_delete_files (§4.9).
+	orphanEnv := newTestEnv(t)
+	orphanTable := orphanEnv.createTable(t)
+	withDeletes, err := table.ApplyDelta(t.Context(), orphanTable, []table.Row{
+		row(t, "x", "c1", 1, next, nil),
+		row(t, "y", "c1", 2, next, nil),
+	}, nil, "c1")
+	require.NoError(t, err)
+	withDeletes, err = table.ApplyDelta(t.Context(), withDeletes, nil, []string{"x"}, "c2")
+	require.NoError(t, err)
+	withDeletes, err = table.ApplyDelta(t.Context(), withDeletes, nil, []string{"y"}, "c3")
+	require.NoError(t, err)
+	require.Equal(t, 2, summaryInt(t, withDeletes, "total-delete-files"),
+		"two merge-on-read deletes write two position delete files")
+
+	rebuiltRows := []table.Row{
+		row(t, "w", "c4", 3, next, nil),
+		row(t, "z", "c4", 4, next, nil),
+	}
+	rebuilt, err := table.Rebuild(t.Context(), withDeletes, rowSeq(rebuiltRows), "c4")
+	require.NoError(t, err)
+	require.Zero(t, summaryInt(t, rebuilt, "total-delete-files"),
+		"a rebuild must leave no delete file behind")
+	recompacted, err := table.Compact(t.Context(), rebuilt, "c4")
+	require.NoError(t, err)
+	require.Zero(t, summaryInt(t, recompacted, "total-delete-files"),
+		"compaction must not keep a delete file the rebuild orphaned")
+	requireScanRows(t, orphanEnv.loadTable(t), rebuiltRows)
+
+	// A delete file orphaned without a rebuild: a copy-on-write delta rewrites the data file a
+	// position delete file belongs to and keeps the delete file (§4.9's reason for ReplaceFiles),
+	// so no scan task carries it. Compaction removes it by enumerating the snapshot's manifests.
+	morDelete, err := table.ApplyDelta(t.Context(), recompacted, nil, []string{"z"}, "c5")
+	require.NoError(t, err)
+	require.Equal(t, 1, summaryInt(t, morDelete, "total-delete-files"),
+		"a delete of one row of a two-row data file writes a position delete file")
+	cowRewritten, err := table.ApplyDelta(t.Context(), morDelete, []table.Row{
+		row(t, "z", "c6", 30, next, nil),
+	}, nil, "c6", table.WithDeleteMode(table.WriteModeCopyOnWrite))
+	require.NoError(t, err)
+	require.Equal(t, 1, summaryInt(t, cowRewritten, "total-delete-files"),
+		"copy-on-write keeps the position delete file of the data file it rewrote")
+	orphansRemoved, err := table.Compact(t.Context(), cowRewritten, "c6")
+	require.NoError(t, err)
+	require.Zero(t, summaryInt(t, orphansRemoved, "total-delete-files"),
+		"compaction must remove a delete file no scan task carries")
+	requireScanRows(t, orphanEnv.loadTable(t), []table.Row{
+		row(t, "w", "c4", 3, next, nil),
+		row(t, "z", "c6", 30, next, nil),
+	})
 }
 
 // TestApplyDeltaValidation pins the errors of a malformed write.
