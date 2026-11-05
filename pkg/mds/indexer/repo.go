@@ -139,55 +139,135 @@ func (x *Indexer) ensureInitialised(ctx context.Context, repository, metadata, d
 	return nil
 }
 
-// verifyInitCommit walks the first-parent log of R-metadata and decides whether the repository is
-// the indexer's (§4.8). The initialisation commit is accepted in exactly two places:
+// verifyInitCommit streams the first-parent log of R-metadata and decides whether the repository is
+// the indexer's (§4.8). The initialisation commit is accepted in exactly two shapes:
 //
-//   - at the root, for a companion repository that was created bare (the original initialisation);
-//   - as the first commit after lakeFS's automatic "Repository created" root, which is what a
-//     non-bare CreateRepository writes.
+//   - a contiguous run of initialisation commits that reaches the root, for a companion repository
+//     that was created bare (the original initialisation);
+//   - a contiguous run of initialisation commits directly above lakeFS's automatic
+//     "Repository created" root, which is what a non-bare CreateRepository writes.
+//
+// A run and not a single commit, because a second initialisation can reach the branch before the
+// first one commits (§4.1: two indexer processes may overlap, and a rolling restart is enough):
+// initialise no longer commits an empty change set (IO-1), so the loser of that race commits
+// nothing, but a repository an older indexer already wrote carries the duplicate mds: init commit,
+// and refusing it forever would throw the mirror away over a history the indexer itself produced.
+// The commit the tick records is the run's member closest to the root: the one that created the
+// table, and the one §4.5 seeds branches from.
 //
 // A repository whose only commit is that automatic root has not been initialised yet: the
 // namespace, the table and the mds: init commit are written on top of it. Any other history
-// without the marker at one of those two positions is not the indexer's and is refused.
+// without the marker in one of those two shapes is not the indexer's and is refused.
+//
+// The walk keeps a fixed number of commits and stops as soon as the answer is known (TS-5): the
+// alternative read every commit of R-metadata into memory on every process start, page by page,
+// before the first branch could be indexed, and R-metadata gets one indexing commit per indexed
+// source commit, so its history is as long as everything the repository ever indexed. The number of
+// calls is the same as before for a healthy repository - the run and the root sit at the bottom of
+// its history - but a refusal is decided at the commit that makes it one instead of after reading
+// the whole history into memory first.
 func (x *Indexer) verifyInitCommit(ctx context.Context, repository, metadata, branch string) (metadataState, error) {
-	history, err := x.firstParentHistory(ctx, metadata, branch)
-	if err != nil {
+	scan := &initScan{}
+	if err := x.walkFirstParent(ctx, metadata, branch, scan.visit); err != nil {
 		return metadataState{}, err
 	}
-	if len(history) == 0 {
+	switch {
+	case scan.commits == 0:
 		return metadataState{}, fmt.Errorf("%w: %q@%s", ErrNoCommit, metadata, branch)
-	}
-	root := history[len(history)-1]
-	for i, commit := range history {
-		if commit.Metadata[MetadataKeyInit] == MetadataKeyInitValue {
-			if initCommitAccepted(history, i, root) {
-				return metadataState{defaultBranch: branch, initCommit: commit.ID, initialised: true}, nil
-			}
-			return metadataState{}, fmt.Errorf("%w: %q carries %s on a commit that is neither its root nor its first commit after %q",
-				ErrForeignRepository, metadata, MetadataKeyInit, automaticCreationCommitMessage)
-		}
-	}
-	if len(history) == 1 && isAutomaticCreationCommit(root) {
+	case scan.accepted():
+		return metadataState{defaultBranch: branch, initCommit: scan.initCommit.ID, initialised: true}, nil
+	case scan.freshAutomaticRoot():
 		x.log.WithFields(logging.Fields{
 			"repository": repository,
 			"metadata":   metadata,
-			"root":       root.ID,
+			"root":       scan.first.ID,
 		}).Info("mds: completing the initialisation of a newly created metadata repository")
 		return x.initialise(ctx, repository, metadata, branch)
+	case scan.markerSeen:
+		return metadataState{}, fmt.Errorf("%w: %q carries %s on a commit that is neither its root nor part of a run of %s commits directly above %q",
+			ErrForeignRepository, metadata, MetadataKeyInit, MetadataKeyInit, automaticCreationCommitMessage)
 	}
 	return metadataState{}, fmt.Errorf("%w: %q has no %s commit",
 		ErrForeignRepository, metadata, MetadataKeyInit)
 }
 
-// initCommitAccepted reports whether the init marker at index i of a newest-first first-parent
-// history is in one of the two accepted positions of §4.8.
-func initCommitAccepted(history []client.Commit, i int, root client.Commit) bool {
-	if i == len(history)-1 {
-		// The marker is the root: a bare companion repository, the original form.
-		return true
+// initScan is the state of verifyInitCommit's single streaming pass over the first-parent log of
+// R-metadata (§4.8). It holds the commits the decision needs, never the history (TS-5).
+//
+// The walk is newest first, so the commits above the run are indexing commits (or a foreign
+// commit), and the answer is a property of the run and of the commit immediately below it.
+type initScan struct {
+	// commits counts the commits visited, and first is the newest of them.
+	commits int
+	first   client.Commit
+
+	// markerSeen reports that an initialisation commit was visited, and initCommit is the one
+	// closest to the root visited so far, i.e. the oldest member of the run.
+	markerSeen bool
+	initCommit client.Commit
+
+	// gap is the first commit below the run that carries no marker. A run is accepted only when
+	// that commit is lakeFS's automatic creation root; a marker below the gap, or a second gap,
+	// ends the walk with a refusal.
+	gap     client.Commit
+	gapSeen bool
+	refused bool
+}
+
+// visit consumes one commit of the walk, newest first, and reports whether the walk can stop. The
+// walk visits nothing below an automatic creation root: it has no parent.
+func (s *initScan) visit(commit client.Commit) (bool, error) {
+	if s.commits == 0 {
+		s.first = commit
 	}
-	// The marker is the first commit after lakeFS's automatic root of a non-bare repository.
-	return i == len(history)-2 && isAutomaticCreationCommit(root)
+	s.commits++
+	switch {
+	case isInitCommit(commit):
+		if s.gapSeen {
+			// A marker below a commit without one: the run is not contiguous, so it is neither the
+			// root nor a run that starts above it.
+			s.refused = true
+			return true, nil
+		}
+		s.markerSeen = true
+		s.initCommit = commit
+		return false, nil
+	case !s.markerSeen:
+		// Commits above the run, which are indexing commits (§4.3): the initialisation commit can
+		// still be anywhere below. The automatic creation root has no parent, so it is the last
+		// commit there is to read.
+		return isAutomaticCreationCommit(commit), nil
+	case s.gapSeen:
+		// A second commit without the marker below the run: the run does not end at the root.
+		s.refused = true
+		return true, nil
+	default:
+		s.gap = commit
+		s.gapSeen = true
+		// The accepted run ends at the automatic creation root, whose parent list is empty: stop
+		// here instead of reading the rest of an indexing history that may be very long (TS-5).
+		return isAutomaticCreationCommit(commit), nil
+	}
+}
+
+// accepted reports whether the branch is the indexer's: the newest run of initialisation commits
+// reaches the root (bare) or ends directly above the automatic creation root (non-bare).
+func (s *initScan) accepted() bool {
+	if !s.markerSeen || s.refused {
+		return false
+	}
+	return !s.gapSeen || isAutomaticCreationCommit(s.gap)
+}
+
+// freshAutomaticRoot reports whether the branch carries lakeFS's automatic creation root and
+// nothing else: the initialisation has not happened yet and is completed now.
+func (s *initScan) freshAutomaticRoot() bool {
+	return !s.markerSeen && s.commits == 1 && isAutomaticCreationCommit(s.first)
+}
+
+// isInitCommit reports whether a commit carries §4.8's initialisation marker.
+func isInitCommit(commit client.Commit) bool {
+	return commit.Metadata[MetadataKeyInit] == MetadataKeyInitValue
 }
 
 // isAutomaticCreationCommit reports whether commit is lakeFS's automatic root commit of a non-bare
@@ -218,11 +298,30 @@ func (x *Indexer) initialise(ctx context.Context, repository, metadata, branch s
 			MetadataKeyInit:             MetadataKeyInitValue,
 			MetadataKeySourceRepository: repository,
 		},
-		// The commit carries the table creation, so it is never empty. allow_empty keeps a
-		// retried initialisation from failing when the creation was already committed by a
-		// previous attempt.
-		AllowEmpty: true,
+		// §4.8 (IO-1): the commit is the idempotency point of the initialisation. It carries the
+		// table creation, so it is never legitimately empty; an initialisation that finds nothing
+		// to commit lost a race to a concurrent one that committed the same staging. lakeFS answers
+		// that with graveler.ErrNoChanges, a 400 (pkg/api/controller.go maps it to
+		// StatusBadRequest, and pkg/graveler/graveler.go:2355 tolerates it only under
+		// AllowEmpty), so AllowEmpty would let the loser write a duplicate mds: init on top of the
+		// winner, which the branch then carries for ever.
+		AllowEmpty: false,
 	})
+	if errors.Is(err, client.ErrBadRequest) {
+		// Nothing was staged: a concurrent initialisation committed first. Adopt its commit, so
+		// both processes index the same repository instead of one refusing the other's work.
+		state, verifyErr := x.verifyInitCommit(ctx, repository, metadata, branch)
+		if verifyErr != nil {
+			return metadataState{}, fmt.Errorf("commit the initialisation of %q@%s: %w; the branch is not initialised either: %w",
+				metadata, branch, err, verifyErr)
+		}
+		x.log.WithFields(logging.Fields{
+			"repository": repository,
+			"metadata":   metadata,
+			"commit":     state.initCommit,
+		}).Info("mds: a concurrent initialisation committed the metadata repository")
+		return state, nil
+	}
 	if err != nil {
 		return metadataState{}, fmt.Errorf("commit the initialisation of %q@%s: %w", metadata, branch, err)
 	}
@@ -245,9 +344,10 @@ func (x *Indexer) initCommit(repository string) (string, error) {
 	return state.initCommit, nil
 }
 
-// firstParentHistory returns the first-parent history of a branch, newest first.
-func (x *Indexer) firstParentHistory(ctx context.Context, repository, branch string) ([]client.Commit, error) {
-	var commits []client.Commit
+// walkFirstParent calls visit for every commit of the first-parent log of a branch, newest first,
+// and stops when visit asks it to. It keeps no history of its own: callers that need one would hold
+// the whole repository in memory (TS-5).
+func (x *Indexer) walkFirstParent(ctx context.Context, repository, branch string, visit func(client.Commit) (bool, error)) error {
 	after := ""
 	for {
 		page, hasMore, err := x.lakeFS.LogCommits(ctx, repository, branch, client.LogCommitsOptions{
@@ -255,15 +355,23 @@ func (x *Indexer) firstParentHistory(ctx context.Context, repository, branch str
 			After:       after,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("log commits of %q@%s: %w", repository, branch, err)
+			return fmt.Errorf("log commits of %q@%s: %w", repository, branch, err)
 		}
-		commits = append(commits, page...)
+		for _, commit := range page {
+			stop, err := visit(commit)
+			if err != nil {
+				return err
+			}
+			if stop {
+				return nil
+			}
+		}
 		if !hasMore {
-			return commits, nil
+			return nil
 		}
 		after = lastNameOf(len(page), func(i int) string { return page[i].ID })
 		if after == "" {
-			return nil, fmt.Errorf("%w: log commits of %q@%s: more results without a cursor",
+			return fmt.Errorf("%w: log commits of %q@%s: more results without a cursor",
 				client.ErrBadPagination, repository, branch)
 		}
 	}
