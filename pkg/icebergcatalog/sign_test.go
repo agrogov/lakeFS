@@ -592,8 +592,12 @@ func newSignResolverFixture(t *testing.T) *signResolverFixture {
 	require.NoError(t, store.CreateNamespace(ctx, metaNamespaceAddr, map[string]string{"owner": "mds"}),
 		"create the system namespace of the companion repository")
 	metaTableLocation := strings.TrimRight(metaStorageNamespace, "/") + "/_iceberg/" + resolverMetaUUID
+	// The companion table carries the property the indexer writes (MDS-SEC-3): the catalog serves a
+	// resolved virtual table only when lakefs.mds.repository names the data repository, so a fixture
+	// without it is not "the state the indexer leaves behind" any more.
 	objects.put(metaTableLocation+"/metadata/00001.metadata.json",
-		tablesTestMetadata(resolverMetaUUID, metaTableLocation))
+		resolverMetadataWithProperties(t, resolverMetaUUID, metaTableLocation,
+			map[string]string{MetadataSearchRepositoryProperty: tablesTestRepo}))
 	metaTableAddr := metaNamespaceAddr
 	metaTableAddr.Table = resolverObjectMetadataTable
 	require.NoError(t, store.CreateTable(ctx, metaTableAddr, TablePointer{

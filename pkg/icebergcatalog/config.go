@@ -127,6 +127,10 @@ type MetadataSearchConfig struct {
 	// §5.2 and the reserved system namespace of §5.4. False is the default and the documented
 	// behaviour of every catalog without Metadata Search: no address resolves anywhere but to
 	// itself, no namespace is reserved and no listing has extra entries.
+	//
+	// It requires iceberg.enabled: the feature is served by the catalog, so enabling it while the
+	// catalog is off would describe a catalog that is not mounted. Config.Validate rejects that
+	// combination (MDS-SEC-4).
 	Enabled bool `mapstructure:"enabled"`
 }
 
@@ -357,6 +361,15 @@ func (c *Config) setDefaults() {
 // lifetime is a configuration bug, and failing startup is cheaper than discovering it after the
 // catalog is switched on.
 func (c *Config) Validate() error {
+	// Metadata Search is a mode of the catalog, not a feature of its own: the mount serves it from
+	// the catalog routes, and the alias of §5.5 only exists while the catalog is mounted. Accepting
+	// it with iceberg.enabled false would install the principals and the deny policy of the
+	// feature (§8) and then answer the documented endpoint with a 501 or a 404, so the
+	// combination is refused here, once, with one message (MDS-SEC-4).
+	if c.MetadataSearch.Enabled && !c.Enabled {
+		return fmt.Errorf("%w: metadata_search.enabled requires enabled: Metadata Search is served by the Iceberg catalog, which is off",
+			ErrInvalidConfig)
+	}
 	if c.Prefix != CatalogPrefix {
 		return fmt.Errorf("%w: prefix %q is not supported, only %q is; the prefix is the constant of GET /v1/config overrides",
 			ErrInvalidConfig, c.Prefix, CatalogPrefix)
