@@ -81,10 +81,9 @@ type Row struct {
 // table.SchemaToArrowSchema(schema, nil, true, false)).
 //
 // The schema is the *table's* schema (Table.Schema()), not the constant this package creates the
-// table with: the catalog assigns field IDs itself when it applies a create request
-// (iceberg-go's NewMetadataWithUUID reassigns every ID in pre-order), so a reader built from the
-// constant would carry different IDs than the table it is written into. See Schema for what the
-// catalog does with the fixed IDs of §3.1.
+// table with: take field IDs from the loaded table, never from the constants. The constants are the
+// created table's IDs (see Schema), so the two agree at creation; the rule is what keeps a reader
+// right if the catalog's own numbering, or a future schema change, ever differs.
 func ArrowSchema(sc *iceberg.Schema) (*arrow.Schema, error) {
 	schema, err := icebergtable.SchemaToArrowSchema(sc, nil, true, false)
 	if err != nil {

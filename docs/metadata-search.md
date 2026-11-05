@@ -62,7 +62,10 @@ The second key is the only Metadata Search setting the server itself reads (desi
   ([`iceberg.md` § The upstream endpoint](iceberg.md#the-upstream-endpoint-mdsicebergapi)).
 
 While either switch is false the virtual table does not resolve, no namespace is reserved and
-`/mds/iceberg/api` is not mounted. There is no per-repository switch in this version: enabling the
+`/mds/iceberg/api` is not mounted: the request falls through to the core router's not-implemented
+placeholder and answers **`501 Not Implemented`**, the same answer a plain `lakefs` binary gives at
+`/iceberg/api` (design §5.5; `pkg/api/services.go`, mounted by `cmd/lakefs/cmd/run.go`). It is not a
+`404`. There is no per-repository switch in this version: enabling the
 feature with a configuration that lists no repositories is harmless, because the indexer, not the
 catalog, decides what is indexed.
 
@@ -104,8 +107,11 @@ Put that pair in `metadata_search.access_key_id` and `metadata_search.secret_key
 file with restrictive permissions and prefer the environment variables for the secret.
 
 The deny policy is attached to the base groups of both lakeFS group templates — `Admins`, `Supers`,
-`Writers`, `Readers`, `SuperUsers`, `Developers` and `Viewers` — never to
-`MetadataSearchIndexers`. It denies `fs:Write*`, `fs:Delete*`,
+`Writers`, `Readers`, `SuperUsers`, `Developers` and `Viewers` — plus any group listed in
+`datasets.immutable_guard_groups`, which is the same list the installation-wide datasets deny and
+the reserved-prefix deny are attached to. It is never attached to `MetadataSearchIndexers`, and the
+bootstrap drops that group from the list with a warning even when
+`datasets.immutable_guard_groups` names it (design §8). It denies `fs:Write*`, `fs:Delete*`,
 `fs:Create*`, `fs:Revert*`, `catalog:Create*`, `catalog:Update*`, `catalog:Delete*` and
 `catalog:WriteTableData` on `*-metadata` ARNs, so an administrator's `fs:*` allow cannot make a
 companion repository a hand-edited second source of truth. The indexer and the catalog are not in
@@ -248,10 +254,15 @@ What a first run does, in order (design §4.2, §4.5, §4.8):
 
 The indexer is safe to restart at any point. A crash between the Iceberg commit (staged on the
 branch) and the lakeFS commit is recovered by committing the staged table; a crash after the lakeFS
-commit but before the tag is recovered by creating the tag; a branch with uncommitted changes that
-are not the expected next commit is reset and re-indexed. Orphaned data files from an interrupted
-Iceberg commit are unreferenced and removed by `lakectl iceberg cleanup` (see
-[`Maintenance`](#maintenance)).
+commit but before the tag is recovered by creating the tag — a tag that points at a commit that does
+not record the position is deleted and created again, because lakeFS never overwrites a tag even
+with `force`. A branch with uncommitted changes that are not the expected next commit is reset and
+re-indexed; that includes foreign staged changes whose table property happens to record the
+expected commit, because the indexer also asks the branch for its uncommitted changes. A history
+rewrite discards the staging before it moves the branch. When a concurrent writer moves the table,
+a `409` restarts the branch tick up to 3 times before the branch fails for that tick. Orphaned data
+files from an interrupted Iceberg commit are unreferenced and removed by `lakectl iceberg cleanup`
+(see [`Maintenance`](#maintenance)).
 
 ### 5. Verify
 
@@ -283,7 +294,9 @@ as soon as one repository or branch carries an error. Its body is per repository
 
 `last_error` appears only when the last attempt failed. A repository-level failure (missing
 repository, companion namespace not derivable or overlapping) is on the repository object; a branch
-failure is in that branch's object and clears on the next successful attempt.
+failure is in that branch's object and clears on the next successful attempt. A branch that is no
+longer mirrored — deleted in `my-repo`, or no longer matching `branches` — is removed from the
+report, so its last error does not keep `/_health` at `503` until the indexer restarts.
 
 ## Querying
 
@@ -542,9 +555,12 @@ WHERE path LIKE 'orders/%';
 ### What was verified
 
 The end-to-end suite [`../esti/mds_test.go`](../esti/mds_test.go) runs the PyIceberg and DuckDB
-snippets above against a real `lakefs-sso` and a real indexer on SeaweedFS: PyIceberg through
-`/mds/iceberg/api` and DuckDB through `/iceberg/relative_to`, including tags, short commit IDs, a
-hard reset and an indexer restart.
+snippets above against a real `lakefs-sso` and a real indexer on SeaweedFS, on both endpoints: PyIceberg
+through `/mds/iceberg/api` (identifier form) and through `/iceberg/relative_to`, DuckDB through
+`/iceberg/relative_to` and through `/mds/iceberg/api` with the three-level identifier. Every read of
+the suite takes all four paths and requires them to agree on path, `commit_id`, etag, `size_bytes`
+and user metadata (commit `91b30f485`), including tags, short commit IDs, a hard reset and an indexer
+restart.
 
 The Spark and Trino snippets are not part of the esti suite; they were run separately against the
 same local recipe (a `lakefs-sso` with both switches on, an indexer with `period: 2s`, and the
@@ -674,12 +690,12 @@ reports `lag_commits` per branch.
 | Repository name length | A data repository name is at most **54** characters. `R-metadata` must fit lakeFS's 63-character repository ID limit, and configuration validation rejects a longer name at startup. |
 | The `-metadata` suffix | A data repository whose name ends in `-metadata` cannot be indexed: `icebergcatalog.IsMetadataRepository` treats it as a companion repository. Validation rejects it. |
 | Bucket-root namespace | If `R`'s storage namespace is a bucket root (`s3://bucket`), the companion namespace cannot be derived. Set `metadata_search.repositories.<R>.storage_namespace` explicitly, for example `s3://bucket/metadata/my-repo`. |
-| Non-overlapping namespaces | `R-metadata`'s namespace must not be inside `R`'s namespace, nor `R`'s inside it. `R`'s uncommitted GC sweeps every unreferenced object under `R`'s prefix and would delete the metadata files. The indexer refuses such a configuration and marks the repository failed. |
+| Non-overlapping namespaces | `R-metadata`'s namespace must not be inside `R`'s namespace, nor `R`'s inside it. `R`'s uncommitted GC sweeps every unreferenced object under `R`'s prefix and would delete the metadata files. The indexer checks the pair on every tick, not only when it creates the companion repository, refuses such a configuration and marks the repository failed. |
 | First-parent only | Only first-parent history is indexed and addressable. A commit that exists only on a merged side branch has no `mds-*` tag. |
 | Indexed branches only | Branches that do not match `branches` have no rows and no virtual table. Adding a branch to the configuration later indexes it from its head (or history, per `backfill`/`since`). |
 | One row per object | No change history is stored in the table; `commit_id` is the last change. |
 | `commit_id` after backfill/rebuild | The starting (or rebuilding) commit, not the original change, as described in [`Deviations`](#deviations-from-the-commit-that-changed-the-object). |
-| Rebuild memory | Above `rebuild_threshold` upserts plus deletes, the indexer rebuilds from a full listing rather than holding a huge delta in memory. A full listing still costs one page per `listObjects` page and one row per object. |
+| Rebuild memory | Above `rebuild_threshold` upserts plus deletes, the indexer stops reading the diff at the first entry over the threshold and rebuilds from a full listing rather than holding a huge delta in memory; a rebuilt commit makes no per-object stat call. A full listing still costs one page per `listObjects` page and one row per object. |
 | Per-tick work | One branch applies at most `max_commits` commits per tick; a long backlog needs several ticks. `concurrency` bounds parallel branches, not commits. |
 | Query scale | The table is unpartitioned and sorted by `path` within each file. There is no path-prefix partitioning and no server-side scan planning, so a filtered query is only as selective as the Iceberg expression the engine pushes down. Partitioning by prefix is a later version. |
 | Structured metadata only | There is no full-text, vector or JSON-path search. `user_metadata` is a map of strings, queryable with the engine's map functions. |
@@ -687,10 +703,20 @@ reports `lag_commits` per branch.
 | One indexer replica | Run exactly one. A second replica does duplicate work and gets `409` responses; it does not corrupt the table. |
 | No UI, no server-side SQL | OSS has no Metadata Search tab and no SQL endpoint. Queries run in the engine that connects to the catalog (PyIceberg, DuckDB, Spark, Trino). Option B is future work (see [`Option B`](#option-b-outlook)). |
 
-The measured backfill number in the end-to-end run is 10,000 imported objects indexed 2.7 seconds
-after the indexer started, with 0.46 seconds of indexer work. The 100,000-object case was not
-measured: writing the objects took longer than the test's timeout, which is a setup cost rather
-than an indexer failure.
+The measured backfill numbers (commit `59828bcd1`) are two runs of
+[`TestMetadataSearchBackfill`](../esti/mds_test.go), which times the first indexing separately from
+building the source commit:
+
+- **10,000 objects** (the CI setting): first indexed 2.7 seconds after the indexer started, one
+tick, 0.46 seconds of indexer work, all four engine paths counting 10,000 rows.
+- **100,000 objects**: the source commit was built in 5m46.159s (33ms for the one uploaded object,
+the rest the import of 100,000 entries). The indexer first indexed it 3.212 seconds after it started
+(31,135 objects/s at `period: 2s`), with `lakefs_mds_tick_duration_seconds_sum` 0.86s, one rebuild
+and 100,000 rows written; PyIceberg and DuckDB both count 100,000 rows and see `source_commit` at
+the head. The whole test took 447.26s, almost all of it setup.
+
+So the 100,000-object case has been measured; what used to exceed the test timeout was building the
+source commit, not indexing it. The CI job keeps `ESTI_MDS_BACKFILL_OBJECTS=10000` for run time.
 
 ## Permissions
 
@@ -800,13 +826,17 @@ data repository readable through the virtual table. They also keep their snapsho
 commit is retained forever by lakeFS GC.
 
 `tag_retention` (default `0`, keep forever) retires `mds-*` tags whose **source** commit is older
-than the duration. After the tag is gone, the ref mapper answers `404 NoSuchTableException` for that
-commit or tag, and lakeFS GC may reclaim the data. Set it only as long as your users need
-commit-level history; branch reads do not depend on the tags of old commits. A tag whose source
-commit no longer exists is retired too, because it can no longer resolve.
+than the duration. A tag that records the current position of a live branch of `my-repo-metadata` is
+never retired, however old its source commit is: tag repair would recreate it, so retiring it would
+just delete and recreate it on every tick. After the tag is gone, the ref mapper answers
+`404 NoSuchTableException` for that commit or tag, and lakeFS GC may reclaim the data. Set it only as
+long as your users need commit-level history; branch reads do not depend on the tags of old commits.
+A tag whose source commit no longer exists is retired too, because it can no longer resolve.
 
 `delete_branches` (default `true`) deletes the mirrored branch when a matching branch of `R` is
-deleted. Its tags stay, so history that was tagged remains readable; the branch itself does not.
+deleted. Its tags stay, so history that was tagged remains readable; the branch itself does not. The
+companion repository's own default branch is never deleted, even after `R` renames its default
+branch: lakeFS refuses a default-branch delete, so the indexer keeps it and logs the skip once.
 
 ### Upgrades and restarts
 

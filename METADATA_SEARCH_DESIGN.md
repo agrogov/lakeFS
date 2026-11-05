@@ -51,7 +51,10 @@ The indexer is a **REST client** of lakeFS (lakeFS API + the Iceberg REST catalo
 Iceberg format **v2**, unpartitioned, sort order `path ASC`, `identifier-field-ids = [2]`.
 Field IDs below are the ones the created table has; schema changes only add optional fields with new IDs.
 The catalog's create path (iceberg-go `NewMetadataWithUUID`) renumbers IDs in pre-order, so the map's key and
-value come right after `user_metadata`. Readers and the writer take IDs from the loaded table, never from constants.
+value come right after `user_metadata`. The fixed-ID constants in `pkg/mds/table/schema.go` are these created IDs:
+the create request is built in the same pre-order, so the catalog's renumbering is a no-op and the constants, the
+request and the created table agree (commit `39486c0d2`). Readers and the writer still take IDs from the loaded
+table, never from the constants; the constants only describe the table this package creates.
 
 | ID | Column | Iceberg type | Req. | Value |
 |---|---|---|---|---|
@@ -103,7 +106,7 @@ Every snapshot the indexer produces also carries `lakefs.mds.source-commit` in i
 | Name | `R + "-metadata"` (`icebergcatalog.MetadataRepositorySuffix`). `R` longer than 54 characters cannot be indexed (repository IDs are at most 63 characters); config validation rejects it. A data repository whose own name ends in `-metadata` cannot be indexed either (`icebergcatalog.IsMetadataRepository` treats it as a companion). |
 | Default branch | same name as `R`'s default branch |
 | Storage ID | same as `R` |
-| Storage namespace | `repositories.<R>.storage_namespace` if set; else `<R namespace without trailing "/">-metadata` **only if** `R`'s namespace has a path component (`s3://bucket/path` → `s3://bucket/path-metadata`). A bucket-root namespace (`s3://bucket`) requires an explicit value. The namespace must **not** be inside `R`'s namespace (nor `R`'s inside it): `R`'s uncommitted GC sweeps every unreferenced object under `R`'s prefix and would delete `R-metadata`'s files. Validated at startup with the same `"/"`-normalised prefix test the GC uses (`normalizeStorageNamespace`). |
+| Storage namespace | `repositories.<R>.storage_namespace` if set; else `<R namespace without trailing "/">-metadata` **only if** `R`'s namespace has a path component (`s3://bucket/path` → `s3://bucket/path-metadata`). A bucket-root namespace (`s3://bucket`) requires an explicit value. The namespace must **not** be inside `R`'s namespace (nor `R`'s inside it): `R`'s uncommitted GC sweeps every unreferenced object under `R`'s prefix and would delete `R-metadata`'s files. Checked on every tick, not only when the companion repository is created, with the same `"/"`-normalised prefix test the GC uses (`normalizeStorageNamespace`): a companion repository that already exists with an overlapping namespace (created earlier, by hand, by a replica with another namespace, or because `R`'s namespace moved) is refused - that repository is marked failed in `/_health` and metrics - instead of indexed (commit `7ec4ebec7`). |
 | Read-only flag | **not** set: catalog writes never pass `graveler.WithForce`, so a read-only repository would also block the indexer. User writes are blocked by a deny policy instead (section 8). |
 | Contents | namespace `system`, table `system.object_metadata` (pointer under `_lakefs_iceberg/tables/…`, files under `<ns>/_iceberg/<table-uuid>/`). No other bookkeeping objects. |
 | Commits | one lakeFS commit per indexed commit of `R`, message `mds: index <R>@<commit>`, metadata `lakefs.mds.source-commit=<commit>`, `lakefs.mds.source-repository=<R>`. |
@@ -135,7 +138,8 @@ idempotency check (4.4), not from a lease; a second replica only wastes work and
    "Order in the code" below.
 2. `last` = `lakefs.mds.source-commit` of `R-metadata@b` head commit (none on a branch that was never indexed → 4.5).
 3. `head` = head commit of `R@b`. If `last == head`, there is nothing to apply; the tag repair (4.4, "crashed
-   after 4") and the 4.9 compaction check still run.
+   after 4" - it repairs only a missing tag, or one whose commit does not record `last` - and the 4.9 compaction
+   check still run.
 4. If `last` is not an ancestor of `head` (`findMergeBase(R, last, head)` ≠ `last`) → history rewrite (4.7).
 5. `todo` = first-parent commits of `R@b` after `last` up to `head`, **oldest first**, at most `max_commits`
    (`logCommits(R, head, first_parent=true, stop_at=last)` paged, then reversed).
@@ -149,7 +153,9 @@ before it. That is equivalent to the logical order above:
 
 - Recovery's decision compares the staged `lakefs.mds.source-commit` with exactly two values - the recorded
   position (step 2) and the next commit to apply (step 5, `todo[0]`) - so the list has to exist before the
-  comparison can be made. Recovery adds no API call: it reads the position the tick already has.
+  comparison can be made. Recovery reads the position the tick already has; when the staged property equals the
+  recorded position it also costs one paged branch-diff call (`GET /repositories/{repo}/branches/{branch}/diff`,
+  `client.DiffBranch`) to tell an empty staging from a foreign staged write that records the same source commit.
 - The position is still read before anything is written, and recovery never moves it backwards. It either
   finishes the staged commit and advances the position to it, consuming `todo[0]`, or discards the staging
   and leaves both `last` and `todo` untouched.
@@ -164,12 +170,20 @@ before it. That is equivalent to the logical order above:
    (paged `listObjects(R, C)`). Else page `diffRefs(R, left=P, right=C, type=two_dot, include_right_stats=true)`,
    no delimiter. `added`/`changed` → upsert, `removed` → delete. `include_right_stats` gives `checksum`, `mtime`,
    `content_type`, `metadata`; `size_bytes` is on the diff. The parameter is marked experimental in the swagger;
-   if a needed field is missing, `statObject(R, C, path)` fills it in.
+   if a needed field is missing, `statObject(R, C, path)` fills it in. "Missing" means the whole right-side stat
+   absent (`include_right_stats` not honoured), an empty checksum, a zero mtime or a zero size. `content_type` and
+   `metadata` are excluded on purpose: an object may legitimately have neither, so an empty value there is a fact
+   about the object, not a gap in the answer. The size is on the diff and the narrowed client reports a size the
+   server omitted as zero, which is also the size of an empty object, so a zero-size entry is statted: one extra
+   call per empty object, in exchange for never writing a size the server did not confirm (commit `1cb131f13`).
    `committer` and `creation_date` come from `C` (`getCommit`), the same for every row of the commit.
 2. **Large change sets.** If upserts + deletes > `rebuild_threshold` (default 100 000), skip the delta and do a
    full rebuild of the branch at `C`: rows = paged `listObjects(R, C)`, all with `commit_id = C`, written with
-   `Transaction.Overwrite` (no filter). This bounds memory and the size of delete predicates. The loss of
-   per-object `commit_id` history on a rebuild is documented.
+   `Transaction.Overwrite` (no filter). This bounds memory and the size of delete predicates. The walk of the diff
+   stops at the first entry that takes the count over the threshold (`changeSet.large`): the entries read so far
+   are dropped and no `statObject` call is made for that commit, so a commit that is going to be rebuilt costs
+   neither the rest of its diff nor a single stat (commit `1cb131f13`). The loss of per-object `commit_id` history
+   on a rebuild is documented.
 3. **Iceberg transaction** on the table, via `iceberg-go` v0.7.0 `catalog/rest` against
    `<lakefs_mds_endpoint>/iceberg/relative_to/<R>-metadata.<b>/api`, identifier `system.object_metadata`:
    - `tx.Delete(ctx, In("path", upserts ∪ deletes), props)`. With `write.delete.mode=merge-on-read` on a v2 table
@@ -187,7 +201,12 @@ before it. That is equivalent to the logical order above:
    `lakefs.mds.source-commit` property, even for a change set with no objects. The walk of 4.2 step 5 must
    therefore drop the recorded position itself even though the log API's `stop_at` is inclusive; applying it
    again would stage nothing and fail here with `commit: no changes`.
-5. **Tag** `mds-<C>` → the new commit (`createTag`, `force=true`, so a retry after a crash overwrites it).
+5. **Tag** `mds-<C>` → the new commit (`createTag`). lakeFS never overwrites a tag, even with `force`:
+   `pkg/graveler/graveler.go` `CreateTag` uses force only to pass the read-only check and returns
+   `ErrTagAlreadyExists` for an existing tag, so the indexer deletes a stale tag before creating it (commit
+   `30748d488`). A tag whose commit already records `C` is left where it is, even when it does not point at the
+   branch head: after a compaction (4.9) the head is the compaction commit and the tag stays on the
+   pre-compaction indexing commit, which has the same rows (commit `aab9216aa`).
 
 Step 3 is the atomicity boundary for readers on the branch head (the staged pointer is what the catalog reads on a
 branch). Step 4 is the atomicity boundary for the indexing position and for tag/commit reads.
@@ -200,12 +219,20 @@ Crash windows and what the next tick does (step 1 of 4.2):
 |---|---|---|
 | 3 (Iceberg commit staged, no lakeFS commit) | `R-metadata@b` has uncommitted changes, and the staged table's `lakefs.mds.source-commit` = next commit `C` after `last` | do steps 4–5 for `C` |
 | 3, but the staged property is anything else (partial or foreign writes) | uncommitted changes | `resetBranch(R-metadata, b)` (discard staging), then index normally |
-| 4 (lakeFS commit done, no tag) | head metadata = `C`, tag `mds-<C>` missing or pointing elsewhere | do step 5 |
+| 3, but a foreign write staged changes whose property happens to equal `last` | uncommitted changes, property = `last` | the branch diff (4.2) shows the staged changes, so `resetBranch(R-metadata, b)` (discard staging), then index normally |
+| 4 (lakeFS commit done, no tag) | head metadata = `C`, tag `mds-<C>` missing or pointing elsewhere | do step 5 (a mispointed tag is deleted and created again) |
 | during 3 (data files written, commit not sent) | orphan files under `_iceberg/<uuid>/data/`, nothing staged | nothing. The files are unreferenced and removed by `lakectl iceberg cleanup` (section 9). |
 
-Before step 3 the indexer also reloads the table and skips to step 4 if the current
-`lakefs.mds.source-commit` already equals `C`. A 409 from the Iceberg commit means another writer moved the
-table: reload, re-run recovery, continue.
+A history rewrite (4.7) discards the staging before it resets the branch: real lakeFS `ResetHard` keeps the
+staging area (`pkg/graveler/graveler.go`), so a pointer staged by a crashed step 3 would otherwise survive the
+hard reset and the rewrite would run on top of the stale table (commit `383bf37b5`).
+
+Before step 3 the indexer also reloads the table (so the "already at `C`, skip to step 4" check reads durable
+state, not the tick's cached table) and skips to step 4 if the current `lakefs.mds.source-commit` already equals
+`C`. A 409 from the Iceberg commit means another writer moved the table: the branch tick restarts up to 3 times
+(`conflictRetries` in `pkg/mds/indexer/indexer.go`), re-reading the position and re-running recovery each time;
+after the third restart the branch fails for this tick and the next tick resumes at the recorded position
+(commit `383bf37b5`).
 
 ### 4.5 First indexing of a branch (backfill)
 
@@ -237,18 +264,21 @@ work, but it is not tested.
 
 ### 4.7 History rewrites (hard reset, revert-by-reset, force-moved branches)
 
-When `last` is not an ancestor of `head`: `mb = findMergeBase(R, last, head)`. If tag `mds-<mb>` exists,
-`hardResetBranch(R-metadata, b, "mds-<mb>")` and continue from `mb`. Otherwise do the full listing of 4.5
-step 2 at `head`, on a branch hard-reset to the initialisation commit. (A normal `revert` is a new commit and needs
-none of this.)
+When `last` is not an ancestor of `head`: discard the staging (4.4) and then `mb = findMergeBase(R, last, head)`.
+If tag `mds-<mb>` exists, `hardResetBranch(R-metadata, b, "mds-<mb>")` and continue from `mb`. Otherwise do the
+full listing of 4.5 step 2 at `head`, on a branch hard-reset to the initialisation commit. The fallback is also
+taken when the server answers `findMergeBase` with its unmapped "no merge base" 500 (unrelated histories after a
+force-move), and when `last` is an ancestor of `head` only through a merge's second parent: the first-parent walk
+never meets `last` there, so replaying the chain would rebuild the table from the root on top of the stale one.
+(A normal `revert` is a new commit and needs none of this; commit `383bf37b5`.)
 
 ### 4.8 Branch and repository lifecycle
 
 | Event in `R` | Indexer action |
 |---|---|
 | matching branch created | 4.5 |
-| matching branch deleted | delete `R-metadata@b` if `delete_branches` (default true). Its tags stay, so commit/tag reads of its history still work. |
-| branch stops matching the config | nothing (left as is) |
+| matching branch deleted | delete `R-metadata@b` if `delete_branches` (default true). Its tags stay, so commit/tag reads of its history still work. Its `/_health` entry and lag gauge are removed, so a failed last attempt of the deleted branch does not keep `/_health` at 503. `R-metadata`'s **default branch is never deleted**, even when its name is no longer a branch of `R` (an `R` default-branch rename): lakeFS refuses a default-branch delete (`pkg/graveler/graveler.go` `DeleteBranch` returns `ErrDeleteDefaultBranch`), so the indexer skips it and logs the skip once per process. |
+| branch stops matching the config | nothing to the table (left as is); its `/_health` entry is removed, so a stale error does not keep `/_health` at 503. |
 | repository added to config | create `R-metadata` (3.3). lakeFS creates it non-bare, so its default branch starts with the automatic `Repository created` root; create namespace `system` and the table through the catalog on the default branch, then lakeFS commit `mds: init` as the first commit after that root (the **initialisation commit**, metadata `lakefs.mds.init=true`). Then 4.5 for each matching branch. |
 | `R-metadata` exists and its history is only lakeFS's automatic `Repository created` root | complete the initialisation on top: create namespace `system` and the table, then the `mds: init` commit (metadata `lakefs.mds.init=true`). |
 | `R-metadata` exists with the `lakefs.mds.init=true` marker at its root (a bare repository) or at its first commit after the automatic root | accept it as the indexer's; later commits are indexing commits. |
@@ -267,7 +297,11 @@ none of this.)
   on a schedule (`cmd/lakectl/cmd/iceberg_cleanup.go`). It honours lakeFS references (branch heads, tags, commits
   retained by GC), so `mds-*` tags keep their snapshots readable.
 - **Tag retention.** `tag_retention` (default `0` = keep forever) deletes `mds-*` tags whose source commit is
-  older than the duration, then lakeFS GC can reclaim their data.
+  older than the duration, then lakeFS GC can reclaim their data. A tag that records the current position (head
+  source commit) of any live branch of `R-metadata` is never retired, however old its source commit is: tag
+  repair (4.4) recreates a missing tag of an indexed position, so retiring it would make the next tick recreate
+  it and the tick after that delete it again (commit `aab9216aa`). A tag whose source commit no longer exists is
+  retired because it can no longer resolve.
 
 ## 5. Catalog side (landed in R10-1, plus R10-2)
 
@@ -328,6 +362,12 @@ Upstream clients point at `<lakefs>/mds/iceberg/api` (warehouse/prefix `lakefs`,
 `<lakefs>/mds/iceberg/api/v1/oauth/tokens`). When `iceberg.metadata_search.enabled` is true, `RoutesBuilder`
 also mounts the same `/iceberg/api` handler at `/mds/iceberg/api`. Same auth, same prefix (`CatalogPrefix = "lakefs"`).
 No `relative_to` alias. Upstream configs then work unchanged apart from the host.
+
+While `iceberg.metadata_search.enabled` is false the alias is not mounted, and the prefix is left to the core
+router's not-implemented placeholder: `/mds/iceberg/api/…` answers **501** (`http.StatusNotImplemented`), not a
+plain 404. The placeholder is `notImplementedMounts` in `pkg/api/services.go`, mounted by `cmd/lakefs/cmd/run.go`
+after the extra-routes builders, so a plain `lakefs` binary (no `lakefs-sso` hook) answers the same 501. Only a
+wrapper binary that claims the prefix with the real handler replaces it.
 
 ## 6. Ref mapping (`pkg/mds/refmap`, server side)
 
@@ -414,8 +454,11 @@ Two principals, as upstream separates indexing from querying:
 
 Write protection of `R-metadata`: policy `mds-metadata-repo-protect` (Deny `fs:Write*`, `fs:Delete*`,
 `fs:Create*`, `fs:Revert*`, `catalog:Create*`, `catalog:Update*`, `catalog:Delete*`, `catalog:WriteTableData` on
-the `*-metadata` ARNs), attached to the base groups (`datasets.PinsProtectGroups`, the same list
-`iceberg-reserved-prefix-protect` uses), never to `MetadataSearchIndexers`. As with the reserved-prefix deny, an auth
+the `*-metadata` ARNs), attached to the caller's guard groups - `cmd/lakefs-sso/main.go`'s `guardGroups()`, which is
+`datasets.PinsProtectGroups(datasets.immutable_guard_groups)`: the base groups of both group templates plus the
+operator's extras, the same list `iceberg-reserved-prefix-protect` uses - and never to `MetadataSearchIndexers`,
+which the bootstrap drops from the list with a warning even when `datasets.immutable_guard_groups` names it
+(commit `451bca5a1`). As with the reserved-prefix deny, an auth
 service without policies (`BasicAuthService`) logs a warning naming what is not enforced, and startup continues.
 
 ## 9. Operations

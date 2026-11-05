@@ -195,3 +195,80 @@ sso:
 #   # partially, because a file that is not an entry can be collected by GC (§6.3). 50000 files
 #   # is roughly six seconds of staging at the default 32 workers.
 #   max_staged_files: 50000
+#   # Metadata Search, server side (METADATA_SEARCH_DESIGN.md §5.4, §5.5). Requires
+#   # iceberg.enabled: true. When true, <repo>.<ref>.system.object_metadata resolves to the
+#   # companion repository, the `system` namespace of every data repository is reserved and
+#   # read-only for clients, the catalog is mounted a second time at /mds/iceberg/api (the upstream
+#   # endpoint), and lakefs-sso bootstraps the mds-indexer principals and the
+#   # mds-metadata-repo-protect deny (design §8). When false the virtual table does not resolve and
+#   # /mds/iceberg/api answers 501 from the core placeholder. The indexer itself is configured in
+#   # the top-level metadata_search section at the end of this file.
+#   metadata_search:
+#     enabled: false
+
+# --------------------------------------------------------------------------------------------
+# Metadata Search indexer (METADATA_SEARCH_DESIGN.md §4, §7, §9). Read only by
+# `lakefs-sso mds run --config <file>`, from the top-level `metadata_search` section; the server
+# ignores this section and reads only iceberg.metadata_search.enabled above, so both can live in
+# this file. The defaults below are what pkg/mds/config.go applies when a key is absent. Every
+# key can also be set through the environment: LAKEFS_METADATA_SEARCH_SECRET_KEY,
+# LAKEFS_METADATA_SEARCH_LAKEFS_MDS_ENDPOINT, ... (the repositories and storage maps are read from
+# the file only). Leave the whole section commented out in a server-only deployment.
+# metadata_search:
+#   # Base URL of lakeFS. The API is used at /api/v1 and the catalog at /iceberg; append neither.
+#   # Required.
+#   lakefs_mds_endpoint: "http://lakefs:8000"
+#   # Credentials of the mds-indexer principal. Create them once with
+#   # `lakectl auth users credentials create --id mds-indexer` (design §8). Required.
+#   access_key_id: "AKIA..."
+#   secret_key: "..."
+#   # Address of the indexer's own HTTP server: /_health, /metrics, /_pprof/. Default 0.0.0.0:8080.
+#   listen_address: "0.0.0.0:8080"
+#   # Interval between ticks; must be positive. Default 60s.
+#   period: 60s
+#   # Branches one tick processes in parallel; must be positive. Default 25.
+#   concurrency: 25
+#   # First-parent source commits one branch applies per tick; must be positive. Default 1000.
+#   max_commits: 1000
+#   # Oldest commit (RFC 3339) a first indexing of a branch starts at, by creation date. Optional
+#   # and unset by default; when set it wins over backfill.
+#   # since: "2026-01-01T00:00:00Z"
+#   # What the first indexing of a branch covers when since is unset: `head` (the head commit only)
+#   # or `history` (the branch's oldest first-parent commit). Default head.
+#   backfill: head
+#   # First-parent commits walked back looking for an indexed ancestor whose mds-* tag seeds a new
+#   # branch; must be positive. Default 1000.
+#   seed_lookback: 1000
+#   # Upserts plus deletes above which one commit is indexed by rebuilding the branch's table from a
+#   # full listing; must be positive. Default 100000.
+#   rebuild_threshold: 100000
+#   # Mirror the deletion of a matching branch of the data repository to its companion branch (its
+#   # tags stay). Default true.
+#   delete_branches: true
+#   # Retire mds-* tags whose source commit is older than this; 0 keeps them forever. Default 0s.
+#   tag_retention: 0s
+#   compaction:
+#     # Compact a branch's table when it has more position-delete files than this; 0 disables the
+#     # trigger. Default 200.
+#     max_delete_files: 200
+#     # Compact after this many indexed commits, counted from the companion branch's commit log;
+#     # 0 disables the trigger. Default 500.
+#     every_commits: 500
+#   # Optional iceberg-go IO properties for writing table files when the catalog does not vend
+#   # write credentials (design §4.6). Omit the section when credential vending is configured.
+#   # storage:
+#   #   s3.endpoint: "http://seaweedfs:8333"
+#   #   s3.region: "us-east-1"
+#   #   s3.access-key-id: "..."
+#   #   s3.secret-access-key: "..."
+#   #   s3.path-style-access: "true"
+#   # The data repositories to index, by name; at least one entry. A data repository name must not
+#   # end in "-metadata" and must be at most 54 characters (its companion is <R>-metadata).
+#   repositories:
+#     my-repo:
+#       # Exact branch names, or a prefix with a single trailing "*"; at least one.
+#       branches: [main, "dev-*"]
+#       # Storage namespace of the companion repository. Optional: derived as <R namespace>-metadata
+#       # when R's namespace has a path component, and required for a bucket-root namespace. It must
+#       # not overlap R's namespace (design §3.3).
+#       # storage_namespace: "s3://my-bucket/metadata/my-repo"
