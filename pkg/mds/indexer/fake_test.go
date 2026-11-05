@@ -75,9 +75,10 @@ type fake struct {
 	compactCalls        int
 
 	// dataBranchHook, when set, is run for every head read that starts a branch tick of a data
-	// repository (indexer.runBranchOnce reads it with GetCommit). It lets a test hold several branch
+	// repository (indexer.runBranchOnce reads it with GetCommit). It receives the commit ID the
+	// read names - the branch's head commit for a branch read - and lets a test hold several branch
 	// ticks in flight at once and measure how many the indexer runs in parallel (design §4.1).
-	dataBranchHook func(branch string) (done func())
+	dataBranchHook func(commitID string) (done func())
 
 	// Injected failures. Each is one-shot unless documented otherwise.
 	applyErr    error
@@ -100,7 +101,16 @@ type fake struct {
 	logCalls   map[string]int
 	logCommits map[string]int
 
+	// logRequests records the options of every LogCommits call, so a test can pin the
+	// FirstParent flag §3.2 requires (TS-10).
+	logRequests []logCommitsCall
+
 	index int
+}
+
+type logCommitsCall struct {
+	repository string
+	opts       client.LogCommitsOptions
 }
 
 type createdBranch struct {
@@ -348,17 +358,28 @@ func (f *fake) resetCalls() []string {
 	return slices.Clone(f.resetBranches)
 }
 
+// setReadOnly marks a repository read-only, as an operator creating the companion repository with
+// read_only: true (or flipping the flag later) would (TS-4).
+func (f *fake) setReadOnly(repository string, readOnly bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	stored := f.repositories[repository]
+	stored.ReadOnly = readOnly
+	f.repositories[repository] = stored
+}
+
 // setDataBranchHook installs the hook that enterDataBranch runs for the head read of a data branch.
-func (f *fake) setDataBranchHook(hook func(branch string) (done func())) {
+func (f *fake) setDataBranchHook(hook func(commitID string) (done func())) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.dataBranchHook = hook
 }
 
 // enterDataBranch runs the concurrency probe, when one is installed, for a head read of a branch of
-// a data repository. Reads of the metadata repository are excluded: they belong to a branch tick
-// that is already running, they do not start one.
-func (f *fake) enterDataBranch(repository, branch string) func() {
+// a data repository. commitID is what the read names - a branch read names the head commit.
+// Reads of the metadata repository are excluded: they belong to a branch tick that is already
+// running, they do not start one.
+func (f *fake) enterDataBranch(repository, commitID string) func() {
 	f.mu.Lock()
 	hook := f.dataBranchHook
 	metadata := f.metadataRepo
@@ -366,7 +387,7 @@ func (f *fake) enterDataBranch(repository, branch string) func() {
 	if hook == nil || repository == metadata {
 		return nil
 	}
-	return hook(branch)
+	return hook(commitID)
 }
 
 // diffRefsCalls returns how many pages of a diff the indexer read.
@@ -478,14 +499,15 @@ func (f *fake) CreateBranch(_ context.Context, repository, branch, source string
 func (f *fake) DeleteBranch(_ context.Context, repository, branch string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.branches[repository][branch]; !ok {
-		return &client.NotFoundError{Operation: "delete branch", Subject: branch}
+	if err := f.requireWritableBranchLocked(repository, branch); err != nil {
+		return err
 	}
 	if f.repositories[repository].DefaultBranch == branch {
-		// Real lakeFS refuses to delete a repository's default branch: pkg/graveler/graveler.go
-		// DeleteBranch returns ErrDeleteDefaultBranch before touching the branch. Model that so an
-		// indexer that tries it fails the test instead of silently "succeeding".
-		return fmt.Errorf("delete branch %q: default branch: %w", branch, client.ErrBadRequest)
+		// Real lakeFS refuses to delete a repository's default branch: graveler.DeleteBranch
+		// returns ErrDeleteDefaultBranch, which pkg/api/controller.go maps to 403, not 400
+		// (handleApiErrorCallback, errors.Is(err, graveler.ErrDeleteDefaultBranch)). Model the
+		// status so an indexer that tries it fails the test instead of silently "succeeding".
+		return fmt.Errorf("delete branch %q: default branch: %w", branch, client.ErrForbidden)
 	}
 	delete(f.branches[repository], branch)
 	delete(f.staged, branch)
@@ -496,6 +518,12 @@ func (f *fake) DeleteBranch(_ context.Context, repository, branch string) error 
 func (f *fake) ResetBranch(_ context.Context, repository, branch string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Real lakeFS resolves the branch first and answers 404 for one that does not exist, so a
+	// reset that "succeeds" on a missing branch would hide a metadata branch deleted under a
+	// tick (graveler.ErrBranchNotFound and ErrRepositoryNotFound are 404 in pkg/api/controller.go).
+	if err := f.requireWritableBranchLocked(repository, branch); err != nil {
+		return err
+	}
 	delete(f.staged, branch)
 	f.resetBranches = append(f.resetBranches, branch)
 	f.events = append(f.events, "reset:"+branch)
@@ -505,6 +533,9 @@ func (f *fake) ResetBranch(_ context.Context, repository, branch string) error {
 func (f *fake) HardResetBranch(_ context.Context, repository, branch, ref string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.requireWritableBranchLocked(repository, branch); err != nil {
+		return err
+	}
 	commit, err := f.resolveLocked(repository, ref)
 	if err != nil {
 		return err
@@ -515,6 +546,25 @@ func (f *fake) HardResetBranch(_ context.Context, repository, branch, ref string
 	// the fake model that, so an indexer that rewrites before discarding staging is caught.
 	f.hardResets = append(f.hardResets, hardReset{repository: repository, branch: branch, ref: ref})
 	f.events = append(f.events, "hard-reset:"+branch+":"+ref)
+	return nil
+}
+
+// requireWritableBranchLocked reports the answers real lakeFS gives before it writes to a branch:
+// 404 for a repository or branch that does not exist (pkg/api/controller.go maps
+// graveler.ErrRepositoryNotFound and ErrBranchNotFound to http.StatusNotFound), and 403 for a
+// read-only repository (graveler.ErrReadOnlyRepository comes before the branch lookup in Commit,
+// Reset, ResetHard and DeleteBranch, and is http.StatusForbidden in pkg/api/controller.go). A branch
+// that exists but has no commit yet is not missing: lakeFS lets a root commit be written to it.
+func (f *fake) requireWritableBranchLocked(repository, branch string) error {
+	if _, ok := f.repositories[repository]; !ok {
+		return &client.NotFoundError{Operation: "get repository", Subject: repository}
+	}
+	if f.repositories[repository].ReadOnly {
+		return fmt.Errorf("write to branch %q: read-only repository: %w", branch, client.ErrForbidden)
+	}
+	if _, ok := f.branches[repository][branch]; !ok {
+		return &client.NotFoundError{Operation: "get branch", Subject: branch}
+	}
 	return nil
 }
 
@@ -550,39 +600,85 @@ func (f *fake) findMergeBaseLocked(repository, sourceRef, destinationRef string)
 	if err != nil {
 		return "", err
 	}
-	reached := f.ancestorsLocked(repository, destination)
-	queue := []string{source}
-	seen := map[string]bool{}
+	for _, commit := range []string{source, destination} {
+		if _, ok := f.commits[repository][commit]; !ok {
+			return "", &client.NotFoundError{Operation: "get commit", Subject: commit}
+		}
+	}
+	if source == destination {
+		return source, nil
+	}
+
+	// The best common ancestor, as graveler's ref.FindMergeBase computes it
+	// (pkg/graveler/ref/merge_base_finder.go): walk both sides in generation order - highest
+	// generation first, newest commit first on a tie - and report the first commit reached from
+	// both. A breadth-first walk from the source instead answers the first common ancestor it
+	// meets, which on a criss-cross or nested-merge history is an ancestor of the best one, so a
+	// test could pin a tag real lakeFS never produces (TS-10).
+	const (
+		fromSource uint8 = 1 << iota
+		fromDestination
+	)
+	reached := map[string]uint8{source: fromSource, destination: fromDestination}
+	queue := []string{source, destination}
 	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-		if seen[current] {
-			continue
+		current := f.popNewestLocked(repository, &queue)
+		flags := reached[current]
+		for _, parent := range f.commits[repository][current].Parents {
+			if _, ok := reached[parent]; !ok {
+				queue = append(queue, parent)
+			}
+			reached[parent] |= flags
+			if reached[parent]&fromSource != 0 && reached[parent]&fromDestination != 0 {
+				if _, ok := f.commits[repository][parent]; !ok {
+					return "", &client.NotFoundError{Operation: "get commit", Subject: parent}
+				}
+				return parent, nil
+			}
 		}
-		seen[current] = true
-		if reached[current] {
-			return current, nil
-		}
-		queue = append(queue, f.commits[repository][current].Parents...)
 	}
 	// graveler.FindMergeBase returns ErrNoMergeBase for unrelated histories; pkg/api turns that
 	// into a 500. The fake reports the same typed error the client must produce.
 	return "", client.ErrNoMergeBase
 }
 
-func (f *fake) ancestorsLocked(repository, commit string) map[string]bool {
-	reached := map[string]bool{}
-	queue := []string{commit}
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-		if current == "" || reached[current] {
-			continue
+// popNewestLocked removes the queued commit graveler's commit-generation priority queue would pop
+// first: the highest generation, and the newest commit on a tie (pkg/graveler/ref/
+// commit_generation_priority_queue.go).
+func (f *fake) popNewestLocked(repository string, queue *[]string) string {
+	best := 0
+	bestGeneration := f.generationLocked(repository, (*queue)[0])
+	for i := 1; i < len(*queue); i++ {
+		generation := f.generationLocked(repository, (*queue)[i])
+		if generation > bestGeneration ||
+			(generation == bestGeneration &&
+				f.commits[repository][(*queue)[i]].CreationDate.After(f.commits[repository][(*queue)[best]].CreationDate)) {
+			best, bestGeneration = i, generation
 		}
-		reached[current] = true
-		queue = append(queue, f.commits[repository][current].Parents...)
 	}
-	return reached
+	current := (*queue)[best]
+	*queue = append((*queue)[:best], (*queue)[best+1:]...)
+	return current
+}
+
+// generationLocked returns a commit's generation: 1 for a root, and one more than the highest
+// generation of its parents. graveler stores it on the commit; the fake derives it, so a test can
+// build a history with addCommit alone.
+func (f *fake) generationLocked(repository, commitID string) int {
+	commit, ok := f.commits[repository][commitID]
+	if !ok || len(commit.Parents) == 0 {
+		return 1
+	}
+	generation := 0
+	for _, parent := range commit.Parents {
+		if candidate := f.generationLocked(repository, parent) + 1; candidate > generation {
+			generation = candidate
+		}
+	}
+	if generation == 0 {
+		generation = 1
+	}
+	return generation
 }
 
 // Commit reads and writes.
@@ -591,6 +687,7 @@ func (f *fake) LogCommits(_ context.Context, repository, ref string, opts client
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.logCalls[repository]++
+	f.logRequests = append(f.logRequests, logCommitsCall{repository: repository, opts: opts})
 	head, err := f.resolveLocked(repository, ref)
 	if err != nil {
 		return nil, false, err
@@ -604,20 +701,46 @@ func (f *fake) LogCommits(_ context.Context, repository, ref string, opts client
 		}
 	}
 	var chain []client.Commit
-	for current := head; current != ""; {
-		commit, ok := f.commits[repository][current]
-		if !ok {
-			break
+	if opts.FirstParent {
+		for current := head; current != ""; {
+			commit, ok := f.commits[repository][current]
+			if !ok {
+				break
+			}
+			chain = append(chain, commit)
+			// The lakeFS API's stop_at is inclusive: the stop commit is the last item returned.
+			if opts.StopAt != "" && current == opts.StopAt {
+				break
+			}
+			if len(commit.Parents) == 0 {
+				break
+			}
+			current = commit.Parents[0]
 		}
-		chain = append(chain, commit)
-		// The lakeFS API's stop_at is inclusive: the stop commit is the last item returned.
-		if opts.StopAt != "" && current == opts.StopAt {
-			break
+	} else {
+		// Without first_parent graveler's ListCommits walks every parent. The fake walks them
+		// breadth first, which is enough to make a dropped FirstParent: true visible (§3.2,
+		// TS-10); the order is not graveler's generation order, and nothing the indexer does
+		// reads a log without first_parent (the client test pins what the client sends).
+		queue := []string{head}
+		seen := map[string]bool{}
+		for len(queue) > 0 {
+			current := queue[0]
+			queue = queue[1:]
+			if current == "" || seen[current] {
+				continue
+			}
+			seen[current] = true
+			commit, ok := f.commits[repository][current]
+			if !ok {
+				continue
+			}
+			chain = append(chain, commit)
+			if opts.StopAt != "" && current == opts.StopAt {
+				continue
+			}
+			queue = append(queue, commit.Parents...)
 		}
-		if len(commit.Parents) == 0 {
-			break
-		}
-		current = commit.Parents[0]
 	}
 	if opts.After != "" {
 		for i, commit := range chain {
@@ -653,6 +776,13 @@ func (f *fake) GetCommit(_ context.Context, repository, commitID string) (client
 func (f *fake) Commit(_ context.Context, repository, branch string, opts client.CommitOptions) (client.Commit, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Real lakeFS resolves the branch before it commits and answers 404 when it (or its
+	// repository) is gone. Re-creating a branch under a commit instead produced a repository state
+	// lakeFS cannot have - a metadata branch whose root commit is an indexing commit - and hid the
+	// 404 a branch deleted under a tick must surface.
+	if err := f.requireWritableBranchLocked(repository, branch); err != nil {
+		return client.Commit{}, err
+	}
 	var state *fakeState
 	if repository == f.metadataRepo {
 		staged, ok := f.staged[branch]
@@ -846,18 +976,25 @@ func (f *fake) StatObject(_ context.Context, repository, ref, path string) (clie
 func (f *fake) LoadTable(_ context.Context, _, branch string) (indexer.Table, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if state, ok := f.staged[branch]; ok {
-		return &fakeTable{f: f, branch: branch, state: state.clone()}, nil
-	}
-	head, ok := f.branches[f.metadataRepo][branch]
-	if !ok || head == "" {
-		return nil, indexer.ErrTableNotFound
-	}
-	state, ok := f.tableAt[head]
+	state, ok := f.tableStateLocked(branch)
 	if !ok {
 		return nil, indexer.ErrTableNotFound
 	}
 	return &fakeTable{f: f, branch: branch, state: state.clone()}, nil
+}
+
+// tableStateLocked returns the table state a load of the branch sees: the staging when it has any
+// (the catalog reads the staged pointer) and the committed state of the branch head otherwise.
+func (f *fake) tableStateLocked(branch string) (*fakeState, bool) {
+	if state, ok := f.staged[branch]; ok {
+		return state, true
+	}
+	head, ok := f.branches[f.metadataRepo][branch]
+	if !ok || head == "" {
+		return nil, false
+	}
+	state, ok := f.tableAt[head]
+	return state, ok
 }
 
 func (f *fake) CreateTable(_ context.Context, _, branch string) (indexer.Table, error) {
@@ -919,6 +1056,19 @@ type fakeTable struct {
 func (t *fakeTable) SourceCommit() string { return t.state.sourceCommit }
 func (t *fakeTable) SnapshotCount() int   { return t.state.snapshots }
 func (t *fakeTable) DeleteFiles() int     { return t.state.deleteFiles }
+
+// Refresh re-reads the branch the way a TableStore.LoadTable would, through the same handle: the
+// staging if the branch has any, the committed state of its head otherwise.
+func (t *fakeTable) Refresh(context.Context) error {
+	t.f.mu.Lock()
+	defer t.f.mu.Unlock()
+	state, ok := t.f.tableStateLocked(t.branch)
+	if !ok {
+		return indexer.ErrTableNotFound
+	}
+	t.state = state.clone()
+	return nil
+}
 
 func (t *fakeTable) ApplyDelta(_ context.Context, upserts []table.Row, deletes []string, sourceCommit string) error {
 	t.f.mu.Lock()
@@ -1233,4 +1383,107 @@ func added(path string, size int64) client.Change {
 // removed is a diff entry that removes an object.
 func removed(path string) client.Change {
 	return client.Change{Path: path, Type: client.ChangeRemoved}
+}
+
+// TestFakeWriteMethodsRefuseAMissingBranchOrRepository pins the fake against the answers real
+// lakeFS gives, so an indexer bug the fake would otherwise hide fails a test (TS-3).
+// pkg/api/controller.go maps graveler.ErrNotFound - ErrBranchNotFound, ErrRepositoryNotFound,
+// ErrCommitNotFound - to http.StatusNotFound, and graveler.ErrDeleteDefaultBranch to
+// http.StatusForbidden; Commit, ResetHard and the reset path all resolve the branch before they
+// write (pkg/graveler/graveler.go Commit, ResetHard; pkg/catalog/catalog.go ResetBranch), so none
+// of them invents a branch lakeFS would answer 404 for.
+func TestFakeWriteMethodsRefuseAMissingBranchOrRepository(t *testing.T) {
+	ctx := t.Context()
+	f := newFake()
+	f.addRepository("repo-metadata", "s3://bucket/data-metadata", "main")
+	init := f.addCommit("repo-metadata", "main", "init", nil, nil)
+
+	_, err := f.Commit(ctx, "repo-metadata", "gone", client.CommitOptions{AllowEmpty: true})
+	require.ErrorIs(t, err, client.ErrNotFound, "commit to a branch that does not exist")
+	require.ErrorIs(t, f.ResetBranch(ctx, "repo-metadata", "gone"), client.ErrNotFound,
+		"reset of a branch that does not exist")
+	require.ErrorIs(t, f.HardResetBranch(ctx, "repo-metadata", "gone", init.ID), client.ErrNotFound,
+		"hard reset of a branch that does not exist")
+	_, created := f.branchHead("repo-metadata", "gone")
+	require.False(t, created, "a refused write does not create the branch")
+
+	_, err = f.Commit(ctx, "gone", "main", client.CommitOptions{AllowEmpty: true})
+	require.ErrorIs(t, err, client.ErrNotFound, "commit in a repository that does not exist")
+	require.ErrorIs(t, f.ResetBranch(ctx, "gone", "main"), client.ErrNotFound,
+		"reset in a repository that does not exist")
+	require.ErrorIs(t, f.HardResetBranch(ctx, "gone", "main", init.ID), client.ErrNotFound,
+		"hard reset in a repository that does not exist")
+	_, registered := f.branches["gone"]
+	require.False(t, registered, "a refused write does not create the repository")
+
+	// The refusal of a default-branch delete carries the status lakeFS answers: 403, not 400.
+	err = f.DeleteBranch(ctx, "repo-metadata", "main")
+	require.ErrorIs(t, err, client.ErrForbidden, "lakeFS refuses a default-branch delete with 403")
+	require.NotErrorIs(t, err, client.ErrBadRequest)
+	head, ok := f.branchHead("repo-metadata", "main")
+	require.True(t, ok)
+	require.Equal(t, init.ID, head)
+
+	// An existing branch without a commit is not a missing branch: a root commit is written.
+	f.addRepository("bare", "s3://bucket/bare", "main")
+	root, err := f.Commit(ctx, "bare", "main", client.CommitOptions{AllowEmpty: true})
+	require.NoError(t, err)
+	require.Empty(t, root.Parents, "a root commit has no parent")
+}
+
+// TestFakeFindMergeBaseIsTheBestCommonAncestor pins the rule of pkg/graveler/ref/merge_base_finder.go
+// - the best common ancestor, one that is not an ancestor of another common ancestor - instead of
+// the first common ancestor a walk from the source meets (TS-10).
+func TestFakeFindMergeBaseIsTheBestCommonAncestor(t *testing.T) {
+	ctx := t.Context()
+	f := newFake()
+	f.addRepository("repo", "s3://bucket/data", "main")
+	f.addCommit("repo", "", "root", nil, nil)
+	f.addCommit("repo", "", "x", []string{"root"}, nil)
+	f.addCommit("repo", "", "y", []string{"x"}, nil)
+	// tip's first parent is x, and its second parent y - and x is an ancestor of y.
+	f.addCommit("repo", "", "tip", []string{"x", "y"}, nil)
+
+	base, err := f.FindMergeBase(ctx, "repo", "tip", "y")
+	require.NoError(t, err)
+	require.Equal(t, "y", base,
+		"y is the best common ancestor: a walk from tip meets x first, but x is an ancestor of y")
+	base, err = f.FindMergeBase(ctx, "repo", "y", "tip")
+	require.NoError(t, err)
+	require.Equal(t, "y", base, "the answer does not depend on the argument order")
+
+	// A linear chain keeps answering the ancestor.
+	base, err = f.FindMergeBase(ctx, "repo", "root", "tip")
+	require.NoError(t, err)
+	require.Equal(t, "root", base)
+}
+
+// TestFakeLogCommitsHonoursFirstParent pins TS-10(b): the fake walks every parent unless the caller
+// asks for the first-parent chain, so dropping FirstParent: true from any of the indexer's walks
+// (pending, seedTag, backfillStart, firstParentHistory) changes what a test sees.
+func TestFakeLogCommitsHonoursFirstParent(t *testing.T) {
+	ctx := t.Context()
+	f := newFake()
+	f.addRepository("repo", "s3://bucket/data", "main")
+	f.addCommit("repo", "main", "s1", nil, nil)
+	f.addCommit("repo", "main", "s2", []string{"s1"}, nil)
+	f.addCommit("repo", "", "side", []string{"s1"}, nil)
+	f.addCommit("repo", "main", "m", []string{"s2", "side"}, nil)
+
+	firstParent, _, err := f.LogCommits(ctx, "repo", "m", client.LogCommitsOptions{FirstParent: true})
+	require.NoError(t, err)
+	require.Equal(t, []string{"m", "s2", "s1"}, commitIDs(firstParent), "the first-parent chain only")
+
+	everyParent, _, err := f.LogCommits(ctx, "repo", "m", client.LogCommitsOptions{FirstParent: false})
+	require.NoError(t, err)
+	require.Equal(t, []string{"m", "s2", "side", "s1"}, commitIDs(everyParent),
+		"every parent's history, so a dropped FirstParent is visible")
+}
+
+func commitIDs(commits []client.Commit) []string {
+	ids := make([]string, 0, len(commits))
+	for _, commit := range commits {
+		ids = append(ids, commit.ID)
+	}
+	return ids
 }

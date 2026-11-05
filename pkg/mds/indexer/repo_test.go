@@ -701,3 +701,42 @@ func (f *fake) addBareMetadataRepository(namespace string) string {
 	f.tableAt[init.ID] = newState()
 	return init.ID
 }
+
+// TestReadOnlyMetadataRepositoryFailsTheRepository pins TS-4: a companion repository lakeFS reports
+// as read-only cannot take the indexing commit or a reset (§4.4 steps 4-5, §4.7), so every branch of
+// it would report the same 403 on every tick and /_health would stay 503. The repository is refused
+// once per tick, before any branch is touched, with a message that names the cause and the fix.
+func TestReadOnlyMetadataRepositoryFailsTheRepository(t *testing.T) {
+	e := newEnv(t)
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.tick()
+	require.NoError(t, e.health.repositoryError("repo"))
+
+	// R-metadata created with read_only: true, or flagged later by an operator.
+	e.fake.setReadOnly("repo-metadata", true)
+	e.fake.addCommit("repo", "main", "s2", []string{"s1"},
+		[]client.ObjectStat{object("a", 10), object("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	made := len(e.fake.madeCommits())
+
+	e.tick()
+
+	err := e.health.repositoryError("repo")
+	require.ErrorIs(t, err, indexer.ErrReadOnlyMetadataRepository)
+	require.Contains(t, err.Error(), "read_only=false", "the error names the reason and the fix")
+	require.Contains(t, err.Error(), "COMMIT", "and the protection rule that would do the same")
+	require.NoError(t, e.health.branch("repo", "main").err, "no branch collects a 403 of its own")
+	require.Len(t, e.fake.madeCommits(), made, "nothing is written into a read-only repository")
+	require.Equal(t, []string{"repo/" + indexer.StageRepository}, e.metrics.errors,
+		"one repository error per tick, not one per branch")
+	require.Empty(t, e.fake.resetCalls())
+
+	// Clearing the flag lets the next tick continue from the recorded position.
+	e.fake.setReadOnly("repo-metadata", false)
+	e.tick()
+
+	require.NoError(t, e.health.repositoryError("repo"))
+	require.NoError(t, e.health.branch("repo", "main").err)
+	require.Equal(t, []string{"a", "b"}, e.paths("main"))
+	require.Equal(t, "s2", e.health.branch("repo", "main").lastIndexed)
+}

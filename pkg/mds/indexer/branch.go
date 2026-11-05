@@ -78,7 +78,7 @@ func (x *Indexer) runBranchOnce(ctx context.Context, repository, branch string, 
 		}
 		return x.runBranchOnce(ctx, repository, branch, state, false)
 	case err != nil:
-		return fmt.Errorf("load the metadata table of %s@%s: %w", branch, repository, err)
+		return fmt.Errorf("load the metadata table of %s@%s: %w", repository, branch, err)
 	}
 	handle := &tableHandle{x: x, repository: repository, branch: branch, table: tbl}
 	defer handle.close()
@@ -212,8 +212,8 @@ func (x *Indexer) lastIndexed(ctx context.Context, repository, branch string) (c
 	return head, head.Metadata[MetadataKeySourceCommit], nil
 }
 
-// tableHandle owns the table of one branch tick and lets a recovery step replace it: a discarded
-// staging must be re-read, and the handle that described it must be released.
+// tableHandle owns the table of one branch tick. A reload re-reads it in place (§4.4), so the
+// handle is released once, when the tick is done with the branch.
 type tableHandle struct {
 	x          *Indexer
 	repository string
@@ -221,16 +221,22 @@ type tableHandle struct {
 	table      Table
 }
 
-// swap closes the current handle and adopts table.
-func (h *tableHandle) swap(table Table) {
-	if h.table != nil && h.table != table {
-		h.x.closeTable(h.table, h.repository, h.branch)
+// close releases the handle.
+func (h *tableHandle) close() {
+	if h.table == nil {
+		return
 	}
-	h.table = table
+	h.x.closeTable(h.table, h.repository, h.branch)
+	h.table = nil
 }
 
-// close releases the handle.
-func (h *tableHandle) close() { h.swap(nil) }
+// refresh re-reads the table through the handle's catalog (§4.4). A reload between the steps of one
+// branch tick uses it instead of a new TableStore.LoadTable: the latter builds a new REST catalog,
+// which fetches /v1/config eagerly, and closes the previous handle's connection pool - three round
+// trips and a TLS handshake per indexed commit instead of one table load (IX-3).
+func (h *tableHandle) refresh(ctx context.Context) error {
+	return h.table.Refresh(ctx)
+}
 
 // createBranch creates R-metadata@b for a branch that has no mirror yet (§4.5). It seeds from the
 // tag of an indexed ancestor when there is one, and otherwise from the initialisation commit so
@@ -383,17 +389,15 @@ func (x *Indexer) startBranch(ctx context.Context, repository, branch string, ha
 	return source.ID, nil
 }
 
-// resetStaging discards the uncommitted changes of R-metadata@b (§4.4) and replaces the tick's
-// table handle with one that describes the committed state.
+// resetStaging discards the uncommitted changes of R-metadata@b (§4.4) and re-reads the tick's
+// table handle from the committed state.
 func (x *Indexer) resetStaging(ctx context.Context, repository, branch string, handle *tableHandle) error {
 	if err := x.lakeFS.ResetBranch(ctx, metadataRepository(repository), branch); err != nil {
 		return fmt.Errorf("discard the staging of %q@%s: %w", metadataRepository(repository), branch, err)
 	}
-	reloaded, err := x.tables.LoadTable(ctx, repository, branch)
-	if err != nil {
-		return fmt.Errorf("reload the metadata table of %s@%s after a reset: %w", branch, repository, err)
+	if err := handle.refresh(ctx); err != nil {
+		return fmt.Errorf("reload the metadata table of %s@%s after a reset: %w", repository, branch, err)
 	}
-	handle.swap(reloaded)
 	x.log.WithFields(logging.Fields{
 		"repository": repository,
 		"branch":     branch,
@@ -615,11 +619,9 @@ func (x *Indexer) rewrite(ctx context.Context, repository, branch string, handle
 			if err := x.lakeFS.HardResetBranch(ctx, metadata, branch, tag); err != nil {
 				return "", fmt.Errorf("hard reset %q@%s to %q: %w", metadata, branch, tag, err)
 			}
-			reloaded, err := x.tables.LoadTable(ctx, repository, branch)
-			if err != nil {
-				return "", fmt.Errorf("reload the metadata table of %s@%s after a hard reset: %w", branch, repository, err)
+			if err := handle.refresh(ctx); err != nil {
+				return "", fmt.Errorf("reload the metadata table of %s@%s after a hard reset: %w", repository, branch, err)
 			}
-			handle.swap(reloaded)
 			x.log.WithFields(logging.Fields{
 				"repository": repository,
 				"branch":     branch,
@@ -638,11 +640,9 @@ func (x *Indexer) rewrite(ctx context.Context, repository, branch string, handle
 	if err := x.lakeFS.HardResetBranch(ctx, metadata, branch, init); err != nil {
 		return "", fmt.Errorf("hard reset %q@%s to the initialisation commit: %w", metadata, branch, err)
 	}
-	reloaded, err := x.tables.LoadTable(ctx, repository, branch)
-	if err != nil {
-		return "", fmt.Errorf("reload the metadata table of %s@%s after a hard reset: %w", branch, repository, err)
+	if err := handle.refresh(ctx); err != nil {
+		return "", fmt.Errorf("reload the metadata table of %s@%s after a hard reset: %w", repository, branch, err)
 	}
-	handle.swap(reloaded)
 
 	var written int64
 	if err := x.rebuild(ctx, repository, handle.table, head, &written); err != nil {
@@ -672,11 +672,12 @@ func (x *Indexer) applyCommit(ctx context.Context, repository, branch string, ha
 
 	// §4.4: reload the table before step 3. The handle may have been loaded before another
 	// writer staged this commit, so its cached lakefs.mds.source-commit is not authoritative.
-	tbl, err := x.tables.LoadTable(ctx, repository, branch)
-	if err != nil {
-		return fmt.Errorf("reload the metadata table of %s@%s before applying %s: %w", branch, repository, commit.ID, err)
+	// The reload goes through the handle's catalog (Table.Refresh): a tick pays the catalog's
+	// /v1/config call once, not once per applied commit (IX-3).
+	if err := handle.refresh(ctx); err != nil {
+		return fmt.Errorf("reload the metadata table of %s@%s before applying %s: %w", repository, branch, commit.ID, err)
 	}
-	handle.swap(tbl)
+	tbl := handle.table
 
 	var written int64
 	if changes.large || changes.count > x.rebuildThreshold {

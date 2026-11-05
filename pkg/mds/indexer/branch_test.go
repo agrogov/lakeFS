@@ -7,12 +7,20 @@ package indexer_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/mds/client"
 	"github.com/treeverse/lakefs/pkg/mds/indexer"
 	"github.com/treeverse/lakefs/pkg/mds/table"
@@ -405,6 +413,10 @@ func TestMergeUsesTheFirstParent(t *testing.T) {
 	require.Equal(t, merge.CreationDate, *c.CreationDate, "a merge writes its own creation_date")
 	require.Equal(t, 1, e.fake.rebuildCalls, "one rebuild at s1; s2 and the merge are deltas")
 	require.Empty(t, e.fake.statCalls)
+	for _, request := range e.fake.logRequests {
+		require.True(t, request.opts.FirstParent,
+			"§3.2 walks the first-parent chain, so every log read asks for it (repository %q)", request.repository)
+	}
 }
 
 // TestRecovery pins every row of §4.4's crash table by injecting the state a crash leaves behind.
@@ -537,14 +549,50 @@ func TestRecovery(t *testing.T) {
 
 	t.Run("crashed during the iceberg commit", func(t *testing.T) {
 		e := indexed(t)
-		// Data files written, no staged pointer: the next tick finds a clean branch and indexes
-		// the pending commit normally. The orphan files are lakectl iceberg cleanup's problem.
+		// The transaction wrote data files and never staged a pointer: the next tick finds a clean
+		// branch and indexes the pending commit normally. The orphan files are unreferenced and
+		// are lakectl iceberg cleanup's problem (§4.4 row 5, §9); the fake has no object store to
+		// leave them in, so what is pinned here is that nothing staged is neither replayed nor reset.
 		e.tick()
 
 		require.Empty(t, e.fake.resetCalls())
 		state, _ := e.fake.tableState("main")
 		require.Equal(t, []string{"a", "b"}, state.paths())
 		require.Equal(t, 2, e.metrics.indexed["repo"])
+	})
+
+	t.Run("crashed during the iceberg commit with a partial staging", func(t *testing.T) {
+		e := indexed(t)
+		// The crash left a partial write behind: the transaction staged rows but never moved the
+		// table pointer, so the staged lakefs.mds.source-commit is empty and cannot describe s2.
+		// An indexer that treats any staging as "already applied" would commit the partial state
+		// (and record no position); the correct recovery discards it and applies s2 as a delta.
+		committed, ok := e.fake.tableState("main")
+		require.True(t, ok)
+		partial := committed.clone()
+		partial.sourceCommit = ""
+		partial.rows["b"] = table.Row{
+			Repository:   "repo",
+			Path:         "b",
+			CommitID:     "s2",
+			SizeBytes:    999, // the partial value: the delta must replace it
+			LastModified: time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC),
+			ETag:         "etag-partial",
+		}
+		e.fake.stage("main", partial)
+		e.fake.applyCalls = 0
+
+		e.tick()
+
+		require.Equal(t, []string{"main"}, e.fake.resetCalls(), "the partial staging is discarded")
+		require.Equal(t, 1, e.fake.applyCalls, "and s2 is applied as a normal delta")
+		state, ok := e.fake.tableState("main")
+		require.True(t, ok)
+		require.Equal(t, "s2", state.sourceCommit)
+		e.requireRow("main", "b", "s2", 20)
+		require.Equal(t, []string{"a", "b"}, state.paths())
+		_, ok = e.fake.tagCommit("repo-metadata", "mds-s2")
+		require.True(t, ok, "the recovered commit is tagged")
 	})
 
 	t.Run("a concurrent writer moves the table", func(t *testing.T) {
@@ -1049,20 +1097,34 @@ func TestBranchStopsMatchingKeepsItsTable(t *testing.T) {
 	require.Empty(t, e.fake.deletedBranches, "and it is not deleted: it still exists in R")
 }
 
-// loadHookStore wraps the fake's table store and runs a hook around selected LoadTable calls, so a
-// test can act "between" two steps of one tick.
-type loadHookStore struct {
+// reloadHookStore wraps the fake's table store and runs a hook before the first reload of the
+// handle it serves, so a test can act "between" two steps of one tick.
+type reloadHookStore struct {
 	indexer.TableStore
-	calls  int
-	onLoad func(int)
+	onReload func()
 }
 
-func (s *loadHookStore) LoadTable(ctx context.Context, repository, branch string) (indexer.Table, error) {
-	s.calls++
-	if s.onLoad != nil {
-		s.onLoad(s.calls)
+func (s *reloadHookStore) LoadTable(ctx context.Context, repository, branch string) (indexer.Table, error) {
+	tbl, err := s.TableStore.LoadTable(ctx, repository, branch)
+	if err != nil {
+		return nil, err
 	}
-	return s.TableStore.LoadTable(ctx, repository, branch)
+	return &reloadHookTable{Table: tbl, store: s}, nil
+}
+
+// reloadHookTable runs the store's hook before the table re-reads itself. The reload goes through
+// the handle (§4.4, Table.Refresh), not through another LoadTable, so the hook belongs here.
+type reloadHookTable struct {
+	indexer.Table
+	store *reloadHookStore
+}
+
+func (t *reloadHookTable) Refresh(ctx context.Context) error {
+	if hook := t.store.onReload; hook != nil {
+		t.store.onReload = nil
+		hook()
+	}
+	return t.Table.Refresh(ctx)
 }
 
 // TestReloadTableBeforeApplyingCommit pins §4.4's "before step 3 the indexer reloads the table and
@@ -1077,11 +1139,8 @@ func TestReloadTableBeforeApplyingCommit(t *testing.T) {
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
 	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
 
-	store := &loadHookStore{TableStore: e.fake}
-	store.onLoad = func(call int) {
-		if call != 2 {
-			return
-		}
+	store := &reloadHookStore{TableStore: e.fake}
+	store.onReload = func() {
 		// Another writer stages s2 after the tick's first LoadTable and before step 3.
 		state, ok := e.fake.tableState("main")
 		require.True(t, ok)
@@ -1316,4 +1375,223 @@ func TestConcurrencyBoundsBranchesInFlight(t *testing.T) {
 		require.Zero(t, health.lag, "branch %q", branch)
 		e.requireRow(branch, "b", "s2-"+branch, 20)
 	}
+}
+
+// deleteMetadataBranchBeforeCommit wraps the fake lakeFS and deletes one metadata branch just
+// before the indexer commits to it. It is the probe TS-3 describes: a branch (or its repository)
+// that disappears while a tick is writing is a 404 in real lakeFS, not a silent success.
+type deleteMetadataBranchBeforeCommit struct {
+	client.LakeFS
+	repository string
+	branch     string
+	once       sync.Once
+}
+
+func (w *deleteMetadataBranchBeforeCommit) Commit(ctx context.Context, repository, branch string, opts client.CommitOptions) (client.Commit, error) {
+	if repository == w.repository && branch == w.branch {
+		w.once.Do(func() { _ = w.LakeFS.DeleteBranch(ctx, w.repository, w.branch) })
+	}
+	return w.LakeFS.Commit(ctx, repository, branch, opts)
+}
+
+// TestMetadataBranchDeletedDuringATickFails pins §4.2 step 6 and §4.4 for the one write real lakeFS
+// refuses with a 404 that the tick must surface: the metadata branch deleted between the tick's load
+// and its commit. The old fake re-created the branch under an indexing commit - a history lakeFS
+// cannot produce - and reported success (TS-3). The next tick finds no mirror, creates it again
+// (seeded from the mds-s1 tag) and catches up, so the failure is not permanent.
+func TestMetadataBranchDeletedDuringATickFails(t *testing.T) {
+	e := newEnv(t, func(opts *indexer.Options) {
+		opts.Repositories[0].Branches = []string{"main", "feature"}
+	})
+	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.setBranchHead("repo", "feature", "s1")
+	e.tick()
+	require.Len(t, e.fake.createdBranches, 1, "the feature mirror is created")
+
+	e.fake.addCommit("repo", "feature", "s2", []string{"s1"}, nil)
+	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+
+	wrapped := &deleteMetadataBranchBeforeCommit{
+		LakeFS:     e.fake,
+		repository: "repo-metadata",
+		branch:     "feature",
+	}
+	idx, err := indexer.New(indexer.Options{
+		LakeFS:       wrapped,
+		Tables:       e.fake,
+		Repositories: []indexer.Repository{{Name: "repo", Branches: []string{"main", "feature"}}},
+		Health:       e.health,
+		Metrics:      e.metrics,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, idx.Tick(t.Context()))
+
+	err = e.health.branch("repo", "feature").err
+	require.Error(t, err, "a commit to a branch that is gone is not a success")
+	require.ErrorIs(t, err, client.ErrNotFound, "it is the 404 lakeFS answers")
+	require.NoError(t, e.health.branch("repo", "main").err, "the other branch is unaffected")
+	_, ok := e.fake.branchHead("repo-metadata", "feature")
+	require.False(t, ok, "the fake does not re-create the branch under an indexing commit")
+
+	// §4.5 again on the next tick: the mirror is gone, so it is seeded from the indexed ancestor.
+	e.tick()
+
+	require.NoError(t, e.health.branch("repo", "feature").err)
+	require.Equal(t, []string{"a", "b"}, e.paths("feature"))
+	require.Equal(t, "s2", e.health.branch("repo", "feature").lastIndexed)
+}
+
+// failingReloadStore makes the reload of every table it serves fail, so a test can force the error
+// paths between the steps of a tick (IX-6).
+type failingReloadStore struct {
+	indexer.TableStore
+	err error
+}
+
+func (s *failingReloadStore) LoadTable(ctx context.Context, repository, branch string) (indexer.Table, error) {
+	tbl, err := s.TableStore.LoadTable(ctx, repository, branch)
+	if err != nil {
+		return nil, err
+	}
+	return &failingReloadTable{Table: tbl, err: s.err}, nil
+}
+
+type failingReloadTable struct {
+	indexer.Table
+	err error
+}
+
+func (t *failingReloadTable) Refresh(context.Context) error { return t.err }
+
+// TestErrorMessagesNameTheRepositoryBeforeTheBranch pins IX-6: every message that identifies a
+// metadata table names repository@branch, like the rest of the package, not branch@repository.
+func TestErrorMessagesNameTheRepositoryBeforeTheBranch(t *testing.T) {
+	reloadErr := errors.New("the catalog is unreachable")
+	requireMessage := func(t *testing.T, err error, phrase string) {
+		t.Helper()
+		require.ErrorIs(t, err, reloadErr)
+		require.Contains(t, err.Error(), phrase)
+		require.Contains(t, err.Error(), "repo@main", "the repository comes before the branch")
+		require.NotContains(t, err.Error(), "main@repo")
+	}
+
+	t.Run("before applying a commit", func(t *testing.T) {
+		e := newEnv(t)
+		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.tick()
+		e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
+		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+
+		idx, err := indexer.New(indexer.Options{
+			LakeFS:       e.fake,
+			Tables:       &failingReloadStore{TableStore: e.fake, err: reloadErr},
+			Repositories: []indexer.Repository{{Name: "repo", Branches: []string{"main"}}},
+			Health:       e.health,
+			Metrics:      e.metrics,
+		})
+		require.NoError(t, err)
+		require.NoError(t, idx.Tick(t.Context()))
+
+		requireMessage(t, e.health.branch("repo", "main").err, "before applying s2")
+	})
+
+	t.Run("after discarding staging", func(t *testing.T) {
+		e := newEnv(t)
+		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.tick()
+		committed, ok := e.fake.tableState("main")
+		require.True(t, ok)
+		staged := committed.clone()
+		staged.sourceCommit = "not-a-commit-of-this-branch"
+		e.fake.stage("main", staged)
+
+		idx, err := indexer.New(indexer.Options{
+			LakeFS:       e.fake,
+			Tables:       &failingReloadStore{TableStore: e.fake, err: reloadErr},
+			Repositories: []indexer.Repository{{Name: "repo", Branches: []string{"main"}}},
+			Health:       e.health,
+			Metrics:      e.metrics,
+		})
+		require.NoError(t, err)
+		require.NoError(t, idx.Tick(t.Context()))
+
+		requireMessage(t, e.health.branch("repo", "main").err, "after a reset")
+	})
+}
+
+// TestReloadReusesTheBranchCatalog pins IX-3: the reload before step 3 goes through the branch's
+// catalog (Table.Refresh), so a tick that applies two commits fetches the catalog's /v1/config once
+// instead of once per commit. The old path built a new rest.Catalog per reload, and rest.NewCatalog
+// eagerly fetches /v1/config; it also closed the previous handle, dropping its connection pool.
+func TestReloadReusesTheBranchCatalog(t *testing.T) {
+	ctx := t.Context()
+	env := newMDSServerEnv(t)
+
+	// The first tick backfills the branch; the counted tick applies two deltas.
+	require.NoError(t, env.catalog.CreateEntry(ctx, env.dataRepo, "main", env.entry(t, "a", 10, "etag-a")))
+	_, err := env.catalog.Commit(ctx, env.dataRepo, "main", "add a", "tester", nil, nil, nil, false)
+	require.NoError(t, err)
+	buildIndexer := func(endpoint string) *indexer.Indexer {
+		t.Helper()
+		idx, err := indexer.New(indexer.Options{
+			Endpoint:    endpoint,
+			AccessKeyID: env.accessKeyID,
+			SecretKey:   env.secretKey,
+			Repositories: []indexer.Repository{{
+				Name:     env.dataRepo,
+				Branches: []string{"main"},
+			}},
+			// The fixture's object addresses are outside the blockstore root, so a full listing
+			// of a commit with objects is not available; starting from the root commit keeps the
+			// tick to deltas, which is all this test needs.
+			Backfill: indexer.BackfillHistory,
+			Log:      logging.FromContext(ctx),
+		})
+		require.NoError(t, err)
+		return idx
+	}
+	require.NoError(t, buildIndexer(env.url).Tick(ctx), "backfill the branch")
+
+	require.NoError(t, env.catalog.CreateEntry(ctx, env.dataRepo, "main", env.entry(t, "b", 20, "etag-b")))
+	_, err = env.catalog.Commit(ctx, env.dataRepo, "main", "add b", "tester", nil, nil, nil, false)
+	require.NoError(t, err)
+	require.NoError(t, env.catalog.CreateEntry(ctx, env.dataRepo, "main", env.entry(t, "c", 30, "etag-c")))
+	third, err := env.catalog.Commit(ctx, env.dataRepo, "main", "add c", "tester", nil, nil, nil, false)
+	require.NoError(t, err)
+
+	target, err := url.Parse(env.url)
+	require.NoError(t, err)
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	var configCalls atomic.Int64
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/v1/config") {
+			configCalls.Add(1)
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(front.Close)
+
+	require.NoError(t, buildIndexer(front.URL).Tick(ctx), "one tick, two pending commits")
+	require.EqualValues(t, 1, configCalls.Load(),
+		"one catalog per branch tick: the reloads reuse it instead of fetching /v1/config again")
+
+	// And both commits really were applied by that tick.
+	readCatalog, err := table.NewCatalog(ctx, table.CatalogConfig{
+		Endpoint:        env.url,
+		Repository:      env.metadataRepo,
+		Branch:          "main",
+		AccessKeyID:     env.accessKeyID,
+		SecretAccessKey: env.secretKey,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = readCatalog.Close() })
+	tbl, err := readCatalog.LoadTable(ctx, table.Identifier())
+	require.NoError(t, err)
+	require.Equal(t, third.Reference, tbl.Properties()[table.PropertySourceCommit])
+	paths := make([]string, 0, 3)
+	for _, row := range scanMDSRows(t, tbl) {
+		paths = append(paths, row.Path)
+	}
+	require.Equal(t, []string{"a", "b", "c"}, paths)
 }

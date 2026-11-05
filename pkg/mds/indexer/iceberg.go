@@ -131,6 +131,13 @@ func (t *icebergTable) SnapshotCount() int {
 	return len(t.table.Metadata().Snapshots())
 }
 
+// Refresh implements Table: it reloads the table through the catalog the handle was loaded from.
+// A fresh TableStore.LoadTable would build a new REST catalog, whose construction eagerly fetches
+// /v1/config and whose Close drops the connection pool, once per applied commit (IX-3).
+func (t *icebergTable) Refresh(ctx context.Context) error {
+	return t.table.Refresh(ctx)
+}
+
 // DeleteFiles implements Table: the number of delete files of the current snapshot, read from the
 // snapshot summary instead of the manifest list so that a tick does not pay an extra read for a
 // maintenance decision (§4.9).

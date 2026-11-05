@@ -22,13 +22,22 @@ type Table interface {
 	// the table has none (a table that was created but never written).
 	SourceCommit() string
 
-	// SnapshotCount returns the number of snapshots the table metadata carries. §4.9's
-	// every_commits trigger counts them.
+	// SnapshotCount returns the number of snapshots the table metadata carries. It is a log
+	// field of the compaction decision, nothing more: §4.9's every_commits trigger counts the
+	// indexing commits in the first-parent log of R-metadata@b (indexedSinceCompaction), not
+	// snapshots - compaction adds a snapshot itself, so counting snapshots would advance the
+	// trigger on every compaction (the bug commit 7f06dad27 fixed).
 	SnapshotCount() int
 
 	// DeleteFiles returns the number of delete files the current snapshot reads. §4.9's
 	// max_delete_files trigger counts them.
 	DeleteFiles() int
+
+	// Refresh re-reads the table through the store the handle was loaded from, and is how §4.4's
+	// reload before step 3 and the reloads after a reset see durable state. It reuses the
+	// handle's catalog instead of building a new one, so a reload does not pay the catalog's
+	// /v1/config round trip once per indexed commit, nor drop and rebuild its connection pool.
+	Refresh(ctx context.Context) error
 
 	// ApplyDelta applies one commit of the data repository: the upserts replace the rows of their
 	// paths, the deletes remove theirs, and the table property lakefs.mds.source-commit moves to

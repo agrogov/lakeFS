@@ -28,6 +28,15 @@ import (
 // a test pins it to the real constant.
 const automaticCreationCommitMessage = "Repository created"
 
+// ErrReadOnlyMetadataRepository is reported for a companion repository that lakeFS reports as
+// read-only (§3.3, §4.8). A read-only repository refuses every write of a tick with 403
+// (graveler.ErrReadOnlyRepository, mapped to http.StatusForbidden in pkg/api/controller.go), so the
+// branch would report the same error on every tick, /_health would stay 503 and tag retention would
+// never run. A branch-protection rule that blocks COMMIT on the companion's branches has the same
+// effect but is not visible in the repository record; the error names both causes, and the
+// repository is refused once per tick instead of failing every branch of it.
+var ErrReadOnlyMetadataRepository = errors.New("the companion repository is read-only")
+
 // ensureMetadataRepository makes sure R-metadata of a configured repository exists, is one this
 // indexer created, and is initialised (§3.3, §4.8). It returns the name of the companion
 // repository and caches its default branch and initialisation commit for the rest of the tick.
@@ -53,6 +62,14 @@ func (x *Indexer) ensureMetadataRepository(ctx context.Context, repository Repos
 		}
 	case err != nil:
 		return "", fmt.Errorf("companion repository %q: %w", metadata, err)
+	}
+
+	// A companion repository that cannot be written fails every commit, reset and rewrite of §4.4
+	// and §4.7 with 403. Report that as a repository-level refusal instead of the same per-branch
+	// error on every tick, which no operator could tell apart from a transient failure (TS-4).
+	if meta.ReadOnly {
+		return "", fmt.Errorf("%w: %q: create it with read_only=false and do not protect its branches against COMMIT",
+			ErrReadOnlyMetadataRepository, metadata)
 	}
 
 	// §3.3's namespace rule, checked on every tick and not only when R-metadata is created. Both
