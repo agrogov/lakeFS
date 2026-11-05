@@ -37,12 +37,15 @@
 //	overwrite                the same row carries the new etag, size and commit_id
 //	delete                   the row is gone
 //	S3-gateway upload        the row carries the object's X-Amz-Meta-* user metadata
+//	filtered scan            PyIceberg's row_filter and DuckDB's WHERE ... ORDER BY ... LIMIT
+//	                         return the same data/ rows through all four engine/mount recipes
 //	new branch               the branch is seeded from the mds-<commit> tag of the indexed
 //	                         ancestor (§4.5 step 1), which its own history proves
 //	merge                    the object a merge brings in gets the merge commit's id (§3.2)
 //	tag, short commit id     both refs read the snapshot the index recorded for that commit (§6)
 //	hard reset               the branch is rewritten to the indexed ancestor (§4.7)
-//	indexer restart          a kill mid-tick and a restart converge on the branch head (§4.4)
+//	indexer restart          a deterministic kill after the Iceberg commit and before the lakeFS
+//	                         commit is recovered, with no replay and no leftover staging (§4.4)
 //	user without R access    403 on the virtual table
 //	user with R-metadata only  200 on R-metadata's own table, 403 through R.<ref>.system.object_metadata
 //	non-indexer write        admin cannot write R-metadata (the deny of §8 is in force)
@@ -55,6 +58,12 @@
 // branch - the full-listing rebuild of §4.5 step 2 - reporting the number. It is a measurement, not
 // a gate: the assertions are about the rows that come out, and the duration is logged (and quoted
 // in the commit that added this file).
+//
+// TestMetadataSearchCompactionAndTagRetention runs §4.9 on a real catalog with a low
+// max_delete_files and a short tag_retention: the compaction commit, the pre-compaction tag, the
+// unchanged rows and position, lakefs_mds_compactions_total, and the retirement of an old tag
+// while the live position's tag stays. TestMetadataSearchBranchDeletion runs §4.8's mirrored
+// deletion: the R-metadata branch is gone, its tags and history remain readable.
 //
 // # No workarounds
 //
@@ -89,6 +98,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/exec"
@@ -203,6 +214,21 @@ const (
 	// of the local recipe removes a 100k-object prefix slowly on one stream, and the run has to fit
 	// in the suite's own time budget.
 	mdsCleanupStreams = 16
+
+	// mdsCommitWindowTimeout bounds the wait for the indexer to reach the lakeFS commit of
+	// R-metadata after a data commit: the indexer ticks every mdsIndexerPeriod, so ten seconds is
+	// several periods. Missing it is a failed case, not a slower run: the restart case must kill
+	// inside the crash window of §4.4, not between ticks.
+	mdsCommitWindowTimeout = 10 * time.Second
+
+	// mdsHeldCommitTimeout bounds how long the intercepting proxy holds a lakeFS commit when the
+	// test does not release it. It is a safety net for a failed test, not a wait the case relies
+	// on.
+	mdsHeldCommitTimeout = 30 * time.Second
+
+	// mdsFilteredPathPrefix is the prefix of the filtered-scan example of
+	// docs/metadata-search.md: the suite's objects live under data/ instead of orders/.
+	mdsFilteredPathPrefix = "data/"
 )
 
 // mdsEnv is one running lakefs-sso with Metadata Search enabled, one running `lakefs-sso mds run`,
@@ -256,6 +282,22 @@ type mdsEnv struct {
 
 	// metadataRepo is R + icebergcatalog.MetadataRepositorySuffix (§3.3).
 	metadataRepo string
+
+	// indexerEndpoint is the lakeFS base URL written to metadata_search.lakefs_mds_endpoint.
+	// It is the intercepting proxy below, so the restart case can hold one lakeFS request and
+	// kill the indexer inside the crash window of §4.4.
+	indexerEndpoint string
+
+	// indexerProxy forwards every indexer request to the server and can hold the lakeFS commit
+	// of R-metadata after the Iceberg commit has been staged.
+	indexerProxy *mdsProxy
+
+	// The maintenance settings of metadata_search (§4.9, §7). newMDSEnv writes the design's
+	// defaults; a maintenance case overrides them before startIndexer.
+	tagRetention             string
+	deleteBranches           bool
+	compactionMaxDeleteFiles int
+	compactionEveryCommits   int
 
 	// indexerKey and indexerSecret are the credentials of mds-indexer, created by this suite
 	// through the auth API after the server's bootstrap created the user (§8).
@@ -355,6 +397,22 @@ func TestMetadataSearchEndToEnd(t *testing.T) {
 			"the gateway stores X-Amz-Meta-<lowercased name>; row metadata: %v", row.UserMetadata)
 		require.Equal(t, row.UserMetadata, mdsRowOf(t, read.DuckDB.Rows, "data/gateway.txt").UserMetadata,
 			"DuckDB must read the map column the same way")
+	})
+
+	t.Run("filtered scan", func(t *testing.T) {
+		// The guide's filtered reads - PyIceberg's row_filter and DuckDB's WHERE ... ORDER BY
+		// size_bytes DESC LIMIT - are not the full scan every other case runs. This step runs them
+		// through all four engine/mount recipes and requires the same signatures: the predicate is
+		// pushed down and the two engines must not answer different tables.
+		read := env.readFilteredRows(t, mdsBranch)
+		require.Equal(t, []string{"data/gateway.txt", "data/one.txt"}, mdsPaths(read.PyIceberg.Rows),
+			"the row_filter GreaterThan(size_bytes, 0) & StartsWith(path, %q) must return exactly the data/ rows",
+			mdsFilteredPathPrefix)
+		require.NotEmpty(t, read.DuckDB.Rows, "DuckDB's filtered WHERE ... ORDER BY ... LIMIT must return the same rows")
+		require.Equal(t, "data/one.txt", read.DuckDB.Rows[0].Path,
+			"DuckDB's ORDER BY size_bytes DESC must put the largest row first")
+		requireNonIncreasingSizes(t, read.DuckDB.Rows, "DuckDB through "+icebergcatalog.RelativeToBasePath)
+		requireNonIncreasingSizes(t, read.DuckDBIdentifier.Rows, "DuckDB through "+icebergcatalog.MetadataSearchBasePath)
 	})
 
 	t.Run("new branch is seeded", func(t *testing.T) {
@@ -474,23 +532,75 @@ func TestMetadataSearchEndToEnd(t *testing.T) {
 	})
 
 	t.Run("indexer restart", func(t *testing.T) {
-		// A restart must be harmless: the position is a lakeFS commit, so the next process resumes
-		// there (§4.4). The kill is attempted while a tick is in progress - a crash window the
-		// unit tests of M4 pin exactly; here the observable outcome is convergence, not recovery.
+		// §4.4 row 1: a kill after the Iceberg commit (step 3) and before the lakeFS commit
+		// (step 4) must be recovered by the next process. The test does not hope to catch the gap
+		// between two ticks: it holds the lakeFS commit request at the indexer's proxy, which is
+		// the observable moment after the staged pointer exists and before it is committed, and
+		// fails when that request does not arrive within a bounded wait.
 		env.uploadObject(t, mdsBranch, "data/before-restart.txt", "before")
-		env.commitBranch(t, cl, mdsBranch, "mds test: commit before the restart")
-		env.stopIndexerWhenTicking(t)
+		beforeRestart := env.commitBranch(t, cl, mdsBranch, "mds test: commit before the restart")
+		env.waitIndexed(t, mdsBranch, beforeRestart)
+		seededAt := env.metadataCommitTagged(t, beforeRestart)
+
+		gate := env.indexerProxy.holdNextMetadataCommit(t)
+		env.uploadObject(t, mdsBranch, "data/during-window.txt", "window")
+		windowCommit := env.commitBranch(t, cl, mdsBranch, "mds test: commit in the crash window")
+		env.waitForMetadataCommitWindow(t, gate, windowCommit)
+		env.stopIndexer(t)
+		gate.letGo()
+
+		// The kill landed after step 3 and before step 4: the staged pointer is on the branch,
+		// and the branch head still records the previous commit because the held commit was never
+		// forwarded.
+		require.NotEmptyf(t, env.metadataStaging(t, mdsBranch),
+			"the kill must land after the Iceberg commit staged %s on %s@%s",
+			windowCommit, env.metadataRepo, mdsBranch)
+		afterKill := env.metadataLog(t, mdsBranch)
+		require.Equalf(t, seededAt, afterKill[0].Id,
+			"the held lakeFS commit of %s must not exist after the kill; history: %v",
+			windowCommit, mdsCommitLog(afterKill))
 
 		env.uploadObject(t, mdsBranch, "data/after-restart.txt", "after")
 		restartCommit := env.commitBranch(t, cl, mdsBranch, "mds test: commit while the indexer is down")
 		env.startIndexer(t)
 		env.waitIndexed(t, mdsBranch, restartCommit)
+		env.waitMetadataStagingEmpty(t, mdsBranch)
 
 		read := env.readRows(t, mdsBranch)
 		require.Contains(t, mdsPaths(read.PyIceberg.Rows), "data/before-restart.txt")
+		require.Contains(t, mdsPaths(read.PyIceberg.Rows), "data/during-window.txt",
+			"the commit the killed process had already staged must be completed, not lost")
 		require.Contains(t, mdsPaths(read.PyIceberg.Rows), "data/after-restart.txt",
 			"a restarted indexer must index the commits it missed")
 		require.Equal(t, restartCommit, read.PyIceberg.SourceCommit)
+
+		// Recovery must advance the position by exactly the two commits the process missed: one
+		// indexing commit for the staged windowCommit and one for restartCommit, with no replay
+		// of windowCommit and no leftover staging.
+		log := env.metadataLog(t, mdsBranch)
+		var aboveSeed []apigen.Commit
+		seenSeed := false
+		for _, commit := range log {
+			if commit.Id == seededAt {
+				seenSeed = true
+				break
+			}
+			aboveSeed = append(aboveSeed, commit)
+		}
+		require.Truef(t, seenSeed, "the log of %s@%s must still contain %s; history: %v",
+			env.metadataRepo, mdsBranch, seededAt, mdsCommitLog(log))
+		indexCommits := make([]string, 0, 2)
+		for _, commit := range aboveSeed {
+			if strings.HasPrefix(commit.Message, "mds: index ") {
+				indexCommits = append(indexCommits, commit.Message)
+			}
+		}
+		require.ElementsMatchf(t, []string{
+			fmt.Sprintf(indexer.IndexCommitMessage, env.repo, windowCommit),
+			fmt.Sprintf(indexer.IndexCommitMessage, env.repo, restartCommit),
+		}, indexCommits,
+			"recovery must write exactly one indexing commit per missed commit and no replay; history: %v",
+			mdsCommitLog(log))
 	})
 
 	t.Run("user without access is refused", func(t *testing.T) {
@@ -733,6 +843,133 @@ func TestMetadataSearchBackfill(t *testing.T) {
 		"the backfilled table must record the imported commit as its position")
 }
 
+// TestMetadataSearchCompactionAndTagRetention runs §4.9 on a real catalog: a low max_delete_files
+// makes two deletes trigger the compaction, the compaction commit is visible in R-metadata's
+// history, the mds-* tag stays on the pre-compaction commit, the rows and the position do not
+// change, lakefs_mds_compactions_total reports the rewrite, and a short tag_retention retires the
+// old tag while keeping the tag of the live position.
+func TestMetadataSearchCompactionAndTagRetention(t *testing.T) {
+	env := newMDSEnv(t)
+	env.compactionMaxDeleteFiles = 1
+	env.compactionEveryCommits = 1000
+	env.tagRetention = "1s"
+	env.writeConfig(t, env.indexerKey, env.indexerSecret)
+	env.startIndexer(t)
+	cl := env.admin
+
+	for path, content := range map[string]string{
+		"data/keep-one.txt": "keep one",
+		"data/keep-two.txt": "keep two",
+		"data/gone-one.txt": "gone one",
+		"data/gone-two.txt": "gone two",
+	} {
+		env.uploadObject(t, mdsBranch, path, content)
+	}
+	first := env.commitBranch(t, cl, mdsBranch, "mds test: four rows before compaction")
+	env.waitIndexed(t, mdsBranch, first)
+	require.Len(t, env.readRows(t, mdsBranch).PyIceberg.Rows, 4, "the four objects must be indexed")
+
+	// Age the first source commit beyond tag_retention: retention measures the source commit's
+	// creation date, not the tag's.
+	time.Sleep(1500 * time.Millisecond)
+
+	// Two separate deletes are two merge-on-read transactions, so the table carries two delete
+	// files; max_delete_files=1 makes the second one cross the threshold.
+	env.deleteObject(t, mdsBranch, "data/gone-one.txt")
+	firstDelete := env.commitBranch(t, cl, mdsBranch, "mds test: first delete")
+	env.waitIndexed(t, mdsBranch, firstDelete)
+	env.deleteObject(t, mdsBranch, "data/gone-two.txt")
+	secondDelete := env.commitBranch(t, cl, mdsBranch, "mds test: second delete")
+	env.waitIndexed(t, mdsBranch, secondDelete)
+
+	log := env.metadataLog(t, mdsBranch)
+	require.NotEmpty(t, log)
+	require.Equalf(t, fmt.Sprintf(indexer.CompactCommitMessage, env.repo, secondDelete), log[0].Message,
+		"the tick that crossed max_delete_files must end with the %q commit of §4.9; history: %v",
+		indexer.CompactCommitMessage, mdsCommitLog(log))
+	require.Equal(t, secondDelete, mdsSourceCommitOf(log[0]),
+		"the compaction commit keeps the same source commit")
+
+	tagCommit := env.metadataCommitTagged(t, secondDelete)
+	require.NotEqualf(t, log[0].Id, tagCommit,
+		"the compaction must not move %s%s: the tag stays on the pre-compaction commit; history: %v",
+		indexer.TagPrefix, secondDelete, mdsCommitLog(log))
+	require.Equalf(t, log[1].Id, tagCommit,
+		"%s%s must stay on the indexing commit the compaction rewrote, not on an older one; history: %v",
+		indexer.TagPrefix, secondDelete, mdsCommitLog(log))
+	require.Equal(t, secondDelete, mdsSourceCommitOf(log[1]),
+		"the commit under the compaction commit must be the index commit it compacted; history: %v",
+		mdsCommitLog(log))
+
+	read := env.readRows(t, mdsBranch)
+	require.Equal(t, []string{"data/keep-one.txt", "data/keep-two.txt"}, mdsPaths(read.PyIceberg.Rows),
+		"compaction must keep the rows that were not deleted and must not duplicate the survivors")
+	require.Equal(t, secondDelete, read.PyIceberg.SourceCommit,
+		"compaction must not move the freshness property")
+
+	line := env.indexerMetric(t, "lakefs_mds_compactions_total")
+	require.NotEqualf(t, "unavailable", line, "the indexer must expose %s", "lakefs_mds_compactions_total")
+	fields := strings.Fields(line)
+	require.Lenf(t, fields, 2, "unexpected %s line: %q", "lakefs_mds_compactions_total", line)
+	require.Equalf(t, "1", fields[1], "one compaction must be counted: %q", line)
+
+	// Retention is measured on the source commit, so the old tag is retired once it is older than
+	// tag_retention. The tag that records the branch's current position stays: §4.4 would recreate
+	// it on the next tick, and retention must not fight tag repair.
+	env.waitTagGone(t, indexer.TagPrefix+first)
+	res, err := env.admin.GetTagWithResponse(t.Context(), env.metadataRepo, indexer.TagPrefix+secondDelete)
+	require.NoErrorf(t, err, "get tag %s%s", indexer.TagPrefix, secondDelete)
+	require.Equalf(t, http.StatusOK, res.StatusCode(),
+		"tag_retention must keep the tag of the live position: %s", res.Body)
+}
+
+// TestMetadataSearchBranchDeletion runs §4.8's mirrored deletion on a real catalog: deleting a data
+// branch removes its R-metadata branch, but the mds-* tags stay, so the branch's history is still
+// readable by commit and by tag.
+func TestMetadataSearchBranchDeletion(t *testing.T) {
+	env := newMDSEnv(t)
+	env.startIndexer(t)
+	cl := env.admin
+
+	env.uploadObject(t, mdsBranch, "data/base.txt", "base")
+	base := env.commitBranch(t, cl, mdsBranch, "mds test: base for the deleted branch")
+	env.waitIndexed(t, mdsBranch, base)
+
+	env.createBranch(t, cl, mdsFeatureBranch, mdsBranch)
+	env.waitIndexed(t, mdsFeatureBranch, base)
+	env.uploadObject(t, mdsFeatureBranch, "data/feature-only.txt", "feature only")
+	featureCommit := env.commitBranch(t, cl, mdsFeatureBranch, "mds test: commit on the branch to delete")
+	env.waitIndexed(t, mdsFeatureBranch, featureCommit)
+	tagged := env.metadataCommitTagged(t, featureCommit)
+
+	force := true
+	res, err := cl.DeleteBranchWithResponse(t.Context(), env.repo, mdsFeatureBranch,
+		&apigen.DeleteBranchParams{Force: &force})
+	require.NoErrorf(t, err, "delete branch %s", mdsFeatureBranch)
+	require.Equalf(t, http.StatusNoContent, res.StatusCode(), "delete branch %s: %s", mdsFeatureBranch, res.Body)
+
+	env.waitMetadataBranchGone(t, mdsFeatureBranch)
+	require.Equalf(t, http.StatusOK, env.metadataBranchStatus(t, mdsBranch),
+		"R-metadata's default branch must never be deleted")
+
+	tag, err := env.admin.GetTagWithResponse(t.Context(), env.metadataRepo, indexer.TagPrefix+featureCommit)
+	require.NoErrorf(t, err, "get the tag of the deleted branch's commit")
+	require.Equalf(t, http.StatusOK, tag.StatusCode(),
+		"§4.8: the deleted branch's tags stay, so its history is still addressable; body: %s", tag.Body)
+	require.NotNilf(t, tag.JSON200, "get tag %s%s: %s", indexer.TagPrefix, featureCommit, tag.Body)
+	require.Equal(t, tagged, tag.JSON200.CommitId, "the tag must still point at the indexed commit")
+
+	read := env.readRows(t, featureCommit)
+	require.Contains(t, mdsPaths(read.PyIceberg.Rows), "data/feature-only.txt",
+		"a commit read of a deleted branch's history must still work through its mds-* tag")
+
+	report, ok := env.indexerHealth(t)
+	require.True(t, ok, "the indexer must still serve /_health")
+	_, found := report.Repositories[env.repo].Branches[mdsFeatureBranch]
+	require.Falsef(t, found,
+		"§4.8: /_health must not keep an entry for the deleted branch; report: %+v", report.Repositories[env.repo])
+}
+
 // mdsTableSourceCommit is the table property that holds the indexing position (§3.1, §3.3, §9).
 const mdsTableSourceCommit = "lakefs.mds.source-commit"
 
@@ -781,6 +1018,15 @@ func newMDSEnv(t *testing.T) *mdsEnv {
 	env.bucket, env.runPrefix, env.storageNamespace = icebergStorageNamespace(t, env.repo)
 	env.metadataRepo = icebergcatalog.MetadataRepository(env.repo)
 	env.ensureBucket(t)
+
+	// §7 defaults, written explicitly so a maintenance case can override one without losing the
+	// others. tag_retention 0 keeps every tag; compaction fires above 200 delete files or every
+	// 500 indexed commits; a deleted data branch loses its metadata branch.
+	env.tagRetention = "0s"
+	env.deleteBranches = true
+	env.compactionMaxDeleteFiles = 200
+	env.compactionEveryCommits = 500
+	env.startIndexerProxy(t)
 
 	// The server and the indexer read one file, as §7 documents. The metadata_search section is
 	// written without credentials first, because the mds-indexer user does not exist until the
@@ -870,6 +1116,11 @@ metadata_search:
   concurrency: 4
   max_commits: 1000
   backfill: head
+  delete_branches: %t
+  tag_retention: %s
+  compaction:
+    max_delete_files: %d
+    every_commits: %d
   storage:
 %s  repositories:
     %s:
@@ -878,7 +1129,8 @@ metadata_search:
 		mdsAdminUsername, e.key, e.secret,
 		e.issuer, "http://"+e.listenAddress,
 		blockstore.String(), icebergcatalog.CatalogPrefix,
-		e.baseURL, indexerKey, indexerSecret, e.indexerListenAddress, mdsIndexerPeriod,
+		e.indexerEndpoint, indexerKey, indexerSecret, e.indexerListenAddress, mdsIndexerPeriod,
+		e.deleteBranches, e.tagRetention, e.compactionMaxDeleteFiles, e.compactionEveryCommits,
 		storage.String(), e.repo, mdsBranch, mdsFeatureBranch)
 
 	require.NoError(t, os.WriteFile(e.configPath, []byte(document), mdsConfigFileMode),
@@ -899,6 +1151,162 @@ func (e *mdsEnv) ensureBucket(t *testing.T) {
 	}
 	err = cl.MakeBucket(ctx, e.bucket, minio.MakeBucketOptions{Region: e.s3.Region})
 	require.NoErrorf(t, err, "create the bucket %q the Metadata Search run writes into", e.bucket)
+}
+
+// mdsProxy is an in-process reverse proxy in front of the lakeFS server. The indexer's
+// metadata_search.lakefs_mds_endpoint names it, so a case can observe the exact request boundary
+// of §4.4: the Iceberg commit has already staged the metadata table on R-metadata@b when the
+// indexer sends the following POST of the lakeFS commit. Holding that request and killing the
+// indexer lands the kill after step 3 and before step 4, deterministically, instead of hoping to
+// catch the few milliseconds between two ticks.
+type mdsProxy struct {
+	server       *httptest.Server
+	reverse      *httputil.ReverseProxy
+	metadataRepo string
+	branch       string
+
+	mu   sync.Mutex
+	gate *mdsCommitGate
+}
+
+// mdsCommitGate is one armed hold of the next lakeFS commit of R-metadata@branch. reached is
+// closed when the commit request arrives; release allows the handler to finish without forwarding
+// the request.
+type mdsCommitGate struct {
+	reached chan struct{}
+	release chan struct{}
+
+	releaseOnce sync.Once
+}
+
+// letGo releases a held commit request. It is safe to call more than once (the test releases it
+// after the kill and the cleanup releases it again if the case failed before that point).
+func (g *mdsCommitGate) letGo() {
+	g.releaseOnce.Do(func() { close(g.release) })
+}
+
+// startIndexerProxy starts the proxy and points the indexer configuration at it. Every request is
+// forwarded unchanged except a commit request while a hold is armed.
+func (e *mdsEnv) startIndexerProxy(t *testing.T) {
+	t.Helper()
+	target, err := url.Parse(e.baseURL)
+	require.NoErrorf(t, err, "parse the lakeFS URL %q for the indexer proxy", e.baseURL)
+	p := &mdsProxy{
+		reverse:      httputil.NewSingleHostReverseProxy(target),
+		metadataRepo: e.metadataRepo,
+		branch:       mdsBranch,
+	}
+	p.server = httptest.NewServer(http.HandlerFunc(p.serveHTTP))
+	e.indexerProxy = p
+	e.indexerEndpoint = p.server.URL
+	t.Cleanup(func() { p.server.Close() })
+}
+
+// holdNextMetadataCommit arms the next lakeFS commit of R-metadata@main. The returned gate's
+// reached channel is closed when that request is in flight, which is the observed signal the
+// restart case waits for; the request itself is never forwarded.
+func (p *mdsProxy) holdNextMetadataCommit(t *testing.T) *mdsCommitGate {
+	t.Helper()
+	gate := &mdsCommitGate{reached: make(chan struct{}), release: make(chan struct{})}
+	p.mu.Lock()
+	require.Nil(t, p.gate, "a lakeFS commit hold is already armed")
+	p.gate = gate
+	p.mu.Unlock()
+	t.Cleanup(gate.letGo)
+	return gate
+}
+
+// takeGate consumes an armed hold. A hold is consumed by the first matching request, so a retry
+// after the case has decided the window was reached is not held again.
+func (p *mdsProxy) takeGate() *mdsCommitGate {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	gate := p.gate
+	p.gate = nil
+	return gate
+}
+
+func (p *mdsProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if isMetadataCommitRequest(r, p.metadataRepo, p.branch) {
+		if gate := p.takeGate(); gate != nil {
+			close(gate.reached)
+			select {
+			case <-gate.release:
+			case <-r.Context().Done():
+			case <-time.After(mdsHeldCommitTimeout):
+			}
+			// The request never reaches the server: the process being killed has already
+			// staged the Iceberg commit, and no lakeFS commit exists for it.
+			http.Error(w, "the Metadata Search restart case held this lakeFS commit", http.StatusServiceUnavailable)
+			return
+		}
+	}
+	p.reverse.ServeHTTP(w, r)
+}
+
+// isMetadataCommitRequest reports whether r is POST .../repositories/<metadataRepo>/branches/<branch>/commits.
+func isMetadataCommitRequest(r *http.Request, metadataRepo, branch string) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	want := "/api/v1/repositories/" + url.PathEscape(metadataRepo) + "/branches/" + url.PathEscape(branch) + "/commits"
+	return r.URL.Path == want
+}
+
+// waitForMetadataCommitWindow waits, with a bounded timeout, until the indexer has sent the lakeFS
+// commit of R-metadata and the proxy holds it. A kill outside that window proves nothing about
+// §4.4, so a missed window fails the case with the indexer's observed state.
+func (e *mdsEnv) waitForMetadataCommitWindow(t *testing.T, gate *mdsCommitGate, sourceCommit string) {
+	t.Helper()
+	timer := time.NewTimer(mdsCommitWindowTimeout)
+	defer timer.Stop()
+	select {
+	case <-gate.reached:
+		t.Logf("the indexer staged %s on %s@%s and its lakeFS commit is in flight; killing it now",
+			sourceCommit, e.metadataRepo, mdsBranch)
+		return
+	case <-e.indexer.done:
+		e.exitedWhileRunning(t, e.indexer, "waiting for the lakeFS commit of "+sourceCommit)
+		t.Fatalf("the indexer exited before it sent the lakeFS commit of %s", sourceCommit)
+	case <-timer.C:
+		report := "unavailable"
+		if health, ok := e.indexerHealth(t); ok {
+			encoded, _ := json.Marshal(health)
+			report = string(encoded)
+		}
+		t.Fatalf("the indexer did not send the lakeFS commit of %s within %s, so a kill would land between ticks and prove nothing about §4.4; last health report: %s\nlast %d lines of the indexer log:\n%s",
+			sourceCommit, mdsCommitWindowTimeout, report, mdsLogTailLines, mdsLogTail(e.indexPath, mdsLogTailLines))
+	}
+}
+
+// metadataStaging returns the uncommitted changes of R-metadata@branch. §4.4 row 1 calls the
+// non-empty staging the observable state a crash after step 3 leaves behind.
+func (e *mdsEnv) metadataStaging(t *testing.T, branch string) []apigen.Diff {
+	t.Helper()
+	res, err := e.admin.DiffBranchWithResponse(t.Context(), e.metadataRepo, branch, &apigen.DiffBranchParams{})
+	require.NoErrorf(t, err, "diff the uncommitted changes of %s@%s", e.metadataRepo, branch)
+	require.Equalf(t, http.StatusOK, res.StatusCode(), "diff the uncommitted changes of %s@%s: %s",
+		e.metadataRepo, branch, res.Body)
+	require.NotNilf(t, res.JSON200, "diff the uncommitted changes of %s@%s: %s", e.metadataRepo, branch, res.Body)
+	return res.JSON200.Results
+}
+
+// waitMetadataStagingEmpty waits until R-metadata@branch has no uncommitted changes. The restart
+// case uses it after the recovery: a recovered staged pointer is committed, not left behind.
+func (e *mdsEnv) waitMetadataStagingEmpty(t *testing.T, branch string) {
+	t.Helper()
+	deadline := time.Now().Add(mdsIndexTimeout)
+	for {
+		e.exitedWhileRunning(t, e.indexer, "waiting for the staging of "+e.metadataRepo+"@"+branch+" to clear")
+		if len(e.metadataStaging(t, branch)) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s@%s still has uncommitted changes after %s; last %d lines of the indexer log:\n%s",
+				e.metadataRepo, branch, mdsIndexTimeout, mdsLogTailLines, mdsLogTail(e.indexPath, mdsLogTailLines))
+		}
+		time.Sleep(mdsPollInterval)
+	}
 }
 
 // mdsProcess is one watched child process. A goroutine reaps it, so its exit status is recorded
@@ -1084,33 +1492,6 @@ func (e *mdsEnv) stop(t *testing.T) {
 			t.Logf("%s log (tail):\n%s", log.name, body)
 		}
 	}
-}
-
-// stopIndexerWhenTicking kills the indexer while a tick is in progress, if it can observe one.
-//
-// A tick of a repository reports in_progress on /_health (§9), so the suite can aim the kill at the
-// window §4.4 is about (the Iceberg commit staged, or the lakeFS commit written) instead of at an
-// idle period. A tick can still be too short to catch; the kill then lands between ticks, which is
-// just as valid a restart and is logged.
-func (e *mdsEnv) stopIndexerWhenTicking(t *testing.T) {
-	t.Helper()
-	deadline := time.Now().Add(3 * mdsIndexerPeriodDuration)
-	ticking := false
-	for time.Now().Before(deadline) {
-		report, ok := e.indexerHealth(t)
-		if ok {
-			repo, found := report.Repositories[e.repo]
-			if found && repo.InProgress {
-				ticking = true
-				break
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if !ticking {
-		t.Logf("no tick was in progress when the indexer was killed; the restart covers a kill between ticks")
-	}
-	e.stopIndexer(t)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1356,6 +1737,17 @@ func mdsRowSignature(rows []mdsRow) []string {
 	return signatures
 }
 
+// requireNonIncreasingSizes asserts that a DuckDB result is in the ORDER BY size_bytes DESC order
+// the guide's filtered snippet asks for.
+func requireNonIncreasingSizes(t *testing.T, rows []mdsRow, description string) {
+	t.Helper()
+	for i := 1; i < len(rows); i++ {
+		require.GreaterOrEqualf(t, rows[i-1].SizeBytes, rows[i].SizeBytes,
+			"%s must return the filtered rows in size_bytes DESC order: %s is %d, %s is %d",
+			description, rows[i-1].Path, rows[i-1].SizeBytes, rows[i].Path, rows[i].SizeBytes)
+	}
+}
+
 // readRows reads the virtual table of R at ref with both published engines on both published
 // mounts: PyIceberg and DuckDB through /mds/iceberg/api (the upstream endpoint of §5.5) and through
 // /iceberg/relative_to/{repo}.{ref}/api, the four recipes of docs/metadata-search.md. Every row of
@@ -1363,8 +1755,25 @@ func mdsRowSignature(rows []mdsRow) []string {
 // what its published recipe selects. The four reports must agree (requireAgrees).
 func (e *mdsEnv) readRows(t *testing.T, ref string) mdsRead {
 	t.Helper()
-	read := mdsDecode[mdsRead](t, e.runReadStep(t, ref, true))
+	read := mdsDecode[mdsRead](t, e.runReadStep(t, ref, true, false))
 	read.requireAgrees(t, ref)
+	return read
+}
+
+// readFilteredRows runs the guide's filtered scans - PyIceberg's row_filter expression and DuckDB's
+// WHERE ... ORDER BY size_bytes DESC LIMIT - through the same four engine/mount recipes. It
+// returns the same result shape as readRows so the four answers are compared the same way.
+func (e *mdsEnv) readFilteredRows(t *testing.T, ref string) mdsRead {
+	t.Helper()
+	result := e.runReadStep(t, ref, true, true)
+	filtered, ok := result["filtered"]
+	require.Truef(t, ok, "the read step must report the filtered scan: %v", result)
+	filteredMap, ok := filtered.(map[string]any)
+	require.Truef(t, ok, "the read step must report the filtered scan as an object: %v", filtered)
+	read := mdsDecode[mdsRead](t, filteredMap)
+	read.requireAgrees(t, ref)
+	require.NotEmptyf(t, read.PyIceberg.Rows,
+		"the filtered scan of %s must return rows, or the four engines agree only on an empty answer", ref)
 	return read
 }
 
@@ -1372,13 +1781,25 @@ func (e *mdsEnv) readRows(t *testing.T, ref string) mdsRead {
 // through the step's JSON result.
 func (e *mdsEnv) countRows(t *testing.T, ref string) mdsRead {
 	t.Helper()
-	read := mdsDecode[mdsRead](t, e.runReadStep(t, ref, false))
+	read := mdsDecode[mdsRead](t, e.runReadStep(t, ref, false, false))
 	read.requireAgrees(t, ref)
 	return read
 }
 
 // runReadStep runs the read program in the client container and returns its JSON object.
-func (e *mdsEnv) runReadStep(t *testing.T, ref string, withRows bool) map[string]any {
+func (e *mdsEnv) runReadStep(t *testing.T, ref string, withRows, filtered bool) map[string]any {
+	t.Helper()
+	env := e.readStepEnv(t, ref, withRows)
+	env["MDS_FILTERED"] = "0"
+	if filtered {
+		env["MDS_FILTERED"] = "1"
+		env["MDS_FILTER_PREFIX"] = mdsFilteredPathPrefix
+	}
+	return e.runClient(t, "mds-read:"+ref, mdsReadScript, env)
+}
+
+// readStepEnv is the environment of one read step: the table, the ref and the four catalog mounts.
+func (e *mdsEnv) readStepEnv(t *testing.T, ref string, withRows bool) map[string]string {
 	t.Helper()
 	identifier, err := json.Marshal([]string{e.repo, ref, icebergcatalog.SystemNamespace, icebergcatalog.ObjectMetadataTable})
 	require.NoError(t, err, "marshal the PyIceberg identifier")
@@ -1386,7 +1807,7 @@ func (e *mdsEnv) runReadStep(t *testing.T, ref string, withRows bool) map[string
 	if !withRows {
 		rows = "0"
 	}
-	return e.runClient(t, "mds-read:"+ref, mdsReadScript, map[string]string{
+	return map[string]string{
 		"MDS_WAREHOUSE":          e.storageNamespace,
 		"MDS_IDENTIFIER":         string(identifier),
 		"MDS_CREDENTIAL":         e.key + ":" + e.secret,
@@ -1397,7 +1818,7 @@ func (e *mdsEnv) runReadStep(t *testing.T, ref string, withRows bool) map[string
 		"MDS_RELATIVE_TABLE":     icebergcatalog.SystemNamespace + "." + icebergcatalog.ObjectMetadataTable,
 		"MDS_MDS_SCHEMA":         e.repo + "." + ref + "." + icebergcatalog.SystemNamespace,
 		"MDS_ROWS":               rows,
-	})
+	}
 }
 
 // loadTableAs loads the virtual table of R at ref as an arbitrary principal and returns the status
@@ -1600,6 +2021,62 @@ func (e *mdsEnv) metadataCommitTagged(t *testing.T, sourceCommit string) string 
 		"the indexer must tag %s with %s once it has indexed %s: %s", sourceCommit, tag, sourceCommit, res.Body)
 	require.NotNilf(t, res.JSON200, "get tag %s of %s: %s", tag, e.metadataRepo, res.Body)
 	return res.JSON200.CommitId
+}
+
+// metadataBranchStatus returns the status of GET branch of R-metadata, for the lifecycle cases of
+// §4.8 that assert a mirrored branch exists or is gone.
+func (e *mdsEnv) metadataBranchStatus(t *testing.T, branch string) int {
+	t.Helper()
+	res, err := e.admin.GetBranchWithResponse(t.Context(), e.metadataRepo, branch)
+	require.NoErrorf(t, err, "get branch %s of %s", branch, e.metadataRepo)
+	return res.StatusCode()
+}
+
+// waitMetadataBranchGone waits, bounded, until the deletion of a data branch has removed its
+// R-metadata branch (§4.8). The data branch itself is already gone; this is the indexer's mirror.
+func (e *mdsEnv) waitMetadataBranchGone(t *testing.T, branch string) {
+	t.Helper()
+	deadline := time.Now().Add(mdsIndexTimeout)
+	for {
+		e.exitedWhileRunning(t, e.indexer, "waiting for "+e.metadataRepo+"@"+branch+" to be deleted")
+		status := e.metadataBranchStatus(t, branch)
+		if status == http.StatusNotFound {
+			t.Logf("%s@%s was deleted after the data branch was deleted (§4.8)", e.metadataRepo, branch)
+			return
+		}
+		require.Equalf(t, http.StatusOK, status,
+			"getting %s@%s answered %d, not 200 while it exists or 404 after the §4.8 deletion",
+			e.metadataRepo, branch, status)
+		if time.Now().After(deadline) {
+			t.Fatalf("%s@%s still exists %s after the data branch was deleted; last %d lines of the indexer log:\n%s",
+				e.metadataRepo, branch, mdsIndexTimeout, mdsLogTailLines, mdsLogTail(e.indexPath, mdsLogTailLines))
+		}
+		time.Sleep(mdsPollInterval)
+	}
+}
+
+// waitTagGone waits, bounded, until tag_retention has removed a tag of R-metadata (§4.9).
+func (e *mdsEnv) waitTagGone(t *testing.T, tag string) {
+	t.Helper()
+	deadline := time.Now().Add(mdsIndexTimeout)
+	for {
+		e.exitedWhileRunning(t, e.indexer, "waiting for tag "+tag+" to be retired")
+		res, err := e.admin.GetTagWithResponse(t.Context(), e.metadataRepo, tag)
+		require.NoErrorf(t, err, "get tag %s of %s", tag, e.metadataRepo)
+		switch res.StatusCode() {
+		case http.StatusNotFound:
+			t.Logf("tag_retention retired %s", tag)
+			return
+		case http.StatusOK:
+		default:
+			t.Fatalf("getting tag %s of %s answered %d: %s", tag, e.metadataRepo, res.StatusCode(), res.Body)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tag %s of %s was not retired within %s; last %d lines of the indexer log:\n%s",
+				tag, e.metadataRepo, mdsIndexTimeout, mdsLogTailLines, mdsLogTail(e.indexPath, mdsLogTailLines))
+		}
+		time.Sleep(mdsPollInterval)
+	}
 }
 
 // mdsSourceCommitOf returns the commit of R a commit of R-metadata recorded, or "" on a commit that
@@ -2188,6 +2665,7 @@ import os
 
 import duckdb
 from pyiceberg.catalog.rest import RestCatalog
+from pyiceberg.expressions import GreaterThan, StartsWith
 
 
 def required(name):
@@ -2218,6 +2696,7 @@ def metadata_map(value):
 
 
 with_rows = os.environ.get("MDS_ROWS", "1") != "0"
+filtered = os.environ.get("MDS_FILTERED", "0") != "0"
 
 s3_properties = {
     "s3.access-key-id": required("ICEBERG_S3_KEY"),
@@ -2229,7 +2708,7 @@ if os.environ.get("ICEBERG_S3_ENDPOINT"):
     s3_properties["s3.path-style-access"] = os.environ.get("ICEBERG_S3_PATH_STYLE", "true")
 
 
-def pyiceberg_read(uri, identifier):
+def pyiceberg_read(uri, identifier, row_filter=None):
     catalog = RestCatalog(
         name="lakefs",
         uri=uri,
@@ -2238,7 +2717,10 @@ def pyiceberg_read(uri, identifier):
         **s3_properties,
     )
     table = catalog.load_table(identifier)
-    scanned = table.scan().to_arrow()
+    if row_filter is None:
+        scanned = table.scan().to_arrow()
+    else:
+        scanned = table.scan(row_filter=row_filter).to_arrow()
     rows = []
     if with_rows:
         for row in scanned.to_pylist():
@@ -2347,10 +2829,37 @@ if not with_rows:
     duckdb_mds_query = 'SELECT count(*) FROM lakefs_mds.%s."object_metadata"' % mds_schema
 duckdb_identifier = duckdb_rows(con_mds, duckdb_mds_query, duckdb_columns)
 
-print("RESULT:" + json.dumps({
+# --- the guide's filtered scans ---------------------------------------------------------------
+# PyIceberg takes the expression as a row_filter; DuckDB spells the same predicate in SQL and adds
+# the guide's ORDER BY size_bytes DESC LIMIT 20. Both are pushed down to the catalog.
+result = {
     "pyiceberg": pyiceberg,
     "pyiceberg_relative": pyiceberg_relative,
     "duckdb": duckdb_relative,
     "duckdb_identifier": duckdb_identifier,
-}))
+}
+if filtered:
+    prefix = required("MDS_FILTER_PREFIX")
+    expression = GreaterThan("size_bytes", 0) & StartsWith("path", prefix)
+    filtered_pyiceberg = pyiceberg_read(required("MDS_CATALOG_URI"),
+                                         tuple(json.loads(required("MDS_IDENTIFIER"))), expression)
+    filtered_pyiceberg_relative = pyiceberg_read(required("MDS_RELATIVE_URI"),
+                                                  required("MDS_RELATIVE_TABLE"), expression)
+    like = sql_literal(prefix + "%")
+    filtered_duckdb_query = (
+        'SELECT %s FROM lakefs."system"."object_metadata" '
+        'WHERE path LIKE %s AND size_bytes > 0 ORDER BY size_bytes DESC LIMIT 20'
+    ) % (", ".join(duckdb_columns), like)
+    filtered_duckdb_query_mds = (
+        'SELECT %s FROM lakefs_mds.%s."object_metadata" '
+        'WHERE path LIKE %s AND size_bytes > 0 ORDER BY size_bytes DESC LIMIT 20'
+    ) % (", ".join(duckdb_columns), mds_schema, like)
+    result["filtered"] = {
+        "pyiceberg": filtered_pyiceberg,
+        "pyiceberg_relative": filtered_pyiceberg_relative,
+        "duckdb": duckdb_rows(con, filtered_duckdb_query, duckdb_columns),
+        "duckdb_identifier": duckdb_rows(con_mds, filtered_duckdb_query_mds, duckdb_columns),
+    }
+
+print("RESULT:" + json.dumps(result))
 `

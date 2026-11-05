@@ -17,7 +17,7 @@ load_state
 
 require_command docker
 
-TRINO_IMAGE=${MDS_TRINO_IMAGE:-trinodb/trino:latest}
+TRINO_IMAGE=${MDS_TRINO_IMAGE:-trinodb/trino@sha256:2704eb53935af5e582d63d6033e9bf99d20c325e9b0e30b1016ef59a4773979f}
 TRINO_TIMEOUT=${MDS_TRINO_TIMEOUT:-300}
 # The colima VM is amd64 on an arm64 host. Trino 484's JVM crashes in the C1 compiler under that
 # emulation; C2-only startup is stable and runs the same connector code.
@@ -36,6 +36,7 @@ run_trino_variant() {
   local etc="$RUN_DIR/trino-${variant}/etc/catalog"
   local logfile="$RUN_DIR/trino-${variant}.log"
   local querylog="$RUN_DIR/trino-${variant}.query.log"
+  local rows_file="$RUN_DIR/trino-${variant}.rows.tsv"
   local name="mds-trino-${variant}"
   local start deadline remaining status
 
@@ -103,9 +104,13 @@ run_trino_variant() {
   fi
 
   log "querying Trino ${variant}"
-  run_bounded "$remaining" "$querylog" -- docker exec "$name" /usr/bin/trino --execute "$sql"
-  grep -q 'orders/' "$querylog" || die "Trino ${variant} returned no orders/ rows; see $querylog"
-  grep -E 'orders/' "$querylog" | tail -n 5
+  run_bounded "$remaining" "$querylog" -- docker exec "$name" /usr/bin/trino \
+    --output-format TSV --execute "$sql"
+  # The guide selects path, size_bytes, commit_id and user_metadata. TSV keeps them tab-separated,
+  # so the first three fields are the row the script compares with state.env's SOURCE_COMMIT.
+  awk -F'\t' '$1 ~ /^orders\// { print $1 "\t" $2 "\t" $3 }' "$querylog" |
+    tr -d '\r' >"$rows_file"
+  assert_orders_rows "$rows_file" "Trino ${variant}"
 
   docker_rm "$name"
   CURRENT_CONTAINER=
@@ -119,4 +124,5 @@ run_trino_variant relative \
   "${MDS_DOCKER_SERVER_URL}/iceberg/relative_to/${MDS_REPO}.main/api" \
   "${MDS_DOCKER_SERVER_URL}/iceberg/api/v1/oauth/tokens" \
   false
+assert_same_rows "$RUN_DIR/trino-mds.rows.tsv" "$RUN_DIR/trino-relative.rows.tsv" "Trino"
 log "Trino snippets passed"

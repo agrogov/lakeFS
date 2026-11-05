@@ -23,6 +23,15 @@ The scripts do not edit or import the esti suite; they write the same layout int
   docker compose -f esti/ops/docker-compose-mds.yaml up -d
   ```
 
+  Without the compose plugin (for example colima with only the docker client):
+
+  ```bash
+  docker run -d --name esti-seaweedfs -p 8333:8333 \
+    -v "$PWD/esti/ops/seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro" \
+    -v esti-seaweedfs:/data chrislusf/seaweedfs:latest \
+    server -s3 -dir=/data -s3.config=/etc/seaweedfs/s3.json
+  ```
+
 - Go, `curl`, `jq` and `python3` on `PATH`. The scripts build `lakefs-sso` and a one-purpose bucket
   helper from the repository sources. The brief's Go toolchain:
 
@@ -90,7 +99,9 @@ tail; it is never waited out.
 
 ## Versions used
 
-The snippets were run on 2026-11-04 with:
+The snippets were run on 2026-11-04 with the images below. `run-spark.sh` and `run-trino.sh`
+default to these digests, so a rerun reproduces the recorded versions; override `MDS_SPARK_IMAGE` or
+`MDS_TRINO_IMAGE` to use another image (for example a local `:latest` tag).
 
 | Component | Version / image |
 |---|---|
@@ -120,6 +131,12 @@ orders/2025/three.parquet  36  <source commit ID>  {}
 
 The `customers/c1.json` object was deliberately outside the `orders/%` filter. The Spark and Trino
 runs used the same source commit as the indexer's `/_health` report.
+
+That observation is a gate, not a reading of `.run/*.log`: each runner captures its row file
+(`.run/spark-*.rows.tsv`, `.run/trino-*.rows.tsv`), requires exactly those three rows with those
+sizes and `SOURCE_COMMIT` from `.run/state.env`, and diffs the two catalog endpoints' captures. A
+missing row, a stale snapshot, an extra row of another repository or a different commit fails the
+script.
 
 ## Snippet changes this run required
 

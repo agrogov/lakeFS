@@ -45,6 +45,60 @@ load_state() {
   . "$STATE_FILE"
 }
 
+# write_expected_orders_rows FILE COMMIT
+# The three rows env-up.sh uploads, as the guide's engine snippets project them: path, size_bytes,
+# commit_id. The commit is the SOURCE_COMMIT of state.env, so a stale snapshot, a row of another
+# repository or a different commit fails the comparison.
+write_expected_orders_rows() {
+  local file=$1 commit=$2
+  printf '%s\t%s\t%s\n' \
+    'orders/2024/one.parquet' 34 "$commit" \
+    'orders/2024/two.parquet' 34 "$commit" \
+    'orders/2025/three.parquet' 36 "$commit" |
+    LC_ALL=C sort >"$file"
+}
+
+# normalize_rows INPUT OUTPUT
+# Trim CRs and blank lines and sort, so the endpoint comparison is about the rows and not about the
+# order or the line ending an engine happened to print.
+normalize_rows() {
+  local input=$1 output=$2
+  tr -d '\r' <"$input" | sed '/^[[:space:]]*$/d' | LC_ALL=C sort >"$output"
+}
+
+# assert_orders_rows FILE DESCRIPTION
+# Require exactly the three expected orders/ rows of state.env. A file with a missing row, an extra
+# row, a different size or a different commit_id fails here, not in a human reading .run/*.log.
+assert_orders_rows() {
+  local file=$1 description=$2
+  local expected="$RUN_DIR/expected-orders.tsv"
+  local normalized="$file.normalized"
+  local count
+
+  write_expected_orders_rows "$expected" "$SOURCE_COMMIT"
+  normalize_rows "$file" "$normalized"
+  count=$(wc -l <"$normalized" | tr -d ' ')
+  if [ "$count" -ne 3 ]; then
+    printf 'mds-engines: %s returned %s orders/ rows, expected exactly 3; rows:\n' "$description" "$count" >&2
+    cat "$normalized" >&2 || true
+    die "$description returned the wrong number of orders/ rows"
+  fi
+  if ! diff -u "$expected" "$normalized" >&2; then
+    die "$description rows differ from the expected orders/ rows (SOURCE_COMMIT=${SOURCE_COMMIT})"
+  fi
+  log "$description returned exactly the three expected orders/ rows at ${SOURCE_COMMIT}"
+}
+
+# assert_same_rows FILE_A FILE_B DESCRIPTION
+# The two catalog endpoints must return the same rows: diff their normalized captures.
+assert_same_rows() {
+  local a=$1 b=$2 description=$3
+  if ! diff -u "$a.normalized" "$b.normalized" >&2; then
+    die "$description returned different rows through the two catalog endpoints"
+  fi
+  log "$description returned the same rows through both catalog endpoints"
+}
+
 docker_rm() {
   docker rm -f "$1" >/dev/null 2>&1 || true
 }
