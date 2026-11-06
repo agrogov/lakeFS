@@ -19,7 +19,9 @@
 #
 # --self-test fabricates part-file layouts under a temporary directory and requires the gate to
 # accept the three expected rows spread over several part files and to reject an extra row or a
-# wrong user_metadata in any part file.
+# wrong user_metadata in any part file. The user_metadata cases hold exactly three rows, so the row
+# count gate is satisfied and only the row comparison can reject them; each case also asserts which
+# of the gate's two failure messages was produced, so it cannot pass for the wrong reason.
 
 set -euo pipefail
 
@@ -129,14 +131,21 @@ SQL
 # first-file-only comparison produces whenever Spark does not coalesce the output, (c) fails when
 # one part file holds exactly the expected rows and another one an extra row, in both creation
 # orders (the R2T-4 probe: a first-file-only gate passes whichever of the two layouts it happens to
-# read the correct file from), (d) fails when one part file holds the three expected rows and
-# another the same rows with a user_metadata the guide's snippet selects, in both creation orders,
-# and (e) fails when the directory holds no part-* file at all.
+# read the correct file from), (d) fails through the row comparison -- three rows in total, exactly
+# one of them carrying a user_metadata the guide's snippet selects, so the row count gate is
+# satisfied and only the diff can reject the layout -- with the wrong row in one part file, in
+# part-00001, and in part-00000 (the mirror image), and (e) fails when the directory holds no
+# part-* file at all.
 #
 # Each two-file case is written twice, once with the wrong content in part-00000 and once with it in
 # part-00001. A gate that reads only one part-* file passes one of the two layouts whatever order
 # the filesystem lists the two names in, so it cannot pass both; a gate that reads all of them
 # rejects both, because the rows they hold together are not the three expected rows.
+#
+# Every case names the message it requires: a passing case the success line, a failing case either
+# the row count rejection or, for the three-row user_metadata cases, the diff rejection. A case that
+# fails for another reason -- the six-row layout an earlier revision used, rejected on the count
+# before the fourth column was ever compared -- is a self-test failure, not a pass.
 
 write_part_file() { # <dir> <name> <contents>
   mkdir -p "$1"
@@ -160,17 +169,25 @@ run_self_test() {
   extra=$(printf 'orders/2025/four.parquet\t37\t%s\t{}' "$SOURCE_COMMIT")
   bad=$(printf 'orders/2025/three.parquet\t36\t%s\t{"team":"analytics"}' "$SOURCE_COMMIT")
 
-  expect() { # <expected-exit> <dir> <description>
+  expect() { # <expected-exit> <dir> <description> <gate-message>
     local expected=$1 dir=$2 description=$3 status=0
+    local message=${4:?expect needs the gate message to require}
     ( check_spark_rows "$dir" "$description" "$RUN_DIR/selftest.rows.tsv" ) \
       >"$RUN_DIR/selftest.log" 2>&1 || status=$?
-    if [ "$status" -eq "$expected" ]; then
-      printf 'PASS: %s (exit %s)\n' "$description" "$status"
-    else
+    if [ "$status" -ne "$expected" ]; then
       printf 'FAIL: %s (expected exit %s, got %s)\n' "$description" "$expected" "$status" >&2
       tail_file "$RUN_DIR/selftest.log" 20
       failures=$((failures + 1))
+      return 0
     fi
+    if ! grep -qF -- "$message" "$RUN_DIR/selftest.log"; then
+      printf 'FAIL: %s (exit %s as expected, but the gate did not report %s)\n' \
+        "$description" "$status" "'$message'" >&2
+      tail_file "$RUN_DIR/selftest.log" 20
+      failures=$((failures + 1))
+      return 0
+    fi
+    printf 'PASS: %s (exit %s, %s)\n' "$description" "$status" "'$message'"
   }
 
   where="$tmp/one-file"
@@ -178,7 +195,8 @@ run_self_test() {
 $two
 $three
 "
-  expect 0 "$where" "selftest: one part file with the three expected rows passes"
+  expect 0 "$where" "selftest: one part file with the three expected rows passes" \
+    "returned exactly the three expected orders/ rows"
 
   where="$tmp/split"
   write_part_file "$where" 'part-00000-0000-0000-0000-c000.txt' "$one
@@ -186,7 +204,8 @@ $three
   write_part_file "$where" 'part-00001-0000-0000-0000-c000.txt' "$two
 $three
 "
-  expect 0 "$where" "selftest: the three expected rows over two part files pass"
+  expect 0 "$where" "selftest: the three expected rows over two part files pass" \
+    "returned exactly the three expected orders/ rows"
 
   where="$tmp/extra-in-part-00001"
   write_part_file "$where" 'part-00000-0000-0000-0000-c000.txt' "$one
@@ -195,7 +214,8 @@ $three
 "
   write_part_file "$where" 'part-00001-0000-0000-0000-c000.txt' "$extra
 "
-  expect 1 "$where" "selftest: an extra row in part-00001 fails (R2T-4)"
+  expect 1 "$where" "selftest: an extra row in part-00001 fails (R2T-4)" \
+    "returned the wrong number of orders/ rows"
 
   where="$tmp/extra-in-part-00000"
   write_part_file "$where" 'part-00001-0000-0000-0000-c000.txt' "$one
@@ -204,33 +224,42 @@ $three
 "
   write_part_file "$where" 'part-00000-0000-0000-0000-c000.txt' "$extra
 "
-  expect 1 "$where" "selftest: an extra row in part-00000 fails (R2T-4)"
+  expect 1 "$where" "selftest: an extra row in part-00000 fails (R2T-4)" \
+    "returned the wrong number of orders/ rows"
+
+  # Three rows in total in every user_metadata case, so the row count gate passes and the fourth
+  # column, not the count, decides: `bad` is `three` with a non-empty map. With six rows (an earlier
+  # revision wrote the three expected rows next to three more) the count gate rejects the layout
+  # before the comparison runs, and a gate that ignored user_metadata would still pass the case.
+  where="$tmp/metadata-in-one-file"
+  write_part_file "$where" 'part-00000-0000-0000-0000-c000.txt' "$one
+$two
+$bad
+"
+  expect 1 "$where" "selftest: a user_metadata in one three-row part file fails the comparison" \
+    "rows differ from the expected orders/ rows"
 
   where="$tmp/metadata-in-part-00001"
   write_part_file "$where" 'part-00000-0000-0000-0000-c000.txt' "$one
 $two
-$three
 "
   write_part_file "$where" 'part-00001-0000-0000-0000-c000.txt' "$bad
-$two
-$one
 "
-  expect 1 "$where" "selftest: a user_metadata in part-00001 is compared"
+  expect 1 "$where" "selftest: a user_metadata in part-00001 fails the comparison" \
+    "rows differ from the expected orders/ rows"
 
   where="$tmp/metadata-in-part-00000"
   write_part_file "$where" 'part-00001-0000-0000-0000-c000.txt' "$one
 $two
-$three
 "
   write_part_file "$where" 'part-00000-0000-0000-0000-c000.txt' "$bad
-$two
-$one
 "
-  expect 1 "$where" "selftest: a user_metadata in part-00000 is compared"
+  expect 1 "$where" "selftest: a user_metadata in part-00000 fails the comparison" \
+    "rows differ from the expected orders/ rows"
 
   where="$tmp/no-part"
   write_part_file "$where" '_SUCCESS' ''
-  expect 1 "$where" "selftest: a directory with no part-* file fails"
+  expect 1 "$where" "selftest: a directory with no part-* file fails" "wrote no part-* file"
 
   if [ "$failures" -ne 0 ]; then
     printf 'self-test FAILED (%s case(s))\n' "$failures" >&2
