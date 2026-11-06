@@ -8,6 +8,8 @@ import (
 	"slices"
 	"sort"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/iceberg-go"
 	icebergio "github.com/apache/iceberg-go/io"
 	icebergtable "github.com/apache/iceberg-go/table"
@@ -49,10 +51,12 @@ var (
 	ErrMergeRows = errors.New("cannot merge the rows of the compaction")
 
 	// ErrRowsOutOfOrder is returned when a row source of a rebuild yields a path that does not
-	// come after the previous one. The table declares sort order path ASC (§3.1), and a rebuild
-	// streams its source instead of collecting it (design §4.3 step 2), so the order of the files
-	// it writes is the order of the source: rather than writing files that contradict the table's
-	// declared order, a source that breaks it is refused (MDS_REVIEW.md TB-2).
+	// come after the previous one, or when a delta names the same path in two upserts. The table
+	// declares sort order path ASC and path is the identifier field, so a path appears once
+	// (§3.1); a rebuild streams its source instead of collecting it (design §4.3 step 2), so the
+	// order of the files it writes is the order of the source: rather than writing files that
+	// contradict the table's declared order or two rows for one identifier, such a source is
+	// refused (MDS_REVIEW.md TB-2, MDS_REVIEW_4.md R4T-5).
 	ErrRowsOutOfOrder = errors.New("rows are not in path order")
 
 	// ErrNoTable is returned when a write is applied without a loaded table. The caller loads the
@@ -87,7 +91,13 @@ type writeOptions struct {
 // WithDeleteMode overrides the manner in which deleted paths are removed for this write:
 // WriteModeMergeOnRead writes position delete files (design §4.3 step 3, §10 decision 2) and
 // WriteModeCopyOnWrite rewrites the data files that hold a deleted path (the fallback of §13 and
-// the plan's risk list). The default is the table's own write.delete.mode property.
+// the plan's risk list). The default is the table's own write.delete.mode property, and
+// iceberg-go's copy-on-write when the table does not carry it (see resolve).
+//
+// WriteModeCopyOnWrite needs no property: Overwrite always rewrites the files it matches.
+// WriteModeMergeOnRead is applied by iceberg-go's Delete, which takes the mode from the table's
+// write.delete.mode (v0.7.0 table/transaction.go:2603-2619), so it is what a table that carries the
+// property writes - as every table this package creates does (§3.1).
 func WithDeleteMode(mode string) Option {
 	return func(o *writeOptions) { o.deleteMode = mode }
 }
@@ -105,6 +115,20 @@ func WithRecordBatchSize(size int) Option {
 }
 
 // resolve returns the effective options of one write against tbl.
+//
+// An absent write.delete.mode keeps iceberg-go's default, copy-on-write (iceberg-go v0.7.0
+// table/properties.go:101-102), and not merge-on-read, the mode this package creates its tables
+// with (§3.1). The reason is that the delete mode of a transaction is not this package's to choose
+// for a table that does not carry the property: iceberg-go reads write.delete.mode from the
+// metadata the transaction is building and runs either Delete or Overwrite from it (v0.7.0
+// table/transaction.go:2603-2619), so a resolve that answered merge-on-read for an absent property
+// would name a mode the transaction does not run unless this writer wrote the property into the
+// table on every delta - a per-table setting §3.1 makes at creation, and one that would outlive the
+// write and change what other writers of the same table do. Reporting the mode that actually runs
+// is also the lesson of R4T-1: claiming one delete mode and applying another is how a row came
+// back. Copy-on-write is a correct answer on such a table now that that arm folds the live delete
+// files into its data files first (compactDeleteFiles), at the fallback's documented cost (§13);
+// merge-on-read remains the mode of every table this package creates.
 func resolve(tbl *icebergtable.Table, opts []Option) (writeOptions, error) {
 	o := writeOptions{
 		deleteMode:      tbl.Properties().Get(PropertyWriteDeleteMode, WriteModeCopyOnWrite),
@@ -216,18 +240,29 @@ func snapshotIDOf(tbl *icebergtable.Table) int64 {
 // carries lakefs.mds.source-commit and lakefs.mds.source-repository in its summary, and the
 // table property carries the commit even when the change set is empty.
 //
+// The one exception is a copy-on-write delta on a snapshot that still carries live delete files:
+// it commits one compaction before it commits the delta (compactDeleteFiles), so the branch head
+// moves twice, inside the same lakeFS commit of §4.3 step 4. The intermediate snapshot holds the
+// rows of the snapshot before it - a compaction rewrites files and removes delete files, it does
+// not change the row set (§4.9) - so a reader between the two commits sees the delta not applied
+// yet, never a half-applied one.
+//
 // An empty delta is not a no-op: the property still moves, which is what makes a commit that
 // changed no object a recoverable indexing position (§4.3 step 3, §4.4).
 //
 // The deletes are applied in merge-on-read mode by default, which writes position delete files;
 // WithDeleteMode(WriteModeCopyOnWrite) selects the fallback that rewrites the affected data files
-// instead (design §13 risk "Delete files and catalog staging").
+// instead (design §13 risk "Delete files and catalog staging"). A copy-on-write write cannot read a
+// data file that still has a delete file through it, so the arm folds the snapshot's delete files
+// into its data files first, with one compaction (compactDeleteFiles, R4T-1).
 //
 // A delta with upserts refuses a table whose schema carries a column this writer does not know
 // (ErrUnknownSchema): the upserts are built from Row's ten fields, and a table with an optional
 // column a later schema version appended (§3.1) cannot be written that way (R2T-1). A delete-only
-// delta writes no row and is still applied. The write is never replayed: every write pins
-// commit.retry.num-retries to 0 and migrates a table created before the property existed (R2T-3).
+// delta writes no row and is still applied. The upserts name a path at most once (ErrRowsOutOfOrder
+// otherwise, as a rebuild's source does), because path is the identifier field (§3.1, R4T-5). The
+// write is never replayed: every write pins commit.retry.num-retries to 0 and migrates a table
+// created before the property existed (R2T-3).
 func ApplyDelta(ctx context.Context, tbl *icebergtable.Table, upserts []Row, deletes []string, sourceCommit string, opts ...Option) (*icebergtable.Table, error) {
 	if tbl == nil {
 		return nil, ErrNoTable
@@ -251,15 +286,38 @@ func ApplyDelta(ctx context.Context, tbl *icebergtable.Table, upserts []Row, del
 			return nil, err
 		}
 	}
+	sorted := slices.Clone(upserts)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Path < sorted[j].Path })
+	// Path is the identifier field and the table's sort key (§3.1: "One row per (branch, path)"),
+	// so an upsert may name a path once. Writing the same path twice would put two rows under one
+	// identifier, which nothing in Iceberg refuses on append and a later IN (path ...) delete then
+	// removes together; Rebuild refuses the identical input with ErrRowsOutOfOrder (orderedRows), so
+	// the two write paths keep one input contract (R4T-5). Sorting first is what makes a duplicate
+	// adjacent, and it happens before any commit, so a refused delta changes nothing.
+	for i := 1; i < len(sorted); i++ {
+		if sorted[i].Path == sorted[i-1].Path {
+			return nil, fmt.Errorf("%w: %q appears twice in the upserts", ErrRowsOutOfOrder, sorted[i].Path)
+		}
+	}
+	paths := changedPaths(sorted, deletes)
+
 	tbl, err = ensureNoReplay(ctx, tbl)
 	if err != nil {
 		return nil, fmt.Errorf("make the delta at %s non-replayable: %w", sourceCommit, err)
 	}
 	snapshotProps := SnapshotProperties(repository, sourceCommit)
 
-	rows := slices.Clone(upserts)
-	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Path < rows[j].Path })
-	paths := changedPaths(rows, deletes)
+	// A copy-on-write delta rewrites the data files its filter matches by reading them alone
+	// (iceberg-go's rewriteSingleFile builds a scan task with no delete file), so on a snapshot that
+	// still carries delete files it reads the rows they removed back as live (R4T-1). Folding them
+	// into the data files first is what makes the arm correct; the compaction is paid only while
+	// such a snapshot is met, because a copy-on-write delta writes no delete file of its own.
+	if o.deleteMode == WriteModeCopyOnWrite && len(paths) > 0 {
+		tbl, err = compactDeleteFiles(ctx, tbl)
+		if err != nil {
+			return nil, fmt.Errorf("compact the delete files before the copy-on-write delta at %s: %w", sourceCommit, err)
+		}
+	}
 
 	txn := tbl.NewTransaction()
 	switch o.deleteMode {
@@ -269,15 +327,15 @@ func ApplyDelta(ctx context.Context, tbl *icebergtable.Table, upserts []Row, del
 				return nil, fmt.Errorf("delete %d paths: %w", len(chunk), err)
 			}
 		}
-		if len(rows) > 0 {
-			reader, err := NewRecordReader(tbl.Schema(), rows, o.recordBatchSize)
+		if len(sorted) > 0 {
+			reader, err := NewRecordReader(tbl.Schema(), sorted, o.recordBatchSize)
 			if err != nil {
 				return nil, err
 			}
 			appendErr := txn.Append(ctx, reader, snapshotProps)
 			reader.Release()
 			if appendErr != nil {
-				return nil, fmt.Errorf("append %d rows: %w", len(rows), appendErr)
+				return nil, fmt.Errorf("append %d rows: %w", len(sorted), appendErr)
 			}
 		}
 	case WriteModeCopyOnWrite:
@@ -287,7 +345,7 @@ func ApplyDelta(ctx context.Context, tbl *icebergtable.Table, upserts []Row, del
 		// whole table.
 		switch {
 		case len(paths) > 0:
-			reader, err := NewRecordReader(tbl.Schema(), rows, o.recordBatchSize)
+			reader, err := deltaUpsertReader(tbl.Schema(), sorted, o.recordBatchSize)
 			if err != nil {
 				return nil, err
 			}
@@ -297,15 +355,15 @@ func ApplyDelta(ctx context.Context, tbl *icebergtable.Table, upserts []Row, del
 			if overwriteErr != nil {
 				return nil, fmt.Errorf("overwrite %d paths: %w", len(paths), overwriteErr)
 			}
-		case len(rows) > 0:
-			reader, err := NewRecordReader(tbl.Schema(), rows, o.recordBatchSize)
+		case len(sorted) > 0:
+			reader, err := NewRecordReader(tbl.Schema(), sorted, o.recordBatchSize)
 			if err != nil {
 				return nil, err
 			}
 			appendErr := txn.Append(ctx, reader, snapshotProps)
 			reader.Release()
 			if appendErr != nil {
-				return nil, fmt.Errorf("append %d rows: %w", len(rows), appendErr)
+				return nil, fmt.Errorf("append %d rows: %w", len(sorted), appendErr)
 			}
 		}
 	}
@@ -318,6 +376,75 @@ func ApplyDelta(ctx context.Context, tbl *icebergtable.Table, upserts []Row, del
 		return nil, fmt.Errorf("commit the delta at %s: %w", sourceCommit, err)
 	}
 	return committed, nil
+}
+
+// deltaUpsertReader returns the reader a copy-on-write delta writes: the upserts, or - for a
+// delete-only delta - an empty reader over the table's own Arrow schema.
+//
+// The empty reader is what lets a delete-only delta still apply to a table with a column this
+// writer does not know, which §3.1 promises: "A delete-only delta still applies, because it writes
+// no row". NewRecordReader checks the table's schema (checkKnownSchema), so building one for a row
+// set of length zero refused the delta with ErrUnknownSchema and every delete of a branch failed,
+// even though there is no row to fill (R4T-3). Nothing is written for zero rows, and the Overwrite
+// itself re-emits the columns of the files it rewrites, so the column the writer does not know
+// keeps its value.
+func deltaUpsertReader(sc *iceberg.Schema, rows []Row, batchSize int) (array.RecordReader, error) {
+	if len(rows) > 0 {
+		return NewRecordReader(sc, rows, batchSize)
+	}
+	schema, err := ArrowSchema(sc)
+	if err != nil {
+		return nil, err
+	}
+	return NewBatchesRecordReader(schema, func(_ func(arrow.RecordBatch, error) bool) {}), nil
+}
+
+// compactDeleteFiles folds the live delete files of the table's snapshot into its data files, and
+// returns tbl unchanged when the snapshot carries none.
+//
+// It is what makes a copy-on-write delta correct after a merge-on-read one. iceberg-go's
+// copy-on-write rewrite reads the data file it rewrites and nothing else: the FileScanTask that
+// rewriteSingleFile builds carries no DeleteFiles (iceberg-go v0.7.0 table/transaction.go:2889-2899,
+// while table/scanner.go:2110-2115 shows the field the scan would apply). A row an earlier delete
+// file removed is therefore read back as live and written into the rewritten file, and the old
+// delete file - whose data file is no longer in the snapshot - can neither remove it nor be applied
+// to the new file: the row comes back with the values it had before it was deleted, silently, in a
+// mode the design documents as a fallback (R4T-1).
+//
+// The compaction applies the delete files and removes them, so the Overwrite that follows reads
+// data files only. It costs one rewrite of the table, paid only while a copy-on-write delta runs on
+// a snapshot that still carries delete files; a copy-on-write delta writes none, so a table written
+// that way pays it at most once after the last merge-on-read delete. The delete files are listed
+// from the snapshot's manifest list, not from a scan plan, for the reason Compact documents: a scan
+// task carries only the delete files that apply to the data file it reads.
+//
+// The fold records the table's *current* position as its source commit, not the commit the delta is
+// applying, and it is a commit of its own: iceberg-go stages several snapshots inside one commit
+// but two commits cannot be one, and the indexer's recovery finishes a staged write whose property
+// is the next commit C (§4.4). A fold that recorded C would therefore let a delta that failed after
+// it be committed as if C had been applied, with C's change set missing - the position would move
+// over rows that never changed. Recorded at the current position, whose rows the compaction still
+// holds (§4.9: a compaction does not change the row set), the staging a failed delta leaves behind
+// is not a commit the recovery recognises, so it is discarded and the tick re-indexes C (resetStaging
+// in pkg/mds/indexer).
+func compactDeleteFiles(ctx context.Context, tbl *icebergtable.Table) (*icebergtable.Table, error) {
+	deleteFiles, err := snapshotFilesOf(ctx, tbl, iceberg.ManifestContentDeletes)
+	if err != nil {
+		return nil, fmt.Errorf("list the delete files of the table: %w", err)
+	}
+	if len(deleteFiles) == 0 {
+		return tbl, nil
+	}
+	position := tbl.Properties().Get(PropertySourceCommit, "")
+	if position == "" {
+		// A table with delete files and no recorded position was not written by this package (its
+		// every write records one), so there is no commit the compaction could keep the table at.
+		// Refusing is honest; the caller's full-listing path (Rebuild) needs no position and fixes
+		// the table, delete files included.
+		return nil, fmt.Errorf("%w: the table carries delete files but no %s to compact at",
+			ErrNoSourceCommit, PropertySourceCommit)
+	}
+	return Compact(ctx, tbl, position)
 }
 
 // Rebuild replaces the whole table with rows at sourceCommit (design §4.3 step 2): the rows of a

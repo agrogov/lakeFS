@@ -235,6 +235,182 @@ func TestApplyDeltaCopyOnWriteChunked(t *testing.T) {
 	require.Empty(t, scanRows(t, env.loadTable(t)))
 }
 
+// TestApplyDeltaCopyOnWriteAfterMergeOnReadDelete is R4T-1 of MDS_REVIEW_4.md: the copy-on-write
+// arm rewrites a data file it matched, and iceberg-go's rewrite reads that file alone - the scan
+// task it builds carries no delete file (iceberg-go v0.7.0 table/transaction.go:2889-2899,
+// rewriteSingleFile) - so a row an earlier merge-on-read delete removed was read back as live and
+// written into the new file, with nothing left that could remove it. The arm now folds the
+// snapshot's delete files into the data files first (Compact + Overwrite), so the row set after the
+// delta is the one the two commits describe and no delete file survives.
+func TestApplyDeltaCopyOnWriteAfterMergeOnReadDelete(t *testing.T) {
+	when := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	// seeded: one data file of [w z], then a merge-on-read delete of z. The snapshot a copy-on-write
+	// delta runs on therefore carries a position delete file.
+	seeded := func(t *testing.T) (*testEnv, *icebergtable.Table) {
+		t.Helper()
+		env := newTestEnv(t)
+		tbl := env.createTable(t)
+		created, err := table.ApplyDelta(t.Context(), tbl, []table.Row{
+			row(t, "w", "c1", 1, when, nil),
+			row(t, "z", "c1", 2, when, nil),
+		}, nil, "c1")
+		require.NoError(t, err)
+		deleted, err := table.ApplyDelta(t.Context(), created, nil, []string{"z"}, "c2")
+		require.NoError(t, err)
+		require.Positive(t, summaryInt(t, deleted, "total-delete-files"),
+			"the merge-on-read delete wrote a position delete file")
+		return env, deleted
+	}
+
+	t.Run("an upsert does not resurrect a row an earlier delete removed", func(t *testing.T) {
+		env, tbl := seeded(t)
+		updated, err := table.ApplyDelta(t.Context(), tbl, []table.Row{
+			row(t, "w", "c3", 3, when.Add(time.Hour), nil),
+		}, nil, "c3", table.WithDeleteMode(table.WriteModeCopyOnWrite))
+		require.NoError(t, err)
+
+		// Before the fix the rewritten file carried [w z] and the scan returned z, a row the commit
+		// at c2 removed and no source of the data repository has any more.
+		requireScanRows(t, env.loadTable(t), []table.Row{row(t, "w", "c3", 3, when.Add(time.Hour), nil)})
+		require.Zero(t, summaryInt(t, updated, "total-delete-files"),
+			"the delete files are folded into the rewrite, not left behind")
+
+		// The fold is a commit before the delta's, and it records the position the table was at
+		// (c2), not the delta's commit: a delta that failed after the fold would otherwise leave a
+		// staging whose property is c3, which the indexer's recovery finishes as if c3 had been
+		// applied (§4.4) - moving the position over a change set that never reached the table.
+		current := updated.CurrentSnapshot()
+		require.NotNil(t, current.ParentSnapshotID, "the delta snapshot follows the fold's")
+		fold := updated.Metadata().SnapshotByID(*current.ParentSnapshotID)
+		require.NotNil(t, fold)
+		require.Equal(t, "c2", fold.Summary.Properties[table.PropertySourceCommit],
+			"the fold records the position whose rows it holds")
+		require.Equal(t, "c3", current.Summary.Properties[table.PropertySourceCommit])
+	})
+
+	t.Run("a delete does not keep a row an earlier delete removed", func(t *testing.T) {
+		env, tbl := seeded(t)
+		updated, err := table.ApplyDelta(t.Context(), tbl, nil, []string{"w"}, "c3",
+			table.WithDeleteMode(table.WriteModeCopyOnWrite))
+		require.NoError(t, err)
+
+		// The rewrite of the file holding w used to write z back: the delta removed w and kept z,
+		// which c2 had already removed.
+		require.Empty(t, scanRows(t, env.loadTable(t)))
+		require.Zero(t, summaryInt(t, updated, "total-delete-files"))
+		require.Equal(t, "c3", updated.Properties()[table.PropertySourceCommit])
+	})
+}
+
+// TestApplyDeltaCopyOnWriteDeleteOnlyOnAnEvolvedTable is R4T-3 of MDS_REVIEW_4.md: §3.1 says a
+// delete-only delta still applies, because it writes no row, and the copy-on-write arm refused one
+// with ErrUnknownSchema - it built an upsert reader for a row set of length zero, and that reader
+// checks the schema. A delete-only delta therefore needs no schema check at all, and the column the
+// writer does not know keeps its value.
+func TestApplyDeltaCopyOnWriteDeleteOnlyOnAnEvolvedTable(t *testing.T) {
+	env := newTestEnv(t)
+	tbl := env.createTable(t)
+	when := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	seeded, err := table.ApplyDelta(t.Context(), tbl, []table.Row{
+		row(t, "a", "c1", 1, when, nil),
+		row(t, "b", "c1", 2, when, nil),
+		row(t, "c", "c1", 3, when, nil),
+	}, nil, "c1")
+	require.NoError(t, err)
+	evolved := evolvesWithExtraColumn(t, seeded)
+	appended := appendsWithExtraColumn(t, env, evolved, []table.Row{
+		row(t, "e", "c2", 5, when, nil),
+	}, "keep-me", "c2")
+
+	updated, err := table.ApplyDelta(t.Context(), appended, nil, []string{"a"}, "c3",
+		table.WithDeleteMode(table.WriteModeCopyOnWrite))
+	require.NoError(t, err, "a delete-only delta writes no row, so it needs no column it does not know")
+	require.Equal(t, "c3", updated.Properties()[table.PropertySourceCommit])
+	requireScanRows(t, env.loadTable(t), []table.Row{
+		row(t, "b", "c1", 2, when, nil),
+		row(t, "c", "c1", 3, when, nil),
+		row(t, "e", "c2", 5, when, nil),
+	})
+	values := extraColumnValues(t, env.loadTable(t))
+	require.NotNil(t, values["e"], "the rewrite of the file holding a must not drop the column it does not know")
+	require.Equal(t, "keep-me", *values["e"])
+
+	// The same delta on a snapshot that also carries a live delete file: the copy-on-write arm folds
+	// the delete files into the data files first (R4T-1), and the empty upsert reader it builds
+	// afterwards still carries the evolved schema (R4T-3). b and c share a data file, so a
+	// merge-on-read delete of b leaves a position delete file rather than removing the whole file.
+	withDeleteFile, err := table.ApplyDelta(t.Context(), updated, nil, []string{"b"}, "c4")
+	require.NoError(t, err)
+	require.Positive(t, summaryInt(t, withDeleteFile, "total-delete-files"))
+	folded, err := table.ApplyDelta(t.Context(), withDeleteFile, nil, []string{"c"}, "c5",
+		table.WithDeleteMode(table.WriteModeCopyOnWrite))
+	require.NoError(t, err)
+	requireScanRows(t, env.loadTable(t), []table.Row{row(t, "e", "c2", 5, when, nil)})
+	require.Zero(t, summaryInt(t, folded, "total-delete-files"))
+	values = extraColumnValues(t, env.loadTable(t))
+	require.NotNil(t, values["e"], "the fold of the delete files must not drop the column it does not know")
+	require.Equal(t, "keep-me", *values["e"])
+}
+
+// TestApplyDeltaRefusesDuplicateUpserts is R4T-5 of MDS_REVIEW_4.md: a delta that names the same
+// path twice wrote two rows for the table's identifier field, while Rebuild refuses the identical
+// input with ErrRowsOutOfOrder (path is the identifier field, so a row appears once). The delta now
+// refuses it with the same sentinel, so the two write paths have one input contract.
+func TestApplyDeltaRefusesDuplicateUpserts(t *testing.T) {
+	env := newTestEnv(t)
+	tbl := env.createTable(t)
+	when := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	_, err := table.ApplyDelta(t.Context(), tbl, []table.Row{
+		row(t, "a", "c1", 1, when, nil),
+		row(t, "b", "c1", 2, when, nil),
+		row(t, "a", "c1", 3, when, nil),
+	}, nil, "c1")
+	require.ErrorIs(t, err, table.ErrRowsOutOfOrder,
+		"a delta names a path once, as a rebuild's source does")
+	require.Empty(t, scanRows(t, env.loadTable(t)), "the refused delta committed nothing")
+}
+
+// TestApplyDeltaWithoutTheDeleteModePropertyIsCopyOnWrite pins the absent-property default: a table
+// that does not carry write.delete.mode is deleted in copy-on-write mode, because that is the mode
+// iceberg-go's own Delete runs for it - the transaction takes the mode from the table property and
+// falls back to its own copy-on-write default (iceberg-go v0.7.0 table/properties.go:101-102,
+// table/transaction.go:2603-2619). Reporting merge-on-read here would name a mode the transaction
+// does not run, and forcing it would mean writing the property into a table this package did not
+// create, on every delta. Merge-on-read is what every table CreateTable builds carries (§3.1), and
+// the copy-on-write arm is correct since it folds live delete files first (R4T-1).
+func TestApplyDeltaWithoutTheDeleteModePropertyIsCopyOnWrite(t *testing.T) {
+	env := newTestEnv(t)
+	tbl := env.createTable(t)
+	when := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	created, err := table.ApplyDelta(t.Context(), tbl, []table.Row{
+		row(t, "a", "c1", 1, when, nil),
+		row(t, "b", "c1", 2, when, nil),
+	}, nil, "c1")
+	require.NoError(t, err)
+
+	// Drop the property the way an operator, or a writer of another implementation, would.
+	txn := created.NewTransaction()
+	require.NoError(t, txn.RemoveProperties([]string{table.PropertyWriteDeleteMode}))
+	stripped, err := txn.Commit(t.Context())
+	require.NoError(t, err)
+	require.Empty(t, stripped.Properties()[table.PropertyWriteDeleteMode])
+	before := snapshotCount(stripped)
+
+	updated, err := table.ApplyDelta(t.Context(), stripped, nil, []string{"a"}, "c2")
+	require.NoError(t, err)
+	require.Zero(t, summaryInt(t, updated, "total-position-deletes"),
+		"an absent write.delete.mode is the mode iceberg-go's Delete runs: copy-on-write")
+	require.Zero(t, summaryInt(t, updated, "total-delete-files"))
+	require.Equal(t, before+1, snapshotCount(updated), "a copy-on-write delta is one snapshot")
+	require.Empty(t, updated.Properties()[table.PropertyWriteDeleteMode],
+		"the write does not add a property to a table it did not create")
+	requireScanRows(t, env.loadTable(t), []table.Row{row(t, "b", "c1", 2, when, nil)})
+}
+
 // TestRebuild replaces the whole table and streams its rows: a rebuild is the full-listing path of
 // §4.3 step 2 and §4.5.
 func TestRebuild(t *testing.T) {
@@ -397,9 +573,12 @@ func TestCompact(t *testing.T) {
 		"compaction must not keep a delete file the rebuild orphaned")
 	requireScanRows(t, orphanEnv.loadTable(t), rebuiltRows)
 
-	// A delete file orphaned without a rebuild: a copy-on-write delta rewrites the data file a
-	// position delete file belongs to and keeps the delete file (§4.9's reason for ReplaceFiles),
-	// so no scan task carries it. Compaction removes it by enumerating the snapshot's manifests.
+	// A copy-on-write delta on a snapshot that still carries a delete file no longer orphans it: the
+	// arm folds the delete files into the data files first (compactDeleteFiles, R4T-1 of
+	// MDS_REVIEW_4.md), so the delta leaves none behind and the compaction that follows has nothing
+	// to remove. Before that fix the rewrite read the data file without its delete file and kept the
+	// delete file in the snapshot: the row the delete removed came back, and the file was carried by
+	// no scan task.
 	morDelete, err := table.ApplyDelta(t.Context(), recompacted, nil, []string{"z"}, "c5")
 	require.NoError(t, err)
 	require.Equal(t, 1, summaryInt(t, morDelete, "total-delete-files"),
@@ -408,12 +587,11 @@ func TestCompact(t *testing.T) {
 		row(t, "z", "c6", 30, next, nil),
 	}, nil, "c6", table.WithDeleteMode(table.WriteModeCopyOnWrite))
 	require.NoError(t, err)
-	require.Equal(t, 1, summaryInt(t, cowRewritten, "total-delete-files"),
-		"copy-on-write keeps the position delete file of the data file it rewrote")
+	require.Zero(t, summaryInt(t, cowRewritten, "total-delete-files"),
+		"copy-on-write folds the delete file of the data file it rewrites into the rewrite")
 	orphansRemoved, err := table.Compact(t.Context(), cowRewritten, "c6")
 	require.NoError(t, err)
-	require.Zero(t, summaryInt(t, orphansRemoved, "total-delete-files"),
-		"compaction must remove a delete file no scan task carries")
+	require.Zero(t, summaryInt(t, orphansRemoved, "total-delete-files"))
 	requireScanRows(t, orphanEnv.loadTable(t), []table.Row{
 		row(t, "w", "c4", 3, next, nil),
 		row(t, "z", "c6", 30, next, nil),
