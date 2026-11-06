@@ -124,6 +124,10 @@ const (
 	// both the writer and the PyIceberg reader use for data. The versions are pinned to the set
 	// this suite is verified against: PyIceberg 0.12 turned inspect.manifests() into a PyArrow
 	// Table, so an unpinned install silently changes the shape of what a step reports.
+	//
+	// esti/ops/iceberg-client/Dockerfile bakes this same set into an image, which is what
+	// ESTI_ICEBERG_CLIENT_IMAGE points at so that a step does not install anything: keep the two
+	// lists in step, and note that a step still installs this set when its import probe fails.
 	icebergClientPackages = `"pyiceberg[sql-sqlite,s3fs,pyarrow]==0.12.0" "pyarrow==26.0.1" "duckdb==2.0.0"`
 
 	// icebergClientInstallFailed is the exit code of a step whose dependency install failed, and

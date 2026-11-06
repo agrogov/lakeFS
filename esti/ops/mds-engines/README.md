@@ -39,6 +39,14 @@ The scripts do not edit or import the esti suite; they write the same layout int
   export PATH=$HOME/sdk/go1.25.8/bin:$PATH GOTOOLCHAIN=auto
   ```
 
+- The PyIceberg/DuckDB client image of [`esti/mds_test.go`](../../mds_test.go) bakes the pinned
+  clients in, so no test step spends its time in `pip install`. Build it locally (never pushed to a
+  registry) and point the suite at it:
+
+  ```bash
+  docker build -t esti-iceberg-client esti/ops/iceberg-client && export ESTI_ICEBERG_CLIENT_IMAGE=esti-iceberg-client
+  ```
+
 - Free host ports `8000` (lakeFS), `18080` (indexer) and `18099` (the OIDC discovery document the
   SSO section needs). Override them with `MDS_SERVER_PORT`, `MDS_INDEXER_PORT` and
   `MDS_OIDC_PORT`; the container host alias `lakefs` follows `MDS_SERVER_PORT`.

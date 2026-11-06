@@ -49,6 +49,10 @@
 //	user without R access    403 on the virtual table
 //	user with R-metadata only  200 on R-metadata's own table, 403 through R.<ref>.system.object_metadata
 //	non-indexer write        admin cannot write R-metadata (the deny of §8 is in force)
+//	guard-group attach        a member of a base group cannot CreateRepository, bare or not, on
+//	                          either accepted spelling of R-metadata's storage namespace: each is
+//	                          403 from the deny (R3S-3), while an ordinary namespace is created
+//	                          and deleted by the same principal
 //	system on R rejects writes  a principal that may write R (not the admin) cannot create,
 //	                            commit, rename or drop system.object_metadata on R, nor create or
 //	                            drop the system namespace, through either mount (§5.3); the
@@ -115,10 +119,14 @@ import (
 	minioCredentials "github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/api/apigen"
+	"github.com/treeverse/lakefs/pkg/api/apiutil"
 	"github.com/treeverse/lakefs/pkg/datasets"
 	"github.com/treeverse/lakefs/pkg/icebergcatalog"
+	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/mds/bootstrap"
 	"github.com/treeverse/lakefs/pkg/mds/indexer"
+	"github.com/treeverse/lakefs/pkg/permissions"
+	"github.com/treeverse/lakefs/pkg/testutil"
 )
 
 const (
@@ -169,6 +177,17 @@ const (
 
 	// mdsRequestTimeout bounds one HTTP request the suite issues itself.
 	mdsRequestTimeout = 30 * time.Second
+
+	// mdsPolicyRefreshTimeout bounds the wait for the companion-repository deny policy to name a
+	// repository created after the server started. The bootstrap's refresher runs every
+	// bootstrap.policyRefreshInterval (one minute) and re-derives the whole policy set, so this is
+	// one interval plus the store round trips. Missing it is a failed case: the deny of §8 would
+	// not be in force at the moment the case asserts it.
+	mdsPolicyRefreshTimeout = 90 * time.Second
+
+	// mdsPolicyListAmount is how many policies one list call asks for: the policy set of the suite
+	// is a handful of chunks, well below the API's default page.
+	mdsPolicyListAmount = 100
 
 	// mdsLogTailLines is how much of a dead process's log a failure reports.
 	mdsLogTailLines = 50
@@ -230,6 +249,11 @@ const (
 	// mdsFilteredPathPrefix is the prefix of the filtered-scan example of
 	// docs/metadata-search.md: the suite's objects live under data/ instead of orders/.
 	mdsFilteredPathPrefix = "data/"
+
+	// mdsGuardGroup is the base group the guard-group case adds its principal to. Admins is the
+	// RBAC template's most privileged group - FSFullAccess is fs:* on every resource - so a
+	// refusal of a CreateRepository by a member of it is the deny of §8 and not a missing grant.
+	mdsGuardGroup = "Admins"
 )
 
 // mdsEnv is one running lakefs-sso with Metadata Search enabled, one running `lakefs-sso mds run`,
@@ -637,16 +661,15 @@ func TestMetadataSearchEndToEnd(t *testing.T) {
 		// §8: mds-metadata-repo-protect denies the fs: and catalog: writes on the companion
 		// repositories of every base group, and a deny wins over the administrator's fs:* allow.
 		//
-		// METADATA_SEARCH_PLAN.md (M6) says 403. The lakeFS *core API* reports insufficient
-		// permissions as 401 (its long-standing convention, pkg/api), while the S3 gateway and the
-		// Iceberg catalog answer 403; the case asserts both, so neither convention can hide a
-		// missing deny. See the commit message: the design says "cannot write", not "403".
+		// The suite opts into auth.authorization_failure_status: 403, so the core API reports the
+		// refusal with the 403 plan M6 names; the S3 gateway and the Iceberg catalog answer 403
+		// anyway. Both APIs are asserted, so neither convention can hide a missing deny.
 		res, err := cl.UploadObjectWithBodyWithResponse(t.Context(), env.metadataRepo, mdsBranch,
 			&apigen.UploadObjectParams{Path: "forged/row.txt"}, mdsObjectContentType, strings.NewReader("forged"))
 		require.NoError(t, err, "upload into %s", env.metadataRepo)
-		require.Equalf(t, http.StatusUnauthorized, res.StatusCode(),
+		require.Equalf(t, http.StatusForbidden, res.StatusCode(),
 			"an administrator must not be able to write %s through the API while the deny of §8 is "+
-				"in force; the core API reports insufficient permissions as 401: %s", env.metadataRepo, res.Body)
+				"in force: %s", env.metadataRepo, res.Body)
 		require.Containsf(t, string(res.Body), "denied permission",
 			"the refusal must come from the deny policy, not from a missing grant: %s", res.Body)
 
@@ -658,6 +681,122 @@ func TestMetadataSearchEndToEnd(t *testing.T) {
 		require.Equalf(t, "AccessDenied", response.Code,
 			"the S3 gateway must refuse the write with 403 AccessDenied, the same deny on the other "+
 				"API: %v", err)
+	})
+
+	t.Run("guard group cannot create a repository on the companion storage namespace", func(t *testing.T) {
+		// §8 (R3S-3, MDS_REVIEW_3.md): the deny carries fs:AttachStorageNamespace on the storage
+		// namespace of every companion repository, and CreateRepository authorizes that action on
+		// the raw string the client sent (pkg/api/controller.go) - not on a canonical form - while
+		// the block layer resolves one trailing "/" away (pkg/block.resolveRelative,
+		// formatPathWithNamespace). A deny that named only the stored spelling would therefore leave
+		// the same physical prefix to a guard-group member with fs:*, who could create a bare
+		// repository on it and let its uncommitted GC sweep the index files (§3.3).
+		//
+		// bootstrap.storageNamespaceDenyResources emits one ARN per accepted spelling for exactly
+		// that reason. This case drives the real CreateRepository with each spelling, bare and not
+		// bare - the bare flag is not read before the authorization node, but it decides what the
+		// request would write, so both are sent - and requires the 403.
+		//
+		// The companion repository itself is what carries the namespace, and the indexer creates it
+		// on its first tick of R (§3.3), so the case waits for it instead of assuming an earlier
+		// case indexed something: run alone, nothing has been indexed yet.
+		env.waitMetadataRepository(t)
+		meta, err := env.admin.GetRepositoryWithResponse(t.Context(), env.metadataRepo)
+		require.NoErrorf(t, err, "read %s", env.metadataRepo)
+		require.Equalf(t, http.StatusOK, meta.StatusCode(), "read %s: %s", env.metadataRepo, meta.Body)
+		require.NotNilf(t, meta.JSON200, "read %s: %s", env.metadataRepo, meta.Body)
+		stored := strings.TrimRight(meta.JSON200.StorageNamespace, "/")
+		require.NotEmptyf(t, stored, "%s must report its storage namespace: %s", env.metadataRepo, meta.Body)
+
+		// For a namespace with a path - the indexer derives R-metadata's from R's, so it always has
+		// one - this is the whole enumeration of storageNamespaceDenyResources: the stored spelling
+		// and that spelling with one "/". A bucket-root companion has one more ("…//"), and is not
+		// what this installation creates.
+		spellings := []string{stored, stored + "/"}
+		resources := make(map[string]struct{}, len(spellings))
+		for _, spelling := range spellings {
+			resources[permissions.StorageNamespace(spelling)] = struct{}{}
+		}
+
+		// The deny is re-derived by the bootstrap's refresher, which runs every one minute, so a
+		// companion repository the indexer created after the server started is named only after the
+		// next refresh. Waiting for it is part of §8's contract, not a workaround: the window is at
+		// most one interval, and the wait fails the case (with the policy set it saw) if it is not
+		// closed within mdsPolicyRefreshTimeout.
+		groupID := env.groupID(t, mdsGuardGroup)
+		env.waitCompanionNamespaceDeny(t, groupID, resources)
+
+		// The principal is created after the deny is in force, so its first authorization answer is
+		// the current policy set: the auth service caches a user's effective policies, and a cache
+		// filled before the refresh would hide the deny for its TTL.
+		member := env.createPrincipal(t, "esti-mds-guard-member", nil)
+		added, err := env.admin.AddGroupMembershipWithResponse(t.Context(), groupID, member.username)
+		require.NoErrorf(t, err, "add %s to %s", member.username, mdsGuardGroup)
+		require.Equalf(t, http.StatusCreated, added.StatusCode(), "add %s to %s: %s",
+			member.username, mdsGuardGroup, added.Body)
+		memberClient := env.coreAPIAs(t, member.key, member.secret)
+
+		// The control: the same principal, in the same group, creates and deletes an ordinary
+		// repository. Its fs:* allow is what the deny overrides below, so a failure here means the
+		// grant is broken and the 403s are not evidence of anything.
+		controlNS := "s3://" + env.bucket + "/" + env.runPrefix + "/guard-control"
+		for _, bare := range []bool{true, false} {
+			name := env.repo + "-guard-control"
+			if bare {
+				name += "-bare"
+			}
+			created, err := memberClient.CreateRepositoryWithResponse(t.Context(),
+				&apigen.CreateRepositoryParams{Bare: apiutil.Ptr(bare)},
+				apigen.CreateRepositoryJSONRequestBody{
+					Name:             name,
+					StorageNamespace: controlNS,
+					DefaultBranch:    apiutil.Ptr(mdsBranch),
+				})
+			require.NoErrorf(t, err, "create the control repository %s", name)
+			require.Equalf(t, http.StatusCreated, created.StatusCode(),
+				"%s is a member of %s and holds fs:*, so creating %s (bare=%t) on the ordinary namespace %q "+
+					"must succeed, or the refusals below are not the deny of §8: %s",
+				member.username, mdsGuardGroup, name, bare, controlNS, created.Body)
+
+			deleted, err := memberClient.DeleteRepositoryWithResponse(t.Context(), name, &apigen.DeleteRepositoryParams{})
+			require.NoErrorf(t, err, "delete the control repository %s", name)
+			require.Equalf(t, http.StatusNoContent, deleted.StatusCode(),
+				"delete the control repository %s: %s", name, deleted.Body)
+		}
+
+		for i, spelling := range spellings {
+			// Bare first: it is the shape the pre-fix deny let through, because a bare
+			// CreateRepository skips the storage-namespace-in-use check that refuses a non-bare one
+			// on the same prefix (R3S-3).
+			for _, bare := range []bool{true, false} {
+				name := fmt.Sprintf("%s-guard-%d-%t", env.repo, i, bare)
+				res, err := memberClient.CreateRepositoryWithResponse(t.Context(),
+					&apigen.CreateRepositoryParams{Bare: apiutil.Ptr(bare)},
+					apigen.CreateRepositoryJSONRequestBody{
+						Name:             name,
+						StorageNamespace: spelling,
+						DefaultBranch:    apiutil.Ptr(mdsBranch),
+					})
+				require.NoErrorf(t, err, "create %s on the companion storage namespace spelled %q", name, spelling)
+				require.Equalf(t, http.StatusForbidden, res.StatusCode(),
+					"%s is a member of %s and holds fs:*, so only the deny of §8 can refuse this: a repository "+
+						"(bare=%t) on the storage namespace of %s spelled %q must be 403 (R3S-3); it would share "+
+						"the companion's physical prefix and let its uncommitted GC sweep the index files: %s",
+					member.username, mdsGuardGroup, bare, env.metadataRepo, spelling, res.Body)
+				require.Containsf(t, string(res.Body), "denied permission",
+					"the refusal of the spelling %q must come from the deny policy, not from a missing grant: %s",
+					spelling, res.Body)
+				require.Containsf(t, string(res.Body), permissions.AttachStorageNamespaceAction,
+					"the refusal of the spelling %q must name %s, the action the deny carries: %s",
+					spelling, permissions.AttachStorageNamespaceAction, res.Body)
+
+				// Nothing is created: the authorization node precedes every write.
+				found, err := memberClient.GetRepositoryWithResponse(t.Context(), name)
+				require.NoErrorf(t, err, "read %s after the refused create", name)
+				require.Equalf(t, http.StatusNotFound, found.StatusCode(),
+					"a refused CreateRepository must not create %s: %s", name, found.Body)
+			}
+		}
 	})
 
 	t.Run("system on R rejects writes", func(t *testing.T) {
@@ -1096,6 +1235,11 @@ auth:
     secret_key: "esti-metadata-search-auth-secret"
   ui_config:
     rbac: "internal"
+  # The refusals of §9 are asserted as 403 (plan M6). lakeFS answers an authorization failure 401
+  # by default and only the opt-in changes that (auth.authorization_failure_status, CHANGELOG_SSO.md),
+  # so the suite sets it: a guard-group member's CreateRepository on a companion namespace and a
+  # non-indexer's write into R-metadata are then the 403 the plan names, on the core API too.
+  authorization_failure_status: 403
 sso:
   enabled: true
   client_id: "esti-mds"
@@ -1636,6 +1780,116 @@ func (e *mdsEnv) createPrincipal(t *testing.T, username string, statements []api
 
 // mdsRepoPattern is the repository ARN a policy statement matches (§8 spells the same shape).
 func mdsRepoPattern(repo string) string { return "arn:lakefs:fs:::repository/" + repo }
+
+// coreAPIAs builds a core API client that authenticates as one principal, so a case can act as a
+// user other than the break-glass administrator.
+func (e *mdsEnv) coreAPIAs(t *testing.T, key, secret string) *apigen.ClientWithResponses {
+	t.Helper()
+	client, err := testutil.NewClientFromCreds(logging.ContextUnavailable(), key, secret, e.baseURL+apiutil.BaseURL)
+	require.NoError(t, err, "build a core API client for a suite principal")
+	return client
+}
+
+// groupID resolves the id the membership API takes for a group name. The in-repo ACL service keys a
+// group by its display name and reports it as the id, while the API's Group carries both fields; a
+// group that is missing is a failed case, not a skip - the bootstrap of §8 is what should have
+// created it, and the deny is attached to it.
+func (e *mdsEnv) groupID(t *testing.T, name string) string {
+	t.Helper()
+	amount := apigen.PaginationAmount(mdsPolicyListAmount)
+	res, err := e.admin.ListGroupsWithResponse(e.ctx, &apigen.ListGroupsParams{Amount: &amount})
+	require.NoError(t, err, "list the groups")
+	require.Equalf(t, http.StatusOK, res.StatusCode(), "list the groups: %s", res.Body)
+	require.NotNilf(t, res.JSON200, "list the groups: %s", res.Body)
+	for _, group := range res.JSON200.Results {
+		if group.Id == name || (group.Name != nil && *group.Name == name) {
+			if group.Id != "" {
+				return group.Id
+			}
+			return name
+		}
+	}
+	t.Fatalf("the group %q does not exist in this installation; the groups are %v", name, res.JSON200.Results)
+	return ""
+}
+
+// waitMetadataRepository waits until the indexer has created R-metadata, which it does on its
+// first tick of a data repository (§3.3), and fails the case with the indexer's log tail if that does
+// not happen within mdsIndexTimeout.
+func (e *mdsEnv) waitMetadataRepository(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(mdsIndexTimeout)
+	for {
+		res, err := e.admin.GetRepositoryWithResponse(e.ctx, e.metadataRepo)
+		require.NoErrorf(t, err, "read %s", e.metadataRepo)
+		switch res.StatusCode() {
+		case http.StatusOK:
+			return
+		case http.StatusNotFound:
+		default:
+			t.Fatalf("read %s: %d: %s", e.metadataRepo, res.StatusCode(), res.Body)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the indexer did not create %s within %s (design §3.3)\nindexer log:\n%s",
+				e.metadataRepo, mdsIndexTimeout, mdsLogTail(e.indexPath, mdsLogTailLines))
+		}
+		time.Sleep(mdsPollInterval)
+	}
+}
+
+// waitCompanionNamespaceDeny waits until the deny policy set of §8 names the given storage-namespace
+// ARNs, and fails the case with the policy set it saw if that does not happen within
+// mdsPolicyRefreshTimeout.
+//
+// The set is re-derived by the bootstrap's refresher while the server runs
+// (bootstrap.startPolicyRefresher), so a companion repository created after the server started is
+// named at most one refresh interval later. Reading the policy back is the only way to know the deny
+// is in force without trying the write it refuses, and the write is what the case asserts.
+func (e *mdsEnv) waitCompanionNamespaceDeny(t *testing.T, groupID string, resources map[string]struct{}) {
+	t.Helper()
+	amount := apigen.PaginationAmount(mdsPolicyListAmount)
+	deadline := time.Now().Add(mdsPolicyRefreshTimeout)
+	var seen []string
+	for {
+		res, err := e.admin.ListGroupPoliciesWithResponse(e.ctx, groupID, &apigen.ListGroupPoliciesParams{Amount: &amount})
+		require.NoErrorf(t, err, "list the policies of group %s", groupID)
+		require.Equalf(t, http.StatusOK, res.StatusCode(), "list the policies of group %s: %s", groupID, res.Body)
+		require.NotNilf(t, res.JSON200, "list the policies of group %s: %s", groupID, res.Body)
+
+		seen = seen[:0]
+		for _, policy := range res.JSON200.Results {
+			if !strings.HasPrefix(policy.Id, bootstrap.MetadataRepoProtectPolicyName+"-") {
+				continue
+			}
+			for _, statement := range policy.Statement {
+				seen = append(seen, policy.Id+": "+statement.Resource)
+				if statement.Effect != "deny" || !containsString(statement.Action, permissions.AttachStorageNamespaceAction) {
+					continue
+				}
+				if _, ok := resources[statement.Resource]; ok {
+					return
+				}
+			}
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("the deny of §8 does not name the companion storage namespace within %s; the %s policies "+
+				"attached to group %s carried: %v; wanted one of %v",
+				mdsPolicyRefreshTimeout, bootstrap.MetadataRepoProtectPolicyName, groupID, seen, sortedKeysOfSet(resources))
+		}
+		time.Sleep(mdsPollInterval)
+	}
+}
+
+// sortedKeysOfSet returns the keys of a string set in order, so a failure message is stable.
+func sortedKeysOfSet(values map[string]struct{}) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
 
 // ---------------------------------------------------------------------------------------------
 // the data repository and the objects
