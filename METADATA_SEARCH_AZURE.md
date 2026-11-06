@@ -326,7 +326,8 @@ the non-goals N1–N4, the `abfs[s]://` locations and the `iceberg.azure.locatio
   to `blob` and record which engine needed it.
 
 **Blocked on access (2026-11-07).** The hr2 cluster can be reached only from the office network,
-so AZ7 waits until then. Nothing was deployed and nothing was committed for it. Its Kanban task
+so AZ7 waits until then. The self-contained runbook for the office machine is
+[`AZ7_OFFICE_HANDOFF.md`](AZ7_OFFICE_HANDOFF.md). Nothing was deployed and nothing was committed for it. Its Kanban task
 (`21ca9`) is in Review, in plan mode. It needs these inputs before any step that changes the
 cluster, and an explicit approval for each such step:
 
