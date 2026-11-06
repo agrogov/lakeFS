@@ -244,6 +244,40 @@ func TestMetadataRepoProtectPolicyStatements(t *testing.T) {
 		"no repository the server knows, nothing to deny, and no statement-less policy: the deny never falls back to a pattern")
 }
 
+// TestIsMetadataRepoProtectChunk pins the exported chunk-name predicate the esti suite uses. It
+// accepts exactly the names chunkPolicyName writes for a positive chunk number, and rejects the
+// base name, a zero or zero-padded chunk, and every loose-prefix neighbour, so the
+// suite cannot pass on a policy the bootstrap does not own (R3S-2).
+func TestIsMetadataRepoProtectChunk(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		policy string
+		want   bool
+	}{
+		{name: "first chunk", policy: chunkPolicyName(MetadataRepoProtectPolicyName, 1), want: true},
+		{name: "later chunk", policy: chunkPolicyName(MetadataRepoProtectPolicyName, 42), want: true},
+		{name: "base", policy: MetadataRepoProtectPolicyName, want: false},
+		{name: "zero chunk", policy: MetadataRepoProtectPolicyName + "-0", want: false},
+		{name: "zero padded chunk", policy: MetadataRepoProtectPolicyName + "-01", want: false},
+		{name: "negative chunk", policy: MetadataRepoProtectPolicyName + "--1", want: false},
+		{name: "empty chunk", policy: MetadataRepoProtectPolicyName + "-", want: false},
+		{name: "trailing text", policy: MetadataRepoProtectPolicyName + "-1-extra", want: false},
+		{name: "non-numeric chunk", policy: MetadataRepoProtectPolicyName + "-extra", want: false},
+		{name: "lookalike base", policy: MetadataRepoProtectPolicyName + "x-1", want: false},
+		{name: "indexer chunk", policy: chunkPolicyName(IndexerPolicyName, 1), want: false},
+		{name: "empty", policy: "", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equalf(t, tt.want, IsMetadataRepoProtectChunk(tt.policy),
+				"IsMetadataRepoProtectChunk(%q)", tt.policy)
+		})
+	}
+}
+
 // bootstrapTS is a fixed creation timestamp, so the idempotency assertions compare exact values.
 var bootstrapTS = time.Date(2025, 4, 1, 12, 0, 0, 0, time.UTC)
 

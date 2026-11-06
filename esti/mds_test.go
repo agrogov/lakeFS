@@ -115,6 +115,7 @@ import (
 	minioCredentials "github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/api/apigen"
+	"github.com/treeverse/lakefs/pkg/datasets"
 	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"github.com/treeverse/lakefs/pkg/mds/bootstrap"
 	"github.com/treeverse/lakefs/pkg/mds/indexer"
@@ -1499,8 +1500,9 @@ func (e *mdsEnv) stop(t *testing.T) {
 // ---------------------------------------------------------------------------------------------
 
 // requireMDSCore asserts that the server's Metadata Search bootstrap ran: the mds-indexer user
-// exists, both policies of §8 exist, and mds-metadata-repo-protect is attached to the base groups,
-// which is what makes the deny of §8 enforced in this installation.
+// and allow policy exist, the metadata-repo deny is stored only as numeric chunks (R3S-2: the deny
+// has no repository-independent statement, so it has no base policy), and every chunk is attached
+// to the base groups, which is what makes the deny of §8 enforced in this installation.
 func (e *mdsEnv) requireMDSCore(t *testing.T) {
 	t.Helper()
 	user, err := e.admin.GetUserWithResponse(t.Context(), bootstrap.UserName)
@@ -1508,26 +1510,74 @@ func (e *mdsEnv) requireMDSCore(t *testing.T) {
 	require.Equalf(t, http.StatusOK, user.StatusCode(),
 		"the server must bootstrap the %s user of §8 at startup: %s", bootstrap.UserName, user.Body)
 
-	for _, policy := range []string{bootstrap.IndexerPolicyName, bootstrap.MetadataRepoProtectPolicyName} {
-		res, err := e.admin.GetPolicyWithResponse(t.Context(), policy)
-		require.NoErrorf(t, err, "get policy %s", policy)
-		require.Equalf(t, http.StatusOK, res.StatusCode(),
-			"the server must bootstrap the %s policy of §8 at startup: %s", policy, res.Body)
-	}
+	// The allow policy has repository-independent statements, so its base policy always exists.
+	indexer, err := e.admin.GetPolicyWithResponse(t.Context(), bootstrap.IndexerPolicyName)
+	require.NoErrorf(t, err, "get policy %s", bootstrap.IndexerPolicyName)
+	require.Equalf(t, http.StatusOK, indexer.StatusCode(),
+		"the server must bootstrap the %s policy of §8 at startup: %s", bootstrap.IndexerPolicyName, indexer.Body)
 
-	// The deny is attached to the base groups (§8). Admins is the group the break-glass
-	// administrator is in, so this is the attachment the "non-indexer cannot write" case needs.
-	groups, err := e.admin.ListGroupPoliciesWithResponse(t.Context(), "Admins", &apigen.ListGroupPoliciesParams{})
-	require.NoError(t, err, "list the policies of the Admins group")
-	require.Equalf(t, http.StatusOK, groups.StatusCode(), "list the policies of Admins: %s", groups.Body)
-	require.NotNil(t, groups.JSON200)
-	names := make([]string, 0, len(groups.JSON200.Results))
-	for _, policy := range groups.JSON200.Results {
-		names = append(names, policy.Id)
+	// R3S-2: the deny has no repository-independent statement, and a policy with zero statements
+	// is not a policy (api/authorization.yml requires minItems: 1), so the base name must not
+	// exist at all - the deny lives only in its numeric chunks.
+	base, err := e.admin.GetPolicyWithResponse(t.Context(), bootstrap.MetadataRepoProtectPolicyName)
+	require.NoErrorf(t, err, "get policy %s", bootstrap.MetadataRepoProtectPolicyName)
+	require.Equalf(t, http.StatusNotFound, base.StatusCode(),
+		"the %s deny of §8 must not exist as a base policy, only as numeric chunks: %s: %s",
+		bootstrap.MetadataRepoProtectPolicyName, base.Status(), base.Body)
+
+	// List the chunks the server wrote. Chunk names are matched exactly (base + '-' + digits),
+	// never by a loose prefix, so a policy the bootstrap does not own cannot pass for a chunk.
+	prefix := apigen.PaginationPrefix(bootstrap.MetadataRepoProtectPolicyName)
+	amount := apigen.PaginationAmount(-1)
+	policies, err := e.admin.ListPoliciesWithResponse(t.Context(), &apigen.ListPoliciesParams{
+		Prefix: &prefix,
+		Amount: &amount,
+	})
+	require.NoErrorf(t, err, "list the %s chunk policies", bootstrap.MetadataRepoProtectPolicyName)
+	require.Equalf(t, http.StatusOK, policies.StatusCode(),
+		"list the %s chunk policies: %s", bootstrap.MetadataRepoProtectPolicyName, policies.Body)
+	require.NotNilf(t, policies.JSON200, "list the %s chunk policies: %s",
+		bootstrap.MetadataRepoProtectPolicyName, policies.Body)
+	chunks := make([]string, 0, len(policies.JSON200.Results))
+	for _, policy := range policies.JSON200.Results {
+		if bootstrap.IsMetadataRepoProtectChunk(policy.Id) {
+			chunks = append(chunks, policy.Id)
+		}
 	}
-	require.Containsf(t, names, bootstrap.MetadataRepoProtectPolicyName,
-		"the %s deny of §8 must be attached to the base groups, or the write protection is not "+
-			"in force in this run; Admins policies: %v", bootstrap.MetadataRepoProtectPolicyName, names)
+	require.NotEmptyf(t, chunks,
+		"the server must bootstrap at least one %s-<n> deny chunk of §8 at startup; policies with that prefix: %+v",
+		bootstrap.MetadataRepoProtectPolicyName, policies.JSON200.Results)
+	sort.Strings(chunks)
+
+	// Every chunk is attached to the base groups of §8 - the same guard list the server passes to
+	// the deny, whatever group template the installation runs. A group of the other template does
+	// not exist here and the bootstrap skips it, so a 404 is expected for it; a base group that
+	// does exist must carry every chunk, or the deny is not in force for its members. Admins is
+	// the break-glass administrator's group, so this is also the attachment the "non-indexer
+	// cannot write" case needs.
+	for _, group := range datasets.PinsProtectGroups(nil) {
+		res, err := e.admin.ListGroupPoliciesWithResponse(t.Context(), group, &apigen.ListGroupPoliciesParams{
+			Prefix: &prefix,
+			Amount: &amount,
+		})
+		require.NoErrorf(t, err, "list the policies of the %s group", group)
+		if res.StatusCode() == http.StatusNotFound {
+			continue
+		}
+		require.Equalf(t, http.StatusOK, res.StatusCode(), "list the policies of %s: %s", group, res.Body)
+		require.NotNilf(t, res.JSON200, "list the policies of %s: %s", group, res.Body)
+		attached := make([]string, 0, len(res.JSON200.Results))
+		for _, policy := range res.JSON200.Results {
+			require.Truef(t, bootstrap.IsMetadataRepoProtectChunk(policy.Id),
+				"%s carries %q, which is not a numeric %s chunk of §8", group, policy.Id,
+				bootstrap.MetadataRepoProtectPolicyName)
+			attached = append(attached, policy.Id)
+		}
+		sort.Strings(attached)
+		require.ElementsMatchf(t, chunks, attached,
+			"every %s-<n> deny chunk of §8 must be attached to the base group %s, or the write "+
+				"protection is not in force in this run", bootstrap.MetadataRepoProtectPolicyName, group)
+	}
 }
 
 // createIndexerCredentials creates the access key pair of mds-indexer, which §8 leaves to the

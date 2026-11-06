@@ -348,6 +348,19 @@ func chunkPolicyName(base string, chunk int) string {
 	return fmt.Sprintf("%s-%d", base, chunk)
 }
 
+// IsMetadataRepoProtectChunk reports whether name is one of the numbered chunk policies of the
+// installation-wide metadata-repo deny: mds-metadata-repo-protect-<n> with a positive n, no leading
+// zero, and nothing else. The base name itself is not a chunk - the deny has no base policy (R3S-2)
+// - and an operator policy that merely shares the prefix is not one either.
+//
+// It is exported for the end-to-end suite, which has to assert the policy set the server installs
+// without duplicating the name format: the suite lists the policies attached to the guard groups
+// and checks every metadata-repo-protect name against this predicate.
+func IsMetadataRepoProtectChunk(name string) bool {
+	_, ok := ownedChunkNumber(MetadataRepoProtectPolicyName, name)
+	return ok
+}
+
 // isOwnedPolicyName reports whether name is a policy this package writes: the base name or one of
 // its numeric chunks. It is deliberately narrower than a prefix match, so an operator policy such
 // as mds-indexer-extra-storage-namespace is never deleted as a stale chunk; see the R2S-6 note in
