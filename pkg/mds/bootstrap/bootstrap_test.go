@@ -21,9 +21,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -176,9 +178,9 @@ func TestMetadataRepoProtectPolicyStatements(t *testing.T) {
 	repositoryActions := append(append([]string(nil), fsActions...), "branches:SetBranchProtectionRules")
 	catalogActions := []string{"catalog:Create*", "catalog:Update*", "catalog:Delete*", "catalog:WriteTableData"}
 	policies := MetadataRepoProtectPolicies(policyTestRepositories, time.Unix(0, 0))
-	require.Len(t, policies, 2, "one empty base policy plus one chunk for two companion repositories")
-	require.Equal(t, MetadataRepoProtectPolicyName, policies[0].DisplayName)
-	require.Empty(t, policies[0].Statement, "the base deny has no repository-independent statement")
+	require.Len(t, policies, 1, "one chunk for two companion repositories; the deny has no base policy")
+	require.NotEqual(t, MetadataRepoProtectPolicyName, policies[0].DisplayName,
+		"R3S-2: the deny is never written as a statement-less base policy")
 
 	want := model.Statements{
 		{
@@ -232,15 +234,14 @@ func TestMetadataRepoProtectPolicyStatements(t *testing.T) {
 			Resource: "arn:lakefs:catalog:::view/orders-metadata/*/*",
 		},
 	}
-	chunk := policies[1]
+	chunk := policies[0]
 	require.Equal(t, chunkPolicyName(MetadataRepoProtectPolicyName, 1), chunk.DisplayName)
 	require.True(t, statementsEqual(want, chunk.Statement),
 		"the first chunk is the deny list of §8; got %+v", chunk.Statement)
 
 	empty := MetadataRepoProtectPolicies(nil, time.Unix(0, 0))
-	require.Len(t, empty, 1)
-	require.Empty(t, empty[0].Statement,
-		"no repository the server knows, nothing to deny: the deny never falls back to a pattern")
+	require.Empty(t, empty,
+		"no repository the server knows, nothing to deny, and no statement-less policy: the deny never falls back to a pattern")
 }
 
 // bootstrapTS is a fixed creation timestamp, so the idempotency assertions compare exact values.
@@ -317,15 +318,24 @@ func TestEnsurePrincipalsConfiguredGuardGroups(t *testing.T) {
 	groups := datasets.PinsProtectGroups([]string{extraGuardGroup, GroupName})
 
 	readLog := capturePackageLog(t)
-	inForce, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, groups, nil)
+	inForce, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, groups, repositoryInfos("analytics"))
 	require.NoError(t, err)
 	require.True(t, inForce)
 
-	require.Contains(t, policyNames(t, svc, extraGuardGroup), MetadataRepoProtectPolicyName,
+	// The deny has no repository-independent statement, so the deny policy set is its chunks and
+	// nothing else (R3S-2): no statement-less base policy is written to any of these groups.
+	denyChunk := chunkPolicyName(MetadataRepoProtectPolicyName, 1)
+	require.Contains(t, policyNames(t, svc, extraGuardGroup), denyChunk,
 		"a configured extra guard group gets the deny exactly like a base group")
-	require.Contains(t, policyNames(t, svc, "Admins"), MetadataRepoProtectPolicyName)
-	require.NotContains(t, policyNames(t, svc, GroupName), MetadataRepoProtectPolicyName,
+	require.Contains(t, policyNames(t, svc, "Admins"), denyChunk)
+	require.NotContains(t, policyNames(t, svc, GroupName), denyChunk,
 		"the deny is never attached to MetadataSearchIndexers, even when the guard list names it")
+	for _, group := range []string{"Admins", extraGuardGroup, GroupName} {
+		for _, name := range policyNames(t, svc, group) {
+			require.NotEqual(t, MetadataRepoProtectPolicyName, name,
+				"the statement-less base deny is never written, let alone attached (R3S-2)")
+		}
+	}
 
 	output := readLog()
 	require.Contains(t, output, "level=warning", "dropping the indexer group from the guard list is logged")
@@ -810,10 +820,10 @@ func TestEnsurePrincipalsRepairsDriftedPolicy(t *testing.T) {
 			},
 		},
 		{
-			name: "deny policy with a blanket allow",
+			name: "deny chunk policy with a blanket allow",
 			policy: &model.Policy{
 				CreatedAt:   bootstrapTS,
-				DisplayName: MetadataRepoProtectPolicyName,
+				DisplayName: chunkPolicyName(MetadataRepoProtectPolicyName, 1),
 				Statement: model.Statements{{
 					Effect:   model.StatementEffectAllow,
 					Action:   []string{"fs:*"},
@@ -853,6 +863,31 @@ func TestEnsurePrincipalsRepairsDriftedPolicy(t *testing.T) {
 			require.Contains(t, output, tt.policy.DisplayName)
 		})
 	}
+}
+
+// TestEnsurePrincipalsRemovesStatementLessDenyPolicy is R3S-2 on the stored side: an earlier version
+// wrote an mds-metadata-repo-protect base policy with no statements (and a hand-edit can leave one
+// behind). The bootstrap no longer writes one, so it removes the stored one as a stale owned name
+// instead of trusting or rewriting it. A policy whose statement array is empty is rejected by a
+// server that validates api/authorization.yml (minItems: 1).
+func TestEnsurePrincipalsRemovesStatementLessDenyPolicy(t *testing.T) {
+	svc := newACLService(t)
+	// The ACL service accepts the empty statement list, exactly as the in-process tests always
+	// assumed; the API server on top of it does not (TestEnsurePrincipalsOverAuthAPI).
+	require.NoError(t, svc.WritePolicy(t.Context(), &model.Policy{
+		CreatedAt:   bootstrapTS,
+		DisplayName: MetadataRepoProtectPolicyName,
+		Statement:   model.Statements{},
+	}, false))
+
+	_, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), policyTestRepositories)
+	require.NoError(t, err)
+
+	_, err = svc.GetPolicy(t.Context(), MetadataRepoProtectPolicyName)
+	require.ErrorIs(t, err, auth.ErrNotFound,
+		"the statement-less base deny is removed, and no empty policy replaces it")
+	require.NotEmpty(t, ownedPolicyNames(t, svc, MetadataRepoProtectPolicyName, 10),
+		"the chunk policies that do carry statements are still there")
 }
 
 // TestEnsurePrincipalsDegradesWithoutPolicyBackend drives the documented default auth mode: a
@@ -916,6 +951,70 @@ func TestEnsurePrincipalsNoAuthService(t *testing.T) {
 	require.ErrorIs(t, err, ErrNoAuthorizer)
 }
 
+// TestEnsurePrincipalsOverAuthAPI is R3S-2 and R3S-5 over the wire, not over the in-process ACL
+// service: contrib/auth/acl.Serve validates every request body against api/authorization.yml, and
+// pkg/auth.APIAuthService is what the lakefs-sso binary uses when auth is external.
+//
+// R3S-2: Policy.statement has minItems: 1, so the statement-less base deny policy the bootstrap used
+// to write is answered with 400 (auth.ErrInvalidRequest), which EnsurePrincipals returned and
+// cmd/lakefs/cmd/run.go's extra-routes hook turned into Fatal. The deny set is now chunks only, so
+// nothing statement-less is ever sent.
+//
+// R3S-5: the ACL HTTP controller answered ListPolicies and DeletePolicy with 501
+// (auth.ErrUnexpectedStatusCode through APIAuthService), and every refresh calls both to remove a
+// stale chunk. A seeded stale chunk makes the refresh call DeletePolicy and proves it is gone.
+func TestEnsurePrincipalsOverAuthAPI(t *testing.T) {
+	aclService := newACLService(t)
+	_, err := aclService.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
+	require.NoError(t, err)
+
+	staleChunk := chunkPolicyName(MetadataRepoProtectPolicyName, 7)
+	require.NoError(t, aclService.WritePolicy(t.Context(), &model.Policy{
+		CreatedAt:   bootstrapTS,
+		DisplayName: staleChunk,
+		Statement: model.Statements{{
+			Effect:   model.StatementEffectDeny,
+			Action:   []string{"fs:Delete*"},
+			Resource: permissions.RepoArn("gone-metadata"),
+		}},
+	}, false /* create */), "seed a stale chunk an earlier refresh left behind")
+
+	server := httptest.NewServer(acl.Serve(aclService, logging.DummyLogger{}))
+	t.Cleanup(server.Close)
+	apiService, err := auth.NewAPIAuthService(
+		server.URL+acl.BaseURL+"/", "", false, false,
+		crypt.NewSecretStore([]byte("mds-bootstrap-api-test-secret")),
+		authparams.ServiceCache{Enabled: false}, logging.DummyLogger{})
+	require.NoError(t, err, "build the auth API client the binary uses for external auth")
+
+	inForce, err := EnsurePrincipals(t.Context(), apiService, bootstrapTS, defaultGuardGroups(), repositoryInfos("analytics"))
+	require.NoError(t, err,
+		"the principals must install over the auth API: a statement-less policy is rejected with 400 and a 501 is fatal")
+	require.True(t, inForce)
+
+	// The deny is in force through the same HTTP service: the guard group carries the chunk that
+	// names the companion repository of the repository the server knows.
+	denyChunk := chunkPolicyName(MetadataRepoProtectPolicyName, 1)
+	require.Contains(t, policyNames(t, apiService, "Admins"), denyChunk)
+	chunk, err := apiService.GetPolicy(t.Context(), denyChunk)
+	require.NoError(t, err)
+	require.NotEmpty(t, chunk.Statement, "a stored deny policy always carries statements")
+
+	_, err = apiService.GetPolicy(t.Context(), staleChunk)
+	require.ErrorIs(t, err, auth.ErrNotFound, "the stale chunk is deleted over the API (DeletePolicy, R3S-5)")
+
+	// A second startup over the API is idempotent: reading the stored chunks back (ListPolicies) and
+	// planning from them rebuilds the same policies, so nothing is rewritten.
+	before, err := apiService.GetPolicy(t.Context(), denyChunk)
+	require.NoError(t, err)
+	_, err = EnsurePrincipals(t.Context(), apiService, bootstrapTS.Add(time.Hour), defaultGuardGroups(), repositoryInfos("analytics"))
+	require.NoError(t, err)
+	after, err := apiService.GetPolicy(t.Context(), denyChunk)
+	require.NoError(t, err)
+	require.Equal(t, before.CreatedAt, after.CreatedAt, "an unchanged refresh does not rewrite a chunk")
+	require.True(t, statementsEqual(before.Statement, after.Statement))
+}
+
 // TestRoutesBuilder covers the builder cmd/lakefs-sso registers: it runs only while
 // iceberg.metadata_search.enabled is true, mounts nothing, and degrades like EnsurePrincipals.
 func TestRoutesBuilder(t *testing.T) {
@@ -949,9 +1048,10 @@ func TestRoutesBuilder(t *testing.T) {
 		}, defaultGuardGroups()))
 		_, err = svc.GetUser(t.Context(), UserName)
 		require.NoError(t, err)
-		_, err = svc.GetPolicy(t.Context(), MetadataRepoProtectPolicyName)
+		denyChunk := chunkPolicyName(MetadataRepoProtectPolicyName, 1)
+		_, err = svc.GetPolicy(t.Context(), denyChunk)
 		require.NoError(t, err, "the policy set is created")
-		require.Contains(t, policyNames(t, svc, "Admins"), MetadataRepoProtectPolicyName,
+		require.Contains(t, policyNames(t, svc, "Admins"), denyChunk,
 			"the builder forwards the guard group list it is handed, as cmd/lakefs-sso does")
 
 		// The repository the catalog holds is the one the policies name.
@@ -1075,9 +1175,9 @@ func TestPolicyRefresher(t *testing.T) {
 	_, err := EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), nil)
 	require.NoError(t, err)
 
-	deny, err := svc.GetPolicy(t.Context(), MetadataRepoProtectPolicyName)
-	require.NoError(t, err)
-	require.Empty(t, deny.Statement, "no repository is known yet, so the deny names none")
+	_, err = svc.GetPolicy(t.Context(), MetadataRepoProtectPolicyName)
+	require.ErrorIs(t, err, auth.ErrNotFound,
+		"no repository is known yet, so no deny policy exists, and no statement-less one is written (R3S-2)")
 
 	ctx, cancel := context.WithCancel(t.Context())
 	done := startPolicyRefresher(ctx, cmdpkg.ServerDeps{
@@ -1092,6 +1192,8 @@ func TestPolicyRefresher(t *testing.T) {
 			policySetNamesRepository(t, svc, IndexerPolicyName, "analytics-metadata")
 	}, 5*time.Second, 10*time.Millisecond,
 		"the refresher must add a repository created after startup to the policy set")
+	require.NotEmpty(t, ownedPolicyNames(t, svc, MetadataRepoProtectPolicyName, 10),
+		"the deny is the chunk policy that now names the companion repository")
 
 	cancel()
 	select {
@@ -1152,10 +1254,12 @@ func TestPolicyChunksShrink(t *testing.T) {
 
 	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS.Add(time.Hour), defaultGuardGroups(), big[:1])
 	require.NoError(t, err)
-	for _, base := range []string{IndexerPolicyName, MetadataRepoProtectPolicyName} {
-		require.ElementsMatch(t, []string{base, chunkPolicyName(base, 1)}, ownedPolicyNames(t, svc, base, 10),
-			"a shrunk repository set leaves only the base and the first chunk of %s", base)
-	}
+	require.ElementsMatch(t, []string{IndexerPolicyName, chunkPolicyName(IndexerPolicyName, 1)},
+		ownedPolicyNames(t, svc, IndexerPolicyName, 10),
+		"a shrunk repository set leaves the indexer base and the one chunk that still names a companion")
+	require.ElementsMatch(t, []string{chunkPolicyName(MetadataRepoProtectPolicyName, 1)},
+		ownedPolicyNames(t, svc, MetadataRepoProtectPolicyName, 10),
+		"a shrunk repository set leaves only the deny chunk that still names a companion (no base deny)")
 }
 
 // TestCompanionStorageNamespaceDeny is R2S-3: a guard-group member cannot create another repository
@@ -1201,6 +1305,93 @@ func TestCompanionStorageNamespaceDeny(t *testing.T) {
 	requireAuthorization(t, svc, UserName, permissions.AttachStorageNamespaceAction,
 		permissions.StorageNamespace("s3://bucket/"+metaRepo), true,
 		"the indexer keeps the namespace/*-metadata pattern it creates companions with")
+}
+
+// TestCompanionStorageNamespaceDenySpellings is R3S-3: CreateRepository authorizes
+// fs:AttachStorageNamespace on the raw storage_namespace string the client sent
+// (pkg/api/controller.go, before it looks at the --bare flag), and the block layer resolves a
+// trailing "/" away, so the same physical prefix has more than one spelling the server accepts. The
+// deny is built from the namespace the catalog stored, so an exact ARN of that one spelling would
+// leave every other spelling to a guard-group member with fs:*: they could create a bare repository
+// on a companion's prefix and let its uncommitted GC sweep the index files.
+//
+// The test drives the exact authorization node CreateRepository evaluates, for both stored spellings
+// and both accepted spellings of the same physical prefix. The node is the 403: the controller
+// authorizes before any other work, and a denial there is the API's 403 response.
+func TestCompanionStorageNamespaceDenySpellings(t *testing.T) {
+	const (
+		dataRepo = "analytics"
+		metaRepo = dataRepo + icebergcatalog.MetadataRepositorySuffix
+	)
+	// The catalog stores whatever spelling the repository was created with, so the companion's own
+	// namespace may itself end in "/". Both stored spellings must deny both accepted spellings.
+	for _, stored := range []string{"mem://" + metaRepo, "mem://" + metaRepo + "/"} {
+		t.Run(stored, func(t *testing.T) {
+			svc := newACLService(t)
+			_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
+			require.NoError(t, err)
+			repositories := []repositoryInfo{
+				{Name: dataRepo, StorageNamespace: "mem://" + dataRepo},
+				{Name: metaRepo, StorageNamespace: stored},
+			}
+			_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), repositories)
+			require.NoError(t, err)
+			operator := newOperatorPrincipal(t, svc)
+
+			for _, spelling := range []string{"mem://" + metaRepo, "mem://" + metaRepo + "/"} {
+				// The CreateRepository node of pkg/api/controller.go: fs:CreateRepository on the
+				// repository ARN (which the operator's fs:* allows) and fs:AttachStorageNamespace on
+				// the namespace as the client spelled it. The bare flag is not read before this node,
+				// so a bare repository is decided by the same two permissions.
+				requireNodeAuthorization(t, svc, operator, permissions.Node{
+					Type: permissions.NodeTypeAnd,
+					Nodes: []permissions.Node{
+						{Permission: permissions.Permission{
+							Action:   permissions.CreateRepositoryAction,
+							Resource: permissions.RepoArn("evil"),
+						}},
+						{Permission: permissions.Permission{
+							Action:   permissions.AttachStorageNamespaceAction,
+							Resource: permissions.StorageNamespace(spelling),
+						}},
+					},
+				}, false, fmt.Sprintf("a guard-group member must not create a repository (bare or not) on the companion storage namespace spelled %q", spelling))
+
+				requireAuthorization(t, svc, operator, permissions.AttachStorageNamespaceAction,
+					permissions.StorageNamespace(spelling), false,
+					"the companion storage namespace is denied in the spelling %q", spelling)
+			}
+
+			// A different physical prefix is still allowed: the deny names the companion's prefix and
+			// nothing else.
+			requireAuthorization(t, svc, operator, permissions.AttachStorageNamespaceAction,
+				permissions.StorageNamespace("mem://ordinary"), true,
+				"an ordinary storage namespace stays allowed")
+		})
+	}
+
+	// A bucket-root namespace (a companion with an explicit storage_namespace in another bucket) has
+	// one more accepted spelling: pkg/block.resolveRelative trims one "/", so "mem://index-bucket//"
+	// resolves to the bucket root like "mem://index-bucket".
+	t.Run("bucket root", func(t *testing.T) {
+		const root = "mem://index-bucket"
+		svc := newACLService(t)
+		_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
+		require.NoError(t, err)
+		repositories := []repositoryInfo{
+			{Name: dataRepo, StorageNamespace: "mem://data-bucket/" + dataRepo},
+			{Name: metaRepo, StorageNamespace: root},
+		}
+		_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), repositories)
+		require.NoError(t, err)
+		operator := newOperatorPrincipal(t, svc)
+
+		for _, spelling := range []string{root, root + "/", root + "//"} {
+			requireAuthorization(t, svc, operator, permissions.AttachStorageNamespaceAction,
+				permissions.StorageNamespace(spelling), false,
+				"the bucket-root companion namespace is denied in the spelling %q", spelling)
+		}
+	})
 }
 
 // TestOrdinaryMetadataSuffixRepository is R2S-4: a repository named x-metadata is a companion only
@@ -1268,7 +1459,7 @@ func TestOperatorPolicySurvivesRefresher(t *testing.T) {
 		"RoutesBuilder does not detach an operator's extra policy")
 
 	// A refresh that adds a repository and rewrites the chunks must leave the operator policy alone.
-	inForce, err := refreshPolicies(t.Context(), svc, repositoryInfos("analytics", "orders"), defaultGuardGroups(), bootstrapTS.Add(time.Hour))
+	inForce, _, err := refreshPolicies(t.Context(), svc, repositoryInfos("analytics", "orders"), defaultGuardGroups(), bootstrapTS.Add(time.Hour))
 	require.NoError(t, err)
 	require.True(t, inForce)
 	stored, err := svc.GetPolicy(t.Context(), policyName)
@@ -1385,6 +1576,174 @@ func TestRefreshPurgesPolicyCache(t *testing.T) {
 	_, err = EnsurePrincipals(t.Context(), noCache, bootstrapTS.Add(time.Hour), defaultGuardGroups(),
 		repositoryInfosWithCompanionNamespaces("analytics", "orders"))
 	require.NoError(t, err, "a service without a policy cache keeps working")
+}
+
+// refillOnAttachService is the cachingPolicyService with the window R3S-6 is about: a request that
+// arrives between a policy write and its attachment refills the effective-policy cache without the
+// policy that is about to be attached. Purging after the write is not enough - that purge happens
+// before the attach - so without a purge after the attach the next Authorize keeps serving the stale
+// entry for up to auth.cache.ttl. The refill runs before delegating each attach, which is exactly a
+// request in that window.
+type refillOnAttachService struct {
+	*cachingPolicyService
+	refill func(ctx context.Context) error
+}
+
+func (s *refillOnAttachService) AttachPolicyToGroup(ctx context.Context, policyDisplayName, groupID string) error {
+	if s.refill != nil {
+		if err := s.refill(ctx); err != nil {
+			return err
+		}
+	}
+	return s.cachingPolicyService.AttachPolicyToGroup(ctx, policyDisplayName, groupID)
+}
+
+// companionRepositoriesNamed builds the repository list of count data repositories plus their
+// companion repositories, each with the companion's derived storage namespace. The names sort after
+// prefix "aaa" and before prefix "repo", which the insertion test relies on.
+func companionRepositoriesNamed(prefix string, count int) []repositoryInfo {
+	repositories := make([]repositoryInfo, 0, count*2)
+	for i := 0; i < count; i++ {
+		name := fmt.Sprintf("%s-%03d", prefix, i)
+		companion := icebergcatalog.MetadataRepository(name)
+		repositories = append(repositories,
+			repositoryInfo{Name: name, StorageNamespace: "s3://bucket/" + name},
+			repositoryInfo{Name: companion, StorageNamespace: "s3://bucket/" + companion})
+	}
+	return repositories
+}
+
+// TestRefreshPurgesCacheAfterAttach is R3S-6: a chunk the refresh *creates and attaches* must be
+// visible to the next Authorize at once, even when a request in the window between its write and
+// its attachment refilled the cache. Only a new chunk shows the gap: a rewritten chunk purges after
+// its own write. The deny is the dangerous half - it fails open on a new companion repository.
+func TestRefreshPurgesCacheAfterAttach(t *testing.T) {
+	svc := newCachingPolicyService(t)
+	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
+	require.NoError(t, err)
+
+	// companionChunkSize companions fill chunk 1 exactly. The late companion sorts before all of
+	// them but does not move any of them: it is a new member, so it lands in a new chunk 2.
+	initial := companionRepositoriesNamed("repo", companionChunkSize)
+	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), initial)
+	require.NoError(t, err)
+	operator := newOperatorPrincipal(t, svc)
+
+	lateNamespace := permissions.StorageNamespace("s3://bucket/late-metadata")
+	requireAuthorization(t, svc, operator, permissions.AttachStorageNamespaceAction, lateNamespace, true,
+		"before the late companion exists its namespace is not denied; this warms the cache too")
+
+	refilling := &refillOnAttachService{cachingPolicyService: svc}
+	refilling.refill = func(ctx context.Context) error {
+		// A request in the window between the new chunk's write and its attachment: it caches the
+		// effective policies of the moment, which do not include the chunk yet.
+		_, err := refilling.Authorize(ctx, &auth.AuthorizationRequest{
+			Username: operator,
+			RequiredPermissions: permissions.Node{Permission: permissions.Permission{
+				Action:   permissions.AttachStorageNamespaceAction,
+				Resource: lateNamespace,
+			}},
+		})
+		return err
+	}
+	late := []repositoryInfo{
+		{Name: "late", StorageNamespace: "s3://bucket/late"},
+		{Name: "late-metadata", StorageNamespace: "s3://bucket/late-metadata"},
+	}
+	_, _, err = refreshPolicies(t.Context(), refilling, append(initial, late...), defaultGuardGroups(), bootstrapTS.Add(time.Hour))
+	require.NoError(t, err)
+
+	require.Contains(t, policyNames(t, svc, "Admins"), chunkPolicyName(MetadataRepoProtectPolicyName, 2),
+		"the new chunk was attached to the guard group")
+	requireAuthorization(t, svc, operator, permissions.AttachStorageNamespaceAction, lateNamespace, false,
+		"the purge after the attach makes the new chunk effective on the very next Authorize (R3S-6)")
+}
+
+// failNthProtectChunkWriteService fails the nth WritePolicy of a deny chunk, after the earlier chunks
+// have been written. It is how the test reproduces a crash or an error in the middle of a refresh.
+type failNthProtectChunkWriteService struct {
+	*acl.AuthService
+	mu     sync.Mutex
+	nth    int
+	writes int
+}
+
+func (s *failNthProtectChunkWriteService) WritePolicy(ctx context.Context, policy *model.Policy, update bool) error {
+	if chunk, ok := ownedChunkNumber(MetadataRepoProtectPolicyName, policy.DisplayName); ok && chunk > 0 {
+		s.mu.Lock()
+		s.writes++
+		write := s.writes
+		s.mu.Unlock()
+		if write == s.nth {
+			return errors.New("injected policy write failure")
+		}
+	}
+	return s.AuthService.WritePolicy(ctx, policy, update)
+}
+
+// TestRefreshKeepsCompanionCoverageAcrossWrites is R3S-7: a companion must never lose its grant or
+// its deny between two policy writes of one refresh. Chunk membership is positional in a fresh plan,
+// so inserting companions that sort first shifts every existing companion up and drops the last
+// member of chunk 1 into chunk 2 - which is only written later. Failing that later write used to
+// leave the shifted companion with neither its indexer grant nor its guard-group deny until the next
+// refresh. The plan keeps every companion in the chunk that already carries it, so a refresh that
+// only adds companions never rewrites a chunk that already covers one.
+func TestRefreshKeepsCompanionCoverageAcrossWrites(t *testing.T) {
+	svc := newACLService(t)
+	_, err := svc.CreateGroup(t.Context(), &model.Group{DisplayName: "Admins", CreatedAt: bootstrapTS})
+	require.NoError(t, err)
+
+	// 130 companions: chunks 1 and 2 are full, chunk 3 holds the last two.
+	initial := companionRepositoriesNamed("repo", companionChunkSize*2+2)
+	_, err = EnsurePrincipals(t.Context(), svc, bootstrapTS, defaultGuardGroups(), initial)
+	require.NoError(t, err)
+	operator := newOperatorPrincipal(t, svc)
+
+	// The last member of chunk 1. Any index object below it stands in for the indexer's writes.
+	const survivor = "repo-063-metadata"
+	indexObject := permissions.ObjectArn(survivor, "_iceberg/table-uuid/data/part-00000.parquet")
+	requireAuthorization(t, svc, operator, permissions.WriteObjectAction, indexObject, false,
+		"the deny covers the survivor before the refresh")
+	requireAuthorization(t, svc, UserName, permissions.WriteObjectAction, indexObject, true,
+		"the indexer may write the survivor before the refresh")
+
+	// 63 companions that sort before every existing one: the insertion that used to shift the set.
+	inserted := companionRepositoriesNamed("aaa", 63)
+	failing := &failNthProtectChunkWriteService{AuthService: svc, nth: 2}
+	_, _, err = refreshPolicies(t.Context(), failing, append(inserted, initial...), defaultGuardGroups(), bootstrapTS.Add(time.Hour))
+	require.Error(t, err, "the injected write failure is reported")
+	require.ErrorContains(t, err, "injected policy write failure")
+
+	requireAuthorization(t, svc, operator, permissions.WriteObjectAction, indexObject, false,
+		"the survivor keeps its deny when a later policy write of the refresh fails (R3S-7)")
+	requireAuthorization(t, svc, UserName, permissions.WriteObjectAction, indexObject, true,
+		"the survivor keeps its indexer grant when a later policy write of the refresh fails (R3S-7)")
+}
+
+// TestExistingCompanionChunksIgnoresChunkNumberGaps pins the read side of the stable plan: a stored
+// chunk policy numbered far above the number of chunks must not make the plan allocate that many
+// chunks. Policy names are predictable, so a principal allowed to write policies can create one.
+func TestExistingCompanionChunksIgnoresChunkNumberGaps(t *testing.T) {
+	svc := newACLService(t)
+	policy := func(chunk int, companion string) *model.Policy {
+		return &model.Policy{
+			CreatedAt:   bootstrapTS,
+			DisplayName: chunkPolicyName(MetadataRepoProtectPolicyName, chunk),
+			Statement: model.Statements{{
+				Effect:   model.StatementEffectDeny,
+				Action:   []string{"fs:Delete*"},
+				Resource: permissions.RepoArn(companion),
+			}},
+		}
+	}
+	require.NoError(t, svc.WritePolicy(t.Context(), policy(2, "orders-metadata"), false))
+	require.NoError(t, svc.WritePolicy(t.Context(), policy(1<<20, "analytics-metadata"), false))
+
+	chunks, err := existingCompanionChunks(t.Context(), svc, MetadataRepoProtectPolicyName)
+	require.NoError(t, err)
+	require.Len(t, chunks, 2, "one entry per chunk that exists, not one per chunk number")
+	require.Equal(t, []string{"orders-metadata"}, chunks[0])
+	require.Equal(t, []string{"analytics-metadata"}, chunks[1])
 }
 
 // TestPolicyRefresherAttachesNewChunks is the attachment half of R2S-2: a chunk created by the

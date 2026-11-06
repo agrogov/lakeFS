@@ -218,8 +218,34 @@ func (c *Controller) AttachPolicyToGroup(w http.ResponseWriter, r *http.Request,
 	writeResponse(w, http.StatusCreated, nil)
 }
 
-func (c *Controller) ListPolicies(w http.ResponseWriter, _ *http.Request, _ apigen.ListPoliciesParams) {
-	writeError(w, http.StatusNotImplemented, "Not implemented")
+// ListPolicies implements GET /auth/policies of api/authorization.yml. Until R3S-5 it answered 501,
+// which pkg/auth.APIAuthService maps to auth.ErrUnexpectedStatusCode: a caller that enumerates
+// policies - pkg/mds/bootstrap removes stale metadata search policy chunks on every refresh - could
+// not run against this server at all, and the 501 is fatal at startup.
+func (c *Controller) ListPolicies(w http.ResponseWriter, r *http.Request, params apigen.ListPoliciesParams) {
+	ctx := r.Context()
+	policies, paginator, err := c.Auth.ListPolicies(ctx, &model.PaginationParams{
+		After:  swag.StringValue((*string)(params.After)),
+		Prefix: swag.StringValue((*string)(params.Prefix)),
+		Amount: paginationAmount(params.Amount),
+	})
+	if c.handleAPIError(w, err) {
+		return
+	}
+
+	response := apigen.PolicyList{
+		Results: make([]apigen.Policy, 0, len(policies)),
+		Pagination: apigen.Pagination{
+			HasMore:    paginator.NextPageToken != "",
+			NextOffset: paginator.NextPageToken,
+			Results:    paginator.Amount,
+		},
+	}
+	for _, p := range policies {
+		response.Results = append(response.Results, serializePolicy(p))
+	}
+
+	writeResponse(w, http.StatusOK, response)
 }
 
 func (c *Controller) CreatePolicy(w http.ResponseWriter, r *http.Request, body apigen.CreatePolicyJSONRequestBody) {
@@ -251,8 +277,20 @@ func (c *Controller) CreatePolicy(w http.ResponseWriter, r *http.Request, body a
 	writeResponse(w, http.StatusCreated, serializePolicy(p))
 }
 
-func (c *Controller) DeletePolicy(w http.ResponseWriter, _ *http.Request, _ string) {
-	writeError(w, http.StatusNotImplemented, "Not implemented")
+// DeletePolicy implements DELETE /auth/policies/{policyId} of api/authorization.yml. It answered 501
+// until R3S-5, which made the stale-chunk cleanup of pkg/mds/bootstrap fail against this server; the
+// service method it delegates to also detaches the policy from every user and group.
+func (c *Controller) DeletePolicy(w http.ResponseWriter, r *http.Request, policyID string) {
+	ctx := r.Context()
+	err := c.Auth.DeletePolicy(ctx, policyID)
+	if errors.Is(err, auth.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "policy not found")
+		return
+	}
+	if c.handleAPIError(w, err) {
+		return
+	}
+	writeResponse(w, http.StatusNoContent, nil)
 }
 
 func (c *Controller) GetPolicy(w http.ResponseWriter, r *http.Request, policyID string) {
