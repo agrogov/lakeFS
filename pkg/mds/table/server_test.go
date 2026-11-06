@@ -103,6 +103,10 @@ type testEnv struct {
 	// clientConfig is the configuration the client catalog was built with, so that a test can
 	// assert the mode it runs in (vended_test.go asserts that metadata_search.storage is empty).
 	clientConfig table.CatalogConfig
+	// cat is the lakeFS catalog the fixture serves. A test that asserts on the catalog's own
+	// entries - the table pointer, the staged table files and their physical addresses - reads
+	// them through it, the way the server wrote them, rather than through the catalog API.
+	cat *lakefscatalog.Catalog
 }
 
 // testEnvOptions are the fixture knobs beyond the local-blockstore default. Every test but the
@@ -180,6 +184,7 @@ func newTestEnvWith(t *testing.T, opts testEnvOptions) *testEnv {
 	}
 	_, err = cat.CreateRepository(ctx, env.repo, "", storageNamespace, testBranch, false)
 	require.NoError(t, err, "create the companion repository")
+	env.cat = cat
 
 	mux := chi.NewRouter()
 	mux.Handle("/*", http.NotFoundHandler())
