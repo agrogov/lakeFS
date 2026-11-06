@@ -2,6 +2,7 @@ package table_test
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/apache/iceberg-go"
+	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/mds/table"
 )
@@ -214,6 +216,53 @@ func TestCatalogConfigURI(t *testing.T) {
 			require.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// TestAzureSchemeRegistered pins the Azure backend import of METADATA_SEARCH_AZURE.md D3. Without
+// it iceberg-go's IO registry answers io.ErrIOSchemeNotFound ("io scheme not registered") for the
+// abfss:// location of a table on an Azure blockstore, so the indexer would fail every branch of
+// every repository on an Azure installation before writing one row.
+//
+// The credentials are fake and no request is made: io.LoadFS builds the Azure container client (the
+// shared key only has to be valid base64), so this test asserts the scheme resolution of the
+// registry, not a reachable account.
+func TestAzureSchemeRegistered(t *testing.T) {
+	props := map[string]string{
+		icebergio.ADLSSharedKeyAccountName: "acct",
+		icebergio.ADLSSharedKeyAccountKey:  base64.StdEncoding.EncodeToString([]byte("not-a-real-key")),
+		icebergio.ADLSEndpoint:             "azurite.test:10000",
+		icebergio.ADLSProtocol:             "http",
+	}
+
+	iofs, err := icebergio.LoadFS(t.Context(), props,
+		"abfss://container@acct.azurite.test/tables/t/metadata/v1.metadata.json")
+	require.NoError(t, err, "the abfss scheme must be registered, not refused as unsupported")
+	require.False(t, errors.Is(err, icebergio.ErrIOSchemeNotFound))
+	require.NotNil(t, iofs, "io.LoadFS reached the Azure backend")
+
+	// The backend registers every scheme of the ADLS URI pattern, so neither an abfs:// location (the
+	// non-TLS form, D1) nor one of the deprecated wasb[s]// spellings a client may have written is
+	// refused.
+	for _, scheme := range []string{"abfs", "abfss", "wasb", "wasbs"} {
+		t.Run(scheme, func(t *testing.T) {
+			iofs, err := icebergio.LoadFS(t.Context(), props, scheme+"://container@acct.azurite.test/tables/t")
+			require.NoError(t, err)
+			require.NotNil(t, iofs)
+		})
+	}
+}
+
+// TestS3SchemeStillRegistered pins the other half of the import: adding the Azure backend next to the
+// S3 one leaves the S3 resolution of iceberg-go's registry unchanged.
+func TestS3SchemeStillRegistered(t *testing.T) {
+	iofs, err := icebergio.LoadFS(t.Context(), map[string]string{
+		"s3.endpoint":          "http://seaweedfs:8333",
+		"s3.access-key-id":     "AKIAEXAMPLE",
+		"s3.secret-access-key": "secret",
+		"s3.region":            "us-east-1",
+	}, "s3://bucket/_iceberg/table/metadata/v1.metadata.json")
+	require.NoError(t, err)
+	require.NotNil(t, iofs)
 }
 
 // TestNewCatalogConcurrentSharedStorage builds catalogs concurrently from one Storage map, as the

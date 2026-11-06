@@ -132,6 +132,9 @@ func TestLoadConfigDocumentedExample(t *testing.T) {
 	require.Equal(t, "http://seaweedfs:8333", cfg.Storage["s3.endpoint"])
 	require.Equal(t, "true", cfg.Storage["s3.path-style-access"])
 	require.Equal(t, "us-east-1", cfg.Storage["s3.region"])
+	require.NotContains(t, cfg.Storage, "adls.endpoint",
+		"an installation without metadata_search.azure gets exactly the storage map it wrote")
+	require.Zero(t, cfg.Azure, "the azure section is optional")
 
 	repo, ok := cfg.Repositories["my-repo"]
 	require.True(t, ok)
@@ -287,6 +290,20 @@ func TestLoadConfigValidationRules(t *testing.T) {
 				"every_commits: 500", "every_commits: -2", 1),
 			wantErr: "metadata_search.compaction.every_commits must not be negative, got -2; 0 disables the trigger",
 		},
+		{
+			// D3: iceberg-go needs the account name to build the container URL and would refuse the
+			// key only at the first write, with an error that does not name the setting.
+			name: "a shared key needs its storage account",
+			document: strings.Replace(fullConfigYAML,
+				"  repositories:\n", "  azure:\n    storage_access_key: c2VjcmV0\n  repositories:\n", 1),
+			wantErr: "metadata_search.azure.storage_access_key requires metadata_search.azure.storage_account",
+		},
+		{
+			name: "the azure protocol must be http or https",
+			document: strings.Replace(fullConfigYAML,
+				"  repositories:\n", "  azure:\n    protocol: ftp\n  repositories:\n", 1),
+			wantErr: `metadata_search.azure.protocol must be "http" or "https", got "ftp"`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -378,6 +395,101 @@ func TestLoadConfigRepositoryNameBoundary(t *testing.T) {
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
 	require.Contains(t, cfg.Repositories, name)
+}
+
+// TestLoadConfigAzureFromEnvironment is the deployment story of D3: the whole Azure section can be
+// a Kubernetes secret, one LAKEFS_METADATA_SEARCH_AZURE_* environment variable per key, and it
+// reaches iceberg-go as the adls.* IO properties of the design's translation table.
+func TestLoadConfigAzureFromEnvironment(t *testing.T) {
+	useConfig(t, minimalConfigYAML)
+	t.Setenv("LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCOUNT", "acct")
+	t.Setenv("LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCESS_KEY", "c2VjcmV0")
+	t.Setenv("LAKEFS_METADATA_SEARCH_AZURE_USE_MANAGED_IDENTITY", "true")
+	t.Setenv("LAKEFS_METADATA_SEARCH_AZURE_CLIENT_ID", "00000000-0000-0000-0000-000000000000")
+	t.Setenv("LAKEFS_METADATA_SEARCH_AZURE_ENDPOINT", "azurite.test:10000")
+	t.Setenv("LAKEFS_METADATA_SEARCH_AZURE_PROTOCOL", "http")
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+
+	require.Equal(t, AzureConfig{
+		StorageAccount:     "acct",
+		StorageAccessKey:   "c2VjcmV0",
+		UseManagedIdentity: true,
+		ClientID:           "00000000-0000-0000-0000-000000000000",
+		Endpoint:           "azurite.test:10000",
+		Protocol:           "http",
+	}, cfg.Azure)
+	require.Equal(t, map[string]string{
+		"adls.auth.shared-key.account.name":  "acct",
+		"adls.auth.shared-key.account.key":   "c2VjcmV0",
+		"adls.auth.managed-identity.enabled": "true",
+		"adls.client-id":                     "00000000-0000-0000-0000-000000000000",
+		"adls.endpoint":                      "azurite.test:10000",
+		"adls.protocol":                      "http",
+	}, cfg.Storage)
+}
+
+// TestLoadConfigAzurePartialSection pins the other half of the translation: an unset key is not
+// translated at all, so iceberg-go keeps its own default (https, the default credential chain, the
+// public blob domain) instead of a value lakeFS would have had to invent.
+func TestLoadConfigAzurePartialSection(t *testing.T) {
+	useConfig(t, minimalConfigYAML+
+		"  azure:\n    storage_account: acct\n    storage_access_key: c2VjcmV0\n")
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{
+		"adls.auth.shared-key.account.name": "acct",
+		"adls.auth.shared-key.account.key":  "c2VjcmV0",
+	}, cfg.Storage)
+}
+
+// TestLoadConfigAzureStorageKeysWin pins the precedence of D3: metadata_search.storage is the raw
+// iceberg-go property map, so an explicit key wins over the translated one, and a key the azure
+// section has no setting for (adls.sas-token.<host>, an S3 property of the same installation)
+// passes through untouched.
+func TestLoadConfigAzureStorageKeysWin(t *testing.T) {
+	useConfig(t, minimalConfigYAML+`  storage:
+    adls.endpoint: from-the-file
+    adls.protocol: https
+    adls.sas-token.acct.dfs.core.windows.net: "?sig=explicit"
+    s3.endpoint: http://seaweedfs:8333
+  azure:
+    storage_account: acct
+    storage_access_key: c2VjcmV0
+    endpoint: from-the-section
+    protocol: http
+`)
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{
+		"adls.auth.shared-key.account.name":        "acct",
+		"adls.auth.shared-key.account.key":         "c2VjcmV0",
+		"adls.endpoint":                            "from-the-file",
+		"adls.protocol":                            "https",
+		"adls.sas-token.acct.dfs.core.windows.net": "?sig=explicit",
+		"s3.endpoint":                              "http://seaweedfs:8333",
+	}, cfg.Storage)
+}
+
+// TestLoadConfigAzureDoesNotReadBlockstore pins D3's last rule: the indexer has no access to the
+// server's blockstore section, so an Azure blockstore key cannot stand in for the indexer's own
+// credentials. A missing metadata_search.azure stays missing.
+func TestLoadConfigAzureDoesNotReadBlockstore(t *testing.T) {
+	useConfig(t, minimalConfigYAML+`  azure: {}
+blockstore:
+  type: azure
+  azure:
+    storage_account: acct
+    storage_access_key: c2VjcmV0
+`)
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.Zero(t, cfg.Azure)
+	require.Nil(t, cfg.Storage, "blockstore.azure.* is not an IO property of the indexer")
 }
 
 func TestValidateBranchGlob(t *testing.T) {

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/spf13/viper"
 	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 )
@@ -122,6 +123,75 @@ type CompactionConfig struct {
 	EveryCommits int `mapstructure:"every_commits"`
 }
 
+// AzureConfig is the metadata_search.azure section (METADATA_SEARCH_AZURE.md D3): the Azure
+// credentials and endpoint the indexer's iceberg-go IO uses to read and write the files of the
+// metadata tables of a companion repository on an Azure blockstore.
+//
+// It is a section of its own rather than keys in metadata_search.storage because the storage map
+// is decoded from the configuration file only (the env-var rule of docs/metadata-search.md): a
+// Kubernetes secret mounted as LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCESS_KEY could not be put
+// there. Every key below is read through applyViperOverrides, so each is its own environment
+// variable, and StorageProperties translates it into the adls.* IO property of iceberg-go.
+//
+// The indexer deliberately does not fall back to blockstore.azure.*: it is a separate process with
+// its own lakeFS credentials and its own identity, and silently borrowing the server's storage key
+// would hide a misconfiguration of that identity (D3).
+type AzureConfig struct {
+	// StorageAccount is the Azure storage account name. It is dimensioned for the shared-key
+	// credentials (iceberg-go builds the container URL from it) and paired with ClientID for a
+	// managed identity.
+	StorageAccount string `mapstructure:"storage_account"`
+
+	// StorageAccessKey is the shared key of StorageAccount. Empty means the credential chain of
+	// iceberg-go: the default Azure credential, or a managed identity when UseManagedIdentity is
+	// set.
+	StorageAccessKey string `mapstructure:"storage_access_key"` //nolint:gosec // a configuration field, not a credential value
+
+	// UseManagedIdentity makes iceberg-go use azidentity.ManagedIdentityCredential instead of the
+	// default credential chain, which also tries a managed identity. Pair it with ClientID to
+	// select a user-assigned identity.
+	UseManagedIdentity bool `mapstructure:"use_managed_identity"`
+
+	// ClientID selects a user-assigned managed identity by client ID. It only takes effect when
+	// UseManagedIdentity is set.
+	ClientID string `mapstructure:"client_id"`
+
+	// Endpoint is the storage domain iceberg-go builds its service URL from
+	// (adls.endpoint), e.g. blob.core.windows.net for the public cloud. It is required for any
+	// other cloud and for Azurite, because iceberg-go ignores the storage domain of the table
+	// location.
+	Endpoint string `mapstructure:"endpoint"`
+
+	// Protocol is the scheme of that service URL (adls.protocol): http or https. Empty means
+	// https, like iceberg-go's own default.
+	Protocol string `mapstructure:"protocol"`
+}
+
+// StorageProperties returns the iceberg-go IO properties of the section (D3), one property per
+// key that is set: the translation table of the design, so that an operator writes
+// storage_account rather than adls.auth.shared-key.account.name in the configuration file.
+//
+// A setting that is empty is not translated, because iceberg-go's own default is what an empty
+// value means: no protocol is https, no managed identity is the default credential chain, and no
+// endpoint is the public blob domain.
+func (a AzureConfig) StorageProperties() map[string]string {
+	props := make(map[string]string)
+	setProperty := func(key, value string) {
+		if value != "" {
+			props[key] = value
+		}
+	}
+	setProperty(icebergio.ADLSSharedKeyAccountName, a.StorageAccount)
+	setProperty(icebergio.ADLSSharedKeyAccountKey, a.StorageAccessKey)
+	if a.UseManagedIdentity {
+		props[icebergio.ADLSManagedIdentityEnabled] = "true"
+	}
+	setProperty(icebergio.ADLSClientID, a.ClientID)
+	setProperty(icebergio.ADLSEndpoint, a.Endpoint)
+	setProperty(icebergio.ADLSProtocol, a.Protocol)
+	return props
+}
+
 // RepositoryConfig is one entry of metadata_search.repositories (§7): a data repository to index
 // and the branches of it that are mirrored into R-metadata.
 type RepositoryConfig struct {
@@ -200,7 +270,15 @@ type Config struct {
 
 	// Storage holds the iceberg-go IO properties (s3.endpoint, s3.access-key-id, ...) used when
 	// the catalog does not vend write credentials (§4.6). Optional.
+	//
+	// LoadConfig merges the azure.* properties of Azure into this map (D3), so this is the single
+	// property map the indexer hands to iceberg-go, and the indexer needs to know nothing about
+	// Azure. An explicit key written here wins over the translated one.
 	Storage map[string]string `mapstructure:"storage"`
+
+	// Azure configures the Azure credentials and endpoint of that IO (D3). Optional: without it
+	// iceberg-go uses the default Azure credential chain.
+	Azure AzureConfig `mapstructure:"azure"`
 
 	// Repositories are the data repositories to index, by repository name (§7). At least one is
 	// required.
@@ -224,6 +302,7 @@ func LoadConfig() (*Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	cfg.applyAzureStorage()
 	return cfg, nil
 }
 
@@ -279,6 +358,47 @@ func (c *Config) applyViperOverrides() {
 	}
 	if viper.IsSet(ConfigKey + ".compaction.every_commits") {
 		c.Compaction.EveryCommits = viper.GetInt(ConfigKey + ".compaction.every_commits")
+	}
+	// The Azure section is scalar end to end, so every key here is a
+	// LAKEFS_METADATA_SEARCH_AZURE_* environment variable (D3).
+	if viper.IsSet(ConfigKey + ".azure.storage_account") {
+		c.Azure.StorageAccount = viper.GetString(ConfigKey + ".azure.storage_account")
+	}
+	if viper.IsSet(ConfigKey + ".azure.storage_access_key") {
+		c.Azure.StorageAccessKey = viper.GetString(ConfigKey + ".azure.storage_access_key")
+	}
+	if viper.IsSet(ConfigKey + ".azure.use_managed_identity") {
+		c.Azure.UseManagedIdentity = viper.GetBool(ConfigKey + ".azure.use_managed_identity")
+	}
+	if viper.IsSet(ConfigKey + ".azure.client_id") {
+		c.Azure.ClientID = viper.GetString(ConfigKey + ".azure.client_id")
+	}
+	if viper.IsSet(ConfigKey + ".azure.endpoint") {
+		c.Azure.Endpoint = viper.GetString(ConfigKey + ".azure.endpoint")
+	}
+	if viper.IsSet(ConfigKey + ".azure.protocol") {
+		c.Azure.Protocol = viper.GetString(ConfigKey + ".azure.protocol")
+	}
+}
+
+// applyAzureStorage merges the adls.* IO properties of the azure section into the storage map
+// (D3), which is what the indexer passes to iceberg-go verbatim. An explicit metadata_search.storage
+// key wins: the map is the documented escape hatch that reaches iceberg-go as-is, including the
+// properties this section has no key for (adls.sas-token.<host>, adls.connection-string.<account>,
+// and any S3 property of the same installation).
+func (c *Config) applyAzureStorage() {
+	props := c.Azure.StorageProperties()
+	if len(props) == 0 {
+		return
+	}
+	if c.Storage == nil {
+		c.Storage = make(map[string]string, len(props))
+	}
+	for key, value := range props {
+		if _, ok := c.Storage[key]; ok {
+			continue
+		}
+		c.Storage[key] = value
 	}
 }
 
@@ -380,6 +500,7 @@ func (c *Config) Validate() error {
 	default:
 		invalid("%s.backfill must be %q or %q, got %q", ConfigKey, BackfillHead, BackfillHistory, c.Backfill)
 	}
+	c.validateAzure(invalid)
 	c.validateRepositories(invalid)
 
 	c.since = nil
@@ -392,6 +513,22 @@ func (c *Config) Validate() error {
 		}
 	}
 	return errors.Join(problems...)
+}
+
+// validateAzure checks the metadata_search.azure section (D3): a shared key needs the account name
+// it belongs to, because iceberg-go builds the container URL from the account and refuses the pair
+// only later, at the first write, with an error that does not name the setting; and a protocol
+// other than http/https is rejected by the storage SDK at that same late point.
+func (c *Config) validateAzure(invalid func(format string, args ...any)) {
+	if c.Azure.StorageAccessKey != "" && c.Azure.StorageAccount == "" {
+		invalid("%s.azure.storage_access_key requires %s.azure.storage_account, iceberg-go builds the container URL from the account name",
+			ConfigKey, ConfigKey)
+	}
+	switch c.Azure.Protocol {
+	case "", "http", "https":
+	default:
+		invalid("%s.azure.protocol must be \"http\" or \"https\", got %q", ConfigKey, c.Azure.Protocol)
+	}
 }
 
 // validateRepositories checks every metadata_search.repositories entry: the repository name rules
