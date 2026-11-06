@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"container/heap"
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"slices"
@@ -38,6 +39,14 @@ const (
 // rebuild of a large branch (design §4.3 step 2) is bounded by it: rows are built in batches
 // instead of all at once, so memory follows the batch size and not the size of the change set.
 const DefaultRecordBatchSize = 64 * 1024
+
+// ErrRowsPanic is returned when a row source panicked. A row source is pulled inside iceberg-go's
+// writer goroutine (Append ranges over the reader in the goroutine of unpartitionedWrite), where a
+// panic has no recover in this package or in the indexer above it and would kill the process, so
+// rowBatches converts it into the reader's error - the same shape mergedBatches uses for the merge
+// with ErrMergeRows (MDS_REVIEW_4.md R4T-4). It is its own sentinel and not ErrMergeRows: the
+// failure is not the compaction's merge, and a caller that logs it should name the row source.
+var ErrRowsPanic = errors.New("the row source panicked")
 
 // Rows is a row source: it yields the rows of a table in the order they should be written, and a
 // non-nil error as its last value when the source fails.
@@ -144,7 +153,9 @@ func NewRecordReader(sc *iceberg.Schema, rows []Row, batchSize int) (array.Recor
 //
 // This is what makes Rebuild bounded by the batch size rather than by the size of the branch
 // (design §4.3 step 2). The caller owns the returned reader and must Release it: the source runs
-// in a goroutine (iter.Pull2) until the reader is released or exhausted.
+// in a goroutine (iter.Pull2) until the reader is released or exhausted. A panic in the source is
+// reported as the reader's error (ErrRowsPanic) rather than propagated: the source is pulled on
+// iceberg-go's writer goroutine, where no recover of the caller can reach it (R4T-4).
 func NewRowsRecordReader(sc *iceberg.Schema, rows Rows, batchSize int) (array.RecordReader, error) {
 	if batchSize <= 0 {
 		batchSize = DefaultRecordBatchSize
@@ -170,11 +181,30 @@ func NewBatchesRecordReader(schema *arrow.Schema, batches iter.Seq2[arrow.Record
 	return newPullRecordReader(schema, batches)
 }
 
+// rowBatchesAllocator allocates the record batches the row-source adapter builds. It is a
+// variable, not memory.DefaultAllocator, only so that a test can route it through a
+// memory.CheckedAllocator and require the adapter to free the builder it holds on every path
+// (MDS_REVIEW_4.md R4T-2). Production never changes it.
+var rowBatchesAllocator memory.Allocator = memory.DefaultAllocator
+
 // rowBatches converts a row source into a batch source of at most batchSize rows per batch.
 func rowBatches(schema *arrow.Schema, rows Rows, batchSize int) iter.Seq2[arrow.RecordBatch, error] {
 	return func(yield func(arrow.RecordBatch, error) bool) {
-		builder := array.NewRecordBuilder(memory.DefaultAllocator, schema)
-		defer builder.Release()
+		// The body runs on iceberg-go's writer goroutine, as the argument of iter.Pull2, where a
+		// panic cannot be recovered by the indexer and would kill the process: the source is
+		// converted to the reader's error the way mergedBatches converts a panic of the merge
+		// (R4T-4).
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				yield(nil, fmt.Errorf("%w: %v", ErrRowsPanic, recovered))
+			}
+		}()
+		builder := array.NewRecordBuilder(rowBatchesAllocator, schema)
+		// Release the builder the body is holding when it returns, not the builder that exists at
+		// this point: a deferred method value evaluates its receiver at the defer statement, and
+		// flush replaces the builder after every batch, so the first builder would be released
+		// twice and the last one never (R4T-2).
+		defer func() { builder.Release() }()
 		count := 0
 		stopped := false
 		flush := func() bool {
@@ -183,7 +213,7 @@ func rowBatches(schema *arrow.Schema, rows Rows, batchSize int) iter.Seq2[arrow.
 			}
 			batch := builder.NewRecordBatch()
 			builder.Release()
-			builder = array.NewRecordBuilder(memory.DefaultAllocator, schema)
+			builder = array.NewRecordBuilder(rowBatchesAllocator, schema)
 			count = 0
 			if !yield(batch, nil) {
 				batch.Release()
@@ -361,6 +391,30 @@ func compactFileBatchRows(files int) int {
 	return max(compactMergeMinFileRows, compactMergeRowBudget/files)
 }
 
+// compactionFileBatchRows returns the number of rows one read batch of a compaction's file may
+// carry for a scan plan: the merge's budget divided by the plan's data files (compactFileBatchRows).
+func compactionFileBatchRows(tasks []icebergtable.FileScanTask) int {
+	return compactFileBatchRows(compactionFileCount(tasks))
+}
+
+// compactionFileCount returns how many data files a scan plan carries: iceberg-go plans one task
+// per data file of the snapshot, except that it splits a Parquet file above
+// read.split.target-size into several tasks that all carry the same File, each with its own Start
+// and Length (table/scan_splits.go:55-60, planned by table/scanner.go:1820).
+//
+// The merge's memory bound is a per-file figure (design §4.9: "one read batch per data file, each
+// max(256, 131072/files)"), so the division is by the files and not by the tasks: on a table that
+// holds a file above 128 MiB, dividing by the tasks shrinks every file's batch below the budget the
+// design documents (MDS_REVIEW_4.md R4T-6). The count is deduplicated by path, the way dataFilesOf
+// (writer.go) reduces a plan to the files a compaction removes (MDS_REVIEW_3.md R3T-1).
+func compactionFileCount(tasks []icebergtable.FileScanTask) int {
+	seen := make(map[string]struct{}, len(tasks))
+	for _, task := range tasks {
+		seen[task.File.FilePath()] = struct{}{}
+	}
+	return len(seen)
+}
+
 // ---------------------------------------------------------------------------------------------
 // The compaction read path
 //
@@ -410,8 +464,11 @@ type rowStream interface {
 // Every file the writer produces is an ascending contiguous slice of the declared order - a delta
 // sorts its upserts before writing them, a rebuild streams a sorted source and refuses an unsorted
 // one, and a compaction since commit 2daeca114 merges sorted files - so a file can be streamed as
-// one run of a k-way merge. The merge holds one read batch per file and one batch of output, and
-// the per-file read batch is compactMergeRowBudget / files, so the rows held follow the number of
+// one run of a k-way merge. The merge holds one read batch per run and one batch of output, and the
+// per-file read batch is compactMergeRowBudget / files - the data files of the plan, which is what
+// design §4.9 sizes it by, not the scan tasks, of which a file above read.split.target-size
+// contributes several (compactionFileCount, R4T-6). A split file is therefore read as several runs
+// of that batch size, one per range, rather than as one run. The rows held follow the number of
 // files and not the number of rows of the table. A file written by a compaction before that commit
 // may be [b d a c] across its batches instead: reading only the path column detects that, and such a
 // file is read whole, sorted on its own and merged as a materialised run. The fallback costs the
@@ -456,7 +513,9 @@ func openCompactionStreams(ctx context.Context, tbl *icebergtable.Table, tasks [
 			stream.release()
 		}
 	}
-	batchRows := compactFileBatchRows(len(tasks))
+	// One read batch per data file, not per scan task: a split file must not shrink every file's
+	// batch (compactionFileCount, R4T-6).
+	batchRows := compactionFileBatchRows(tasks)
 	var schema *arrow.Schema
 	for i, task := range tasks {
 		ordered, err := taskRowsInPathOrder(ctx, tbl, task, batchRows)
