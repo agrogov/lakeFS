@@ -128,6 +128,20 @@ and its commit message includes the commands it ran and their output summary.
 - Done when: every flag, command, exit code and error message in the design appears, and every snippet was run in
   E1.
 
+### W1 — web UI mount modal (official docs, https://docs.lakefs.io/mount/)
+- Files: `webui/src/lib/components/repository/mountModal.jsx` (opened from `tree.jsx`), and its test if one exists.
+- Change: make the modal match the official page. Command `everest mount "lakefs://<repo>/<ref>/<path>" <local-dir>`
+  (the page's syntax is `everest mount <lakefs_uri> <mount_directory> [flags]`); docs link `https://docs.lakefs.io/mount/`
+  (the modal still points at the old `/reference/mount/`); availability line "Available in lakeFS Team and lakeFS
+  Enterprise" (the modal says Enterprise or Cloud). The command stays `everest` in the UI even though the design
+  builds `lakectl mount`: the UI follows the official docs. Add a download link to
+  `https://docs.lakefs.io/releases/everest/` (each version page, e.g. `.../everest/0.15.1/`, lists the macOS, Linux and
+  Windows binaries on `artifacts.lakefs.io`). Link the index, not a per-version artifact URL, so it does not go stale.
+  Also link the CSI driver releases page `https://docs.lakefs.io/releases/everest-csi-driver/` (Kubernetes users; image
+  `treeverse/everest-lakefs-csi-driver:stable`). Link only; the clean-room note keeps us from bundling the binary.
+- Done when: the modal text, command and link match the official page; `cd webui && npm test`, `npm run lint` and
+  `npm run format:check` pass.
+
 Order (Kanban links): R1 and K0 start at once. F1 waits on R1 and K0. K1 and F2 wait on F1. K2 waits on K1
 (go.mod). F3 waits on F2. C1 waits on K1 and F1. C2 waits on C1 and F3. E1 waits on C2 and K2. D1 waits on E1.
 At most four cards are ever in progress together.
