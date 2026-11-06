@@ -325,6 +325,56 @@ the non-goals N1–N4, the `abfs[s]://` locations and the `iceberg.azure.locatio
   account is FNS and Trino or Spark fails on the `dfs` host, switch `iceberg.azure.location_host`
   to `blob` and record which engine needed it.
 
+**Blocked on access (2026-11-07).** The hr2 cluster can be reached only from the office network,
+so AZ7 waits until then. Nothing was deployed and nothing was committed for it. Its Kanban task
+(`21ca9`) is in Review, in plan mode. It needs these inputs before any step that changes the
+cluster, and an explicit approval for each such step:
+
+| Input | Why |
+|---|---|
+| kubectl context for hr2 and the lakeFS namespace | deploy or restart the server and start the indexer |
+| image of this branch's `lakefs-sso` build (registry/repo:tag), or approval to build one | only `cmd/lakefs-sso` wires the catalog and Metadata Search (`cmd/lakefs-sso/main.go`, `mds.go`); the repository `Dockerfile` builds `cmd/lakefs` and has no `lakefs-sso` target |
+| storage account, container, prefix, and whether the account is FNS or HNS | path-form namespace (not a container root); decides whether the `dfs`→`blob` switch can apply |
+| lakeFS ingress URL that reaches `/mds/iceberg/api`, and an admin key pair | catalog URI for Spark and Trino; create the repository, the `orders/` objects and the `mds-indexer` credentials |
+
+Steps once the inputs are there:
+
+1. Build `lakefs-sso` at branch head and record the SHA. Deploy with `blockstore.type: azure`
+   (shared key), `iceberg.enabled`, `iceberg.metadata_search.enabled`, and `location_host` left at
+   its default `dfs`.
+2. Run the indexer from the AZ6 Kubernetes example. It gets its Azure credentials only from
+   `LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCOUNT` and `…_STORAGE_ACCESS_KEY`.
+3. Create one repository on `https://<account>.blob.core.windows.net/<container>/<prefix>` with
+   three `orders/` objects, the same shape as the SeaweedFS record. Wait until the indexer's
+   `/_health` reports `last_indexed` equal to the head.
+4. Run the guide's Spark snippet (ADLSFileIO, the `iceberg-azure-bundle` jar; the same
+   `tabulario/spark-iceberg` digest as the SeaweedFS record) and the Trino snippet (pin the image
+   digest, check whether that version takes `fs.azure.enabled` or `fs.native-azure.enabled`).
+5. If the account is FNS and an engine fails on the `dfs` host, set
+   `iceberg.azure.location_host: blob`, rerun, and record which engine needed the switch.
+6. Record the versions, the exact properties and the observed rows in
+   `esti/ops/mds-engines/README.md`, in one docs-only commit.
+
+### Verification after AZ1–AZ6 (2026-11-07)
+
+Run on `8a28450`:
+
+- `go build ./...` and `go vet` on the touched packages pass.
+- `go test -count=1 -race` passes in `pkg/icebergcatalog/...`, `pkg/mds`, `pkg/mds/bootstrap`,
+  `pkg/mds/client`, `pkg/mds/indexer`, `pkg/mds/refmap` and `pkg/block`.
+- The Azurite tests pass with Docker reachable (colima, `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock`):
+  `pkg/mds/table` `TestAzureObjectMetadataRoundTrip` (http and https) and `pkg/block/azure`.
+  Without `DOCKER_HOST` set, `pkg/block/azure` panics in `TestMain` instead of skipping.
+
+Open items, not caused by AZ1–AZ6:
+
+- `pkg/mds/table` `TestVendedCredentials` fails with an S3 403 (`InvalidAccessKeyId` on PutObject).
+  It fails the same way on `8047321`, the commit before the Azure work.
+- `golangci-lint` has not run on AZ1–AZ6: with the local Go 1.27.2 toolchain it stops at
+  type-checking ("export data version 5 is greater than maximum supported version 4"). Needs a
+  linter built for Go 1.27, or the module's Go 1.26 toolchain.
+- esti AZ5 was run by the task's agent only; it was not rerun independently.
+
 ## 6. Verification rules (every task)
 
 Same as `METADATA_SEARCH_PLAN.md`: `go build ./...`, `go vet` on touched packages,
