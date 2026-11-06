@@ -470,9 +470,10 @@ func (r *MetadataSearchResolver) metadataRef(ctx context.Context, addr Address) 
 //   - the served ref's first-parent history carries the indexer's initialisation commit (§4.8):
 //     message "mds: init", metadata lakefs.mds.init=true, committed by the indexer principal
 //     `mds-indexer`, and positioned as the first commit directly above the repository's root
-//     commit. That commit is written by the indexer after it creates the table, so it also commits
-//     the table and makes the repository's history the state a forger cannot reproduce by editing
-//     metadata.json.
+//     commit - or as that root commit itself, for a companion repository created bare, which is
+//     the form the indexer accepts there too. That commit is written by the indexer after it
+//     creates the table, so it also commits the table and makes the repository's history the state
+//     a forger cannot reproduce by editing metadata.json.
 //
 // A repository someone else created under the companion name can copy the property, but it has no
 // initialisation commit on the history the resolver is about to serve. It is answered as an absent
@@ -515,9 +516,18 @@ func noSuchMetadataTable(requested Address) error {
 // that immutable commit or a previously verified head. A branch that only gained commits pays for
 // the new commits, not for the whole history again.
 //
-// The init commit is the first commit directly above the repository's root commit. That is a
-// position, not just a message: an mds: init commit somewhere higher in history is not the commit
-// the indexer wrote when it initialised the repository.
+// The init commit is the first commit directly above the repository's root commit, or the root
+// commit itself when the companion repository was created bare (§3.3, §4.8). That is a position, not
+// just a message: an mds: init commit somewhere higher in history is not the commit the indexer wrote
+// when it initialised the repository. The bare form is the one other position a root can hold, and it
+// is not weaker evidence: a commit with no parents is a repository's first commit, so it cannot be
+// added on top of a history the catalog already trusts; it appears when the repository is created
+// (pkg/catalog/catalog.go, CreateBareRepository) or as the first commit of an empty branch, and the
+// committer fact then still requires the indexer principal, which the commit API takes from the
+// authenticated user and not from the request (pkg/api/controller.go, Commit). The residual of §5.1
+// (CreateCommitRecord names any committer, on either form) is not widened by accepting it. It is the
+// shape the indexer accepts (pkg/mds/indexer/repo.go, initScan.accepted), and a companion the indexer
+// indexes must be one the catalog serves.
 //
 // A resolver built with a BranchLister that cannot read commit history fails closed: the property
 // proves nothing without the commit, so the virtual table is the 404 an unindexed ref answers.
@@ -553,10 +563,12 @@ func (r *MetadataSearchResolver) firstParentCarriesInitCommit(ctx context.Contex
 	return true, nil
 }
 
-// findInitCommit walks the first-parent history from target.Ref and returns the first commit
-// directly above the root when it carries the indexer's marker, its committer and its position.
-// The candidate is held from one commit to the next: when the root arrives, the previous commit is
-// the only one that can be "directly above" it.
+// findInitCommit walks the first-parent history from target.Ref and returns the commit that carries
+// the indexer's marker, its committer and its position, when there is one. The position is the first
+// commit directly above the root, or the root itself for a companion repository created bare. The
+// candidate is held from one commit to the next: when the root arrives, the previous commit is the
+// only one that can be "directly above" it, and the root itself is the other. A root that carries
+// the marker is not held back for a later page: the root has no parent, so the walk ends there.
 func (r *MetadataSearchResolver) findInitCommit(ctx context.Context, lister commitLogLister, target Address) (found bool, initCommitID, head string, err error) {
 	after := ""
 	var previous *catalog.CommitLog
@@ -572,14 +584,17 @@ func (r *MetadataSearchResolver) findInitCommit(ctx context.Context, lister comm
 			head = page[0].Reference
 		}
 		for _, commit := range page {
-			if previous != nil && len(commit.Parents) == 0 &&
-				len(previous.Parents) == 1 && previous.Parents[0] == commit.Reference &&
-				isMetadataSearchInitCommit(previous) {
-				return true, previous.Reference, head, nil
-			}
 			if len(commit.Parents) == 0 {
-				// The root: no ancestor can carry the marker, and the commit above it was not the
-				// indexer's initialisation commit.
+				// The root. The bare companion's initialisation commit is this commit itself;
+				// otherwise the commit visited immediately before it is the only one that can be
+				// "directly above" it, and no ancestor can carry the marker (§4.8).
+				if isMetadataSearchInitCommit(commit) {
+					return true, commit.Reference, head, nil
+				}
+				if previous != nil && len(previous.Parents) == 1 && previous.Parents[0] == commit.Reference &&
+					isMetadataSearchInitCommit(previous) {
+					return true, previous.Reference, head, nil
+				}
 				return false, "", "", nil
 			}
 			previous = commit

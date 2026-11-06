@@ -167,6 +167,24 @@ func newResolverFixtureWithInitCommitter(t *testing.T, committer string) *resolv
 	return newResolverFixtureWithCompanionAndInit(t, tablesTestRepo, true, committer)
 }
 
+// newResolverFixtureWithBareCompanion builds the fixture with the companion repository in the bare
+// shape the indexer accepts (METADATA_SEARCH_DESIGN.md §4.8, pkg/mds/indexer/repo.go
+// initScan.accepted): the indexer's initialisation commit is the branch's root commit, with no
+// parent, because the repository was created bare instead of by lakeFS's non-bare CreateRepository
+// (pkg/catalog/catalog.go, CreateBareRepository; pkg/api/controller.go, CreateRepository with
+// bare=true). The catalog has to accept the same shape: the position rule of §5.1 must not serve a
+// companion the indexer refuses, and must not refuse one it indexes.
+//
+// The fixture starts from the non-bare companion buildResolverFixture leaves behind and rewrites its
+// history to that shape - one commit record with no parents that carries the table - so the table,
+// its property and the router stay exactly the ones the other subtests read.
+func newResolverFixtureWithBareCompanion(t *testing.T, initCommitter string) *resolverFixture {
+	t.Helper()
+	f := newResolverFixtureWithCompanionAndInit(t, tablesTestRepo, true, initCommitter)
+	rewriteResolverCompanionAsBare(t, f.catalog, resolverMetaRepo, tablesTestRef, tablesTestRepo, initCommitter)
+	return f
+}
+
 // newResolverFixtureWithCompanion builds the same fixture with the companion table's repository
 // property set to repositoryProperty and, when initCommit is true, the indexer's initialisation
 // commit on the mirrored branch.
@@ -372,6 +390,39 @@ func addResolverInitCommitRecord(t *testing.T, cat *catalog.Catalog, repository,
 	require.NoErrorf(t, err, "create the initialisation commit of %s@%s", repository, branch)
 	require.NoErrorf(t, cat.HardResetBranch(ctx, repository, branch, commitID),
 		"move %s@%s to its initialisation commit", repository, branch)
+}
+
+// rewriteResolverCompanionAsBare replaces the companion's history with the bare shape: a single
+// root commit record - no parents - that carries the table the branch already held, committed by
+// committer. It is what a bare repository's first commit is (pkg/graveler/graveler.go, Commit: a
+// branch with an empty CommitID gives the commit no parents; pkg/graveler/graveler.go,
+// CreateCommitRecord stores a commit without a branch), and it cannot be written by committing
+// through the API because a bare repository has no branch to commit to.
+func rewriteResolverCompanionAsBare(t *testing.T, cat *catalog.Catalog, repository, branch, dataRepo, committer string) {
+	t.Helper()
+	ctx := t.Context()
+	head, err := cat.GetCommit(ctx, repository, branch)
+	require.NoErrorf(t, err, "head of %s@%s", repository, branch)
+	commit := graveler.Commit{
+		Version:      graveler.CommitVersion(head.Version),
+		Committer:    committer,
+		Message:      MetadataSearchInitCommitMessage,
+		MetaRangeID:  graveler.MetaRangeID(head.MetaRangeID),
+		CreationDate: head.CreationDate,
+		Parents:      nil,
+		Metadata: graveler.Metadata{
+			MetadataSearchInitProperty:     MetadataSearchInitValue,
+			"lakefs.mds.source-repository": dataRepo,
+		},
+		Generation: graveler.CommitGeneration(head.Generation),
+	}
+	commitID := ident.NewHexAddressProvider().ContentAddress(commit)
+	require.NoErrorf(t, cat.CreateCommitRecord(ctx, repository, commitID, int(commit.Version),
+		commit.Committer, commit.Message, string(commit.MetaRangeID), commit.CreationDate.Unix(),
+		nil, map[string]string(commit.Metadata), int32(commit.Generation)),
+		"create the root initialisation commit of %s@%s", repository, branch)
+	require.NoErrorf(t, cat.HardResetBranch(ctx, repository, branch, commitID),
+		"move %s@%s to its root initialisation commit", repository, branch)
 }
 
 // virtualTarget is the /iceberg/api load/head URL of the virtual table on one ref of the data
@@ -827,6 +878,38 @@ func TestMetadataSearchCompanionRepositoryProof(t *testing.T) {
 		require.ErrorAs(t, err, &noTable)
 	})
 
+	t.Run("a bare companion whose init commit is the root is served", func(t *testing.T) {
+		// The indexer accepts a companion repository created bare: the mds: init commit is the
+		// branch's root, not the first commit above lakeFS's automatic root (§4.8, pkg/mds/indexer/
+		// repo_test.go TestExistingBareMetadataRepositoryIsAccepted). The two sides have to agree:
+		// a root init commit cannot be added to an existing history, so accepting it keeps the
+		// position rule's protection and stops refusing a companion the indexer indexes.
+		f := newResolverFixtureWithBareCompanion(t, MetadataSearchIndexerPrincipal)
+		head, err := f.catalog.GetCommit(f.ctx, resolverMetaRepo, tablesTestRef)
+		require.NoError(t, err)
+		require.Empty(t, head.Parents, "the fixture is the bare shape: the init commit is the root")
+		require.Equal(t, MetadataSearchIndexerPrincipal, head.Committer)
+		require.Equal(t, http.StatusOK, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", "").Code)
+		require.Equal(t, http.StatusNoContent,
+			f.request(t, http.MethodHead, virtualTarget(tablesTestRef), "alice", "").Code)
+		// The data plane resolves the same table, so a vended session or a signature is scoped to it.
+		_, err = newTableScopeResolver(f.store)(t.Context(), resolverVirtualAddress(tablesTestRef),
+			func(context.Context, Address) error { return nil })
+		require.NoError(t, err)
+	})
+
+	t.Run("a bare companion's root commit written by a non-indexer is not served", func(t *testing.T) {
+		// Accepting the root form must not drop the committer fact: the root position is reachable
+		// by creating the repository bare and committing the marker as the authenticated principal
+		// (pkg/api/controller.go, Commit takes the committer from the authenticated user), so a root
+		// mds: init commit that is not the indexer's is still not proof.
+		f := newResolverFixtureWithBareCompanion(t, "mallory")
+		requireEnvelope(t, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", ""),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+		requireEnvelope(t, f.request(t, http.MethodHead, virtualTarget(tablesTestRef), "alice", ""),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+	})
+
 	t.Run("an init commit that is not the first commit above the root is not served", func(t *testing.T) {
 		// Position is part of the proof: an mds: init commit by the indexer, but with another
 		// commit between it and the repository's automatic root commit, is not the initialisation
@@ -938,6 +1021,68 @@ func (c *resolverCommitChain) ListCommits(_ context.Context, repository, ref str
 		page = append(page, c.commits[i])
 	}
 	return page, index-len(page) >= 0, nil
+}
+
+// newBareResolverCommitChain is the bare shape §4.8 accepts, as a first-parent history: the only
+// commit is the indexer's initialisation commit, and it has no parent. A branch that later gains
+// indexing commits is appendCommit plus setHead.
+func newBareResolverCommitChain() *resolverCommitChain {
+	chain := &resolverCommitChain{heads: make(map[string]int, 1)}
+	chain.commits = []*catalog.CommitLog{{
+		Reference: "commit-00000",
+		Committer: MetadataSearchIndexerPrincipal,
+		Message:   MetadataSearchInitCommitMessage,
+		Metadata:  catalog.Metadata{MetadataSearchInitProperty: MetadataSearchInitValue},
+	}}
+	chain.setHead("repo", tablesTestRef, 0)
+	return chain
+}
+
+// TestMetadataSearchInitCommitAtTheRoot pins the bare companion's history in the resolver's own
+// terms: the root is the initialisation commit, the cache is keyed by that immutable commit, and a
+// branch that grew indexing commits is verified against it without re-walking and without
+// mistaking a look-alike root for it. The integration twin is TestMetadataSearchCompanionRepositoryProof's
+// "a bare companion whose init commit is the root is served".
+func TestMetadataSearchInitCommitAtTheRoot(t *testing.T) {
+	chain := newBareResolverCommitChain()
+	resolver := NewMetadataSearchResolver(chain, nil)
+	target := Address{Repo: "repo", Ref: tablesTestRef}
+
+	found, err := resolver.firstParentCarriesInitCommit(t.Context(), target)
+	require.NoError(t, err)
+	require.True(t, found, "the indexer's root commit is the initialisation commit of a bare companion")
+	commitID, heads, cached := resolver.cachedInitCommit("repo")
+	require.True(t, cached)
+	require.Equal(t, "commit-00000", commitID, "the root is the commit the cache pins")
+	require.Equal(t, []string{"commit-00000"}, heads, "its own head is the verified witness")
+
+	chain.calls = 0
+	found, err = resolver.firstParentCarriesInitCommit(t.Context(), target)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.LessOrEqual(t, chain.calls, 1, "the root is answered from the cached commit")
+
+	chain.appendCommit()
+	chain.setHead("repo", tablesTestRef, len(chain.commits)-1)
+	chain.calls = 0
+	found, err = resolver.firstParentCarriesInitCommit(t.Context(), target)
+	require.NoError(t, err)
+	require.True(t, found, "an indexing commit above the root keeps the repository proven")
+	require.LessOrEqual(t, chain.calls, 1, "the new head is verified against the cached root")
+
+	// The other direction: a branch whose root carries the marker and the committer but is not the
+	// cached commit is not proof, even while the repository has a genuine init commit cached
+	// (MDS_REVIEW_3 R3S-4: a look-alike marker is not the immutable commit).
+	chain.commits = append(chain.commits, &catalog.CommitLog{
+		Reference: "commit-lookalike",
+		Committer: MetadataSearchIndexerPrincipal,
+		Message:   MetadataSearchInitCommitMessage,
+		Metadata:  catalog.Metadata{MetadataSearchInitProperty: MetadataSearchInitValue},
+	})
+	chain.setHead("repo", "other", len(chain.commits)-1)
+	found, err = resolver.firstParentCarriesInitCommit(t.Context(), Address{Repo: "repo", Ref: "other"})
+	require.NoError(t, err)
+	require.False(t, found, "a root the cache does not hold is not the indexer's initialisation")
 }
 
 // TestMetadataSearchInitCommitCache pins MDS-SEC-3's cost model: the init commit is found once per

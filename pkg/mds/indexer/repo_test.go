@@ -12,6 +12,7 @@ import (
 
 	"github.com/apache/iceberg-go/catalog/rest"
 	"github.com/stretchr/testify/require"
+	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/mds/client"
 	"github.com/treeverse/lakefs/pkg/mds/indexer"
@@ -193,6 +194,14 @@ func TestExistingBareMetadataRepositoryIsAccepted(t *testing.T) {
 	require.NoError(t, e.health.repositoryError("repo"))
 	require.Empty(t, e.fake.createdRepositories, "an existing initialised repository is reused")
 	require.Equal(t, init, e.fake.initCommitID(), "the root stays the initialisation commit")
+	root := e.fake.commits["repo-metadata"][init]
+	require.Empty(t, root.Parents, "the bare companion's initialisation commit is its root")
+	// The shape the catalog's ownership proof reads (pkg/icebergcatalog/resolver.go,
+	// findInitCommit): a root commit that carries the marker AND the indexer's committer. When the
+	// two sides drift apart the companion is indexed here and answered 404 there, which is the
+	// bug these two lines pin against.
+	require.Equal(t, icebergcatalog.MetadataSearchIndexerPrincipal, root.Committer,
+		"the catalog reads the committer of this commit as its third fact")
 	commits := e.fake.madeCommits()
 	require.Len(t, commits, 1, "only the indexing commit is written")
 	require.Equal(t, "mds: index repo@s1", commits[0].Message)
@@ -741,6 +750,7 @@ func (f *fake) addNonBareMetadataRepository() string {
 func (f *fake) addInitCommit(id, parent string) string {
 	commit := f.addCommit("repo-metadata", "main", id, []string{parent}, nil)
 	commit.Message = indexer.InitCommitMessage
+	commit.Committer = fakeIndexerPrincipal
 	commit.Metadata = map[string]string{
 		indexer.MetadataKeyInit:             indexer.MetadataKeyInitValue,
 		indexer.MetadataKeySourceRepository: "repo",
@@ -769,6 +779,7 @@ func (f *fake) addBareMetadataRepository(namespace string) string {
 	f.addRepository("repo-metadata", namespace, "main")
 	init := f.addCommit("repo-metadata", "main", "init", nil, nil)
 	init.Message = indexer.InitCommitMessage
+	init.Committer = fakeIndexerPrincipal
 	init.Metadata = map[string]string{
 		indexer.MetadataKeyInit:             indexer.MetadataKeyInitValue,
 		indexer.MetadataKeySourceRepository: "repo",
