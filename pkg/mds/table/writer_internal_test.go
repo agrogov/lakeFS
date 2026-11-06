@@ -1,6 +1,7 @@
 package table
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go"
+	icebergtable "github.com/apache/iceberg-go/table"
 	"github.com/stretchr/testify/require"
 )
 
@@ -93,6 +95,30 @@ func CompactMergeRowBudget(rows int) (restore func()) {
 	return func() { compactMergeRowBudget = previous }
 }
 
+// StreamBatchRows installs an observer of the row count of every record batch a compaction's stream
+// pulls from its file, and returns the function that removes it. The observer runs on the goroutine
+// that feeds the transaction.
+//
+// It is the test half of MDS_REVIEW_3.md R3T-4: the per-file read batch is the merge's row budget
+// divided by the number of files, and this is how a test sees the batch rows one stream actually
+// reads, rather than the sum of held rows that a coincidentally small table could also produce.
+func StreamBatchRows(observe func(rows int)) (restore func()) {
+	streamBatchRows.Store(&observe)
+	return func() { streamBatchRows.Store(nil) }
+}
+
+// CompactionAllocator routes the allocator the merge uses for the batches it builds through alloc
+// and returns the function that restores memory.DefaultAllocator.
+//
+// It is the test half of MDS_REVIEW_3.md R3T-7: with a memory.CheckedAllocator a test can require a
+// whole compaction to free every batch the merge built, instead of trusting the reading that the
+// Retain and Release in mergedBatches are balanced.
+func CompactionAllocator(alloc memory.Allocator) (restore func()) {
+	previous := compactionAllocator
+	compactionAllocator = alloc
+	return func() { compactionAllocator = previous }
+}
+
 // ExtraColumn is the name of the optional column SchemaWithExtraColumn appends.
 const ExtraColumn = extraColumn
 
@@ -125,4 +151,33 @@ func NewExtraColumnRecordReader(sc *iceberg.Schema, rows []Row, extra []string) 
 	reader, err := array.NewRecordReader(arrowSchema, []arrow.RecordBatch{batch})
 	batch.Release()
 	return reader, err
+}
+
+// CompactReaderSchemas returns the schema the compaction's reader declares before its first batch
+// and the schema of every batch it then yields, so that a test can require the two to agree
+// (MDS_REVIEW_3.md R3T-8). It opens the reader the way Compact does and commits nothing.
+func CompactReaderSchemas(ctx context.Context, tbl *icebergtable.Table) (*arrow.Schema, []*arrow.Schema, error) {
+	scan := tbl.Scan()
+	tasks, err := scan.PlanFiles(ctx)
+	closeErr := scan.Close()
+	if err != nil {
+		return nil, nil, err
+	}
+	if closeErr != nil {
+		return nil, nil, closeErr
+	}
+	reader, err := compactReader(ctx, tbl, tasks)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer reader.Release()
+	declared := reader.Schema()
+	var schemas []*arrow.Schema
+	for reader.Next() {
+		schemas = append(schemas, reader.RecordBatch().Schema())
+	}
+	if err := reader.Err(); err != nil {
+		return nil, nil, err
+	}
+	return declared, schemas, nil
 }

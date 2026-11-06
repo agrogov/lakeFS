@@ -261,6 +261,11 @@ func TestMergeHoldsABoundedNumberOfRows(t *testing.T) {
 			newNumberedStream(t, 0, rows, batchSize),
 			newNumberedStream(t, 1, rows, batchSize),
 		}
+		defer func() {
+			for _, stream := range streams {
+				stream.release()
+			}
+		}()
 		var highest atomic.Int64
 		restore := MergeRowsHeld(func(held int) {
 			for {
@@ -288,4 +293,118 @@ func TestMergeHoldsABoundedNumberOfRows(t *testing.T) {
 		"the merge holds the same number of rows for 1 000 and 20 000 rows: %d", small)
 	// One batch per file plus the pending output batch, and no more.
 	require.LessOrEqual(t, large, 2*batchSize+output, "the merge holds a bounded number of rows")
+}
+
+// TestCompactFileBatchRows is the unit test of the merge's memory bound that MDS_REVIEW_3.md R3T-4
+// asks for: the per-file read batch is the merge's row budget divided by the number of files, with a
+// floor that keeps a very wide table decoding parquet in efficient batches. The floor is what makes
+// the "rows follow the number of files" claim stop holding above
+// compactMergeRowBudget/compactMergeMinFileRows files; the design's memory bound has to say so
+// (R3T-5, and the commit message of this fix).
+func TestCompactFileBatchRows(t *testing.T) {
+	// The production budget: 2 × 64 Ki rows.
+	require.Equal(t, 2*DefaultRecordBatchSize, compactMergeRowBudget)
+	require.Equal(t, 131_072, compactFileBatchRows(0), "an empty plan has no division to do")
+	require.Equal(t, 131_072, compactFileBatchRows(1), "one file may read the whole budget")
+	require.Equal(t, 65_536, compactFileBatchRows(2))
+	require.Equal(t, 256, compactFileBatchRows(512), "131072/512 is exactly the floor")
+	require.Equal(t, 256, compactFileBatchRows(513), "131072/513 rounds down below the floor")
+	require.Equal(t, 256, compactFileBatchRows(10_000), "the floor, not 13 rows")
+
+	// A budget that divides evenly and one that does not, both above the floor.
+	restore := CompactMergeRowBudget(3_000)
+	defer restore()
+	require.Equal(t, 3_000, compactFileBatchRows(1))
+	require.Equal(t, 1_000, compactFileBatchRows(3))
+	require.Equal(t, 750, compactFileBatchRows(4), "3000/4 is above the floor, so the budget decides")
+	require.Equal(t, 333, compactFileBatchRows(9), "3000/9 rounds down and stays above the floor")
+	require.Equal(t, 256, compactFileBatchRows(12), "250 is below the floor, so the floor decides")
+}
+
+// panickingStream is a rowStream whose advance panics: an unexpected failure inside the merge,
+// which runs on iceberg-go's writer goroutine, where a panic would kill the indexer process.
+type panickingStream struct{ idx int }
+
+func (s *panickingStream) index() int             { return s.idx }
+func (s *panickingStream) schema() *arrow.Schema  { return nil }
+func (s *panickingStream) currentPath() string    { return "" }
+func (s *panickingStream) currentRow() rowLoc     { return rowLoc{} }
+func (s *panickingStream) held() int              { return 0 }
+func (s *panickingStream) release()               {}
+func (s *panickingStream) advance() (bool, error) { panic("a stream blew up") }
+
+// TestMergeRowsConvertsAPanicToErrMergeRows is MDS_REVIEW_3.md R3T-6: the merge runs inside
+// iceberg-go's writer goroutine, as the argument of iter.Pull2, where a panic cannot be recovered by
+// the indexer and would kill the process. mergedBatches therefore recovers and reports ErrMergeRows
+// as the iterator's error. Nothing tested that recover, that yield can be called from a deferred
+// function during unwinding, or that Next returns false and Err carries the sentinel afterwards.
+func TestMergeRowsConvertsAPanicToErrMergeRows(t *testing.T) {
+	_, arrowSchema := schemaWithExtraColumn(t)
+	reader := newMergeReader(arrowSchema, []rowStream{&panickingStream{idx: 0}})
+	defer reader.Release()
+
+	require.False(t, reader.Next(), "a panicking merge yields no batch")
+	require.ErrorIs(t, reader.Err(), ErrMergeRows,
+		"the panic is reported as the commit's error, not propagated")
+	require.ErrorContains(t, reader.Err(), "a stream blew up", "the panic value is kept for the log")
+	require.False(t, reader.Next(), "the reader stays finished after the error")
+}
+
+// heldBatchStream is a rowStream that holds one record batch, allocated from a given allocator, and
+// releases it in release. It yields no row when it is pulled: it exists so that a test can see with
+// a memory.CheckedAllocator whether the stream was freed when the reader was released without a
+// pull.
+type heldBatchStream struct {
+	idx         int
+	arrowSchema *arrow.Schema
+	batch       arrow.RecordBatch
+}
+
+func newHeldBatchStream(t *testing.T, alloc memory.Allocator, schema *arrow.Schema, idx int) *heldBatchStream {
+	t.Helper()
+	builder := array.NewRecordBuilder(alloc, schema)
+	appendRow(builder, Row{
+		Repository: "data-repo", Path: fmt.Sprintf("path-%d", idx), UserMetadata: map[string]string{},
+	})
+	batch := builder.NewRecordBatch()
+	builder.Release()
+	return &heldBatchStream{idx: idx, arrowSchema: schema, batch: batch}
+}
+
+func (s *heldBatchStream) index() int             { return s.idx }
+func (s *heldBatchStream) schema() *arrow.Schema  { return s.arrowSchema }
+func (s *heldBatchStream) currentPath() string    { return "" }
+func (s *heldBatchStream) currentRow() rowLoc     { return rowLoc{} }
+func (s *heldBatchStream) held() int              { return 0 }
+func (s *heldBatchStream) advance() (bool, error) { return false, nil }
+func (s *heldBatchStream) release() {
+	if s.batch != nil {
+		s.batch.Release()
+		s.batch = nil
+	}
+}
+
+// TestCompactionReaderReleaseFreesStreamsWithoutAPull is R3T-7 of MDS_REVIEW_3.md: the streams a
+// compaction opens used to be freed only by the merge's own defer, and iter.Pull2 does not run the
+// body of an iterator that was stopped before its first next() (go's src/iter/iter.go: the coroutine
+// returns at once when pull.done is set). Compact opens the reader and then runs ReplaceFiles and
+// Append, so an error from either leaves the reader released-before-first-pull - and every scan, and
+// for a legacy file every batch, still open. The reader owns the streams now, so its Release frees
+// them whether the merge ran or not.
+func TestCompactionReaderReleaseFreesStreamsWithoutAPull(t *testing.T) {
+	alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	arrowSchema, err := ArrowSchema(Schema())
+	require.NoError(t, err)
+	streams := []rowStream{
+		newHeldBatchStream(t, alloc, arrowSchema, 0),
+		newHeldBatchStream(t, alloc, arrowSchema, 1),
+	}
+	reader := newMergeReader(arrowSchema, streams)
+	require.Positive(t, alloc.CurrentAlloc(),
+		"the streams hold a batch each before the merge reads anything")
+
+	// What Compact's deferred release does when ReplaceFiles or Append fails before a batch is pulled.
+	reader.Release()
+
+	alloc.AssertSize(t, 0)
 }

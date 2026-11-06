@@ -11,6 +11,8 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go"
 	icebergcataloggo "github.com/apache/iceberg-go/catalog"
 	icebergtable "github.com/apache/iceberg-go/table"
@@ -702,6 +704,24 @@ func TestCompactKeepsAColumnTheWriterDoesNotKnow(t *testing.T) {
 		row(t, "e", "c3", 5, when, nil),
 	}, "keep-me", "c3")
 
+	// R3T-8 of MDS_REVIEW_3.md: a streamed run left the reader's schema nil until its first batch
+	// arrived, so the "no task" branch - the projection, whose fields carry the table's field IDs -
+	// was the common path, and the schema the reader declared was not the schema its batches carry.
+	// The reader now takes the schema of the file's scan at open, so the declaration is known before
+	// the first batch and describes every batch of the merge.
+	// A two-row output batch makes the merge build batches of several runs as well as slices of one,
+	// so the assertion covers both ways buildMergedBatch produces a batch.
+	restoreBatchSize := table.CompactRecordBatchSize(2)
+	defer restoreBatchSize()
+	declared, batchSchemas, err := table.CompactReaderSchemas(t.Context(), appended)
+	require.NoError(t, err)
+	require.NotNil(t, declared, "the reader declares a schema before its first batch")
+	require.NotEmpty(t, batchSchemas, "the reader yielded the table's rows")
+	for _, batchSchema := range batchSchemas {
+		require.True(t, declared.Equal(batchSchema),
+			"the schema the reader declares is the schema its batches carry")
+	}
+
 	compacted, err := table.Compact(t.Context(), appended, "c3")
 	require.NoError(t, err, "a compaction must not panic on a column it does not know")
 
@@ -897,4 +917,162 @@ func TestCompactHoldsABoundedNumberOfRows(t *testing.T) {
 		"the merge holds the same number of rows for 2 000 and 20 000 rows: %d", small)
 	require.LessOrEqual(t, large, mergeBudget+outputBatch,
 		"the merge holds one read batch of the one file plus one batch of output")
+}
+
+// ---------------------------------------------------------------------------------------------
+// MDS_REVIEW_3.md R3T-1, R3T-4, R3T-7 and R3T-8: the compaction's file list and its read path
+// ---------------------------------------------------------------------------------------------
+
+// TestCompactReplacesASplitFileOnce is R3T-1 of MDS_REVIEW_3.md. iceberg-go splits a Parquet file
+// above read.split.target-size into several scan tasks that all carry the same File, each with its
+// own Start and Length (table/scan_splits.go:55-60 in iceberg-go v0.7.0), and ReplaceFiles refuses
+// a delete list in which a path appears twice (table/transaction.go:1843: "delete data file paths
+// must be unique for ReplaceFiles"). Compact removed the split file once per task, so the first
+// compaction of a table holding such a file failed, and because the compaction trigger is derived
+// from the snapshot it stayed due and failed again on every tick.
+//
+// A split target of one byte and a row group limit of two rows make the writer produce one file of
+// four row groups that the scan plans as several tasks, which is the shape a file above the 128 MiB
+// default reaches on a real table.
+func TestCompactReplacesASplitFileOnce(t *testing.T) {
+	env := newTestEnv(t)
+	when := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	tbl := env.createTableWith(t, table.Schema(), iceberg.Properties{
+		icebergtable.ReadSplitTargetSizeKey:  "1",
+		icebergtable.ParquetRowGroupLimitKey: "2",
+	})
+
+	upserts := make([]table.Row, 0, 7)
+	for i := range 7 {
+		upserts = append(upserts, row(t, fmt.Sprintf("path-%02d", i), "c1", int64(i), when, nil))
+	}
+	seeded, err := table.ApplyDelta(t.Context(), tbl, upserts, nil, "c1")
+	require.NoError(t, err)
+
+	scan := seeded.Scan()
+	tasks, err := scan.PlanFiles(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, scan.Close())
+	paths := map[string]struct{}{}
+	for _, task := range tasks {
+		paths[task.File.FilePath()] = struct{}{}
+	}
+	require.Len(t, paths, 1, "the delta wrote one data file")
+	require.Greater(t, len(tasks), len(paths),
+		"the scan plans more tasks than data files, so a file is split into ranges")
+
+	compacted, err := table.Compact(t.Context(), seeded, "c1")
+	require.NoError(t, err, "a split data file must be replaced, not listed twice")
+	require.Equal(t, "c1", compacted.Properties()[table.PropertySourceCommit])
+	requireScanRows(t, env.loadTable(t), upserts)
+}
+
+// TestCompactDividesTheMergeBudgetAcrossFiles is the second half of MDS_REVIEW_3.md R3T-4: the merge
+// budget is divided by the number of files, and the batch a file's stream actually reads is that
+// division rather than the floor. TestCompactHoldsABoundedNumberOfRows cannot see this - it
+// compacts one file with a budget below the floor, so it observes max(256, budget) and a sum - so
+// this test compacts four real data files and requires the row count of the batches the streams
+// pull, not the total the merge holds.
+func TestCompactDividesTheMergeBudgetAcrossFiles(t *testing.T) {
+	const (
+		files       = 4
+		rowsPerFile = 1_000
+		mergeBudget = 3_000
+		// compactMergeRowBudget/files, which is above the 256-row floor, so the budget decides what
+		// one file's read batch is.
+		wantBatchRows = mergeBudget / files
+		floorRows     = 256
+	)
+	restoreBudget := table.CompactMergeRowBudget(mergeBudget)
+	t.Cleanup(restoreBudget)
+
+	env := newTestEnv(t)
+	when := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	tbl := env.createTable(t)
+
+	// One delta per file: each commit appends one data file, so the table has four of them.
+	var want []table.Row
+	seeded := tbl
+	for file := range files {
+		upserts := make([]table.Row, 0, rowsPerFile)
+		for i := range rowsPerFile {
+			upserts = append(upserts, row(t, fmt.Sprintf("file-%d-path-%06d", file, i), "c1",
+				int64(i), when, nil))
+		}
+		var err error
+		seeded, err = table.ApplyDelta(t.Context(), seeded, upserts, nil, "c1")
+		require.NoError(t, err)
+		want = append(want, upserts...)
+	}
+
+	scan := seeded.Scan()
+	tasks, err := scan.PlanFiles(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, scan.Close())
+	require.Len(t, tasks, files, "the table is one data file per delta")
+
+	var highest, batches atomic.Int64
+	unobserve := table.StreamBatchRows(func(rows int) {
+		batches.Add(1)
+		for {
+			was := highest.Load()
+			if int64(rows) <= was || highest.CompareAndSwap(was, int64(rows)) {
+				return
+			}
+		}
+	})
+	defer unobserve()
+
+	compacted, err := table.Compact(t.Context(), seeded, "c1")
+	require.NoError(t, err)
+	unobserve()
+
+	require.GreaterOrEqual(t, batches.Load(), int64(files),
+		"every file's stream pulled at least one batch")
+	require.LessOrEqual(t, highest.Load(), int64(wantBatchRows),
+		"a stream's read batch is the budget divided by the files")
+	require.Greater(t, highest.Load(), int64(floorRows),
+		"the division, not the floor, decided a stream's read batch")
+	requireScanRows(t, env.loadTable(t), want)
+	require.Equal(t, "c1", compacted.Properties()[table.PropertySourceCommit])
+}
+
+// TestCompactReleasesEveryBatchItReads is R3T-7 of MDS_REVIEW_3.md. The compaction's streams were
+// released only by the merge's own defer, and iter.Pull2 does not run a body that was never started,
+// while Compact opens the reader before ReplaceFiles and Append - either of which can fail before the
+// first batch is pulled. Under memory.DefaultAllocator the garbage collector hides that; under a
+// memory.CheckedAllocator every batch that is not released is still allocated when the compaction
+// returns. The scan's batches and the batches the merge builds both go through the checked allocator
+// here, so an unreleased batch of either kind fails the test.
+func TestCompactReleasesEveryBatchItReads(t *testing.T) {
+	env := newTestEnv(t)
+	when := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	tbl := env.createTable(t)
+
+	alloc := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	t.Cleanup(func() { alloc.AssertSize(t, 0) })
+	restoreAllocator := table.CompactionAllocator(alloc)
+	t.Cleanup(restoreAllocator)
+	ctx := compute.WithAllocator(t.Context(), alloc)
+
+	// Three data files, so the merge concatenates groups of rows from different batches and the
+	// batches it builds itself are allocated as well.
+	var want []table.Row
+	seeded := tbl
+	for file := range 3 {
+		upserts := make([]table.Row, 0, 50)
+		for i := range 50 {
+			upserts = append(upserts, row(t, fmt.Sprintf("file-%d-path-%03d", file, i), "c1",
+				int64(i), when, nil))
+		}
+		var err error
+		seeded, err = table.ApplyDelta(ctx, seeded, upserts, nil, "c1")
+		require.NoError(t, err)
+		want = append(want, upserts...)
+	}
+
+	compacted, err := table.Compact(ctx, seeded, "c1")
+	require.NoError(t, err)
+	require.Equal(t, "c1", compacted.Properties()[table.PropertySourceCommit])
+	requireScanRows(t, env.loadTable(t), want)
 }

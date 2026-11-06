@@ -412,12 +412,21 @@ func Rebuild(ctx context.Context, tbl *icebergtable.Table, rows Rows, sourceComm
 // which is what §4.9 asks the compaction to preserve; deleting the files is what makes it a
 // compaction.
 //
+// The removal list is one entry per data file, not one per scan task: iceberg-go splits a file above
+// read.split.target-size into several tasks, and ReplaceFiles refuses a path that appears twice
+// (dataFilesOf, R3T-1). The read side is unaffected - each split range is a disjoint set of row
+// groups - so a split file is read once and removed once.
+//
 // The delete files are enumerated from the snapshot's manifest list, not from the scan tasks: a
 // scan task carries only the delete files that apply to the data file it reads, so a delete file
 // whose data files were replaced by a Rebuild (§4.3 step 2, §4.5, §4.7) is carried by no task. It
 // would then stay in the manifest list forever - referenced by the live snapshot, so no file
 // cleanup could reclaim it - and the snapshot summary's total-delete-files, which is exactly what
 // §4.9's delete-file trigger compares, would never fall back to zero (TB-1).
+//
+// The reader is owned by this function and released by Release, which frees the streams it opened,
+// so an error from ReplaceFiles or from Append before the first batch is pulled still closes every
+// file (R3T-7).
 //
 // The rows come back out of a scan in the table's declared path order: the scan plans the table's
 // data files in the order they were committed, not in the table's declared sort order, and
@@ -431,8 +440,11 @@ func Rebuild(ctx context.Context, tbl *icebergtable.Table, rows Rows, sourceComm
 // contiguous slice of the declared order, and two commits of interleaved paths compact into one
 // file of [a b c d] with narrow path bounds for the next delta's IN (path ...) scan to prune with
 // (R2T-2). A file written by a compaction before commit 2daeca114 may not be sorted: reading only
-// its path column detects that, and the file is then read whole and sorted on its own before it
-// is merged, so the memory of the fallback is that file and not the table.
+// its path column detects that, and the file is then read whole and sorted on its own before it is
+// merged. The memory of the fallback is therefore the memory of every legacy file at once, not of
+// the table: a k-way merge cannot stream a run whose rows are not already in order, so each legacy
+// file stays resident until the merge is done (R3T-3). It is bounded by the legacy files only, and
+// the first compaction after the fix removes the reason for it.
 //
 // The rows are the scan's own Arrow columns, sliced and concatenated, never rebuilt from the ten
 // fields of Row: a column this writer does not know - an optional column a later schema version
@@ -583,11 +595,27 @@ func manifestEntriesOf(fs icebergio.IO, manifest iceberg.ManifestFile) ([]iceber
 	return entries, nil
 }
 
-// dataFilesOf returns the data file of every scan task: a scan plans one task per live data file
-// of the snapshot, so this is the whole data side of a compaction.
+// dataFilesOf returns the data files of a scan plan, one entry per file: a scan plans one task per
+// live data file of the snapshot, except that iceberg-go splits a Parquet file larger than
+// read.split.target-size into several tasks that all carry the same File, each with its own Start
+// and Length (iceberg-go v0.7.0 table/scan_splits.go:55-60, planned by table/scanner.go:1820).
+//
+// ReplaceFiles refuses a delete list in which a path appears twice - "delete data file paths must be
+// unique for ReplaceFiles" (table/transaction.go:1843) or, when the snapshot has no delete file,
+// "delete data file paths must be unique for ReplaceDataFilesWithDataFiles" (table/transaction.go:1682)
+// - so listing a split file once per task made the first compaction of a table holding such a file
+// fail, and the trigger, read from the snapshot the failed compaction left alone, failed again on
+// every tick (MDS_REVIEW_3.md R3T-1). One entry per path removes exactly the file: the split ranges
+// are disjoint row groups, so the read side still reads all of it.
 func dataFilesOf(tasks []icebergtable.FileScanTask) []iceberg.DataFile {
 	dataFiles := make([]iceberg.DataFile, 0, len(tasks))
+	seen := make(map[string]struct{}, len(tasks))
 	for _, task := range tasks {
+		path := task.File.FilePath()
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
 		dataFiles = append(dataFiles, task.File)
 	}
 	return dataFiles

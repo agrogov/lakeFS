@@ -215,12 +215,16 @@ func rowBatches(schema *arrow.Schema, rows Rows, batchSize int) iter.Seq2[arrow.
 // pullRecordReader is a record reader over a push iterator, pulled one batch at a time
 // (iter.Pull2). It owns the current batch: moving to the next one and Release release it.
 type pullRecordReader struct {
-	schema   *arrow.Schema
-	next     func() (arrow.RecordBatch, error, bool)
-	stop     func()
-	current  arrow.RecordBatch
-	err      error
-	released bool
+	schema *arrow.Schema
+	next   func() (arrow.RecordBatch, error, bool)
+	stop   func()
+	// onRelease frees what the reader owns beyond the batches it yields - the streams a compaction
+	// opened - and runs after the iterator has been stopped, so that no goroutine can touch a freed
+	// stream (MDS_REVIEW_3.md R3T-7).
+	onRelease func()
+	current   arrow.RecordBatch
+	err       error
+	released  bool
 }
 
 func newPullRecordReader(schema *arrow.Schema, batches iter.Seq2[arrow.RecordBatch, error]) *pullRecordReader {
@@ -272,6 +276,10 @@ func (r *pullRecordReader) Release() {
 	if r.current != nil {
 		r.current.Release()
 		r.current = nil
+	}
+	if r.onRelease != nil {
+		r.onRelease()
+		r.onRelease = nil
 	}
 }
 
@@ -407,20 +415,36 @@ type rowStream interface {
 // files and not the number of rows of the table. A file written by a compaction before that commit
 // may be [b d a c] across its batches instead: reading only the path column detects that, and such a
 // file is read whole, sorted on its own and merged as a materialised run. The fallback costs the
-// memory of that one file, not of the table, and it will disappear once the legacy files have been
-// compacted away.
+// memory of every legacy file at once, not of one file: a k-way merge cannot stream a run whose rows
+// are not already in order, so each legacy file stays resident until the merge is done. It is the
+// memory of the legacy files only and it disappears once the table has been compacted once.
 //
 // The detection is a second read of every file, of its path column only, before the merge reads the
 // rows. That is the price of knowing a file is sorted without collecting it; a table whose files are
 // all sorted pays it too, and it is bounded by the same per-file read batch as the merge.
 //
-// The caller owns the reader and must Release it.
+// The caller owns the reader and must Release it, whether or not a batch was pulled.
 func compactReader(ctx context.Context, tbl *icebergtable.Table, tasks []icebergtable.FileScanTask) (*pullRecordReader, error) {
 	streams, schema, err := openCompactionStreams(ctx, tbl, tasks)
 	if err != nil {
 		return nil, err
 	}
-	return newPullRecordReader(schema, mergedBatches(schema, streams, compactRecordBatchSize)), nil
+	return newMergeReader(schema, streams), nil
+}
+
+// newMergeReader returns a pull reader over the merge of streams, which it owns: releasing the
+// reader releases the streams, whether or not the merge ran. The merge's own defer cannot be the
+// only place that frees them, because iter.Pull2 stops a body that was never started without running
+// it - and Compact opens the reader before it calls ReplaceFiles and Append, either of which can
+// fail before the first batch is pulled (MDS_REVIEW_3.md R3T-7).
+func newMergeReader(schema *arrow.Schema, streams []rowStream) *pullRecordReader {
+	reader := newPullRecordReader(schema, mergedBatches(schema, streams, compactRecordBatchSize))
+	reader.onRelease = func() {
+		for _, stream := range streams {
+			stream.release()
+		}
+	}
+	return reader
 }
 
 // openCompactionStreams opens one run per scan task and returns the Arrow schema they carry. A
@@ -455,7 +479,10 @@ func openCompactionStreams(ctx context.Context, tbl *icebergtable.Table, tasks [
 	}
 	if schema == nil {
 		// No task, so no row: the caller appends nothing, and the schema of the reader is the
-		// table's own projection. It is still needed by a caller that asks for the reader's schema.
+		// table's own projection. An empty plan is the only way to reach this branch now that a
+		// streamed run stores the schema of its scan at open (R3T-8): a reader with rows always
+		// declares the schema its batches carry. It is still needed by a caller that asks for the
+		// schema of a reader over an empty table.
 		scan := tbl.Scan()
 		defer func() { _ = scan.Close() }()
 		projection, err := scan.Projection()
@@ -546,11 +573,17 @@ func newStreamedRun(ctx context.Context, tbl *icebergtable.Table, task icebergta
 		_ = scan.Close()
 		return nil, err
 	}
+	cursor := newRecordCursor(batches)
+	// Store the scan's schema at open instead of waiting for the first batch: a streamed run is the
+	// common case, so leaving it nil made the reader declare another schema - the projection, whose
+	// fields carry the table's field IDs, while the scan's batches carry none - on every compaction
+	// whose last file happened to be a streamed one (MDS_REVIEW_3.md R3T-8).
+	cursor.schema = schema
 	return &streamedRun{
 		idx:    idx,
 		file:   task.File.FilePath(),
 		scan:   scan,
-		batch:  newRecordCursor(batches),
+		batch:  cursor,
 		column: column,
 	}, nil
 }
@@ -721,6 +754,9 @@ func (c *recordCursor) advance() bool {
 			continue
 		}
 		c.schema = batch.Schema()
+		if observe := streamBatchRows.Load(); observe != nil {
+			(*observe)(int(batch.NumRows()))
+		}
 		c.batch, c.row = batch, 0
 	}
 }
@@ -748,17 +784,29 @@ func (c *recordCursor) release() {
 // check costs one atomic load per batch (TestCompactHoldsABoundedNumberOfRows).
 var mergeRowsHeld atomic.Pointer[func(held int)]
 
+// streamBatchRows is the test seam of one stream's read batch: when it is not nil, every record
+// batch a stream pulls from its file is reported with its row count, so a test can require the
+// batch rows a file's stream actually sees instead of the sum the merge holds
+// (TestCompactDividesTheMergeBudgetAcrossFiles, MDS_REVIEW_3.md R3T-4). Production leaves it nil,
+// and the check costs one atomic load per pulled batch.
+var streamBatchRows atomic.Pointer[func(rows int)]
+
+// compactionAllocator allocates the record batches the merge builds by concatenating the scan's
+// columns. It is a variable, not memory.DefaultAllocator, only so that a test can route it through a
+// memory.CheckedAllocator and require a compaction to free every batch it built (CompactionAllocator
+// in writer_internal_test.go, MDS_REVIEW_3.md R3T-7). Production never changes it.
+var compactionAllocator memory.Allocator = memory.DefaultAllocator
+
 // mergedBatches merges sorted runs into the table's declared path order, one record batch of at
 // most batchSize rows at a time. The k-way merge holds one record batch per file (K is the number
 // of files of the snapshot, not the number of rows) and one batch of output, so its memory does not
 // follow the size of the table (R2T-2).
+//
+// The streams belong to the caller, not to the iterator: the body runs only if a batch is pulled, so
+// it cannot be the only place that frees them (newMergeReader, R3T-7). The batches it retains for
+// its own output it does release, in its own defer, on every path out of the body.
 func mergedBatches(schema *arrow.Schema, streams []rowStream, batchSize int) iter.Seq2[arrow.RecordBatch, error] {
 	return func(yield func(arrow.RecordBatch, error) bool) {
-		defer func() {
-			for _, stream := range streams {
-				stream.release()
-			}
-		}()
 		// The writer this merge feeds runs on its own goroutine (iceberg-go pulls the reader inside
 		// the goroutine of unpartitionedWrite, where a panic cannot be recovered by the indexer).
 		// A merge must therefore never panic: anything unexpected is reported as the commit's error
@@ -901,7 +949,7 @@ func buildMergedBatch(schema *arrow.Schema, rows []rowLoc) (arrow.RecordBatch, e
 		for _, group := range groups {
 			parts = append(parts, array.NewSlice(group.batch.Column(c), int64(group.start), int64(group.end)))
 		}
-		merged, err := array.Concatenate(parts, memory.DefaultAllocator)
+		merged, err := array.Concatenate(parts, compactionAllocator)
 		for _, part := range parts {
 			part.Release()
 		}
