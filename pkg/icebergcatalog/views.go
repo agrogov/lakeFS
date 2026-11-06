@@ -350,6 +350,13 @@ func (s *Store) StageViewMetadata(ctx context.Context, addr Address, viewUUID uu
 	if len(files) > s.maxStagedFiles {
 		return &TableFileLimitError{Count: len(files), Max: s.maxStagedFiles}
 	}
+	// The physical address of an entry is the location in the block adapter's own spelling (D2,
+	// location.go blockIdentifier), which needs the repository's storage namespace: on an Azure
+	// blockstore the document's location is abfs[s]:// and the adapter reads https://.
+	repo, err := s.catalog.GetRepository(ctx, addr.Repo)
+	if err != nil {
+		return fmt.Errorf("%w: resolve repository %q: %w", ErrTableFileRegistration, addr.Repo, err)
+	}
 	trimmedRoot := strings.TrimRight(root, "/") + "/"
 	now := time.Now().UTC()
 	planned := make([]TableFile, 0, len(files))
@@ -370,7 +377,7 @@ func (s *Store) StageViewMetadata(ctx context.Context, addr Address, viewUUID uu
 		planned = append(planned, TableFile{
 			Kind:            TableFileKindMetadata,
 			Path:            entryPath,
-			PhysicalAddress: file.Location,
+			PhysicalAddress: blockIdentifier(repo.StorageNamespace, file.Location),
 			Size:            file.Size,
 			// A view metadata document carries no last-updated-ms, so the write time is the
 			// closest thing to when the object appeared: the uncommitted GC ages staged entries
@@ -465,7 +472,9 @@ func (s *Store) WriteViewMetadata(ctx context.Context, repositoryID, location st
 
 // loadViewMetadata reads and parses the view metadata document at a physical URI through the block
 // adapter. The URI is fully qualified by design, so it is resolved as a full identifier against the
-// repository's storage namespace - exactly like loadMetadata does for a table.
+// repository's storage namespace - exactly like loadMetadata does for a table - and in the block
+// adapter's own spelling (D2, location.go blockIdentifier), because the adapter cannot read
+// abfs[s]:// on an Azure blockstore.
 func (s *Store) loadViewMetadata(ctx context.Context, repositoryID, location string) (view.Metadata, []byte, error) {
 	repo, err := s.catalog.GetRepository(ctx, repositoryID)
 	if err != nil {
@@ -474,7 +483,7 @@ func (s *Store) loadViewMetadata(ctx context.Context, repositoryID, location str
 	reader, err := s.block.Get(ctx, block.ObjectPointer{
 		StorageID:        repo.StorageID,
 		StorageNamespace: repo.StorageNamespace,
-		Identifier:       location,
+		Identifier:       blockIdentifier(repo.StorageNamespace, location),
 		IdentifierType:   block.IdentifierTypeFull,
 	})
 	if err != nil {

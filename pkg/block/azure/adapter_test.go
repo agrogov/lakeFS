@@ -213,3 +213,37 @@ func TestAzureParseURL(t *testing.T) {
 		})
 	}
 }
+
+// TestDFSDomainFor pins the DFS endpoint of every blob domain this adapter serves, and the refusal
+// of a domain it does not: the catalog translates an Azure namespace into an abfs[s] location only
+// through this mapping (METADATA_SEARCH_AZURE.md D1), so a domain without a DFS endpoint must not
+// silently keep its blob host.
+func TestDFSDomainFor(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		Name    string
+		Blob    string
+		DFS     string
+		Invalid bool
+	}{
+		{Name: "public", Blob: azure.BlobEndpointDefaultDomain, DFS: "dfs.core.windows.net"},
+		{Name: "china", Blob: azure.BlobEndpointChinaDomain, DFS: "dfs.core.chinacloudapi.cn"},
+		{Name: "us_gov", Blob: azure.BlobEndpointUSGovDomain, DFS: "dfs.core.usgovcloudapi.net"},
+		{Name: "test_domain", Blob: azure.BlobEndpointTestDomain, DFS: azure.BlobEndpointTestDomain},
+		{Name: "unsupported_cloud", Blob: "blob.core.australiacloudapi.net", Invalid: true},
+		{Name: "empty", Blob: "", Invalid: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.Name, func(t *testing.T) {
+			t.Parallel()
+			dfs, err := azure.DFSDomainFor(tt.Blob)
+			if tt.Invalid {
+				require.ErrorIs(t, err, azure.ErrInvalidDomain)
+				require.Empty(t, dfs)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.DFS, dfs)
+		})
+	}
+}

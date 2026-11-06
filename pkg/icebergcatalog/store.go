@@ -639,7 +639,8 @@ func (s *Store) getEntry(ctx context.Context, addr Address, path string) (*catal
 
 // loadMetadata reads and parses metadata.json at a physical URI through the block adapter. The
 // URI is fully qualified by design (§6.1, Q-I5), so it is resolved as a full identifier against
-// the repository's storage namespace.
+// the repository's storage namespace; on an Azure blockstore the identifier is the block adapter's
+// spelling of that URI (D2, location.go blockIdentifier), because the adapter cannot read abfs[s]://.
 func (s *Store) loadMetadata(ctx context.Context, repositoryID, location string) (table.Metadata, []byte, error) {
 	repo, err := s.catalog.GetRepository(ctx, repositoryID)
 	if err != nil {
@@ -648,7 +649,7 @@ func (s *Store) loadMetadata(ctx context.Context, repositoryID, location string)
 	reader, err := s.block.Get(ctx, block.ObjectPointer{
 		StorageID:        repo.StorageID,
 		StorageNamespace: repo.StorageNamespace,
-		Identifier:       location,
+		Identifier:       blockIdentifier(repo.StorageNamespace, location),
 		IdentifierType:   block.IdentifierTypeFull,
 	})
 	if err != nil {

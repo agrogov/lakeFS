@@ -425,6 +425,10 @@ func (e *TableFileLimitError) ErrorType() string { return ErrTypeBadRequest }
 //
 //	<storage_namespace>/_iceberg/<table-uuid>
 //
+// with <storage_namespace> in the form the catalog hands out - the Iceberg abfs[s] form on an Azure
+// blockstore (azure_location.go D1), the namespace itself everywhere else - so that it names the
+// same directory as the location metadata.json declares.
+//
 // It is the location this catalog gives a table that the create request did not place itself
 // (Q-I5). File registration uses the root the table itself declares (tableRootForMetadata), which
 // is this value for a defaulted table and the client's location for a table created with one.
@@ -440,7 +444,7 @@ func TableRoot(storageNamespace string, tableUUID uuid.UUID) (string, error) {
 		return "", fmt.Errorf("%w: the table has no UUID to stage table files under",
 			ErrTableFileRegistration)
 	}
-	return namespace + "/" + DataPrefix + "/" + tableUUID.String(), nil
+	return tableAreaNamespace(namespace) + "/" + DataPrefix + "/" + tableUUID.String(), nil
 }
 
 // TableFilePath returns the lakeFS entry key of a table file:
@@ -502,6 +506,15 @@ func tableRootForMetadata(storageNamespace string, meta table.Metadata) (string,
 	}
 	area := TableAreaLocation(storageNamespace)
 	relative, ok := strings.CutPrefix(location, area)
+	if !ok {
+		// An Azure table created before the location translation keeps its files under the
+		// namespace spelling of the area (D2's read/commit tolerance): its location is accepted so
+		// that a commit can still register its files, and the root stays in that spelling so the
+		// manifest entries under it are matched by the collector.
+		if legacyArea := legacyTableAreaLocation(storageNamespace); legacyArea != "" {
+			relative, ok = strings.CutPrefix(location, legacyArea)
+		}
+	}
 	if !ok || relative == "" {
 		return "", &ForeignTableFileError{
 			Kind:     TableFileKindMetadata,
@@ -555,10 +568,11 @@ func (s *Store) PlanTableFiles(ctx context.Context, addr Address, request StageT
 		maxFiles = DefaultMaxStagedFiles
 	}
 	collector := &tableFileCollector{
-		tableUUID: tableUUID,
-		root:      root,
-		maxFiles:  maxFiles,
-		files:     make(map[string]TableFile),
+		tableUUID:        tableUUID,
+		root:             root,
+		storageNamespace: repo.StorageNamespace,
+		maxFiles:         maxFiles,
+		files:            make(map[string]TableFile),
 	}
 	set := &TableFileSet{TableRoot: root}
 
@@ -888,12 +902,14 @@ func (s *Store) collectManifestFiles(ctx context.Context, repo *catalog.Reposito
 // metadata.json gets (store.go loadMetadata).
 //
 // The caller has already checked that the location is under the table root, which is what keeps
-// this from reading another bucket with the server's credentials (§13).
+// this from reading another bucket with the server's credentials (§13). The identifier is the
+// location in the block adapter's own spelling (D2, location.go blockIdentifier): on an Azure
+// blockstore the location is abfs[s]:// and the adapter reads https://.
 func (s *Store) readTableObject(ctx context.Context, repo *catalog.Repository, location string) ([]byte, error) {
 	reader, err := s.block.Get(ctx, block.ObjectPointer{
 		StorageID:        repo.StorageID,
 		StorageNamespace: repo.StorageNamespace,
-		Identifier:       location,
+		Identifier:       blockIdentifier(repo.StorageNamespace, location),
 		IdentifierType:   block.IdentifierTypeFull,
 	})
 	if err != nil {
@@ -913,8 +929,11 @@ func (s *Store) readTableObject(ctx context.Context, repo *catalog.Repository, l
 type tableFileCollector struct {
 	tableUUID uuid.UUID
 	root      string
-	maxFiles  int
-	files     map[string]TableFile
+	// storageNamespace is the repository's namespace in the block adapter's spelling; add turns a
+	// validated Iceberg location into the physical address the adapter can read (D2).
+	storageNamespace string
+	maxFiles         int
+	files            map[string]TableFile
 
 	manifestsSkipped int
 	entriesSkipped   int
@@ -973,7 +992,7 @@ func (c *tableFileCollector) add(kind TableFileKind, location string, size int64
 	c.files[entryPath] = TableFile{
 		Kind:            kind,
 		Path:            entryPath,
-		PhysicalAddress: location,
+		PhysicalAddress: blockIdentifier(c.storageNamespace, location),
 		Size:            size,
 		LastModified:    modified,
 	}

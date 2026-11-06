@@ -33,6 +33,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 	require.Equal(t, DefaultUncommittedGCGrace, cfg.UncommittedGCGrace, "24h of grace for client-written files")
 	require.True(t, cfg.IgnoreCompactionCommits)
 	require.Equal(t, DefaultMaxStagedFiles, cfg.MaxStagedFiles, "50000 files per commit by default")
+	require.Equal(t, DefaultAzureLocationHost, cfg.Azure.LocationHost, "the Iceberg locations are spelled on the dfs host")
 
 	// The documented defaults of ICEBERG_CATALOG_PLAN.md section 10, spelled out.
 	require.Equal(t, "lakefs", cfg.Prefix)
@@ -163,6 +164,11 @@ func TestLoadConfigValidationErrors(t *testing.T) {
 			name:    "metadata_search without the catalog and without an explicit enabled",
 			yaml:    "iceberg:\n  metadata_search:\n    enabled: true\n",
 			wantErr: "metadata_search.enabled requires enabled",
+		},
+		{
+			name:    "unsupported azure location_host",
+			yaml:    "iceberg:\n  azure:\n    location_host: wasb\n",
+			wantErr: "azure.location_host \"wasb\" is not supported",
 		},
 		{
 			name:    "malformed section",
@@ -312,5 +318,43 @@ func TestLoadConfigMetadataSearch(t *testing.T) {
 		section, ok := c.Iceberg["metadata_search"]
 		require.True(t, ok, "the nested section is kept verbatim in the absorbed map")
 		require.Equal(t, map[string]any{"enabled": true}, section)
+	})
+}
+
+// TestLoadConfigAzureLocationHost pins iceberg.azure.location_host (METADATA_SEARCH_AZURE.md D1):
+// dfs by default, settable from the file and from the environment, and - because the location
+// translation is a package function of the setting - recorded where the mapping reads it.
+func TestLoadConfigAzureLocationHost(t *testing.T) {
+	previous := azureLocationHost()
+	t.Cleanup(func() { setAzureLocationHost(previous) })
+
+	t.Run("default is dfs", func(t *testing.T) {
+		useConfig(t, "{}\n")
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.Equal(t, AzureLocationHostDFS, cfg.Azure.LocationHost)
+		require.Equal(t, DefaultAzureLocationHost, azureLocationHost())
+	})
+
+	t.Run("blob from the file", func(t *testing.T) {
+		useConfig(t, "iceberg:\n  azure:\n    location_host: blob\n")
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.Equal(t, AzureLocationHostBlob, cfg.Azure.LocationHost)
+		require.Equal(t, AzureLocationHostBlob, azureLocationHost(),
+			"the setting is what the location translation reads")
+	})
+
+	t.Run("blob from the environment", func(t *testing.T) {
+		useConfig(t, "{}\n")
+		t.Setenv("LAKEFS_ICEBERG_AZURE_LOCATION_HOST", "blob")
+		viper.SetEnvPrefix("LAKEFS")
+		viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+		viper.AutomaticEnv()
+
+		cfg, err := LoadConfig()
+		require.NoError(t, err)
+		require.Equal(t, AzureLocationHostBlob, cfg.Azure.LocationHost,
+			"a per-key environment variable must reach the section")
 	})
 }

@@ -111,10 +111,10 @@ const (
 	defaultSTSRegion = "us-east-1"
 
 	// CredentialVendingUnsupportedMessage is the 501 answer when this deployment cannot vend
-	// credentials. Vending is S3 only in OSS (§8), so the message names the requirement rather
-	// than leaving a client to guess why the endpoint is off: a non-S3 blockstore (Azure, GCS)
-	// has no vending at all, and an S3 blockstore needs a role.
-	CredentialVendingUnsupportedMessage = "credential vending is not enabled for this catalog: it requires an S3 blockstore and blockstore.s3.credentials_vending.role_arn" //nolint:gosec // an error message naming a setting, not a credential
+	// credentials. Vending is S3 only in OSS (§8, METADATA_SEARCH_AZURE.md N1), so the message
+	// names the requirement rather than leaving a client to guess why the endpoint is off: an
+	// Azure or GCS blockstore has no vending at all, and an S3 blockstore needs a role.
+	CredentialVendingUnsupportedMessage = "credential vending is not enabled for this catalog: it requires an S3 blockstore and blockstore.s3.credentials_vending.role_arn; Azure Blob Storage credentials are not vended" //nolint:gosec // an error message naming a setting, not a credential
 )
 
 // The refusals a credentials request can produce. They are sentinels so the handler and the tests

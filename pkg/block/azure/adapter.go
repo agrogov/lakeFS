@@ -40,6 +40,14 @@ const (
 	BlobEndpointChinaDomain   = "blob.core.chinacloudapi.cn"
 	BlobEndpointUSGovDomain   = "blob.core.usgovcloudapi.net"
 	BlobEndpointTestDomain    = "azurite.test"
+
+	// dfsEndpointDefaultDomain, dfsEndpointChinaDomain and dfsEndpointUSGovDomain are the Data
+	// Lake Storage Gen2 (ABFS) service hosts of the same accounts, i.e. the hosts every Iceberg
+	// FileIO opens an abfs[s]:// location on (METADATA_SEARCH_AZURE.md D1). The test domain has
+	// no separate DFS endpoint: Azurite serves the one host it has.
+	dfsEndpointDefaultDomain = "dfs.core.windows.net"
+	dfsEndpointChinaDomain   = "dfs.core.chinacloudapi.cn"
+	dfsEndpointUSGovDomain   = "dfs.core.usgovcloudapi.net"
 )
 
 var (
@@ -53,6 +61,32 @@ var (
 		BlobEndpointTestDomain,
 	}
 )
+
+// DFSDomainFor returns the Data Lake Storage Gen2 (ABFS) service host of a blob endpoint domain:
+//
+//	blob.core.windows.net       -> dfs.core.windows.net
+//	blob.core.chinacloudapi.cn  -> dfs.core.chinacloudapi.cn
+//	blob.core.usgovcloudapi.net -> dfs.core.usgovcloudapi.net
+//	azurite.test                -> azurite.test
+//
+// A domain this adapter does not support is an ErrInvalidDomain: the catalog maps a repository's
+// namespace to an Iceberg location only for the clouds it can also read and write itself, so a
+// host that is not one of them is refused instead of being translated into a location no client
+// could open (METADATA_SEARCH_AZURE.md D1).
+func DFSDomainFor(blobDomain string) (string, error) {
+	switch blobDomain {
+	case BlobEndpointDefaultDomain:
+		return dfsEndpointDefaultDomain, nil
+	case BlobEndpointChinaDomain:
+		return dfsEndpointChinaDomain, nil
+	case BlobEndpointUSGovDomain:
+		return dfsEndpointUSGovDomain, nil
+	case BlobEndpointTestDomain:
+		return BlobEndpointTestDomain, nil
+	default:
+		return "", fmt.Errorf("%q has no dfs endpoint: %w", blobDomain, ErrInvalidDomain)
+	}
+}
 
 type Adapter struct {
 	clientCache        *ClientCache

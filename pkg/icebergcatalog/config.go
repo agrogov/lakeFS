@@ -192,6 +192,22 @@ type Config struct {
 	// MetadataSearch is the iceberg.metadata_search section (METADATA_SEARCH_DESIGN.md §5.5): the
 	// catalog side of Metadata Search, which is off by default.
 	MetadataSearch MetadataSearchConfig `mapstructure:"metadata_search"`
+
+	// Azure is the iceberg.azure section (METADATA_SEARCH_AZURE.md D1): how the catalog spells an
+	// Azure storage namespace in the locations it hands out.
+	Azure AzureConfig `mapstructure:"azure"`
+}
+
+// AzureConfig is the iceberg.azure section of §10, added by METADATA_SEARCH_AZURE.md D1. It holds
+// the one switch the location translation needs on this side of the catalog; the indexer's Azure
+// credentials are a separate section of its own (metadata_search.azure, D3).
+type AzureConfig struct {
+	// LocationHost picks the service part of the host of a translated Azure location. "dfs" (the
+	// default) is the Data Lake Storage Gen2 endpoint - abfss://c@acct.dfs.core.windows.net/p - and
+	// is the form every target engine opens. "blob" keeps the blob endpoint's host -
+	// abfss://c@acct.blob.core.windows.net/p - for an engine whose ABFS driver refuses a non-HNS
+	// (flat namespace) account over the dfs endpoint (Hadoop >= 3.4). The scheme stays abfs[s].
+	LocationHost string `mapstructure:"location_host"`
 }
 
 // LoadConfig reads and validates the "iceberg:" configuration section through viper. It is
@@ -208,6 +224,9 @@ func LoadConfig() (*Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	// The location translation is a package-level function of the namespace (azure_location.go), so
+	// the validated setting is recorded once here, where every mount reads it before serving.
+	setAzureLocationHost(cfg.Azure.LocationHost)
 	return cfg, nil
 }
 
@@ -224,6 +243,7 @@ func (c *Config) applyViperOverrides() {
 		ignoreCompactionCommitsKey = ConfigKey + ".ignore_compaction_commits"
 		maxStagedFilesKey          = ConfigKey + ".max_staged_files"
 		metadataSearchEnabledKey   = ConfigKey + ".metadata_search.enabled"
+		azureLocationHostKey       = ConfigKey + ".azure.location_host"
 	)
 	if viper.IsSet(enabledKey) {
 		c.Enabled = viper.GetBool(enabledKey)
@@ -257,6 +277,10 @@ func (c *Config) applyViperOverrides() {
 	// installation wrote has to be read: an explicit false is the zero value and needs no branch.
 	if viper.IsSet(metadataSearchEnabledKey) {
 		c.MetadataSearch.Enabled = viper.GetBool(metadataSearchEnabledKey)
+	}
+	// The default is dfs; an absent key keeps the zero value, which setDefaults fills.
+	if viper.IsSet(azureLocationHostKey) {
+		c.Azure.LocationHost = viper.GetString(azureLocationHostKey)
 	}
 }
 
@@ -353,6 +377,9 @@ func (c *Config) setDefaults() {
 	if c.MaxStagedFiles == 0 {
 		c.MaxStagedFiles = DefaultMaxStagedFiles
 	}
+	if c.Azure.LocationHost == "" {
+		c.Azure.LocationHost = DefaultAzureLocationHost
+	}
 }
 
 // Validate checks the catalog configuration (ICEBERG_CATALOG_PLAN.md §10). Unlike the datasets
@@ -393,6 +420,12 @@ func (c *Config) Validate() error {
 	if c.MaxStagedFiles < 0 {
 		return fmt.Errorf("%w: max_staged_files must not be negative, got %d",
 			ErrInvalidConfig, c.MaxStagedFiles)
+	}
+	// The location host is one of two spellings of the same location (D1): anything else would
+	// either be ignored or produce a host no engine can open, so it is refused at startup.
+	if host := c.Azure.LocationHost; host != "" && host != AzureLocationHostDFS && host != AzureLocationHostBlob {
+		return fmt.Errorf("%w: azure.location_host %q is not supported, only %q and %q are",
+			ErrInvalidConfig, host, AzureLocationHostDFS, AzureLocationHostBlob)
 	}
 	return c.CredentialsVending.Validate()
 }

@@ -150,6 +150,10 @@ func (s *Store) WriteMetadata(ctx context.Context, repositoryID, location string
 // adapter. It is the write half WriteMetadata and WriteViewMetadata (views.go) share: both write
 // <location>/metadata/<seq>-<uuid>.metadata.json into the repository's storage namespace with the
 // server's credentials, and neither may exist twice under one name.
+//
+// The identifier is the location in the block adapter's own spelling (D2, location.go
+// blockIdentifier): on an Azure blockstore the location is abfs[s]:// and the adapter writes
+// https://.
 func (s *Store) writeDocument(ctx context.Context, repositoryID, location string, data []byte) error {
 	repo, err := s.catalog.GetRepository(ctx, repositoryID)
 	if err != nil {
@@ -158,7 +162,7 @@ func (s *Store) writeDocument(ctx context.Context, repositoryID, location string
 	_, err = s.block.Put(ctx, block.ObjectPointer{
 		StorageID:        repo.StorageID,
 		StorageNamespace: repo.StorageNamespace,
-		Identifier:       location,
+		Identifier:       blockIdentifier(repo.StorageNamespace, location),
 		IdentifierType:   block.IdentifierTypeFull,
 	}, int64(len(data)), bytes.NewReader(data), block.PutOpts{})
 	if err != nil {
