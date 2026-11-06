@@ -159,10 +159,24 @@ func newResolverFixtureWithoutInitCommit(t *testing.T) *resolverFixture {
 	return newResolverFixtureWithCompanion(t, tablesTestRepo, false)
 }
 
+// newResolverFixtureWithInitCommitter builds a companion repository whose init commit carries the
+// marker and the message but is committed by committer: the ownership proof must not accept a
+// commit written by anyone other than the indexer principal.
+func newResolverFixtureWithInitCommitter(t *testing.T, committer string) *resolverFixture {
+	t.Helper()
+	return newResolverFixtureWithCompanionAndInit(t, tablesTestRepo, true, committer)
+}
+
 // newResolverFixtureWithCompanion builds the same fixture with the companion table's repository
 // property set to repositoryProperty and, when initCommit is true, the indexer's initialisation
 // commit on the mirrored branch.
 func newResolverFixtureWithCompanion(t *testing.T, repositoryProperty string, initCommit bool) *resolverFixture {
+	t.Helper()
+	return newResolverFixtureWithCompanionAndInit(t, repositoryProperty, initCommit, MetadataSearchIndexerPrincipal)
+}
+
+// newResolverFixtureWithCompanionAndInit builds the fixture with an explicit init-commit committer.
+func newResolverFixtureWithCompanionAndInit(t *testing.T, repositoryProperty string, initCommit bool, initCommitter string) *resolverFixture {
 	t.Helper()
 	base := newTablesFixture(t)
 	ctx := base.ctx
@@ -195,7 +209,7 @@ func newResolverFixtureWithCompanion(t *testing.T, repositoryProperty string, in
 		FormatVersion:    2,
 	}), "create system.object_metadata in the companion repository")
 	if initCommit {
-		commitResolverInit(t, base.catalog, resolverMetaRepo, tablesTestRef, tablesTestRepo)
+		commitResolverInitAs(t, base.catalog, resolverMetaRepo, tablesTestRef, tablesTestRepo, initCommitter, false)
 	}
 
 	// alice may read the data repository (tablesReadStatements, fs on lakehouse only), carol may
@@ -312,11 +326,20 @@ func putResolverObject(t *testing.T, cat *catalog.Catalog, repository, location,
 // does when it creates the namespace and the table.
 func commitResolverInit(t *testing.T, cat *catalog.Catalog, repository, branch, dataRepo string) {
 	t.Helper()
-	_, err := cat.Commit(t.Context(), repository, branch, MetadataSearchInitCommitMessage, "mds",
+	commitResolverInitAs(t, cat, repository, branch, dataRepo, MetadataSearchIndexerPrincipal, false)
+}
+
+// commitResolverInitAs is commitResolverInit with an explicit committer: the ownership proof reads
+// the committer, so a forged init commit is a commit with the marker and the message written by
+// someone else. allowEmpty lets a test place a different commit between the root and the init
+// commit.
+func commitResolverInitAs(t *testing.T, cat *catalog.Catalog, repository, branch, dataRepo, committer string, allowEmpty bool) {
+	t.Helper()
+	_, err := cat.Commit(t.Context(), repository, branch, MetadataSearchInitCommitMessage, committer,
 		catalog.Metadata{
 			MetadataSearchInitProperty:     MetadataSearchInitValue,
 			"lakefs.mds.source-repository": dataRepo,
-		}, nil, nil, false)
+		}, nil, nil, allowEmpty)
 	require.NoErrorf(t, err, "commit the initialisation of %s@%s", repository, branch)
 }
 
@@ -331,7 +354,7 @@ func addResolverInitCommitRecord(t *testing.T, cat *catalog.Catalog, repository,
 	require.NoErrorf(t, err, "head of %s@%s", repository, branch)
 	commit := graveler.Commit{
 		Version:      graveler.CommitVersion(head.Version),
-		Committer:    "mds",
+		Committer:    MetadataSearchIndexerPrincipal,
 		Message:      MetadataSearchInitCommitMessage,
 		MetaRangeID:  graveler.MetaRangeID(head.MetaRangeID),
 		CreationDate: head.CreationDate,
@@ -790,10 +813,200 @@ func TestMetadataSearchCompanionRepositoryProof(t *testing.T) {
 		require.ErrorAs(t, err, &noTable)
 	})
 
+	t.Run("an init commit written by a non-indexer is not served", func(t *testing.T) {
+		// The marker and the message are not proof of who wrote the commit: anyone with
+		// fs:CreateCommit on R-metadata can copy them. The genuine indexer principal is mds-indexer.
+		f := newResolverFixtureWithInitCommitter(t, "mallory")
+		requireEnvelope(t, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", ""),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+		requireEnvelope(t, f.request(t, http.MethodHead, virtualTarget(tablesTestRef), "alice", ""),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+		_, err := newTableScopeResolver(f.store)(t.Context(), resolverVirtualAddress(tablesTestRef),
+			func(context.Context, Address) error { return nil })
+		var noTable *NoSuchTableException
+		require.ErrorAs(t, err, &noTable)
+	})
+
+	t.Run("an init commit that is not the first commit above the root is not served", func(t *testing.T) {
+		// Position is part of the proof: an mds: init commit by the indexer, but with another
+		// commit between it and the repository's automatic root commit, is not the initialisation
+		// commit the indexer writes when it creates R-metadata.
+		f := newResolverFixtureWithoutInitCommit(t)
+		_, err := f.catalog.Commit(f.ctx, resolverMetaRepo, tablesTestRef, "mds: bootstrap",
+			"operator", nil, nil, nil, false)
+		require.NoError(t, err, "commit the table before the forged init commit")
+		commitResolverInitAs(t, f.catalog, resolverMetaRepo, tablesTestRef, tablesTestRepo,
+			MetadataSearchIndexerPrincipal, true)
+		requireEnvelope(t, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", ""),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+		requireEnvelope(t, f.request(t, http.MethodHead, virtualTarget(tablesTestRef), "alice", ""),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+	})
+
 	t.Run("a companion table that names the data repository and has the init commit is served", func(t *testing.T) {
 		f := newResolverFixture(t)
 		require.Equal(t, http.StatusOK, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", "").Code)
 	})
+}
+
+// resolverCommitChain is a BranchLister and commitLogLister with a deterministic first-parent
+// history. It lets the cache tests count commit-log reads without materializing a catalog: the root
+// is commits[0], the indexer's init commit is commits[1], and every later commit is a normal child
+// of the one before it. calls is read and reset by the test that owns the chain, which runs its
+// assertions sequentially.
+type resolverCommitChain struct {
+	commits []*catalog.CommitLog
+	heads   map[string]int
+	calls   int //nolint:unused // read by TestMetadataSearchInitCommitCache
+}
+
+func newResolverCommitChain(n int) *resolverCommitChain {
+	if n < 2 {
+		n = 2
+	}
+	chain := &resolverCommitChain{heads: make(map[string]int, 1)}
+	for i := 0; i < n; i++ {
+		commit := &catalog.CommitLog{
+			Reference: fmt.Sprintf("commit-%05d", i),
+			Committer: "author",
+			Message:   fmt.Sprintf("commit %d", i),
+		}
+		if i > 0 {
+			commit.Parents = []string{chain.commits[i-1].Reference}
+		}
+		if i == 1 {
+			commit.Committer = MetadataSearchIndexerPrincipal
+			commit.Message = MetadataSearchInitCommitMessage
+			commit.Metadata = catalog.Metadata{MetadataSearchInitProperty: MetadataSearchInitValue}
+		}
+		chain.commits = append(chain.commits, commit)
+	}
+	return chain
+}
+
+// appendCommit adds one first-parent child of the current tip.
+func (c *resolverCommitChain) appendCommit() {
+	i := len(c.commits)
+	commit := &catalog.CommitLog{
+		Reference: fmt.Sprintf("commit-%05d", i),
+		Committer: "author",
+		Message:   fmt.Sprintf("commit %d", i),
+		Parents:   []string{c.commits[i-1].Reference},
+	}
+	c.commits = append(c.commits, commit)
+}
+
+func (c *resolverCommitChain) setHead(repository, ref string, index int) {
+	c.heads[repository+"/"+ref] = index
+}
+
+func (c *resolverCommitChain) GetBranchReference(_ context.Context, repository, branch string) (string, error) {
+	index, ok := c.heads[repository+"/"+branch]
+	if !ok {
+		return "", fmt.Errorf("branch %q: %w", branch, graveler.ErrBranchNotFound)
+	}
+	return c.commits[index].Reference, nil
+}
+
+// ListCommits mimics catalog.ListCommits page semantics: FromReference is skipped, the page starts
+// at its first parent, and hasMore reports that older commits remain.
+func (c *resolverCommitChain) ListCommits(_ context.Context, repository, ref string, params catalog.LogParams) ([]*catalog.CommitLog, bool, error) {
+	c.calls++
+	index, ok := c.heads[repository+"/"+ref]
+	if !ok {
+		return nil, false, nil
+	}
+	if params.FromReference != "" {
+		found := false
+		for i := index; i >= 0; i-- {
+			if c.commits[i].Reference == params.FromReference {
+				index = i - 1
+				found = true
+				break
+			}
+		}
+		if !found {
+			index = -1
+		}
+	}
+	amount := params.Amount
+	if amount <= 0 {
+		amount = metadataSearchInitPageSize
+	}
+	page := make([]*catalog.CommitLog, 0, amount)
+	for i := index; i >= 0 && len(page) < amount; i-- {
+		page = append(page, c.commits[i])
+	}
+	return page, index-len(page) >= 0, nil
+}
+
+// TestMetadataSearchInitCommitCache pins MDS-SEC-3's cost model: the init commit is found once per
+// repository, and a second read - the same head or one new commit - does not walk the history again.
+// The commit-log call count is the observable; before the per-repository cache it grew with the
+// length of the branch on every new head.
+func TestMetadataSearchInitCommitCache(t *testing.T) {
+	for _, n := range []int{300, 4096} {
+		t.Run(fmt.Sprintf("history of %d commits", n), func(t *testing.T) {
+			chain := newResolverCommitChain(n)
+			chain.setHead("repo", tablesTestRef, len(chain.commits)-1)
+			resolver := NewMetadataSearchResolver(chain, nil)
+			target := Address{Repo: "repo", Ref: tablesTestRef}
+
+			found, err := resolver.firstParentCarriesInitCommit(t.Context(), target)
+			require.NoError(t, err)
+			require.True(t, found, "the genuine init commit directly above the root is proof")
+			require.Positive(t, chain.calls, "the first read has to walk the history")
+
+			chain.calls = 0
+			found, err = resolver.firstParentCarriesInitCommit(t.Context(), target)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.LessOrEqual(t, chain.calls, 1, "an unchanged head is answered from the cached witness")
+
+			chain.appendCommit()
+			chain.setHead("repo", tablesTestRef, len(chain.commits)-1)
+			chain.calls = 0
+			found, err = resolver.firstParentCarriesInitCommit(t.Context(), target)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.LessOrEqual(t, chain.calls, 1,
+				"a new head is verified against a cached witness, not by re-walking the whole history")
+		})
+	}
+}
+
+// TestMetadataSearchInitCommitCacheBound pins the cache bounds: many heads of one repository are
+// one repository entry with a bounded witness list, and many repositories do not grow the cache
+// without limit.
+func TestMetadataSearchInitCommitCacheBound(t *testing.T) {
+	const heads = 24
+	chain := newResolverCommitChain(heads + 2)
+	resolver := NewMetadataSearchResolver(chain, nil)
+	for i := 0; i < heads; i++ {
+		ref := fmt.Sprintf("branch-%02d", i)
+		chain.setHead("repo", ref, len(chain.commits)-1-i)
+		found, err := resolver.firstParentCarriesInitCommit(t.Context(), Address{Repo: "repo", Ref: ref})
+		require.NoError(t, err)
+		require.Truef(t, found, "branch %s descends from the init commit", ref)
+	}
+	require.Len(t, resolver.initCache, 1, "the cache is keyed by repository, not by head")
+	entry := resolver.initCache["repo"]
+	require.NotNil(t, entry)
+	require.LessOrEqual(t, len(entry.heads), metadataSearchInitCacheMaxHeads,
+		"the verified-head witnesses of one repository are bounded")
+
+	const repositories = metadataSearchInitCacheMaxRepositories + 1
+	tiny := newResolverCommitChain(3)
+	resolver = NewMetadataSearchResolver(tiny, nil)
+	for i := 0; i < repositories; i++ {
+		repository := fmt.Sprintf("repo-%04d", i)
+		tiny.setHead(repository, tablesTestRef, len(tiny.commits)-1)
+		found, err := resolver.firstParentCarriesInitCommit(t.Context(), Address{Repo: repository, Ref: tablesTestRef})
+		require.NoError(t, err)
+		require.Truef(t, found, "repository %s descends from the init commit", repository)
+	}
+	require.LessOrEqual(t, len(resolver.initCache), metadataSearchInitCacheMaxRepositories,
+		"old repository entries are evicted at the cache bound")
 }
 
 // mustMarshalRaw re-encodes a decoded metadata document so it can be compared with require.JSONEq.
