@@ -76,14 +76,23 @@ The four unread areas are now read, and every question the brief asked has a def
 
 ## Summary of findings
 
-| Key | Severity | Status | Title | File:line |
-|---|---|---|---|---|
-| R4T-1 | MAJOR | CONFIRMED (probe) | A copy-on-write delta rewrites data files without their position delete files, so rows a merge-on-read delete removed come back | `pkg/mds/table/writer.go:283-295` |
-| R4T-2 | MINOR | CONFIRMED (probe; the trailing-builder half is a reading) | `rowBatches` releases its first `array.RecordBuilder` twice and never releases the last one it allocates | `pkg/mds/table/rows.go:176-186` |
-| R4T-3 | MINOR | CONFIRMED (probe) | A delete-only delta is refused with `ErrUnknownSchema` in the copy-on-write mode, which §3.1 says cannot happen | `pkg/mds/table/writer.go:290` |
-| R4T-4 | NIT | CONFIRMED (probe) | A panic in `Rebuild`'s row source runs on iceberg-go's writer goroutine and kills the process; unlike the merge there is no `ErrMergeRows` conversion | `pkg/mds/table/rows.go:196-208` |
-| R4T-5 | NIT | CONFIRMED (probe) | `ApplyDelta` writes two rows for a path that appears twice in the upserts, a table its own `Rebuild` refuses | `pkg/mds/table/writer.go:260-261,266-282` |
-| R4T-6 | NIT | UNVERIFIED (read only) | §4.9 says the compaction's per-file read batch is `max(256, 131072/files)`; the code divides by the scan-task count, so a split file gets a smaller batch than documented | `pkg/mds/table/rows.go:459` vs `:350-360` |
+| Key | Severity | Status | Confirmation | Title | File:line |
+|---|---|---|---|---|---|
+| R4T-1 | MAJOR | Fixed in `5d68d07af` | CONFIRMED (probe) | A copy-on-write delta rewrites data files without their position delete files, so rows a merge-on-read delete removed come back | `pkg/mds/table/writer.go:283-295` |
+| R4T-2 | MINOR | Fixed in `2b494acc4` | CONFIRMED (probe; the trailing-builder half is a reading) | `rowBatches` releases its first `array.RecordBuilder` twice and never releases the last one it allocates | `pkg/mds/table/rows.go:176-186` |
+| R4T-3 | MINOR | Fixed in `5d68d07af` | CONFIRMED (probe) | A delete-only delta is refused with `ErrUnknownSchema` in the copy-on-write mode, which §3.1 says cannot happen | `pkg/mds/table/writer.go:290` |
+| R4T-4 | NIT | Fixed in `2b494acc4` | CONFIRMED (probe) | A panic in `Rebuild`'s row source runs on iceberg-go's writer goroutine and kills the process; unlike the merge there is no `ErrMergeRows` conversion | `pkg/mds/table/rows.go:196-208` |
+| R4T-5 | NIT | Fixed in `5d68d07af` | CONFIRMED (probe) | `ApplyDelta` writes two rows for a path that appears twice in the upserts, a table its own `Rebuild` refuses | `pkg/mds/table/writer.go:260-261,266-282` |
+| R4T-6 | NIT | Fixed in `2b494acc4` (design sentence still to say which figure the package guarantees) | UNVERIFIED (read only) | §4.9 says the compaction's per-file read batch is `max(256, 131072/files)`; the code divides by the scan-task count, so a split file gets a smaller batch than documented | `pkg/mds/table/rows.go:459` vs `:350-360` |
+
+All six findings are fixed; none was left open, so no row says `Not fixed`. The
+`Confirmation` column is this review's own evidence for the finding (a probe, or a reading), kept
+so the probes quoted below stay attributable; `Status` is the fix. Each fix commit carries the
+probe as a permanent test. The behaviour changes they make to the documented design (the
+delete-mode default, the copy-on-write fold, `ErrNoSourceCommit`, the row-source panic as
+`ErrRowsPanic`, the compaction's per-file batch and its split-range residual) are recorded in
+`METADATA_SEARCH_DESIGN.md` §3.1, §4.3, §4.4 and §4.9 and in `docs/metadata-search.md` by the docs
+commit that follows them.
 
 ## Duplicates and relations
 
@@ -137,6 +146,21 @@ does. No `MemStats` curve was taken; the checked-allocator curve was, and is rep
 ### R4T-1 - MAJOR: a copy-on-write delta rewrites data files without their position delete files, so rows a merge-on-read delete removed come back
 
 Status: **CONFIRMED** (probe ran).
+
+**Fixed in `5d68d07af`** - option (a), not (b): when the snapshot still carries live delete files,
+`ApplyDelta` runs one `Compact` first (`compactDeleteFiles`), so the file the rewrite reads has no
+delete file through it. The fold records the table's current position as its source commit, so a
+delta that fails after its fold is discarded by §4.4's recovery and re-indexed. Option (b) -
+refusing the mode - was not taken: it would have made the plan's copy-on-write fallback useless on
+exactly the tables that need it. A table that carries delete files and **no** `lakefs.mds.source-commit` is
+refused with the new `ErrNoSourceCommit`, because the fold has no position to record; `Rebuild`,
+which needs none, fixes such a table. The absent-property default stays `copy-on-write` (iceberg-go's
+and the documented upstream default), now correct because of the fold; it is pinned by a decision
+test, not a regression test. Tests: `TestApplyDeltaCopyOnWriteAfterMergeOnReadDelete` (upsert and
+delete-only shapes), `TestApplyDeltaCopyOnWriteDeleteOnlyOnAnEvolvedTable`,
+`TestApplyDeltaWithoutTheDeleteModePropertyIsCopyOnWrite`, and `TestCompact`'s copy-on-write block,
+which now requires the fold instead of the delete file it used to keep. Upstream
+`apache/iceberg-go#2042`, fixed upstream in `apache/iceberg-go#2046` after the pinned v0.7.0.
 
 **Where**
 
@@ -221,6 +245,14 @@ the copy-on-write arm in general: `TestProbeCopyOnWriteUpsertAfterCopyOnWriteDel
 Status: **CONFIRMED** (probe ran: the double `Release`); the trailing-builder half is
 **CONFIRMED** by reading (it allocates no buffer, so a checked allocator cannot see it).
 
+**Fixed in `2b494acc4`** - the deferred method value became a closure that releases whatever
+builder the body holds when it returns, so exactly one builder is released on every exit: drained
+source, last batch at the boundary, consumer stopping early, and failing source. The new
+`rowBatchesAllocator` seam is what lets a test route the adapter through
+`memory.CheckedAllocator`. Test: `TestRowBatchesReleasesTheBuilderItHolds`, which fails before the
+fix (under `-tags assert` with "too many releases", which the new recover of R4T-4 turns into a
+plain failure instead of a process death).
+
 **Where**
 
 - `pkg/mds/table/rows.go:174-213` (`rowBatches`, the row source → batch adapter of
@@ -290,6 +322,15 @@ would pass for the wrong reason, because an empty builder allocates nothing.
 
 Status: **CONFIRMED** (probe ran).
 
+**Fixed in `5d68d07af`** - the arm builds `deltaUpsertReader`: the upserts when there are any, and
+otherwise an empty reader over the table's own Arrow schema (`NewBatchesRecordReader` with no
+batches, so nothing is written and `checkKnownSchema` is never called for a row set of length
+zero). The `Overwrite` itself re-emits the columns of the files it rewrites, so the appended column
+keeps its value. The §3.1 sentence was not qualified: a delete-only delta applies in both modes.
+Tests: `TestApplyDeltaCopyOnWriteDeleteOnlyOnAnEvolvedTable` (the evolved column survives the delete
+and a later fold compaction) and the delete-only half of
+`TestApplyDeltaCopyOnWriteAfterMergeOnReadDelete`.
+
 **Where**
 
 - `pkg/mds/table/writer.go:283-295`: the copy-on-write arm runs whenever `len(paths) > 0`, and it
@@ -335,6 +376,14 @@ design's would then have to say the same thing.
 ### R4T-4 - NIT: a panic in `Rebuild`'s row source runs on iceberg-go's writer goroutine and kills the process; unlike the merge there is no `ErrMergeRows` conversion
 
 Status: **CONFIRMED** (probe ran: the test binary died).
+
+**Fixed in `2b494acc4`** - the promise is extended rather than documented away: `rowBatches` has
+the same recover shape as `mergedBatches` and reports the panic as the reader's error, the new
+sentinel `table.ErrRowsPanic` ("the row source panicked") - not a second use of `ErrMergeRows`,
+because the failing loop is the row source and a caller logging it should name it - which is what
+`Transaction.Append` and therefore `Rebuild` return. Tests:
+`TestRowsRecordReaderConvertsAPanicOfTheSource` (a process death before the fix, verified) and
+`TestRebuildConvertsAPanicOfTheSource` (a real table, a panicking source, `ErrRowsPanic`).
 
 **Where**
 
@@ -388,6 +437,11 @@ promise is not extended, §4.3 should say so next to the memory paragraph and th
 
 Status: **CONFIRMED** (probe ran).
 
+**Fixed in `5d68d07af`** - refusal, not last-wins: after the existing stable sort, an adjacent equal
+path returns `ErrRowsOutOfOrder` before `ensureNoReplay`, mirroring `orderedRows`, so the two write
+paths keep one input contract and a refused delta cannot even repair the table first. Test:
+`TestApplyDeltaRefusesDuplicateUpserts`.
+
 **Where**
 
 - `pkg/mds/table/writer.go:260-261`: the upserts are cloned and sorted by path, **not** deduplicated;
@@ -426,6 +480,18 @@ the failing test either way.
 
 Status: **UNVERIFIED** (read only). The arithmetic is exact; I did not build a split-file probe to
 observe the smaller batch at runtime.
+
+**Fixed in `2b494acc4`** - the code moved to the number rather than the sentence: the plan is
+reduced to its distinct data file paths inside `rows.go` (`compactionFileCount` /
+`compactionFileBatchRows`, the same path de-duplication `dataFilesOf` uses), so the batch is
+`max(256, 131072/files)` whatever `read.split.target-size` does to the task count; `compactReader`'s
+signature is unchanged. Residual for the design, recorded in §4.9 by the docs commit: the reader
+still opens one run per scan task, so on a table that holds a file above the split target the merge
+holds one batch of that size per split range - up to (tasks/files) × the budget - rather than one
+batch per file; closing that needs one run per file, a change of the stream layout. Tests:
+`TestCompactionFileBatchRowsCountsFiles` (131 072 rows for one file split into two tasks, 65 536 for
+two files) and `TestCompactSizesTheReadBatchByFilesOnASplitTable` (a real split table whose merge
+must pull 1 000-row batches, not 500).
 
 **Where**
 

@@ -76,9 +76,11 @@ Schema changes are additive - this section allows an optional column a later ver
 and a compaction follows them, but a write that has to build rows does not: a table that already carries a
 top-level column this version of the writer does not know is refused with `table.ErrUnknownSchema` by
 `ApplyDelta` with upserts and by every `Rebuild`, instead of being written with that column nulled over
-another writer's data. A delete-only delta still applies, because it writes no row, and `Compact` re-emits
-the scan's own Arrow columns rather than rebuilding rows, so such a column keeps its values through a
-compaction (commit `d993d602e`).
+another writer's data. A delete-only delta still applies, because it writes no row - in either delete
+mode, because the copy-on-write arm writes an empty reader over the table's own schema instead of
+building rows (commit `5d68d07af`, MDS_REVIEW_4 R4T-3) - and `Compact` re-emits the scan's own Arrow
+columns rather than rebuilding rows, so such a column keeps its values through a compaction (commit
+`d993d602e`).
 
 User metadata keys are stored as lakeFS stores them. Objects written through the S3 gateway have keys
 `X-Amz-Meta-<lowercased name>` (`pkg/gateway/operations/operation_utils.go`), as upstream documents.
@@ -99,6 +101,21 @@ step 2): iceberg-go decides replayability from the retry budget of the metadata 
 on, so the value is set at creation, re-asserted by every write's own `SetProperties`, and repaired
 with one metadata-only commit before the write when an older or operator-raised table is met
 (commit `d993d602e`).
+
+The delete mode a delta runs is the table's `write.delete.mode`, unless the caller passes
+`WithDeleteMode` explicitly (which only a test and the fallback's caller do); when the property is
+**absent** the package keeps iceberg-go's own default, copy-on-write, and does not answer
+merge-on-read. The mode a transaction actually runs is read from the metadata the transaction is
+building, and the documented upstream default is `copy-on-write` (iceberg-go v0.7.0
+`table/transaction.go` and `table/properties.go`, and the upstream configuration reference);
+merge-on-read would also be a mode the write does not run unless this writer added a
+per-table setting to a table it did not create, and that setting would outlive the write. Every table
+this package creates carries merge-on-read, so an absent property is an operator- or
+another-writer-shaped table, and the copy-on-write arm is correct there because of the fold of section
+4.3 step 3 (commit `5d68d07af`, MDS_REVIEW_4 R4T-1 decision). The upserts of one delta name a path at
+most once: a path that appears twice is refused with `table.ErrRowsOutOfOrder` before anything is
+committed - the same input contract `Rebuild`'s source has - rather than writing two rows under one
+identifier, which nothing in Iceberg refuses on append (commit `5d68d07af`, R4T-5).
 
 Property updated on **every** indexed commit (section 4.3): `lakefs.mds.source-commit = <full commit ID of R>`.
 Every snapshot the indexer produces also carries `lakefs.mds.source-commit` in its summary.
@@ -231,7 +248,10 @@ before it. That is equivalent to the logical order above:
    stops at the first entry that takes the count over the threshold (`changeSet.large`): the entries read so far
    are dropped and no `statObject` call is made for that commit, so a commit that is going to be rebuilt costs
    neither the rest of its diff nor a single stat (commit `1cb131f13`). The loss of per-object `commit_id` history
-   on a rebuild is documented. The source of a rebuild must be in the table's declared `path ASC` order:
+   on a rebuild is documented. The rebuild streams its rows, and a panic in the caller's row source is
+   reported as the reader's error - the new `table.ErrRowsPanic` - instead of killing the process: the source
+   is pulled on iceberg-go's writer goroutine, where no recover of the indexer can reach it (commit
+   `2b494acc4`, MDS_REVIEW_4 R4T-4). The source of a rebuild must be in the table's declared `path ASC` order:
    `Rebuild` refuses a source whose paths are not strictly ascending with the new `table.ErrRowsOutOfOrder`
    instead of writing files that contradict the table metadata (commit `2daeca114`). The production caller is
    unaffected - its source is the paged lakeFS listing, which is lexicographic - and refusing beats sorting the
@@ -248,6 +268,25 @@ before it. That is equivalent to the logical order above:
    - `tx.Commit(ctx)` → one `POST …/tables/object_metadata` with `assert-ref-snapshot-id(main)` and
      `assert-table-uuid`. The catalog **stages** the new pointer and the files on `R-metadata@b`
      (`Store.Commit`: "staged on addr.Ref … part of the repository only on an explicit lakeFS commit").
+   - **Copy-on-write fallback.** A write with `write.delete.mode=copy-on-write` (§3.1, the copy-on-write
+     mode of section 10 decision 2, which the plan keeps as the fallback if position delete files cannot be
+     staged) first commits one compaction of the table (`compactDeleteFiles`) whenever the snapshot still
+     carries live delete files, before the `Overwrite` above. `iceberg-go`'s copy-on-write rewrite reads the
+     data file it rewrites and nothing else - `rewriteSingleFile` builds a scan task with no delete files -
+     so without the fold it writes the rows an earlier merge-on-read delete removed back into the new file,
+     and the old delete file, whose data file is no longer in the snapshot, can neither remove them nor be
+     applied to the new file
+     (upstream `apache/iceberg-go#2042`, fixed upstream in `apache/iceberg-go#2046` on 2026-10-15, after the
+     pinned v0.7.0 of 2026-10-01). The fold applies and removes the delete files, so the rewrite reads data
+     files only. It is a commit of its own, so the branch head moves twice inside the same lakeFS commit of
+     step 4, and the cost is paid at most once after the last merge-on-read delete, because a copy-on-write
+     delta writes no delete file itself. The fold records the table's **current**
+     `lakefs.mds.source-commit` as its source commit rather than `C`, because the indexer's recovery finishes
+     a staged write whose property is the next commit `C` (4.4): a fold that recorded `C` would let a delta
+     that failed after it be committed as if `C` had been applied, with `C`'s change set missing. A table that
+     carries delete files and **no** `lakefs.mds.source-commit` was not written by this package and has no
+     position the fold could keep it at, so a copy-on-write delta there is refused with `table.ErrNoSourceCommit`;
+     a `Rebuild`, which needs no position, fixes such a table (commit `5d68d07af`, MDS_REVIEW_4 R4T-1).
 4. **lakeFS commit** of `R-metadata@b`: `POST /repositories/<R>-metadata/branches/<b>/commits` with the message
    and metadata of 3.3, `allow_empty=false`. The commit is never legitimately empty: step 3 always moves the
    `lakefs.mds.source-commit` property, even for a change set with no objects. The walk of 4.2 step 5 must
@@ -274,6 +313,12 @@ Crash windows and what the next tick does (step 1 of 4.2):
 | 3, but a foreign write staged changes whose property happens to equal `last` | uncommitted changes, property = `last` | the branch diff (4.2) shows the staged changes, so `resetBranch(R-metadata, b)` (discard staging), then index normally |
 | 4 (lakeFS commit done, no tag) | head metadata = `C`, tag `mds-<C>` missing or pointing elsewhere | do step 5 (a mispointed tag is deleted and created again) |
 | during 3 (data files written, commit not sent) | orphan files under `_iceberg/<uuid>/data/`, nothing staged | nothing. The files are unreferenced and removed by `lakectl iceberg cleanup` (section 9). |
+
+The copy-on-write fold of 4.3 step 3 is a commit of its own, so one such delta stages two snapshots. The
+fold records the table's *current* `lakefs.mds.source-commit`, not `C`, which keeps the table above exact: a
+staging area left by a delta that failed after its fold carries the recorded position rather than the next
+commit, so it is the "anything else" row, discarded with `resetBranch`, and the tick re-indexes `C` (commit
+`5d68d07af`, MDS_REVIEW_4 R4T-1).
 
 A history rewrite (4.7) discards the staging before it resets the branch: real lakeFS `ResetHard` keeps the
 staging area (`pkg/graveler/graveler.go`), so a pointer staged by a crashed step 3 would otherwise survive the
@@ -391,7 +436,14 @@ the tick instead of re-entering `initialise` (commit `da24d421f`).
   what the next delta's `IN (path …)` scan prunes with. While a compaction runs the process holds (MDS_REVIEW_3
   R3T-5, commit `7f5fd526b`): (a) the merge's own set - one read batch per data file, each
   `max(256, 131072/files)` rows (2 × 64 Ki-row record batches divided by the files, floor 256), plus one output
-  batch of 64 Ki rows - which overrides the table's `read.parquet.batch-size` during the compaction; (b)
+  batch of 64 Ki rows - which overrides the table's `read.parquet.batch-size` during the compaction. The batch
+  is sized by the plan's **data files**, not its scan tasks: `iceberg-go` plans several tasks for one Parquet
+  file above `read.split.target-size`, and dividing by the task count undersized every file's batch (commit
+  `2b494acc4`, MDS_REVIEW_4 R4T-6). The reader still opens one run per scan task, so on a table that holds such
+  a file the merge holds one batch of that size per split range - up to (tasks/files) × the budget, rather than
+  one batch per file; the per-file figure is what this section budgets and what the code holds for a table of
+  files below the split target, and closing the split-range gap needs one run per file, a change of the stream
+  layout rather than of this arithmetic; (b)
   `iceberg-go`'s scan prefetch per file, the arrow scanner's records channel and the sequenced channel it feeds,
   both sized by the scan's concurrency (one worker for a single-task stream, so a small constant), carrying
   batches of the same per-file size; (c) `iceberg-go`'s writer queue, up to 64 record batches of at most 64 Ki
@@ -419,8 +471,11 @@ the tick instead of re-entering `initialise` (commit `da24d421f`).
   R3T-7, commit `7f5fd526b`). A panic in the merge's own pull loop becomes `table.ErrMergeRows`, because
   `iceberg-go` runs the merge on the writer's goroutine, where the indexer cannot recover it; the setup reads
   before the merge - the path-order scan and the materialisation of a legacy file - run in the caller's
-  goroutine and are not converted (MDS_REVIEW_3 R3T-6, commit `7f5fd526b`). The transaction pins
-  `commit.retry.num-retries = 0` like every other write, so a lost CAS
+  goroutine and are not converted (MDS_REVIEW_3 R3T-6, commit `7f5fd526b`). The rebuild's row source is
+  converted the same way and for the same reason: `rowBatches` reports a panic of the caller's `Rows` source as
+  the new `table.ErrRowsPanic`, which is what `Transaction.Append` and therefore `Rebuild` return, so a panicking
+  source fails the branch instead of taking the process down (commit `2b494acc4`, MDS_REVIEW_4 R4T-4; 4.3
+  step 2). The transaction pins `commit.retry.num-retries = 0` like every other write, so a lost CAS
   is a conflict the indexer retries rather than a replay of the removals on top of a newer snapshot (commits
   `2daeca114` and `d993d602e`). Then it does a lakeFS commit `mds: compact <R>@<C>` (no
   new tag; the tag stays on the pre-compaction commit, which has the same rows).
@@ -474,7 +529,8 @@ The resolved table is also **proved** before it is served: `MetadataSearchResolv
 independent facts hold. First, the loaded table's `lakefs.mds.repository` property equals the data repository the
 caller named. Second, the served ref's first-parent history carries the indexer's initialisation commit: message
 `mds: init`, metadata `lakefs.mds.init=true`, committer `mds-indexer`, and position as the first commit directly
-above the repository's root commit (§4.8). The property alone proves nothing: it lives in
+above the repository's root commit, or - for a companion repository created bare - the root commit itself
+(§4.8). The property alone proves nothing: it lives in
 `metadata.json`, which anyone who can create `R-metadata` can write, while the initialisation commit is written by
 the indexer after it creates the table, so it also commits the table and is the state a forger cannot reproduce by
 editing a document. A table that names another repository, carries no property, or whose history has no such
@@ -487,22 +543,37 @@ path loads it again; correctness, not read count, motivated the placement (commi
 
 `Commit` takes the message and the metadata from the client, so those two facts alone prove nothing; the committer
 is the authenticated user and the position is where the commit sits in history, and before both were checked
-(MDS_REVIEW_3 R3S-1) any principal that could commit to `R-metadata` could forge the proof. **Residual**, stated
-in the code: `CreateCommitRecord` authorizes
-`fs:CreateCommit` on the repository ARN and also takes the committer from the client, so a principal that already
-holds it can still supply `mds-indexer` as the committer of a commit directly above the root. Closing that last
-step needs an authorization rule only the indexer's group is exempt from, which is a design decision for the
-owner and not something the catalog can prove from a commit record (commit `db52bd9a7`).
+(MDS_REVIEW_3 R3S-1) any principal that could commit to `R-metadata` could forge the proof. The
+`CreateCommitRecord` half of that residual is **closed through the API**: the endpoint still authorizes
+`fs:CreateCommit` on the repository ARN, and it now answers **403** when the body's committer is `mds-indexer` and
+the authenticated caller is not that user, so a principal that holds the grant can no longer mint a commit
+attributed to the indexer. The name is reserved on every repository, not only companions, because a record
+attributed to the indexer anywhere could later be copied into a companion and the name is load-bearing only
+because this check compares it exactly; the indexer still records its own committer and every other committer is
+still accepted, so recording historical commits is unchanged (commit `2a822c719`).
 
-The position rule is the one the indexer applies to a non-bare companion: the initialisation commit is the first
-commit directly above a root commit. A companion repository created **bare** has no root commit - its `mds: init`
-commit is the branch's first commit and has no parent - and the indexer accepts that history (§4.8, a run of init
-commits reaching the root), but the catalog does not serve its table, so `R.<ref>.system.object_metadata` answers
-the 404 of an unindexed ref for it. That is a consequence of the check `db52bd9a7` added and not a shape it or any
-test covers; it is recorded here rather than left for a reader to discover.
+The remaining boundary is `LoadCommits`, not this endpoint. `lakectl refs-restore` restores a repository through
+`RestoreSubmit` → `catalog.LoadCommits`, which copies commit records verbatim from the manifest's metaranges and
+never calls `CreateCommitRecord`: restoring an ordinary repository is unchanged, restoring a companion repository
+can reproduce the true records - the indexer's included - but not fabricate them through the API, because a
+manifest from another companion carries another `lakefs.mds.repository` property, which the first check still
+refuses. A caller able to write forged metaranges directly into the block store is outside the API trust boundary
+(commit `2a822c719`).
+
+The position rule is the one the indexer applies, for both shapes of companion: the initialisation commit is the
+first commit directly above a root commit, **or** the root commit itself when the companion repository was created
+bare - its `mds: init` commit is the branch's first commit and has no parent (§3.3, §4.8). The indexer accepted
+that history before the catalog did, so a bare companion used to be indexed but not served: every read of its
+`system.object_metadata` answered the 404 of an unindexed ref. The catalog now accepts the root form too, with the
+same three facts (message `mds: init`, metadata `lakefs.mds.init=true`, committer `mds-indexer`), so a bare
+companion is served like a non-bare one; a commit with no parents cannot be appended to a history the catalog
+already trusts, and the committer fact still requires the indexer principal. The negative shapes stay refused: an
+init commit by a committer other than `mds-indexer`, and an init commit with another commit between it and the
+root (commit `30af7b3a5`).
 
 The history half costs the length of the served history in the worst case, because the initialisation commit is
-the oldest non-root commit: the walk is newest first, one 256-commit page at a time, and stops at the root. The
+the oldest non-root commit (or the root itself on a bare companion): the walk is newest first, one 256-commit
+page at a time, and stops at the root. The
 init commit it finds is then cached per companion repository - immutable once found - together with a bounded
 set of at most 8 heads already proven to descend from it, and a new or repeated head is verified newest first only
 until it reaches that commit or one of those heads, so a branch that gained commits pays for the new commits and
@@ -786,6 +857,16 @@ Two further write paths into a companion repository are covered explicitly (comm
   namespace below the companion's - the over-match the exact ARNs avoid (MDS_REVIEW_3 R3S-3, commit `9135602ea`).
   The pattern `namespace/*-metadata` stays in the allow, because a companion that does not exist yet has no
   namespace to name.
+
+The catalog's ownership proof trusts the committer `mds-indexer` (§5.1), so the API reserves that name rather
+than leaving it to the deny above: `POST /repositories/{repository}/commits` (`CreateCommitRecord`) authorizes
+`fs:CreateCommit` on the repository ARN as before, and then answers **403** when the body's committer is
+`mds-indexer` and the authenticated caller is not that user. The indexer still records its own committer and
+every other committer is still accepted, so recording historical commits is unchanged; the name is reserved on
+every repository, not only companions, because a record attributed to the indexer anywhere could later be
+copied into a companion (commit `2a822c719`, closing the residual §5.1 recorded for MDS_REVIEW_3 R3S-1). This
+is the API half only: `LoadCommits`, which `lakectl refs-restore` uses, copies commit records verbatim and is
+unchanged (§5.1), so a caller that can write forged metaranges into the block store is outside it.
 
 As with the reserved-prefix deny, an auth service without policies (`BasicAuthService`) logs a warning naming what
 is not enforced, and startup continues. The refresher reads and deletes stored chunk policies, so an auth backend
