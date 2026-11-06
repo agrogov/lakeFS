@@ -793,6 +793,31 @@ func TestCredentialVendingReservedTarget(t *testing.T) {
 	require.Contains(t, objectStatement.Action, "s3:GetObject")
 }
 
+// TestCredentialVendingMetadataSearchVirtualTable is the same rule through the real built-in
+// MetadataSearchResolver rather than a synthetic redirect: a branch write request for
+// R.<ref>.system.object_metadata resolves to R-metadata's system namespace, which is reserved, so
+// the request falls back to a read session and its policy never contains s3:PutObject.
+func TestCredentialVendingMetadataSearchVirtualTable(t *testing.T) {
+	f := newSignResolverFixture(t)
+	virtual := resolverVirtualAddress(tablesTestRef)
+	stsFake := &credsFakeSTS{}
+	service := NewCredentialService(f.store, NewAuthorizer(f.authz.svc), f.catalog,
+		&Config{Prefix: CatalogPrefix, CredentialsVending: credsTestVending()}, stsFake, nil)
+	require.True(t, service.Enabled(), "the fake object store can vend")
+
+	credentials, err := service.TableCredentials(t.Context(), Caller{Username: "carol"}, virtual, true)
+	require.NoError(t, err)
+	require.Len(t, credentials, 1)
+	require.Equal(t, f.metaTableLocation, credentials[0].Prefix,
+		"the read session is scoped to the companion table the virtual address resolves to")
+	require.Equal(t, 1, stsFake.calls, "the write attempt must not reach STS")
+
+	document := policyOf(t, stsFake.input)
+	require.NotContains(t, document.Statement[0].Action, "s3:PutObject",
+		"a virtual table is read-only even when the caller writes the data repository's branch")
+	require.Contains(t, document.Statement[0].Action, "s3:GetObject")
+}
+
 // TestVendMinIO is the integration half of the validation: it assumes a real role through STS,
 // and then proves with the credentials it got back that the session is scoped to the table prefix
 // - a read inside the prefix works, a read outside it and a write from a read session do not.

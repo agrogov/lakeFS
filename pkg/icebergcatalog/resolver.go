@@ -140,7 +140,31 @@ const (
 	MetadataSearchInitProperty      = "lakefs.mds.init"
 	MetadataSearchInitValue         = "true"
 	MetadataSearchInitCommitMessage = "mds: init"
-	metadataSearchInitPageSize      = 256
+
+	// MetadataSearchIndexerPrincipal is the user the indexer authenticates as (design §8: the
+	// `mds-indexer` user that the pkg/mds bootstrap creates). It is the third fact of the
+	// ownership proof: an initialisation commit that anyone could write is not proof that the
+	// indexer created the repository, and a principal allowed fs:CreateCommit on R-metadata can
+	// write the marker and the message. The literal is restated here for the same reason as the
+	// marker above: this package must not import pkg/mds.
+	//
+	// Residual, and deliberately not closed here: a principal with fs:CreateCommit on R-metadata
+	// can call lakeFS's CreateCommitRecord with any committer string, so it can still forge an
+	// init commit attributed to this principal. Closing that is a lakeFS authorization design
+	// decision, not something the catalog can prove from the commit record.
+	MetadataSearchIndexerPrincipal = "mds-indexer"
+
+	metadataSearchInitPageSize = 256
+
+	// metadataSearchInitCacheMaxRepositories bounds the positive ownership cache. An entry is one
+	// repository whose init commit was found; the oldest entry is evicted when the cache is full,
+	// so a process that sees many repositories (or recreated ones) does not grow without bound.
+	metadataSearchInitCacheMaxRepositories = 1024
+
+	// metadataSearchInitCacheMaxHeads bounds the verified-head witnesses kept per repository. The
+	// init commit itself is the immutable fact; the witnesses only let a new head stop walking as
+	// soon as it reaches a history that was already proven to contain that commit.
+	metadataSearchInitCacheMaxHeads = 8
 )
 
 // commitLogLister is the lakeFS commit-history read the ownership proof needs. *catalog.Catalog
@@ -327,12 +351,21 @@ type MetadataSearchResolver struct {
 	// refuses those refs with NoSuchTableException instead of guessing.
 	mapper RefMapper
 
-	// initMu guards initCache, the result of the first-parent initialisation-commit walk keyed by
-	// repository and by the served ref's head commit. The walk is O(history length) because the
-	// init commit is the oldest non-root commit; the cache makes it once per head commit instead
-	// of once per request.
+	// initMu guards initCache, the found initialisation commit of each repository and the heads
+	// whose first-parent history was already proven to contain it. The init commit is immutable
+	// once found; a new head is verified incrementally, by walking back only until it reaches the
+	// init commit or one of the verified heads, instead of walking the whole history again.
 	initMu    sync.Mutex
-	initCache map[string]bool
+	initCache map[string]*metadataSearchInitCacheEntry
+	initOrder []string
+}
+
+// metadataSearchInitCacheEntry is one repository's ownership proof: the init commit the indexer
+// wrote, plus a bounded set of heads known to descend from it. commitID is immutable for the life
+// of the entry.
+type metadataSearchInitCacheEntry struct {
+	commitID string
+	heads    []string
 }
 
 // NewMetadataSearchResolver builds the built-in resolver. branches answers "is this ref a branch?"
@@ -343,7 +376,7 @@ func NewMetadataSearchResolver(branches BranchLister, mapper RefMapper) *Metadat
 	return &MetadataSearchResolver{
 		branches:  branches,
 		mapper:    mapper,
-		initCache: make(map[string]bool),
+		initCache: make(map[string]*metadataSearchInitCacheEntry),
 	}
 }
 
@@ -434,9 +467,11 @@ func (r *MetadataSearchResolver) metadataRef(ctx context.Context, addr Address) 
 //
 //   - the table property lakefs.mds.repository names R (§3.1); and
 //   - the served ref's first-parent history carries the indexer's initialisation commit (§4.8):
-//     message "mds: init" and metadata lakefs.mds.init=true. That commit is written by the indexer
-//     after it creates the table, so it also commits the table and makes the repository's history
-//     the state a forger cannot reproduce by editing metadata.json.
+//     message "mds: init", metadata lakefs.mds.init=true, committed by the indexer principal
+//     `mds-indexer`, and positioned as the first commit directly above the repository's root
+//     commit. That commit is written by the indexer after it creates the table, so it also commits
+//     the table and makes the repository's history the state a forger cannot reproduce by editing
+//     metadata.json.
 //
 // A repository someone else created under the companion name can copy the property, but it has no
 // initialisation commit on the history the resolver is about to serve. It is answered as an absent
@@ -473,11 +508,15 @@ func noSuchMetadataTable(requested Address) error {
 }
 
 // firstParentCarriesInitCommit reports whether the first-parent history of target.Ref carries the
-// indexer's initialisation commit (§4.8). The walk is newest first and stops at the first commit
-// that cannot have an ancestor (the root), so the cost is the length of the served history in the
-// worst case - the init commit is the oldest non-root commit - and one page in the common case of a
-// repository whose head still remembers a cached answer. The result is cached by repository and by
-// the served ref's head commit, so an unchanged branch pays for the walk once per process.
+// indexer's initialisation commit (§4.8). The full walk is newest first and stops at the root, so
+// its cost is the length of the served history in the worst case; the init commit is then cached
+// per repository, and a later head is verified incrementally: the walk stops as soon as it reaches
+// that immutable commit or a previously verified head. A branch that only gained commits pays for
+// the new commits, not for the whole history again.
+//
+// The init commit is the first commit directly above the repository's root commit. That is a
+// position, not just a message: an mds: init commit somewhere higher in history is not the commit
+// the indexer wrote when it initialised the repository.
 //
 // A resolver built with a BranchLister that cannot read commit history fails closed: the property
 // proves nothing without the commit, so the virtual table is the 404 an unindexed ref answers.
@@ -487,75 +526,204 @@ func (r *MetadataSearchResolver) firstParentCarriesInitCommit(ctx context.Contex
 		return false, nil
 	}
 
-	after := ""
-	head := ""
-	for {
-		params := catalog.LogParams{FirstParent: true, Amount: metadataSearchInitPageSize}
-		if after != "" {
-			params.FromReference = after
-		}
-		page, hasMore, err := lister.ListCommits(ctx, target.Repo, target.Ref, params)
+	initCommitID, verifiedHeads, cached := r.cachedInitCommit(target.Repo)
+	if !cached {
+		found, initID, head, err := r.findInitCommit(ctx, lister, target)
 		if err != nil {
-			return false, fmt.Errorf("read the first-parent log of %q@%s: %w", target.Repo, target.Ref, err)
+			return false, err
+		}
+		if !found {
+			return false, nil
+		}
+		r.rememberInitCommit(target.Repo, initID, head)
+		return true, nil
+	}
+
+	found, head, err := r.cachedInitCommitOnHistory(ctx, lister, target, initCommitID, verifiedHeads)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		// The immutable init commit is not on this history: this branch is not an index of the
+		// data repository, even if it carries a look-alike marker somewhere above the root.
+		return false, nil
+	}
+	r.rememberVerifiedHead(target.Repo, initCommitID, head)
+	return true, nil
+}
+
+// findInitCommit walks the first-parent history from target.Ref and returns the first commit
+// directly above the root when it carries the indexer's marker, its committer and its position.
+// The candidate is held from one commit to the next: when the root arrives, the previous commit is
+// the only one that can be "directly above" it.
+func (r *MetadataSearchResolver) findInitCommit(ctx context.Context, lister commitLogLister, target Address) (found bool, initCommitID, head string, err error) {
+	after := ""
+	var previous *catalog.CommitLog
+	for {
+		page, hasMore, err := r.initCommitPage(ctx, lister, target, after)
+		if err != nil {
+			return false, "", "", err
 		}
 		if len(page) == 0 {
-			return false, nil
+			return false, "", "", nil
 		}
 		if head == "" {
 			head = page[0].Reference
-			if found, cached := r.cachedInitCommit(target.Repo, head); cached {
-				return found, nil
-			}
 		}
 		for _, commit := range page {
-			if isMetadataSearchInitCommit(commit) {
-				r.cacheInitCommit(target.Repo, head, true)
-				return true, nil
+			if previous != nil && len(commit.Parents) == 0 &&
+				len(previous.Parents) == 1 && previous.Parents[0] == commit.Reference &&
+				isMetadataSearchInitCommit(previous) {
+				return true, previous.Reference, head, nil
 			}
 			if len(commit.Parents) == 0 {
-				// The root: no ancestor can carry the marker.
-				r.cacheInitCommit(target.Repo, head, false)
-				return false, nil
+				// The root: no ancestor can carry the marker, and the commit above it was not the
+				// indexer's initialisation commit.
+				return false, "", "", nil
 			}
+			previous = commit
 		}
 		if !hasMore {
-			r.cacheInitCommit(target.Repo, head, false)
-			return false, nil
+			return false, "", "", nil
 		}
 		last := page[len(page)-1].Reference
 		if last == "" || last == after {
-			return false, fmt.Errorf("%w: the first-parent log of %q@%s did not advance",
+			return false, "", "", fmt.Errorf("%w: the first-parent log of %q@%s did not advance",
 				ErrInvalidResolution, target.Repo, target.Ref)
 		}
 		after = last
 	}
 }
 
-// isMetadataSearchInitCommit reports whether commit is the indexer's initialisation commit.
-// Both the metadata marker and the message are required, so a commit that merely copied one of
-// them is not mistaken for the indexer's.
+// cachedInitCommitOnHistory verifies a cached init commit against a new (or repeated) head without
+// re-walking the whole history: it stops at the init commit itself or at any head already proven to
+// descend from it. The returned head is the branch head the walk started from, which becomes a new
+// witness when the answer is true.
+func (r *MetadataSearchResolver) cachedInitCommitOnHistory(ctx context.Context, lister commitLogLister, target Address, initCommitID string, verifiedHeads []string) (bool, string, error) {
+	after := ""
+	head := ""
+	for {
+		page, hasMore, err := r.initCommitPage(ctx, lister, target, after)
+		if err != nil {
+			return false, "", err
+		}
+		if len(page) == 0 {
+			return false, "", nil
+		}
+		if head == "" {
+			head = page[0].Reference
+		}
+		for _, commit := range page {
+			if commit.Reference == initCommitID || slices.Contains(verifiedHeads, commit.Reference) {
+				return true, head, nil
+			}
+			if len(commit.Parents) == 0 {
+				return false, head, nil
+			}
+		}
+		if !hasMore {
+			return false, head, nil
+		}
+		last := page[len(page)-1].Reference
+		if last == "" || last == after {
+			return false, "", fmt.Errorf("%w: the first-parent log of %q@%s did not advance",
+				ErrInvalidResolution, target.Repo, target.Ref)
+		}
+		after = last
+	}
+}
+
+// initCommitPage reads one page of the first-parent log, starting after the page's last commit.
+func (r *MetadataSearchResolver) initCommitPage(ctx context.Context, lister commitLogLister, target Address, after string) ([]*catalog.CommitLog, bool, error) {
+	params := catalog.LogParams{FirstParent: true, Amount: metadataSearchInitPageSize}
+	if after != "" {
+		params.FromReference = after
+	}
+	page, hasMore, err := lister.ListCommits(ctx, target.Repo, target.Ref, params)
+	if err != nil {
+		return nil, false, fmt.Errorf("read the first-parent log of %q@%s: %w", target.Repo, target.Ref, err)
+	}
+	return page, hasMore, nil
+}
+
+// isMetadataSearchInitCommit reports whether commit carries the indexer's initialisation marker
+// and committer. The metadata marker, the message and the principal are all required, so a commit
+// that merely copied one of them is not mistaken for the indexer's.
 func isMetadataSearchInitCommit(commit *catalog.CommitLog) bool {
 	return commit != nil &&
+		commit.Committer == MetadataSearchIndexerPrincipal &&
 		commit.Message == MetadataSearchInitCommitMessage &&
 		commit.Metadata[MetadataSearchInitProperty] == MetadataSearchInitValue
 }
 
-// cachedInitCommit returns the cached answer for one repository head, if the walk already ran for it.
-func (r *MetadataSearchResolver) cachedInitCommit(repo, head string) (bool, bool) {
+// cachedInitCommit returns the immutable init commit of one repository and a copy of the heads that
+// were already verified to descend from it.
+func (r *MetadataSearchResolver) cachedInitCommit(repo string) (commitID string, heads []string, ok bool) {
 	r.initMu.Lock()
 	defer r.initMu.Unlock()
-	found, ok := r.initCache[repo+"\x00"+head]
-	return found, ok
+	entry, ok := r.initCache[repo]
+	if !ok || entry == nil {
+		return "", nil, false
+	}
+	return entry.commitID, append([]string(nil), entry.heads...), true
 }
 
-// cacheInitCommit records the answer of one walk, keyed by repository and head commit.
-func (r *MetadataSearchResolver) cacheInitCommit(repo, head string, found bool) {
+// rememberInitCommit records the init commit found for a repository, together with the head whose
+// history proved it. The init commit is immutable once the entry exists.
+func (r *MetadataSearchResolver) rememberInitCommit(repo, commitID, head string) {
 	r.initMu.Lock()
 	defer r.initMu.Unlock()
 	if r.initCache == nil {
-		r.initCache = make(map[string]bool)
+		r.initCache = make(map[string]*metadataSearchInitCacheEntry)
 	}
-	r.initCache[repo+"\x00"+head] = found
+	entry, ok := r.initCache[repo]
+	if !ok || entry == nil {
+		r.evictInitCacheLocked()
+		entry = &metadataSearchInitCacheEntry{commitID: commitID}
+		r.initCache[repo] = entry
+		r.initOrder = append(r.initOrder, repo)
+	} else if entry.commitID != commitID {
+		return
+	}
+	addInitVerifiedHead(entry, head)
+}
+
+// rememberVerifiedHead adds one head to a repository's already known init commit. It never changes
+// the commit itself, and it does nothing when the cache entry was replaced or evicted meanwhile.
+func (r *MetadataSearchResolver) rememberVerifiedHead(repo, commitID, head string) {
+	r.initMu.Lock()
+	defer r.initMu.Unlock()
+	entry, ok := r.initCache[repo]
+	if !ok || entry == nil || entry.commitID != commitID {
+		return
+	}
+	addInitVerifiedHead(entry, head)
+}
+
+// addInitVerifiedHead records head as a witness, keeping the per-repository list bounded.
+func addInitVerifiedHead(entry *metadataSearchInitCacheEntry, head string) {
+	if head == "" {
+		return
+	}
+	for _, verified := range entry.heads {
+		if verified == head {
+			return
+		}
+	}
+	entry.heads = append([]string{head}, entry.heads...)
+	if len(entry.heads) > metadataSearchInitCacheMaxHeads {
+		entry.heads = entry.heads[:metadataSearchInitCacheMaxHeads]
+	}
+}
+
+// evictInitCacheLocked drops the oldest repository entry while the cache is at its bound. The
+// caller holds initMu.
+func (r *MetadataSearchResolver) evictInitCacheLocked() {
+	for len(r.initCache) >= metadataSearchInitCacheMaxRepositories && len(r.initOrder) > 0 {
+		oldest := r.initOrder[0]
+		r.initOrder = r.initOrder[1:]
+		delete(r.initCache, oldest)
+	}
 }
 
 // VirtualNamespaces implements VirtualTableSource: a data repository ref lists system as its one
