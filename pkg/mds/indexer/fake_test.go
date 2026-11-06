@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/iceberg-go/catalog/rest"
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/mds/client"
@@ -593,6 +594,21 @@ func (f *fake) requireWritableBranchLocked(repository, branch string, actions ..
 	return nil
 }
 
+// catalogWriteError answers a refused table write the way the indexer's TableStore sees it. The
+// production table is written through the Iceberg REST catalog, not through the lakeFS API client:
+// a protection rule or a read_only repository makes pkg/icebergcatalog/tables.go writeError answer
+// 403 ForbiddenException over the graveler message, and iceberg-go's REST client turns that status
+// into rest.ErrForbidden (iceberg-go catalog/rest/rest.go). So a catalog write never produces
+// client.ErrForbidden, and a fake that answered the API sentinel left metadataBranchWriteError's
+// rest.ErrForbidden arm - the one production uses - untested (R3I-5). The graveler message stays in
+// the text so a failure still reads the way lakeFS wrote it.
+func catalogWriteError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %v", rest.ErrForbidden, err)
+}
+
 const (
 	fakeProtectionCommit       = "commit"
 	fakeProtectionStagingWrite = "staging_write"
@@ -1066,6 +1082,17 @@ func (f *fake) CreateTable(_ context.Context, dataRepository, branch string) (in
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.createTableCalls++
+	// The catalog's create is a staging write on the branch (pkg/icebergcatalog/tables.go,
+	// CreateTableWithMetadata -> stage), so it meets the same COMMIT/STAGING_WRITE protection and
+	// the same read-only refusal the other table writes do - one step before the initialisation
+	// commit. The fake used to accept it unconditionally and hid the path the indexer did not map
+	// (R3I-2).
+	if err := f.protectionErrorLocked(f.metadataRepo, branch, fakeProtectionStagingWrite); err != nil {
+		return nil, catalogWriteError(err)
+	}
+	if f.repositories[f.metadataRepo].ReadOnly {
+		return nil, catalogWriteError(fmt.Errorf("write to branch %q: read-only repository: %w", branch, client.ErrForbidden))
+	}
 	if f.tableExists {
 		return nil, indexer.ErrTableExists
 	}
@@ -1144,7 +1171,7 @@ func (t *fakeTable) ApplyDelta(_ context.Context, upserts []table.Row, deletes [
 	// A catalog staging write on a STAGING_WRITE-blocked branch is refused with 403
 	// (pkg/icebergcatalog/tables.go maps graveler.ErrWriteToProtectedBranch to ForbiddenException).
 	if err := t.f.protectionErrorLocked(t.f.metadataRepo, t.branch, fakeProtectionStagingWrite); err != nil {
-		return err
+		return catalogWriteError(err)
 	}
 	t.f.applyCalls++
 	if len(t.f.applyErrors) > 0 {
@@ -1178,7 +1205,7 @@ func (t *fakeTable) Rebuild(_ context.Context, rows table.Rows, sourceCommit str
 	t.f.mu.Lock()
 	if err := t.f.protectionErrorLocked(t.f.metadataRepo, t.branch, fakeProtectionStagingWrite); err != nil {
 		t.f.mu.Unlock()
-		return err
+		return catalogWriteError(err)
 	}
 	t.f.rebuildCalls++
 	if t.f.rebuildErr != nil {
@@ -1213,7 +1240,7 @@ func (t *fakeTable) Compact(_ context.Context, sourceCommit string) error {
 	t.f.mu.Lock()
 	defer t.f.mu.Unlock()
 	if err := t.f.protectionErrorLocked(t.f.metadataRepo, t.branch, fakeProtectionStagingWrite); err != nil {
-		return err
+		return catalogWriteError(err)
 	}
 	t.f.compactCalls++
 	if t.f.compactErr != nil {

@@ -2,15 +2,21 @@ package indexer
 
 // internal_test.go tests the small unexported rules of this package directly: the URL the lakeFS
 // client is built for, the storage-namespace prefix test that §3.3 shares with the uncommitted GC,
-// and the branch selectors of §4.1. The behaviour they feed is covered from the outside in
-// *_test.go; these cases pin the rules themselves, including the inputs that are hard to reach
-// through a tick.
+// the branch selectors of §4.1, and the two error mappings at the package's seams (the forbidden
+// write of §3.3/§4.8 and the writer's conflicts of §4.4). The behaviour they feed is covered from
+// the outside in *_test.go; these cases pin the rules themselves, including the inputs that are
+// hard to reach through a tick.
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
+	"github.com/apache/iceberg-go/catalog/rest"
+	icebergtable "github.com/apache/iceberg-go/table"
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/graveler"
+	"github.com/treeverse/lakefs/pkg/mds/client"
 	"github.com/treeverse/lakefs/pkg/mds/table"
 )
 
@@ -188,4 +194,124 @@ func TestCatalogURLFromEndpoint(t *testing.T) {
 // the indexer is a REST client and does not import pkg/graveler.
 func TestAutomaticCreationCommitMessage(t *testing.T) {
 	require.Equal(t, graveler.FirstCommitMsg, automaticCreationCommitMessage)
+}
+
+// TestMetadataBranchWriteError pins R3I-1: a forbidden write is always the
+// ErrReadOnlyMetadataRepository family (a companion repository that refuses every write must fail the
+// repository, not every branch with a bare 403), but only lakeFS's own protection messages claim
+// branch protection. A 401 authorization denial and a catalog permission refusal carry the same
+// sentinel - pkg/mds/client/lakefs.go collapses 401 and 403 into client.ErrForbidden, and lakeFS
+// answers an authorization failure with 401 by default - so the predicate must read the wrapped
+// message, not the status.
+func TestMetadataBranchWriteError(t *testing.T) {
+	const (
+		claimText = "a branch protection rule blocks"
+		remedy    = "remove the rule"
+	)
+
+	t.Run("an authorization refusal is not branch protection", func(t *testing.T) {
+		// The default denial of a principal that lacks the companion repository's grant: lakeFS
+		// answers 401 (pkg/api/controller_authorization_status_test.go) and the client reports it as
+		// client.ErrForbidden.
+		err := fmt.Errorf("apply repo@s2: %w: permission denied: no policy grants fs:WriteObject", client.ErrForbidden)
+
+		got := metadataBranchWriteError("repo-metadata", "main", err)
+
+		require.ErrorIs(t, got, ErrReadOnlyMetadataRepository, "still the same family")
+		require.ErrorIs(t, got, client.ErrForbidden, "the cause stays in the chain")
+		require.NotContains(t, got.Error(), claimText, "branch protection is not the diagnosis")
+		require.NotContains(t, got.Error(), remedy, "and the destructive remedy is not offered")
+		require.NotContains(t, got.Error(), "read_only=false")
+		require.Contains(t, got.Error(), "branch protection", "the neutral text still names the candidates")
+		require.Contains(t, got.Error(), "read_only")
+		require.Contains(t, got.Error(), "permissions")
+		require.Contains(t, got.Error(), "no policy grants fs:WriteObject", "the cause is quoted")
+	})
+
+	t.Run("a catalog permission refusal is not branch protection", func(t *testing.T) {
+		// pkg/icebergcatalog/tables.go answers a PermissionDeniedError 403, which iceberg-go reports
+		// as rest.ErrForbidden: the indexer principal may not write that catalog table.
+		err := fmt.Errorf("apply repo@s2: %w: ForbiddenException: permission denied for catalog:WriteTableData", rest.ErrForbidden)
+
+		got := metadataBranchWriteError("repo-metadata", "main", err)
+
+		require.ErrorIs(t, got, ErrReadOnlyMetadataRepository)
+		require.ErrorIs(t, got, rest.ErrForbidden)
+		require.NotContains(t, got.Error(), claimText)
+		require.NotContains(t, got.Error(), remedy)
+		require.Contains(t, got.Error(), "catalog:WriteTableData")
+	})
+
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "commit to a protected branch",
+			err:  fmt.Errorf("commit %q@main: %w: cannot commit to protected branch", "repo-metadata", client.ErrForbidden),
+		},
+		{
+			name: "write to a protected branch",
+			err:  fmt.Errorf("write %q@main: %w: cannot write to protected branch", "repo-metadata", client.ErrForbidden),
+		},
+		{
+			name: "a read-only repository",
+			err:  fmt.Errorf("commit %q@main: %w: read-only repository", "repo-metadata", client.ErrForbidden),
+		},
+		{
+			name: "the catalog's staging refusal",
+			err:  fmt.Errorf("create %s.%s: %w: ForbiddenException: cannot write to protected branch", table.Namespace, table.Name, rest.ErrForbidden),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := metadataBranchWriteError("repo-metadata", "main", test.err)
+
+			require.ErrorIs(t, got, ErrReadOnlyMetadataRepository)
+			require.ErrorIs(t, got, test.err, "the cause is wrapped")
+			require.Contains(t, got.Error(), claimText, "lakeFS named the cause, so the text claims it")
+			require.Contains(t, got.Error(), remedy)
+		})
+	}
+
+	t.Run("a non-forbidden error passes through", func(t *testing.T) {
+		err := errors.New("block: write failed")
+
+		require.Equal(t, err, metadataBranchWriteError("repo-metadata", "main", err))
+	})
+
+	t.Run("an already mapped error is not wrapped twice", func(t *testing.T) {
+		err := fmt.Errorf("%w: %q", ErrReadOnlyMetadataRepository, "repo-metadata")
+
+		require.Equal(t, err, metadataBranchWriteError("repo-metadata", "main", err))
+	})
+}
+
+// TestTableErrorMapsTheWriterConflict pins R3I-3: table.ErrStaleTable is the writer's second "the
+// table moved since it was read" answer (the repair commit of ensureNoReplay observed the move), and
+// pkg/mds/table/writer.go documents it as the caller's retry (§4.4). runBranch restarts a branch on
+// ErrConflict only, so tableError has to map it like icebergtable.ErrCommitFailed: otherwise the
+// branch fails for the whole tick - and /_health reports the table as broken - exactly in the
+// two-replica overlap the retry exists for.
+func TestTableErrorMapsTheWriterConflict(t *testing.T) {
+	t.Run("a stale table", func(t *testing.T) {
+		err := fmt.Errorf("apply repo@s2: %w: snapshot 1 is now 2", table.ErrStaleTable)
+
+		got := tableError(err)
+
+		require.ErrorIs(t, got, ErrConflict, "the tick reloads and retries")
+		require.ErrorIs(t, got, table.ErrStaleTable, "the writer's cause stays in the chain")
+	})
+
+	t.Run("a refused commit", func(t *testing.T) {
+		got := tableError(fmt.Errorf("commit: %w", icebergtable.ErrCommitFailed))
+
+		require.ErrorIs(t, got, ErrConflict)
+		require.ErrorIs(t, got, icebergtable.ErrCommitFailed)
+	})
+
+	t.Run("any other error passes through", func(t *testing.T) {
+		err := fmt.Errorf("read: %w", table.ErrUnknownSchema)
+
+		require.Equal(t, err, tableError(err))
+	})
 }

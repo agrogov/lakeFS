@@ -41,7 +41,37 @@ const automaticCreationCommitMessage = "Repository created"
 // write that stages on the branch), because the API does not report the rule on the repository.
 var ErrReadOnlyMetadataRepository = errors.New("the companion repository is read-only")
 
-// metadataBranchWriteError answers the 403 of a write to R-metadata with a repository-level error.
+// protectedBranchWriteCauses are the messages with which lakeFS names the two rules that refuse a
+// write to R-metadata independently of the indexer's permissions: a protection rule that blocks
+// COMMIT or STAGING_WRITE on the branch (graveler.ErrCommitToProtectedBranch and
+// ErrWriteToProtectedBranch, pkg/graveler/errors.go) and a repository marked read_only
+// (graveler.ErrReadOnlyRepository). Only one of them is a diagnosis of branch protection; a 401/403
+// that names neither is an authorization refusal, and the difference matters because the two
+// failures have different remedies.
+var protectedBranchWriteCauses = []string{
+	"cannot commit to protected branch",
+	"cannot write to protected branch",
+	"read-only repository",
+}
+
+// claimsProtectedBranchWrite reports whether err carries one of lakeFS's own protection messages.
+// The wrapped cause is what decides: the HTTP status is the same 401/403 for a protection rule, a
+// read_only repository and a principal that lacks fs:WriteObject
+// (pkg/api/controller_authorization_status_test.go: an authorization failure is 401 by default, and
+// 403 when auth.authorization_failure_status opts in), and pkg/mds/client/lakefs.go collapses both
+// statuses into client.ErrForbidden. Claiming protection from the status alone told an operator to
+// look for a rule when the missing grant was the indexer's (R3I-1).
+func claimsProtectedBranchWrite(err error) bool {
+	message := err.Error()
+	for _, cause := range protectedBranchWriteCauses {
+		if strings.Contains(message, cause) {
+			return true
+		}
+	}
+	return false
+}
+
+// metadataBranchWriteError answers a forbidden write to R-metadata with a repository-level error.
 // lakeFS refuses a write to a branch whose protection rule blocks COMMIT or STAGING_WRITE
 // (graveler.ErrCommitToProtectedBranch/ErrWriteToProtectedBranch, both wrapping ErrProtectedBranch)
 // and to a read-only repository (ErrReadOnlyRepository); pkg/api/controller.go maps both to
@@ -49,6 +79,14 @@ var ErrReadOnlyMetadataRepository = errors.New("the companion repository is read
 // write (pkg/icebergcatalog/tables.go), which iceberg-go reports as rest.ErrForbidden. Naming the
 // cause once per refused write is what an operator can act on; leaving the raw 403 made every tick
 // look like a transient failure (TS-4, R2I-3).
+//
+// The message claims branch protection only when lakeFS said so. Any other forbidden answer stays in
+// the same family - a fresh companion repository really is not writable, and /_health must say so -
+// but it names the three candidates (the branch's protection rules, the repository's read_only flag
+// and the indexer principal's own permissions) without picking one, and without the destructive
+// "create the repository with read_only=false" advice. The most common member of that family is the
+// documented one of design §8: a companion repository the policy refresher has not covered yet, so
+// the indexer's deny/grant policy is the thing to look at (R3I-1).
 func metadataBranchWriteError(metadata, branch string, err error) error {
 	if err == nil || errors.Is(err, ErrReadOnlyMetadataRepository) {
 		return err
@@ -56,7 +94,11 @@ func metadataBranchWriteError(metadata, branch string, err error) error {
 	if !errors.Is(err, client.ErrForbidden) && !errors.Is(err, rest.ErrForbidden) {
 		return err
 	}
-	return fmt.Errorf("%w: lakeFS refused a write to %q@%s: a branch protection rule blocks COMMIT or STAGING_WRITE on it, or the repository is read-only (%w); remove the rule or create the repository with read_only=false",
+	if claimsProtectedBranchWrite(err) {
+		return fmt.Errorf("%w: lakeFS refused a write to %q@%s: a branch protection rule blocks COMMIT or STAGING_WRITE on it, or the repository is read-only (%w); remove the rule or create the repository with read_only=false",
+			ErrReadOnlyMetadataRepository, metadata, branch, err)
+	}
+	return fmt.Errorf("%w: lakeFS refused a write to %q@%s: %w; check branch protection on the branch, the companion repository's read_only flag, and the indexer principal's own permissions",
 		ErrReadOnlyMetadataRepository, metadata, branch, err)
 }
 
@@ -371,7 +413,14 @@ func (x *Indexer) initialise(ctx context.Context, repository, metadata, branch s
 			return metadataState{}, err
 		}
 	case err != nil:
-		return metadataState{}, fmt.Errorf("create the metadata table of %q@%s: %w", metadata, branch, err)
+		// A create is a staging write on the branch, so a COMMIT or STAGING_WRITE rule present
+		// before the first tick is refused here, one step before the initialisation commit. The
+		// catalog answers it 403 exactly like the other table writes (pkg/icebergcatalog/tables.go
+		// maps graveler.ErrWriteToProtectedBranch/ErrReadOnlyRepository to ForbiddenException) and
+		// iceberg-go reports it as rest.ErrForbidden, so it belongs to the same family and is mapped
+		// the same way (R3I-2).
+		return metadataState{}, metadataBranchWriteError(metadata, branch,
+			fmt.Errorf("create the metadata table of %q@%s: %w", metadata, branch, err))
 	}
 	x.closeTable(tbl, metadata, branch)
 

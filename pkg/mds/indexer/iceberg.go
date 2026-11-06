@@ -195,8 +195,14 @@ func (t *icebergTable) Close() error {
 
 // tableError maps the writer's errors onto the indexer's: a refused commit is ErrConflict, which
 // §4.4 answers by reloading the table and re-running recovery.
+//
+// table.ErrStaleTable is the writer's other "the table moved since it was read" answer (the repair
+// commit of ensureNoReplay observed the move, pkg/mds/table/writer.go), and the writer documents it
+// as the caller's retry ("the caller reloads and retries the tick (§4.4)"). Mapping only
+// icebergtable.ErrCommitFailed made a tick that met it fail the branch for the whole period instead
+// of reloading and retrying like the 409 path (R3I-3).
 func tableError(err error) error {
-	if errors.Is(err, icebergtable.ErrCommitFailed) {
+	if errors.Is(err, icebergtable.ErrCommitFailed) || errors.Is(err, table.ErrStaleTable) {
 		return fmt.Errorf("%w: %w", ErrConflict, err)
 	}
 	return err

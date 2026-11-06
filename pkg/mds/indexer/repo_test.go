@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/apache/iceberg-go/catalog/rest"
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/mds/client"
@@ -829,6 +830,31 @@ func TestProtectedMetadataBranchFailsTheRepository(t *testing.T) {
 		require.Contains(t, err.Error(), "branch protection")
 		require.Contains(t, err.Error(), "STAGING_WRITE")
 		require.Contains(t, err.Error(), "cannot write to protected branch", "the 403 stays in the chain")
+		require.ErrorIs(t, err, rest.ErrForbidden,
+			"the refusal reaches the indexer as the catalog's sentinel, not as the lakeFS API's (R3I-5)")
+	})
+
+	t.Run("staging write protection before the initialisation", func(t *testing.T) {
+		// §3.3, §4.8: a STAGING_WRITE rule present before the first tick is met at the catalog's
+		// CreateTable, one step before the initialisation commit, and used to escape the family
+		// (R3I-2). The rule blocks only staging, which the COMMIT-protection case above never meets.
+		e := newEnv(t)
+		e.fake.addNonBareMetadataRepository()
+		e.fake.protectBranch("repo-metadata", "main", false, true)
+		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+
+		e.tick()
+
+		err := e.health.repositoryError("repo")
+		require.ErrorIs(t, err, indexer.ErrReadOnlyMetadataRepository,
+			"the create refusal is a repository-level error, not a bare 403")
+		require.Contains(t, err.Error(), "branch protection")
+		require.Contains(t, err.Error(), "STAGING_WRITE")
+		require.Contains(t, err.Error(), "create the metadata table", "the refusal names the write that met it")
+		require.Contains(t, err.Error(), "cannot write to protected branch", "the 403 stays in the chain")
+		require.False(t, e.fake.tableExists, "no table pointer is staged")
+		require.Empty(t, e.health.branch("repo", "main").head, "no branch of the repository is touched")
+		require.Empty(t, e.fake.madeCommits(), "a protected repository is refused before a commit")
 	})
 
 	t.Run("before the initialisation commit", func(t *testing.T) {
@@ -845,6 +871,124 @@ func TestProtectedMetadataBranchFailsTheRepository(t *testing.T) {
 		require.Empty(t, e.fake.madeCommits(), "a protected repository is refused before a commit")
 		require.Empty(t, e.health.branch("repo", "main").head, "no branch of the repository is touched")
 	})
+}
+
+// TestForbiddenMetadataBranchWriteIsNotBranchProtection pins R3I-1 at the branch tick: an
+// authorization refusal answers the same 401/403 as a protection rule (pkg/mds/client/lakefs.go
+// collapses both into client.ErrForbidden, and lakeFS answers an authorization failure 401 by
+// default), and the catalog answers 403 for a permission denial as well. The branch must still
+// report the ErrReadOnlyMetadataRepository family - a companion repository it cannot write is not a
+// transient branch error - but the message must not claim branch protection, because that sends an
+// operator looking for a rule that does not exist instead of at the indexer principal's policy
+// (design §8: the expected state while the policy refresher has not covered a new repository).
+func TestForbiddenMetadataBranchWriteIsNotBranchProtection(t *testing.T) {
+	t.Run("the lakeFS API's 401 authorization denial", func(t *testing.T) {
+		e := newEnv(t)
+		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.tick()
+		require.NoError(t, e.health.repositoryError("repo"))
+
+		e.fake.addCommit("repo", "main", "s2", []string{"s1"},
+			[]client.ObjectStat{object("a", 10), object("b", 20)})
+		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+		e.fake.applyErr = fmt.Errorf("apply repo@s2: %w: permission denied: no policy grants fs:WriteObject", client.ErrForbidden)
+
+		e.tick()
+
+		err := e.health.branch("repo", "main").err
+		require.ErrorIs(t, err, indexer.ErrReadOnlyMetadataRepository, "the refusal still fails the write")
+		require.ErrorIs(t, err, client.ErrForbidden)
+		require.NotContains(t, err.Error(), "a branch protection rule blocks",
+			"branch protection is not what lakeFS answered")
+		require.NotContains(t, err.Error(), "remove the rule")
+		require.NotContains(t, err.Error(), "read_only=false", "and the destructive remedy is not offered")
+		require.Contains(t, err.Error(), "branch protection", "the neutral text still names the candidates")
+		require.Contains(t, err.Error(), "read_only")
+		require.Contains(t, err.Error(), "permissions")
+		require.Contains(t, err.Error(), "no policy grants fs:WriteObject", "the cause is quoted")
+	})
+
+	t.Run("the catalog's 403 permission refusal", func(t *testing.T) {
+		e := newEnv(t)
+		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.tick()
+
+		e.fake.addCommit("repo", "main", "s2", []string{"s1"},
+			[]client.ObjectStat{object("a", 10), object("b", 20)})
+		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+		e.fake.applyErr = fmt.Errorf("apply repo@s2: %w: ForbiddenException: permission denied for catalog:WriteTableData", rest.ErrForbidden)
+
+		e.tick()
+
+		err := e.health.branch("repo", "main").err
+		require.ErrorIs(t, err, indexer.ErrReadOnlyMetadataRepository)
+		require.ErrorIs(t, err, rest.ErrForbidden)
+		require.NotContains(t, err.Error(), "a branch protection rule blocks")
+		require.NotContains(t, err.Error(), "remove the rule")
+		require.Contains(t, err.Error(), "catalog:WriteTableData")
+	})
+}
+
+// catalogCreateRefusal answers CreateTable with a fixed error, the way the production store reaches
+// the indexer: through the Iceberg REST catalog, so a refused create arrives as rest.ErrForbidden
+// (iceberg-go catalog/rest/rest.go).
+type catalogCreateRefusal struct {
+	indexer.TableStore
+	err error
+}
+
+func (s catalogCreateRefusal) CreateTable(context.Context, string, string) (indexer.Table, error) {
+	return nil, s.err
+}
+
+// TestInitialisationCreateRefusalIsTheReadOnlyFamily pins R3I-2: the catalog's CreateTable is a
+// staging write, so it meets a protection rule before the initialisation commit does. It used to
+// return a bare 403 out of initialise, outside the ErrReadOnlyMetadataRepository family: the
+// documented pre-first-tick state of design §3.3 and §4.8 for a STAGING_WRITE rule was reported as
+// an unknown failure while the COMMIT-rule shape was diagnosed.
+func TestInitialisationCreateRefusalIsTheReadOnlyFamily(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		wantClaim bool
+	}{
+		{
+			name:      "a protected branch",
+			body:      "ForbiddenException: cannot write to protected branch",
+			wantClaim: true,
+		},
+		{
+			name:      "an authorization refusal",
+			body:      "ForbiddenException: permission denied for catalog:CreateTable",
+			wantClaim: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			e := newEnv(t, func(opts *indexer.Options) {
+				opts.Tables = catalogCreateRefusal{
+					TableStore: opts.Tables,
+					err:        fmt.Errorf("create %s.%s: %w: %s", table.Namespace, table.Name, rest.ErrForbidden, test.body),
+				}
+			})
+			e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+
+			e.tick()
+
+			err := e.health.repositoryError("repo")
+			require.ErrorIs(t, err, indexer.ErrReadOnlyMetadataRepository, "the create refusal is in the family")
+			require.ErrorIs(t, err, rest.ErrForbidden, "the catalog's cause stays in the chain")
+			require.Contains(t, err.Error(), "create the metadata table", "the refusal names the write that met it")
+			if test.wantClaim {
+				require.Contains(t, err.Error(), "a branch protection rule blocks")
+				require.Contains(t, err.Error(), "STAGING_WRITE")
+			} else {
+				require.NotContains(t, err.Error(), "a branch protection rule blocks")
+				require.Contains(t, err.Error(), "permissions")
+			}
+			require.Empty(t, e.fake.madeCommits(), "the initialisation is refused before its commit")
+		})
+	}
 }
 
 // TestReadOnlyMetadataRepositoryFailsTheRepository pins TS-4: a companion repository lakeFS reports
