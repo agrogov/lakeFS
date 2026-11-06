@@ -61,30 +61,33 @@ consolidation changes no code, test, design or doc, and does not touch `MDS_REVI
 
 ## Summary of findings
 
-| Key | Severity | Area | Title | File:line |
-|---|---|---|---|---|
-| R3S-1 | MAJOR | security | The `mds: init` ownership proof can be forged by any caller who can commit to `R-metadata` | `pkg/icebergcatalog/resolver.go:536-540` |
-| R3S-2 | MAJOR | security | The base `mds-metadata-repo-protect` policy is always written with zero statements, which a spec-validating auth service may reject | `pkg/mds/bootstrap/bootstrap.go:470-485` |
-| R3S-3 | MAJOR | security | The exact-namespace `fs:AttachStorageNamespace` deny matches only the stored spelling of the namespace | `pkg/mds/bootstrap/bootstrap.go:505-506` |
-| R3T-1 | MAJOR | table | `Compact` hands one data file to `ReplaceFiles` once per split scan task, which iceberg-go v0.7.0 rejects | `pkg/mds/table/writer.go:474-476,586-593` |
-| R3S-4 | MINOR | security | The init-commit walk is quadratic in the history length and reruns on every new head of `R-metadata` | `pkg/icebergcatalog/resolver.go:484-500` |
-| R3S-5 | MINOR | security | Bootstrap needs `ListPolicies` and `DeletePolicy`, which the in-repo ACL server answers with 501, and 501 is a fatal startup error | `pkg/mds/bootstrap/bootstrap.go:880-905` |
-| R3S-6 | MINOR | security | The policy cache is not purged after a policy is attached, so a new chunk can be invisible for up to the cache TTL | `pkg/mds/bootstrap/bootstrap.go:846-875` |
-| R3S-7 | MINOR | security | A companion can lose its grant and its deny between two policy writes when the sorted set shifts across chunks | `pkg/mds/bootstrap/bootstrap.go:214-262` |
-| R3S-8 | MINOR | security | `initCache` is keyed by repository and head commit and may never evict | `pkg/icebergcatalog/resolver.go:544-552` |
-| R3I-1 | MINOR | indexer | The new 403 → `ErrReadOnlyMetadataRepository` mapping claims branch protection for an authorization refusal, and the mds client collapses 401 into the same sentinel, so the default denial lands there too | `pkg/mds/indexer/repo.go:52-62` |
-| R3I-2 | MINOR | indexer | The fix does not cover the one catalog write the initialisation makes — `CreateTable` — so a `STAGING_WRITE` rule present before the first tick is still refused with a bare, unmapped 403 | `pkg/mds/indexer/repo.go:359-375` |
-| R3I-3 | MINOR | indexer | `table.ErrStaleTable` is not a §4.4 conflict for the indexer, so a tick that meets it does not reload and retry as the design and the table commit both state | `pkg/mds/indexer/iceberg.go:198-203` |
-| R3I-4 | MINOR | indexer | The design, the guide and the fix commit all say the protection refusal is a repository-level error; the code reports it per branch | `pkg/mds/indexer/branch.go:164,403,712,735,752` |
-| R3T-2 | MINOR | esti | The Spark self-test's two `user_metadata` cases fail on the row count, so they do not show that `user_metadata` is compared | `esti/ops/mds-engines/run-spark.sh:209-229` |
-| R3T-3 | MINOR | table | A table of legacy files is materialised all at once, not "one file's memory" | `pkg/mds/table/rows.go:428-475` |
-| R3T-4 | MINOR | table | The memory tests do not exercise the budget, the floor or more than one file | `pkg/mds/table/writer_test.go:851-899` |
-| R3T-5 | MINOR | table | The documented memory bound counts the merge's own rows, not the scan pipeline or the writer queue | `METADATA_SEARCH_DESIGN.md:381-387` |
-| R3T-6 | MINOR | table | `ErrMergeRows` has no test, and the recover only covers the merge's pull loop | `pkg/mds/table/rows.go:767-770` |
-| R3S-9 | NIT | security | The R2S-5 write-vend guard is exercised only by a fake resolver, and the built-in resolver never reports its own target as reserved | `pkg/icebergcatalog/creds.go:451-458` |
-| R3I-5 | NIT | indexer | The catalogue half of the R2I-3 mapping (`rest.ErrForbidden`) is dead in the test suite, because the fake's table writes answer the API sentinel instead of the catalog's | `pkg/mds/indexer/fake_test.go:1146,1179,1215` |
-| R3T-7 | NIT | table | Streams opened by `compactReader` are released only by the merge's own `defer`, which does not run if the reader is released before its first pull; and no test checks Arrow refcounts | `pkg/mds/table/writer.go:481-496` |
-| R3T-8 | NIT | table | The schema of the compaction reader is `nil` for a streamed run, so the "no task" branch is the common path and the declared schema differs from the yielded batches | `pkg/mds/table/rows.go:537-557` |
+Each finding carries its own fix status below; the `Status` column here is the short form, `Docs only`
+marking a finding the fix cards left to this documentation card on purpose.
+
+| Key | Severity | Area | Status | Title | File:line |
+|---|---|---|---|---|---|
+| R3S-1 | MAJOR | security | Fixed `db52bd9a7` | The `mds: init` ownership proof can be forged by any caller who can commit to `R-metadata` | `pkg/icebergcatalog/resolver.go:536-540` |
+| R3S-2 | MAJOR | security | Fixed `9135602ea` | The base `mds-metadata-repo-protect` policy is always written with zero statements, which a spec-validating auth service may reject | `pkg/mds/bootstrap/bootstrap.go:470-485` |
+| R3S-3 | MAJOR | security | Fixed `9135602ea` | The exact-namespace `fs:AttachStorageNamespace` deny matches only the stored spelling of the namespace | `pkg/mds/bootstrap/bootstrap.go:505-506` |
+| R3T-1 | MAJOR | table | Fixed `7f5fd526b` | `Compact` hands one data file to `ReplaceFiles` once per split scan task, which iceberg-go v0.7.0 rejects | `pkg/mds/table/writer.go:474-476,586-593` |
+| R3S-4 | MINOR | security | Fixed `db52bd9a7` | The init-commit walk is quadratic in the history length and reruns on every new head of `R-metadata` | `pkg/icebergcatalog/resolver.go:484-500` |
+| R3S-5 | MINOR | security | Fixed `9135602ea` | Bootstrap needs `ListPolicies` and `DeletePolicy`, which the in-repo ACL server answers with 501, and 501 is a fatal startup error | `pkg/mds/bootstrap/bootstrap.go:880-905` |
+| R3S-6 | MINOR | security | Fixed `9135602ea` | The policy cache is not purged after a policy is attached, so a new chunk can be invisible for up to the cache TTL | `pkg/mds/bootstrap/bootstrap.go:846-875` |
+| R3S-7 | MINOR | security | Fixed `9135602ea` | A companion can lose its grant and its deny between two policy writes when the sorted set shifts across chunks | `pkg/mds/bootstrap/bootstrap.go:214-262` |
+| R3S-8 | MINOR | security | Fixed `db52bd9a7` | `initCache` is keyed by repository and head commit and may never evict | `pkg/icebergcatalog/resolver.go:544-552` |
+| R3I-1 | MINOR | indexer | Fixed `2ae794038` | The new 403 → `ErrReadOnlyMetadataRepository` mapping claims branch protection for an authorization refusal, and the mds client collapses 401 into the same sentinel, so the default denial lands there too | `pkg/mds/indexer/repo.go:52-62` |
+| R3I-2 | MINOR | indexer | Fixed `2ae794038` | The fix does not cover the one catalog write the initialisation makes — `CreateTable` — so a `STAGING_WRITE` rule present before the first tick is still refused with a bare, unmapped 403 | `pkg/mds/indexer/repo.go:359-375` |
+| R3I-3 | MINOR | indexer | Fixed `2ae794038` | `table.ErrStaleTable` is not a §4.4 conflict for the indexer, so a tick that meets it does not reload and retry as the design and the table commit both state | `pkg/mds/indexer/iceberg.go:198-203` |
+| R3I-4 | MINOR | indexer | Docs only | The design, the guide and the fix commit all say the protection refusal is a repository-level error; the code reports it per branch | `pkg/mds/indexer/branch.go:164,403,712,735,752` |
+| R3T-2 | MINOR | esti | Fixed `0f45215bc` | The Spark self-test's two `user_metadata` cases fail on the row count, so they do not show that `user_metadata` is compared | `esti/ops/mds-engines/run-spark.sh:209-229` |
+| R3T-3 | MINOR | table | Docs only | A table of legacy files is materialised all at once, not "one file's memory" | `pkg/mds/table/rows.go:428-475` |
+| R3T-4 | MINOR | table | Fixed `7f5fd526b` | The memory tests do not exercise the budget, the floor or more than one file | `pkg/mds/table/writer_test.go:851-899` |
+| R3T-5 | MINOR | table | Docs only | The documented memory bound counts the merge's own rows, not the scan pipeline or the writer queue | `METADATA_SEARCH_DESIGN.md:381-387` |
+| R3T-6 | MINOR | table | Fixed `7f5fd526b` | `ErrMergeRows` has no test, and the recover only covers the merge's pull loop | `pkg/mds/table/rows.go:767-770` |
+| R3S-9 | NIT | security | Fixed `db52bd9a7` | The R2S-5 write-vend guard is exercised only by a fake resolver, and the built-in resolver never reports its own target as reserved | `pkg/icebergcatalog/creds.go:451-458` |
+| R3I-5 | NIT | indexer | Fixed `2ae794038` | The catalogue half of the R2I-3 mapping (`rest.ErrForbidden`) is dead in the test suite, because the fake's table writes answer the API sentinel instead of the catalog's | `pkg/mds/indexer/fake_test.go:1146,1179,1215` |
+| R3T-7 | NIT | table | Fixed `7f5fd526b` | Streams opened by `compactReader` are released only by the merge's own `defer`, which does not run if the reader is released before its first pull; and no test checks Arrow refcounts | `pkg/mds/table/writer.go:481-496` |
+| R3T-8 | NIT | table | Fixed `7f5fd526b` | The schema of the compaction reader is `nil` for a streamed run, so the "no task" branch is the common path and the declared schema differs from the yielded batches | `pkg/mds/table/rows.go:537-557` |
 
 ## Duplicates
 
@@ -161,6 +164,8 @@ spot-check column of this consolidation covers the four MAJORs.
 
 ### R3S-1 - MAJOR: the `mds: init` ownership proof can be forged by any caller who can commit to `R-metadata`
 
+**Fixed in `db52bd9a7`** (merged in `96a8834c4`): the proof now also requires the committer `mds-indexer` and the position directly above the repository's root commit. Residual, kept and stated in the code and in design §5.1: `CreateCommitRecord` authorizes `fs:CreateCommit` on the repository ARN and takes the committer from the client, so a principal that holds it can still mint every fact of the proof; closing that last step is an authorization design decision for the owner. Consequence found while documenting this card (code read, no probe): the position rule covers only a non-bare companion, so a companion repository created **bare** - its `mds: init` commit is the branch's first commit and has no parent - is accepted by the indexer (§4.8) but not served by the catalog. Design §5.1 and the guide now record it; no test covers that shape.
+
 Status: **CONFIRMED** (code read, no probe).
 
 **Spot-check (this consolidation): CONFIRMED.** `isMetadataSearchInitCommit` compares only the message and `lakefs.mds.init`, never the committer and never the position, while `Commit` and `CreateCommitRecord` authorize `fs:CreateCommit` alone and take both fields from the client — so the proof establishes nothing that a writer of `R-metadata` cannot mint. The indexer's own `isInitCommit` does not check the committer either, so the ambient premise of the finding holds too.
@@ -196,6 +201,8 @@ Status: **CONFIRMED** (code read, no probe).
 
 ### R3S-2 - MAJOR: the base `mds-metadata-repo-protect` policy is always written with zero statements, which a spec-validating auth service may reject
 
+**Fixed in `9135602ea`**: the deny is written as numbered `mds-metadata-repo-protect-<n>` chunks only, so no policy with zero statements is written and a repository set with no companion repository has no deny policy at all; a statement-less base left by an earlier version is deleted as a stale owned name. `TestEnsurePrincipalsOverAuthAPI` drives `acl.Serve` plus `APIAuthService` and fails before the fix with `create policy mds-metadata-repo-protect: invalid request`.
+
 Status: **UNVERIFIED**. The schema, the validator and the policy are read in code. No HTTP round trip was run, and I did not read the kin-openapi library to confirm it answers 400.
 
 **Spot-check (this consolidation): CONFIRMED.** `MetadataRepoProtectPolicies` puts a statement-less policy first unconditionally and `metadataSearchPolicyNames` keeps it in the written set on every installation; `api/authorization.yml` requires `minItems: 1` and `acl.Serve` validates request bodies on every route but the one carrying `x-validation-exclude-body`, `APIAuthService.WritePolicy` sends `[]`, and the resulting `auth.ErrInvalidRequest` is not `policyBackendUnavailable`, so `RoutesBuilder` returns it and `run.go:306` calls `Fatal`.
@@ -227,6 +234,8 @@ Status: **UNVERIFIED**. The schema, the validator and the policy are read in cod
 
 ### R3S-3 - MAJOR: the exact-namespace `fs:AttachStorageNamespace` deny matches only the stored spelling of the namespace
 
+**Fixed in `9135602ea`**: the deny emits one statement per spelling `CreateRepository` accepts for the same physical prefix (stored, trailing-slash-trimmed, that with one `/`, plus `//` for a bucket root), and `TestCompanionStorageNamespaceDenySpellings` drives the exact `CreateRepository` authorization node. Residual, stated in `storageNamespaceDenyResources`: a second or later extra trailing slash is a different physical prefix for S3 and GS and is the same prefix only in the dev-only mem and local adapters; covering it needs a `namespace/<ns>/*` pattern, which also denies every namespace below the companion's.
+
 Status: **UNVERIFIED**. The mismatch is read in code. I did not run a `CreateRepository` with a variant namespace or a GC against the new repository.
 
 **Spot-check (this consolidation): CONFIRMED.** The deny names `permissions.StorageNamespace(companion.StorageNamespace)` with no wildcard, `CreateRepository` authorizes the raw client string through `ArnMatch`'s exact resource comparison, and `formatPathWithNamespace` trims the trailing slash — so `s3://bucket/prefix/` is the same physical prefix under a different ARN. Only the impact tail (a GC from the variant repository deleting companion data) remains unproven, as the card says.
@@ -256,6 +265,8 @@ Status: **UNVERIFIED**. The mismatch is read in code. I did not run a `CreateRep
 
 
 ### R3T-1 - MAJOR: Compact hands one data file to `ReplaceFiles` once per split scan task, which iceberg-go v0.7.0 rejects
+
+**Fixed in `7f5fd526b`**: `dataFilesOf` de-duplicates by `File.FilePath()` and keeps the first entry, so a split file is removed once while the read side still reads every split range. `TestCompactReplacesASplitFileOnce` (a file with several row groups, more tasks than files) is red before the fix with `delete data file paths must be unique for ReplaceDataFilesWithDataFiles` and green after it.
 
 Status: **UNVERIFIED** end to end (not run). The mechanism is read on both sides and cited below.
 
@@ -300,6 +311,8 @@ A test that fails before the fix: create the table with `read.split.target-size=
 
 ### R3S-4 - MINOR: the init-commit walk is quadratic in the history length and reruns on every new head of `R-metadata`
 
+**Fixed in `db52bd9a7`**: the found init commit is cached per repository - immutable once found - and a new or repeated head is verified newest first only until it reaches that commit or a previously verified head, so a branch that gained commits pays for the new commits only. Tests assert the commit-log call count on the second read, for the same head and after one new head, over 300- and 4096-commit histories.
+
 Status: **UNVERIFIED**. The mechanism is read in code. The cost is arithmetic from the code and was not measured.
 
 **Where**
@@ -329,6 +342,8 @@ Status: **UNVERIFIED**. The mechanism is read in code. The cost is arithmetic fr
 
 ### R3S-5 - MINOR: bootstrap needs `ListPolicies` and `DeletePolicy`, which the in-repo ACL server answers with 501, and 501 is a fatal startup error
 
+**Fixed in `9135602ea`**: `contrib/auth/acl`'s controller implements `GET /auth/policies` (prefix, after, amount, pagination block) and `DELETE /auth/policies/{policyId}` instead of answering 501, and both are covered through `APIAuthService` in the httptest run and by `TestControllerListPolicies` / `TestControllerDeletePolicy`.
+
 Status: **CONFIRMED** (code read, no probe).
 
 **Where**
@@ -356,6 +371,8 @@ Status: **CONFIRMED** (code read, no probe).
 
 ### R3S-6 - MINOR: the policy cache is not purged after a policy is attached, so a new chunk can be invisible for up to the cache TTL
 
+**Fixed in `9135602ea`**: `attachPolicies` purges the auth service's effective-policy cache once after the attachments, when at least one succeeded. `TestRefreshPurgesCacheAfterAttach` adds a 65th companion that lands in a new chunk while a service refills the cache inside the attach window, and the deny is missing on the next `Authorize` before the fix.
+
 Status: **CONFIRMED** (code read, no probe).
 
 **Where**
@@ -382,6 +399,8 @@ Status: **CONFIRMED** (code read, no probe).
 
 ### R3S-7 - MINOR: a companion can lose its grant and its deny between two policy writes when the sorted set shifts across chunks
 
+**Fixed in `9135602ea`**: stable chunk assignment replaces positional chunking (`existingCompanionChunks` reads the companions each stored chunk names, `stableCompanionChunks` keeps each in its chunk and fills spare capacity with new ones), so a refresh that only adds repositories never removes an existing companion from any chunk. `TestRefreshKeepsCompanionCoverageAcrossWrites` (130 companions, the second chunk write failed) keeps the old last member of chunk 1 denied and granted.
+
 Status: **CONFIRMED** (code read and reasoned from the loop, no probe).
 
 **Where**
@@ -406,7 +425,9 @@ Status: **CONFIRMED** (code read and reasoned from the loop, no probe).
 - Failing test: 130 companions, insert a name that sorts first, fail the second `WritePolicy`, and assert the old last member of chunk 1 is still denied and granted.
 
 
-### R3S-8 - MINOR: `initCache` is keyed by repository and head commit and may never evict
+### R3S-8 - MINOR: and may never evict
+
+**Fixed in `db52bd9a7`**: the cache is keyed by repository, bounded to 1024 entries with oldest-first eviction, and each entry keeps at most 8 verified heads. Tests cover 24 heads of one repository (one entry) and 1025 repositories (bounded).
 
 Status: **UNVERIFIED**. I did not establish whether anything deletes entries.
 
@@ -426,6 +447,8 @@ Status: **UNVERIFIED**. I did not establish whether anything deletes entries.
 
 
 ### R3I-1 - MINOR: the new 403 → `ErrReadOnlyMetadataRepository` mapping claims branch protection for an authorization refusal, and the mds client collapses 401 into the same sentinel, so the *default* denial lands there too
+
+**Fixed in `2ae794038`**: the `ErrReadOnlyMetadataRepository` family is unchanged, and the protection claim is made only when the wrapped cause carries lakeFS's own wording (`cannot commit to protected branch`, `cannot write to protected branch`, `read-only repository`); every other forbidden answer gets a neutral text naming branch protection, `read_only` and the indexer principal's own permissions, and quoting the cause. Reversion proofs for both non-protection cases are recorded in the commit.
 
 **Where** `pkg/mds/indexer/repo.go:52-62` (`metadataBranchWriteError`), reached from
 `pkg/mds/indexer/branch.go:164,403,712,735,752`, `repo.go:414`.
@@ -479,6 +502,8 @@ indexer's own permissions"). Test that fails before it: inject `client.ErrForbid
 
 ### R3I-2 - MINOR: the fix does not cover the one catalog write the initialisation makes — `CreateTable` — so a `STAGING_WRITE` rule present before the first tick is still refused with a bare, unmapped 403
 
+**Fixed in `2ae794038`**: `initialise`'s `CreateTable` error is wrapped in `metadataBranchWriteError`, and the fake's `CreateTable` now checks `STAGING_WRITE` protection and `ReadOnly` like the other table writes. `TestInitialisationCreateRefusalIsTheReadOnlyFamily` and a `STAGING_WRITE`-before-the-first-tick case fail before the fix.
+
 **Where** `pkg/mds/indexer/repo.go:359-375` (`initialise`'s `CreateTable` call and its `case err != nil:` at
 `:373-374`), `pkg/mds/indexer/iceberg.go:77-98` (`IcebergStore.CreateTable`), versus
 `pkg/mds/indexer/repo.go:52-62` (the mapping, applied to `Commit`, `ResetBranch`, `HardResetBranch`,
@@ -522,6 +547,8 @@ the repository-level family and no table pointer).
 
 ### R3I-3 - MINOR: `table.ErrStaleTable` is not a §4.4 conflict for the indexer, so a tick that meets it does not reload and retry as the design and the table commit both state
 
+**Fixed in `2ae794038`**: `tableError` maps `table.ErrStaleTable` to `ErrConflict` alongside `icebergtable.ErrCommitFailed`, so `runBranch` reloads and retries on it. `TestTableErrorMapsTheWriterConflict/a_stale_table` fails without the mapping; the retry itself is pinned by `TestRecovery/a_concurrent_writer_moves_the_table` and `TestRecovery/two_consecutive_conflicts`.
+
 **Where** `pkg/mds/indexer/iceberg.go:198-203` (`tableError` maps `icebergtable.ErrCommitFailed` →
 `ErrConflict`, nothing else), `pkg/mds/indexer/branch.go:41-49` (`runBranch` retries only
 `errors.Is(err, ErrConflict)`), versus `pkg/mds/table/writer.go:63-72` ("the caller reloads the table and
@@ -557,6 +584,8 @@ moved — exactly the shape of Probe 2.
 
 
 ### R3I-4 - MINOR: the design, the guide and the fix commit all say the protection refusal is a repository-level error; the code reports it per branch
+
+**Not fixed in code** (`2ae794038` chose the documentation option): the protection refusal stays a per-branch error, so `/_health` is 503 with a per-branch `last_error` and `errors_total{stage="branch"}` per refused branch while the repository's `last_error` stays empty. This documentation card corrects design §3.3 and §9 and the guide to say so, instead of the repository-level wording the design and the guide carried.
 
 **Where** `METADATA_SEARCH_DESIGN.md:125` ("so one repository-level error replaces a bare 403 on every
 branch") and `:592-593` ("a branch-protection rule the first write meets … mark that repository failed in
@@ -594,6 +623,8 @@ second: two protected branches, assert one `repo/repository` metric increment an
 
 ### R3T-2 - MINOR: the Spark self-test's two `user_metadata` cases fail on the row count, so they do not show that `user_metadata` is compared
 
+**Fixed in `0f45215bc`**: the two six-row cases are replaced by three cases of exactly three rows in total (one part file, and both orders over two part files), so only the `diff` can reject them, and `expect` now also asserts the gate message each case must produce. The mutation the finding says was never run - dropping the fourth column from the comparison - now fails 3/3. Follow-up outside this card's files: `esti/ops/mds-engines/README.md` still says seven cases and describes the old layouts.
+
 Status: **CONFIRMED** by reading and arithmetic. The mutation that would show it (drop the fourth column from the comparison) was not run.
 
 **Where**
@@ -627,6 +658,8 @@ Check that each fails with "rows differ", not "wrong number". Optionally make `e
 
 ### R3T-3 - MINOR: a table of legacy files is materialised all at once, not "one file's memory"
 
+**Not fixed in code** (`7f5fd526b`, deliberately): a k-way merge cannot stream a run whose rows are not in order, so materialising legacy files one at a time would mean spilling each to a temporary sorted file - new object-store writes, new orphan files for `lakectl iceberg cleanup`, new failure modes - for a state only a table last compacted before `2daeca114` can be in and that the first compaction removes. That commit corrected the `compactReader` and `Compact` doc comments in the package, and this documentation card corrects design §4.9 and the guide to "the memory of every legacy file at once".
+
 Status: **CONFIRMED** by reading. Not measured.
 
 **Where**
@@ -649,6 +682,8 @@ Correct the doc to "the memory of every legacy file at once", or materialise leg
 
 
 ### R3T-4 - MINOR: the memory tests do not exercise the budget, the floor or more than one file
+
+**Fixed in `7f5fd526b`**: `TestCompactFileBatchRows` pins 0, 1, 2, 512, 513 and 10 000 files against the production budget 131 072 and against smaller ones, so both sides of the floor are covered, and `TestCompactDividesTheMergeBudgetAcrossFiles` compacts four real files with a budget of 3000 (750 per file, above the floor) and asserts the batch rows each stream pulls. Both fail with the old code.
 
 Status: **CONFIRMED** by reading and arithmetic. The numbers 256 and 264 are derived, not observed.
 
@@ -677,6 +712,8 @@ Add a unit test of `compactFileBatchRows` (1, 2, 512, 513, 10 000 files, budget 
 
 ### R3T-5 - MINOR: the documented memory bound counts the merge's own rows, not the scan pipeline or the writer queue
 
+**Not fixed in code**: this one is the written bound, not a repair. `7f5fd526b` wrote the corrected bound out from the module sources pinned in `go.mod` - merge set (with the 131 072-row budget, the 256-row floor and the 512-file point), scan prefetch, writer queue, one row group, plus the legacy case - and this documentation card puts it into design §4.9. No memory was measured for it.
+
 Status: **UNVERIFIED.** The mechanism is read in iceberg-go v0.7.0; no memory was measured beyond what `d993d602e`'s own commit message reports.
 
 **Where**
@@ -702,6 +739,8 @@ Either state the bound as "merge set + scan prefetch + writer queue + one row gr
 
 ### R3T-6 - MINOR: `ErrMergeRows` has no test, and the recover only covers the merge's pull loop
 
+**Fixed in `7f5fd526b`** (test only; the recover was already there and its scope is unchanged): `TestMergeRowsConvertsAPanicToErrMergeRows` runs a `rowStream` whose `advance` panics through the merge and requires `Next()` false, `errors.Is(reader.Err(), ErrMergeRows)`, the panic value in the message and a second `Next()` still false. It fails without the recover as an escaped panic. Design §4.9 now states that the setup reads are outside the recover.
+
 Status: **CONFIRMED** that there is no test (grep above). The scope sub-claim is **UNVERIFIED**.
 
 **Where**
@@ -723,6 +762,8 @@ Add a `rowStream` test double whose `advance` panics. Run `newPullRecordReader(�
 ## NIT (4)
 
 ### R3S-9 - NIT: the R2S-5 write-vend guard is exercised only by a fake resolver, and the built-in resolver never reports its own target as reserved
+
+**Fixed in `db52bd9a7`** (test only, no production change): a branch write credentials request for the virtual table now has a test through the real `MetadataSearchResolver`, which yields a read session scoped to the companion table with no `s3:PutObject`.
 
 Status: **CONFIRMED** (code read).
 
@@ -746,6 +787,8 @@ Status: **CONFIRMED** (code read).
 
 
 ### R3I-5 - NIT: the catalogue half of the R2I-3 mapping (`rest.ErrForbidden`) is dead in the test suite, because the fake's table writes answer the API sentinel instead of the catalog's
+
+**Fixed in `2ae794038`**: the fake's table writes answer `catalogWriteError` - `rest.ErrForbidden` over lakeFS's message, and in `CreateTable` too - which is what production sees, so the catalog arm of the mapping is exercised. Reverting it makes `TestProtectedMetadataBranchFailsTheRepository/staging_write_protection` fail `ErrorIs rest.ErrForbidden`.
 
 **Where** `pkg/mds/indexer/fake_test.go:1146`, `:1179`, `:1215` return
 `client.ErrForbidden` from `ApplyDelta`/`Rebuild`/`Compact`, while production's catalog writes return
@@ -774,6 +817,8 @@ fails before it: the same test with `rest.ErrForbidden` removed from the predica
 
 ### R3T-7 - NIT: streams opened by `compactReader` are released only by the merge's own `defer`, which does not run if the reader is released before its first pull; and no test checks Arrow refcounts
 
+**Fixed in `7f5fd526b`**: `newMergeReader` installs `pullRecordReader.onRelease`, which runs after `stop()`, so `Release` without a pull frees the streams, and `mergedBatches` no longer frees them. `TestCompactionReaderReleaseFreesStreamsWithoutAPull` runs on a `memory.CheckedAllocator` and is red without the wiring; `TestCompactReleasesEveryBatchItReads` compacts three files and requires `AssertSize(t, 0)`.
+
 Status: **CONFIRMED** by reading. Harmless under the Go allocator in production; not probed.
 
 **Where**
@@ -795,6 +840,8 @@ Release the streams in `compactReader`'s reader (for example from `pullRecordRea
 
 
 ### R3T-8 - NIT: the schema of the compaction reader is `nil` for a streamed run, so the "no task" branch is the common path and the declared schema differs from the yielded batches
+
+**Fixed in `7f5fd526b`**: the cursor stores the schema `ReadTasks` returns at open, so the empty-plan branch is now only the empty table. `TestCompactKeepsAColumnTheWriterDoesNotKnow` asserts the reader's schema is known before the first batch and `declared.Equal(batch.Schema())` for every batch, including the multi-run ones; it is red when the cursor stores no schema.
 
 Status: **UNVERIFIED** consequence (the suite is green). The nil schema is **CONFIRMED** by reading.
 

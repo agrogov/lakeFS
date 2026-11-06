@@ -155,10 +155,11 @@ The Spark gate compares the guide's snippet's own projection, `path`, `size_byte
 **and** `user_metadata` (the empty map the uploads have), and it concatenates every `part-*` file
 Spark wrote before comparing, so the three numbers above are checked over the whole result and an
 extra row in a second, third, … part file fails the run. `./run-spark.sh --self-test` proves both
-properties on fabricated part files without docker; the seven cases are a single part file with the
+properties on fabricated part files without docker; the eight cases are a single part file with the
 expected rows, the same rows spread over two part files, an extra row in either part file (each of
-the two creation orders), a wrong `user_metadata` in either part file, and a directory with no
-`part-*` file at all.
+the two creation orders), a wrong `user_metadata` in a single three-row part file and in either of
+two part files (three rows in total, so the row count passes and only the comparison can reject
+them), and a directory with no `part-*` file at all.
 
 ### Rerun after the row-gate fix (2026-11-05)
 
@@ -168,7 +169,8 @@ wall **508s** (8m28s) including `env-up.sh` and `env-down.sh`, `SOURCE_COMMIT=96
 
 Spark wrote **one** `part-*` file per variant in this run (`spark mds wrote 1 part file(s) …;
 comparing all of them`), so the layout this run happened to produce does not exercise the
-multi-file path. That path is proven by `./run-spark.sh --self-test` instead (7/7 cases pass): with
+multi-file path. That path is proven by `./run-spark.sh --self-test` instead (7/7 cases passed at
+the time; `0f45215bc` added the single-file `user_metadata` case, and 8/8 pass since): with
 the pre-fix gate (`find … -name 'part-*' | head -n 1`) the same self-test fails 3 cases — the rows
 split over two part files are reported as 2 rows, and an extra row in a part file goes unnoticed
 whenever the correct file is the one the gate reads.
