@@ -120,24 +120,27 @@ const (
 
 	// icebergClientPackages is what a step installs when the image does not provide the clients.
 	// sql-sqlite is the SqlCatalog the fixture writer needs (no catalog server is involved in
-	// writing the fixture files), s3fs is the FileIO of an s3:// warehouse, and pyarrow is what
-	// both the writer and the PyIceberg reader use for data. The versions are pinned to the set
-	// this suite is verified against: PyIceberg 0.12 turned inspect.manifests() into a PyArrow
+	// writing the fixture files), s3fs is the FileIO of an s3:// warehouse, adlfs is the FileIO of
+	// an abfs[s]:// location (PyIceberg's Azure FileIO, used by mds_azure_test.go), and pyarrow is
+	// what both the writer and the PyIceberg reader use for data. The versions are pinned to the
+	// set this suite is verified against: PyIceberg 0.12 turned inspect.manifests() into a PyArrow
 	// Table, so an unpinned install silently changes the shape of what a step reports.
 	//
 	// esti/ops/iceberg-client/Dockerfile bakes this same set into an image, which is what
 	// ESTI_ICEBERG_CLIENT_IMAGE points at so that a step does not install anything: keep the two
 	// lists in step, and note that a step still installs this set when its import probe fails.
-	icebergClientPackages = `"pyiceberg[sql-sqlite,s3fs,pyarrow]==0.12.0" "pyarrow==26.0.1" "duckdb==2.0.0"`
+	icebergClientPackages = `"pyiceberg[sql-sqlite,s3fs,pyarrow]==0.12.0" "pyarrow==26.0.1" "duckdb==2.0.0" "adlfs==2025.8.0"`
 
 	// icebergClientInstallFailed is the exit code of a step whose dependency install failed, and
 	// the marker it prints. It is how the harness tells "this environment has no package index"
 	// (skip) from "the read path broke" (fail).
 	icebergClientInstallFailed = 97
 	icebergClientInstallMark   = "ICEBERG_CLIENT_INSTALL_FAILED"
-	icebergClientImportProbe   = "import pyiceberg, pyarrow, duckdb"
-	icebergClientResultMarker  = "RESULT:"
-	icebergClientStepTimeout   = 20 * time.Minute
+	// The probe names adlfs too: the Azure read step imports it through PyIceberg, and an image
+	// built before adlfs was part of this set must install the set rather than fail the step.
+	icebergClientImportProbe  = "import pyiceberg, pyarrow, duckdb, adlfs"
+	icebergClientResultMarker = "RESULT:"
+	icebergClientStepTimeout  = 20 * time.Minute
 
 	// icebergClientScriptEnv is how a step's program reaches the container. It is passed in the
 	// environment and run with `python -c` rather than bind-mounted: a mount would tie the suite

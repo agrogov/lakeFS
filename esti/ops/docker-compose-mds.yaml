@@ -1,14 +1,17 @@
-# SeaweedFS as the S3-compatible blockstore of the Metadata Search system tests (esti/mds_test.go,
-# METADATA_SEARCH_DESIGN.md §9, task M6).
+# The object stores of the Metadata Search system tests (esti/mds_test.go,
+# METADATA_SEARCH_DESIGN.md §9, task M6; esti/mds_azure_test.go,
+# METADATA_SEARCH_AZURE.md §5 task AZ5).
 #
-# The suite runs its own lakefs-sso and its own `lakefs-sso mds run` on the host, so this file only
-# provides the object store: an S3 endpoint that does not vend credentials, which is the mode the
-# indexer must support with static `storage` keys (§4.6). SeaweedFS is what the M6 recipe uses;
-# MinIO is not (see METADATA_SEARCH_PLAN.md "M6 needs docker (colima) and SeaweedFS").
+# The suites run their own lakefs-sso and their own `lakefs-sso mds run` on the host, so this file
+# only provides the object stores: one S3 endpoint that does not vend credentials, which is the mode
+# the indexer must support with static `storage` keys (§4.6), and one Azure Blob Storage emulator,
+# which is the only Azure endpoint the acceptance test of METADATA_SEARCH_AZURE can run against in
+# CI. SeaweedFS is what the M6 recipe uses; MinIO is not (see METADATA_SEARCH_PLAN.md "M6 needs
+# docker (colima) and SeaweedFS").
 #
-# Run the suite against it:
+# # S3 (Metadata Search on SeaweedFS)
 #
-#   docker compose -f esti/ops/docker-compose-mds.yaml up -d
+#   docker compose -f esti/ops/docker-compose-mds.yaml up -d seaweedfs
 #   LAKEFS_BLOCKSTORE_TYPE=s3 \
 #   ESTI_STORAGE_NAMESPACE=s3://esti-mds-test \
 #   LAKEFS_BLOCKSTORE_S3_ENDPOINT=http://127.0.0.1:8333 \
@@ -19,9 +22,28 @@
 #   go test -count=1 -v ./esti -run 'TestMetadataSearch' \
 #     --args --system-tests --use-local-credentials
 #
-# The suite creates the bucket if it is missing and removes only its own prefix when it finishes, so
-# one long-lived SeaweedFS is enough for repeated runs. ESTI_ICEBERG_CLIENT_IMAGE may name a prebuilt
-# image with pyiceberg, pyarrow and duckdb (python:3.12-slim installs them when it is unset).
+# # Azure (Metadata Search on Azure Blob Storage, METADATA_SEARCH_AZURE §5 AZ5)
+#
+# The Azure case starts lakefs-sso with the blockstore section the server needs - the adapter, the
+# emulator's account and key, blockstore.azure.domain azurite.test and
+# blockstore.azure.test_endpoint_url pointing at the published port with the account in the path
+# (the server is a host process, so it cannot resolve <account>.azurite.test, and Azurite serves the
+# path-style URL the container's own connection string uses) - and a repository whose storage
+# namespace is https://acct.azurite.test/esti/esti-<run>. The indexer gets the Azure IO settings as
+# LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCOUNT / _STORAGE_ACCESS_KEY / _ENDPOINT / _PROTOCOL and
+# nothing in the configuration file, which is what proves METADATA_SEARCH_AZURE goal G4:
+#
+#   docker compose -f esti/ops/docker-compose-mds.yaml up -d azurite
+#   ESTI_AZURE_STORAGE_ACCOUNT=acct \
+#   ESTI_AZURE_STORAGE_ACCESS_KEY=a2V5MQ== \
+#   go test -count=1 -v ./esti -run 'TestMetadataSearchAzure' \
+#     --args --system-tests --use-local-credentials
+#
+# ESTI_AZURE_ENDPOINT overrides the published endpoint (default http://127.0.0.1:10000). The suites
+# create the bucket/container they are missing and remove only their own prefixes when they finish,
+# so one long-lived store of each is enough for repeated runs. ESTI_ICEBERG_CLIENT_IMAGE may name a
+# prebuilt image with pyiceberg, pyarrow, duckdb and adlfs (esti/ops/iceberg-client/Dockerfile);
+# python:3.12-slim installs them when it is unset.
 services:
   seaweedfs:
     image: chrislusf/seaweedfs:latest
@@ -34,5 +56,38 @@ services:
       - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
       - seaweedfs-data:/data
 
+  # Azurite is the emulator of the Azure acceptance test (METADATA_SEARCH_AZURE AZ5). The image and
+  # the command line are the ones pkg/block/azure's tests and pkg/mds/table's Azure integration test
+  # (AZ4) start: the Azure SDK negotiates a newer REST API version than Azurite implements, so
+  # --skipApiVersionCheck is required, and AZURITE_ACCOUNTS gives the emulator a keyed account
+  # instead of the development one.
+  #
+  # The key is valid base64 ("key1"), because both the shared-key signature and every client of the
+  # run decode it as such. Azurite has neither a Data Lake (dfs) endpoint nor hierarchical namespace
+  # support: the run's locations are still the canonical abfs:// form of METADATA_SEARCH_AZURE D1
+  # (blockstore.azure.domain is azurite.test, which DFSDomainFor keeps as its own dfs host), and the
+  # clients read the files through the Blob API. That is why AZ7 - the same cases on a real account,
+  # with Spark and Trino - is a required gate before the feature is called done (§7).
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.35.0
+    command:
+      - azurite
+      - -l
+      - /data
+      - --blobHost
+      - 0.0.0.0
+      - --queueHost
+      - 0.0.0.0
+      - --tableHost
+      - 0.0.0.0
+      - --skipApiVersionCheck
+    ports:
+      - "10000:10000"
+    environment:
+      - AZURITE_ACCOUNTS=acct:a2V5MQ==
+    volumes:
+      - azurite-data:/data
+
 volumes:
   seaweedfs-data:
+  azurite-data:

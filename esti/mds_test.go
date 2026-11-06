@@ -69,6 +69,11 @@
 // while the live position's tag stays. TestMetadataSearchBranchDeletion runs §4.8's mirrored
 // deletion: the R-metadata branch is gone, its tags and history remain readable.
 //
+// mds_azure_test.go runs the acceptance cases of METADATA_SEARCH_AZURE.md §5 AZ5 on the same
+// harness against an Azure blockstore (Azurite): it is the one place the harness takes another
+// storage profile, and it is why this file's environment is split into a blockstore-neutral
+// skeleton (newMDSEnvSkeleton, start) and the S3 profile (newMDSEnv).
+//
 // # No workarounds
 //
 // The suite drives the product exactly as a user would: the indexer runs from its own section of
@@ -328,6 +333,28 @@ type mdsEnv struct {
 	// through the auth API after the server's bootstrap created the user (§8).
 	indexerKey    string
 	indexerSecret string
+
+	// indexerEnv is the environment of the indexer process only, appended to os.Environ(). It is
+	// how the Azure case proves G4 of METADATA_SEARCH_AZURE.md: the indexer is configured with
+	// LAKEFS_METADATA_SEARCH_AZURE_* variables and the configuration file carries no Azure key at
+	// all. nil keeps the indexer's environment identical to the server's.
+	indexerEnv []string
+
+	// blockstoreSection and storageSection are the YAML fragments writeConfig writes for the
+	// blockstore section and for metadata_search.storage. newMDSEnv fills in the S3 profile; the
+	// Azure profile of mds_azure_test.go fills in its own, and writes no storage key at all.
+	blockstoreSection string
+	storageSection    string
+
+	// setupStorage creates the bucket or container the run's namespaces live in, and
+	// cleanupStorage removes the run's objects at teardown with that blockstore's own client.
+	setupStorage   func(t *testing.T)
+	cleanupStorage func(ctx context.Context) error
+
+	// extraRepositories are further data repositories the indexer is configured to index. The
+	// suite's own repository always is; mds_azure_test.go adds one whose storage namespace the
+	// indexer must refuse (a container root, METADATA_SEARCH_AZURE D4) and removes it again.
+	extraRepositories []string
 }
 
 // TestMetadataSearchEndToEnd is the M6 case list of METADATA_SEARCH_DESIGN.md §9: every row
@@ -1123,6 +1150,24 @@ const mdsTableSourceCommit = "lakefs.mds.source-commit"
 func newMDSEnv(t *testing.T) *mdsEnv {
 	t.Helper()
 	requireIcebergS3Blockstore(t)
+
+	env := newMDSEnvSkeleton(t, "mds-e2e-"+icebergUniqueSuffix())
+	env.s3 = icebergS3Settings(t)
+	env.bucket, env.runPrefix, env.storageNamespace = icebergStorageNamespace(t, env.repo)
+	env.blockstoreSection = mdsS3BlockstoreSection(env.s3)
+	env.storageSection = mdsS3StorageSection(env.s3)
+	env.setupStorage = env.ensureBucket
+	env.cleanupStorage = env.deleteRunPrefix
+	return env.start(t)
+}
+
+// newMDSEnvSkeleton allocates everything that does not depend on the blockstore: the two free
+// ports, the lakefs-sso binary, the working directory and the OIDC issuer the sso: section needs.
+// The caller fills in the storage profile - the namespace, the configuration fragments and the two
+// storage life-cycle functions - and then calls start, so the S3 suite (newMDSEnv) and the Azure
+// acceptance test (newMDSAzureEnv, mds_azure_test.go) differ in the blockstore alone.
+func newMDSEnvSkeleton(t *testing.T, repo string) *mdsEnv {
+	t.Helper()
 	requireIcebergDocker(t)
 
 	dir := t.TempDir()
@@ -1135,7 +1180,7 @@ func newMDSEnv(t *testing.T) *mdsEnv {
 		cancel: cancel,
 		icebergEnv: &icebergEnv{
 			baseURL:       fmt.Sprintf("http://127.0.0.1:%d", serverPort),
-			repo:          "mds-e2e-" + icebergUniqueSuffix(),
+			repo:          repo,
 			branch:        mdsBranch,
 			key:           DefaultAdminAccessKeyID,
 			secret:        DefaultAdminSecretAccessKey,
@@ -1154,35 +1199,41 @@ func newMDSEnv(t *testing.T) *mdsEnv {
 		indexerListenAddress: fmt.Sprintf("0.0.0.0:%d", indexerPort),
 		issuer:               icebergOIDCIssuer(t),
 	}
-	env.s3 = icebergS3Settings(t)
-	env.bucket, env.runPrefix, env.storageNamespace = icebergStorageNamespace(t, env.repo)
 	env.metadataRepo = icebergcatalog.MetadataRepository(env.repo)
-	env.ensureBucket(t)
+	return env
+}
+
+// start runs the server of a skeleton environment, waits for it, asserts the Metadata Search
+// bootstrap of §8, creates the data repository and writes the final configuration with the
+// credentials the suite created for mds-indexer. The indexer is started by the case itself.
+func (e *mdsEnv) start(t *testing.T) *mdsEnv {
+	t.Helper()
+	e.setupStorage(t)
 
 	// §7 defaults, written explicitly so a maintenance case can override one without losing the
 	// others. tag_retention 0 keeps every tag; compaction fires above 200 delete files or every
 	// 500 indexed commits; a deleted data branch loses its metadata branch.
-	env.tagRetention = "0s"
-	env.deleteBranches = true
-	env.compactionMaxDeleteFiles = 200
-	env.compactionEveryCommits = 500
-	env.startIndexerProxy(t)
+	e.tagRetention = "0s"
+	e.deleteBranches = true
+	e.compactionMaxDeleteFiles = 200
+	e.compactionEveryCommits = 500
+	e.startIndexerProxy(t)
 
 	// The server and the indexer read one file, as §7 documents. The metadata_search section is
 	// written without credentials first, because the mds-indexer user does not exist until the
 	// server has bootstrapped it; the file is rewritten with the created credentials before the
 	// indexer starts.
-	env.writeConfig(t, "", "")
-	env.startServer(t)
-	t.Cleanup(func() { env.stop(t) })
+	e.writeConfig(t, "", "")
+	e.startServer(t)
+	t.Cleanup(func() { e.stop(t) })
 
-	env.waitForServer(t)
-	env.admin = env.coreAPI(t)
-	env.requireMDSCore(t)
-	env.createRepository(t)
-	env.indexerKey, env.indexerSecret = env.createIndexerCredentials(t)
-	env.writeConfig(t, env.indexerKey, env.indexerSecret)
-	return env
+	e.waitForServer(t)
+	e.admin = e.coreAPI(t)
+	e.requireMDSCore(t)
+	e.createRepository(t)
+	e.indexerKey, e.indexerSecret = e.createIndexerCredentials(t)
+	e.writeConfig(t, e.indexerKey, e.indexerSecret)
+	return e
 }
 
 // writeConfig writes the one lakefs.yaml both processes read (design §7).
@@ -1190,31 +1241,10 @@ func newMDSEnv(t *testing.T) *mdsEnv {
 // The blockstore section is spelled out in full instead of being inherited from the ambient
 // LAKEFS_* variables: a partial section would shadow viper's nested defaults, and the server, the
 // indexer and the query-engine containers must all address the same bucket with the same
-// credentials and path style.
+// credentials and path style. The section itself is the storage profile's (e.blockstoreSection),
+// so the Azure case writes an Azure blockstore and no metadata_search.storage at all.
 func (e *mdsEnv) writeConfig(t *testing.T, indexerKey, indexerSecret string) {
 	t.Helper()
-	var blockstore strings.Builder
-	blockstore.WriteString("blockstore:\n  type: s3\n  s3:\n")
-	fmt.Fprintf(&blockstore, "    region: %q\n", e.s3.Region)
-	if e.s3.Endpoint != "" {
-		fmt.Fprintf(&blockstore, "    endpoint: %q\n", e.s3.Endpoint)
-	}
-	fmt.Fprintf(&blockstore, "    force_path_style: %t\n", e.s3.PathStyle)
-	blockstore.WriteString("    discover_bucket_region: false\n")
-	fmt.Fprintf(&blockstore, "    credentials:\n      access_key_id: %q\n      secret_access_key: %q\n",
-		e.s3.AccessKey, e.s3.SecretKey)
-
-	var storage strings.Builder
-	if e.s3.Endpoint != "" {
-		fmt.Fprintf(&storage, "    s3.endpoint: %q\n", e.s3.Endpoint)
-	}
-	fmt.Fprintf(&storage, "    s3.region: %q\n", e.s3.Region)
-	fmt.Fprintf(&storage, "    s3.access-key-id: %q\n", e.s3.AccessKey)
-	fmt.Fprintf(&storage, "    s3.secret-access-key: %q\n", e.s3.SecretKey)
-	if e.s3.PathStyle {
-		storage.WriteString("    s3.path-style-access: \"true\"\n")
-	}
-
 	document := fmt.Sprintf(`listen_address: %q
 logging:
   format: text
@@ -1266,20 +1296,71 @@ metadata_search:
   compaction:
     max_delete_files: %d
     every_commits: %d
-  storage:
-%s  repositories:
-    %s:
-      branches: [%s, %s]
-`, e.listenAddress, filepath.Join(e.dir, "metadata"),
+%s%s`, e.listenAddress, filepath.Join(e.dir, "metadata"),
 		mdsAdminUsername, e.key, e.secret,
 		e.issuer, "http://"+e.listenAddress,
-		blockstore.String(), icebergcatalog.CatalogPrefix,
+		e.blockstoreSection, icebergcatalog.CatalogPrefix,
 		e.indexerEndpoint, indexerKey, indexerSecret, e.indexerListenAddress, mdsIndexerPeriod,
 		e.deleteBranches, e.tagRetention, e.compactionMaxDeleteFiles, e.compactionEveryCommits,
-		storage.String(), e.repo, mdsBranch, mdsFeatureBranch)
+		e.storageSectionYAML(), e.repositoriesSection())
 
 	require.NoError(t, os.WriteFile(e.configPath, []byte(document), mdsConfigFileMode),
 		"write the lakefs.yaml both processes read")
+}
+
+// storageSectionYAML renders metadata_search.storage, or nothing at all when the storage profile
+// configures the Indexer's FileIO some other way: the Azure case leaves it to the
+// LAKEFS_METADATA_SEARCH_AZURE_* environment of the indexer process (METADATA_SEARCH_AZURE G4).
+func (e *mdsEnv) storageSectionYAML() string {
+	if e.storageSection == "" {
+		return ""
+	}
+	return "  storage:\n" + e.storageSection
+}
+
+// repositoriesSection renders the repositories of the indexer configuration: the suite's own data
+// repository, indexed on both of its branches, and the extra ones a case configured. An extra
+// repository is indexed on the suite's branch alone: it exists to be refused or to be a control,
+// and a branch it does not have would only add a per-branch error to its report.
+func (e *mdsEnv) repositoriesSection() string {
+	var repositories strings.Builder
+	repositories.WriteString("  repositories:\n")
+	fmt.Fprintf(&repositories, "    %s:\n      branches: [%s, %s]\n", e.repo, mdsBranch, mdsFeatureBranch)
+	for _, name := range e.extraRepositories {
+		fmt.Fprintf(&repositories, "    %s:\n      branches: [%s]\n", name, mdsBranch)
+	}
+	return repositories.String()
+}
+
+// mdsS3BlockstoreSection is the blockstore section of the S3 profile, written out in full.
+func mdsS3BlockstoreSection(s3 icebergS3Config) string {
+	var blockstore strings.Builder
+	blockstore.WriteString("blockstore:\n  type: s3\n  s3:\n")
+	fmt.Fprintf(&blockstore, "    region: %q\n", s3.Region)
+	if s3.Endpoint != "" {
+		fmt.Fprintf(&blockstore, "    endpoint: %q\n", s3.Endpoint)
+	}
+	fmt.Fprintf(&blockstore, "    force_path_style: %t\n", s3.PathStyle)
+	blockstore.WriteString("    discover_bucket_region: false\n")
+	fmt.Fprintf(&blockstore, "    credentials:\n      access_key_id: %q\n      secret_access_key: %q\n",
+		s3.AccessKey, s3.SecretKey)
+	return blockstore.String()
+}
+
+// mdsS3StorageSection is metadata_search.storage of the S3 profile: the same endpoint and
+// credentials, in the iceberg-go property names of design §4.6.
+func mdsS3StorageSection(s3 icebergS3Config) string {
+	var storage strings.Builder
+	if s3.Endpoint != "" {
+		fmt.Fprintf(&storage, "    s3.endpoint: %q\n", s3.Endpoint)
+	}
+	fmt.Fprintf(&storage, "    s3.region: %q\n", s3.Region)
+	fmt.Fprintf(&storage, "    s3.access-key-id: %q\n", s3.AccessKey)
+	fmt.Fprintf(&storage, "    s3.secret-access-key: %q\n", s3.SecretKey)
+	if s3.PathStyle {
+		storage.WriteString("    s3.path-style-access: \"true\"\n")
+	}
+	return storage.String()
 }
 
 // ensureBucket makes sure the bucket the run allocates its prefix in exists. On AWS it does; on the
@@ -1473,12 +1554,17 @@ type mdsProcess struct {
 }
 
 // startProcess starts name with args, tees its output to logPath and reaps it in the background.
-func (e *mdsEnv) startProcess(t *testing.T, name, logPath string, args ...string) *mdsProcess {
+// A non-nil extraEnv is appended to os.Environ() for this process only, which is how the Azure case
+// configures the indexer through LAKEFS_METADATA_SEARCH_AZURE_* alone (METADATA_SEARCH_AZURE G4).
+func (e *mdsEnv) startProcess(t *testing.T, name, logPath string, extraEnv []string, args ...string) *mdsProcess {
 	t.Helper()
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, mdsConfigFileMode)
 	require.NoErrorf(t, err, "open the %s log file", name)
 	cmd := exec.CommandContext(e.ctx, e.binary, args...)
 	cmd.Dir = e.dir
+	if extraEnv != nil {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	require.NoErrorf(t, cmd.Start(), "start %s", name)
 
@@ -1558,7 +1644,7 @@ func mdsLogTail(path string, lines int) string {
 // startServer starts `lakefs-sso run` on the generated configuration.
 func (e *mdsEnv) startServer(t *testing.T) {
 	t.Helper()
-	e.server = e.startProcess(t, "lakefs-sso", e.logPath, "run", "--config", e.configPath)
+	e.server = e.startProcess(t, "lakefs-sso", e.logPath, nil, "run", "--config", e.configPath)
 }
 
 // startIndexer starts `lakefs-sso mds run` on the same configuration (§4.1) and waits until its own
@@ -1566,7 +1652,8 @@ func (e *mdsEnv) startServer(t *testing.T) {
 func (e *mdsEnv) startIndexer(t *testing.T) {
 	t.Helper()
 	require.Nil(t, e.indexer, "the indexer is already running; stop it first")
-	e.indexer = e.startProcess(t, "lakefs-sso mds run", e.indexPath, "mds", "run", "--config", e.configPath)
+	e.indexer = e.startProcess(t, "lakefs-sso mds run", e.indexPath, e.indexerEnv,
+		"mds", "run", "--config", e.configPath)
 	t.Logf("metadata search indexer started (pid %d, period %s)", e.indexer.cmd.Process.Pid, mdsIndexerPeriod)
 	e.waitForIndexerServer(t)
 }
@@ -1616,8 +1703,8 @@ func (e *mdsEnv) stop(t *testing.T) {
 	// cancelled here, hence the fresh one.
 	ctx, cancel := context.WithTimeout(context.Background(), mdsCleanupTimeout)
 	defer cancel()
-	if err := e.deleteRunPrefix(ctx); err != nil {
-		t.Errorf("delete the run prefix s3://%s/%s: %v", e.bucket, e.runPrefix, err)
+	if err := e.cleanupStorage(ctx); err != nil {
+		t.Errorf("delete the run prefix of %s: %v", e.repo, err)
 	}
 
 	if t.Failed() {

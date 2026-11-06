@@ -19,13 +19,15 @@ FROM python:3.12-slim
 
 # --no-cache-dir keeps the image small; the profile extras are the ones the steps need:
 # sql-sqlite is the SqlCatalog the fixture writer uses (no catalog server is involved in writing
-# the fixture files), s3fs is the FileIO of an s3:// warehouse, and pyarrow is what both the writer
-# and the PyIceberg reader use for data.
+# the fixture files), s3fs is the FileIO of an s3:// warehouse, adlfs is the FileIO of the
+# abfs[s]:// locations of the Azure Metadata Search acceptance test (mds_azure_test.go), and
+# pyarrow is what both the writer and the PyIceberg reader use for data.
 RUN pip install --quiet --disable-pip-version-check --no-cache-dir \
         "pyiceberg[sql-sqlite,s3fs,pyarrow]==0.12.0" \
         "pyarrow==26.0.1" \
-        "duckdb==2.0.0"
+        "duckdb==2.0.0" \
+        "adlfs==2025.8.0"
 
 # The same probe icebergClientCommand runs before it decides to install: fail the build, not the
 # test run, when the image does not provide the clients.
-RUN python -c 'import pyiceberg, pyarrow, duckdb'
+RUN python -c 'import pyiceberg, pyarrow, duckdb, adlfs'
