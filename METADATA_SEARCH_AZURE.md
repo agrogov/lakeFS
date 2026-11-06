@@ -1,6 +1,7 @@
 # Metadata Search on Azure Blob Storage — design and plan
 
-Branch: `feature/metadata-search`. Status: **proposed**, nothing implemented. This document is
+Branch: `feature/metadata-search`. Status: **AZ1–AZ6 done**; AZ7 - verification on a real Azure account - is
+an operator step that has not run, and it is the gate before the Azure support is called done. This document is
 self-contained; the design sections it changes are named by number (`METADATA_SEARCH_DESIGN.md`
 §x, `ICEBERG_CATALOG_PLAN.md` §x).
 
@@ -245,12 +246,20 @@ parallel; AZ4 needs AZ1–AZ3; AZ5 needs AZ1–AZ4; AZ6 follows AZ5; AZ7 runs on
 - Store test on the mem blockstore with an Azure-shaped namespace is not possible (the mem adapter
   rejects `https`); the adapter-level round trip is covered in AZ4 instead.
 
+**Done**, commit `b79a41e`: `pkg/icebergcatalog/azure_location.go`, the Azure branch of `TableAreaLocation`,
+the legacy-area tolerance and `blockIdentifier`, with the mapping table, the round trip and the negative
+cases as tests; the S3 and mem tests are unchanged.
+
 ### AZ2 — namespace root, companion namespace, deny ARNs (D4)
 
 - `block.NamespaceRoot` with tests for s3/gs/mem/local/azure path/azure container root/malformed.
 - `metadataNamespace`: container-root refusal; derived name stays in the same container.
 - `storageNamespaceDenyResources`: exact expected ARN lists for Azure path and container root, both
   schemes. Extend the R3S-3 esti spelling case only if AZ5 runs on Azurite (it does).
+
+**Done**, commit `fdedd3e`: `block.NamespaceRoot`, the container-root refusal naming the container, the
+derived name staying in the container, the scheme-normalised overlap test, and the exact ARN lists of
+`TestStorageNamespaceDenyResources` (four ARNs for an Azure prefix, six for a container root).
 
 ### AZ3 — indexer Azure IO and config (D3)
 
@@ -259,6 +268,10 @@ parallel; AZ4 needs AZ1–AZ3; AZ5 needs AZ1–AZ4; AZ6 follows AZ5; AZ7 runs on
 - Unit tests: env-only configuration yields the expected `adls.*` map; `storage` overrides;
   validation errors; the azure scheme is registered (`io.LoadFS` on an `abfss://` URI with a fake
   credential reaches the Azure backend rather than "unsupported scheme").
+
+**Done**, commit `ed7c0d3`: the `io/gocloud/azure` import, `AzureConfig`, the env overrides, the `Validate`
+rules and the property merge, with the env-only configuration, the `storage` override, the validation
+errors and the registered-scheme test.
 
 ### AZ4 — catalog/indexer integration test on Azurite (Go, not esti)
 
@@ -271,6 +284,9 @@ parallel; AZ4 needs AZ1–AZ3; AZ5 needs AZ1–AZ4; AZ6 follows AZ5; AZ7 runs on
   `http://acct.azurite.test/c/…`.
 - Skipped when docker is unavailable, like the block adapter tests.
 
+**Done**, commit `21fbf95`: the table package's Azurite test asserts both spellings (the `abfs://` metadata
+location and the adapter's `http://` physical addresses) and skips without docker.
+
 ### AZ5 — esti end to end on Azurite (acceptance)
 
 - Azurite in `docker-compose-mds.yaml`; lakeFS with `blockstore.type: azure`,
@@ -282,6 +298,10 @@ parallel; AZ4 needs AZ1–AZ3; AZ5 needs AZ1–AZ4; AZ6 follows AZ5; AZ7 runs on
   companion namespace is refused; the R3S-3 spelling case with the `http`/`https` pair.
 - Trino and Spark are not run on Azurite (Trino's native FS has no emulator mode); they are AZ7.
 
+**Done**, commit `cff0360`: `esti/mds_azure_test.go` with the `azurite` service of
+`esti/ops/docker-compose-mds.yaml`, the three cases above, and the indexer configured through
+`LAKEFS_METADATA_SEARCH_AZURE_*` alone (the generated configuration is asserted to carry no Azure key).
+
 ### AZ6 — docs and design records
 
 - Replace `docs/metadata-search.md` lines 294 and 818; add "Azure" to the deployment section with
@@ -290,7 +310,14 @@ parallel; AZ4 needs AZ1–AZ3; AZ5 needs AZ1–AZ4; AZ6 follows AZ5; AZ7 runs on
 - Record D1–D4 in `METADATA_SEARCH_DESIGN.md` and `ICEBERG_CATALOG_PLAN.md`; status line in
   `METADATA_SEARCH_PLAN.md`.
 
+**Done** (this commit, docs only): the Azure deployment section of `docs/metadata-search.md` with the
+`LAKEFS_METADATA_SEARCH_AZURE_*` variables and the Kubernetes example, the per-engine FileIO recipes of D5,
+the non-goals N1–N4, the `abfs[s]://` locations and the `iceberg.azure.location_host` switch in
+`docs/iceberg.md`, and the D1–D4 records.
+
 ### AZ7 — real Azure verification (operator, not CI)
+
+**Not run.** This is the gate before the Azure support is called done.
 
 - On the hr2 cluster (Azure blockstore, shared key): deploy the image, run the indexer with the
   AZ6 Kubernetes example, run the guide's Spark and Trino snippets against one repository. Record

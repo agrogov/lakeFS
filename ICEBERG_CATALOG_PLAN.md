@@ -257,6 +257,33 @@ Enterprise uses a `_managed/` area in the storage namespace per its
 [Starburst IAM example](https://docs.lakefs.io/integrations/starburst_galaxy/). Our layout is our own design;
 Enterprise's layout is not public (Q-I1).
 
+**On an Azure Blob Storage blockstore the location is spelled `abfs[s]://` (METADATA_SEARCH_AZURE.md D1, D2).**
+`<storage_namespace>/_iceberg/<table-uuid>/…` is a URI in the blockstore's own spelling, and the Azure adapter's
+spelling (`https://<account>.<blob domain>/<container>/<path>`) is one that **no** Iceberg `FileIO` opens: Iceberg
+Java's `ADLSFileIO`, Trino's native Azure file system, PyIceberg's `adlfs`, DuckDB's `azure` extension and
+iceberg-go's `io/gocloud/azure` all take `abfs[s]://<container>@<account>.<host>/<path>`. The catalog therefore
+translates the namespace into that form and uses it everywhere a location is produced or compared
+(`pkg/icebergcatalog/azure_location.go`, `TableAreaLocation`):
+
+| Namespace (block adapter) | Iceberg location (metadata.json, manifests, REST responses) |
+|---|---|
+| `https://acct.blob.core.windows.net/c/p` | `abfss://c@acct.dfs.core.windows.net/p` |
+| `https://acct.blob.core.chinacloudapi.cn/c/p` | `abfss://c@acct.dfs.core.chinacloudapi.cn/p` |
+| `https://acct.blob.core.usgovcloudapi.net/c/p` | `abfss://c@acct.dfs.core.usgovcloudapi.net/p` |
+| `http://…` (any of the above) | `abfs://…` (same mapping, non-TLS) |
+
+The mapping is a pure function of the namespace plus `iceberg.azure.location_host` (`dfs`, the default, or `blob`
+for an engine whose Hadoop ≥ 3.4 ABFS driver refuses a non-HNS account over `dfs`; the scheme stays `abfs[s]`).
+`wasb[s]://` is never emitted. The **inverse is not a general parser**: a location is mapped back to the adapter's
+spelling only after the area check, by replacing the area prefix in Iceberg form with the area prefix in namespace
+form, so the "write anywhere" guard of §13 is exactly as strong as it was. Two consequences for the layout above:
+the pointer's `iceberg.metadata-location` and everything in the files' own metadata carry the Iceberg form, while
+every lakeFS entry that records a physical address (`files.go`, `views.go`) stores the adapter's form, because GC,
+`stat` and the S3 gateway read it through the same adapter. A table created before the translation, whose stored
+location is still `https://…`, is accepted as a second spelling of the area on the read, commit and register paths,
+and normalised to the Iceberg form when it is written; `TableLocation` and every new table only ever return that
+form.
+
 ### 6.2 Atomic commit (check-and-put)
 1. Read the pointer entry on the branch (staged, else committed) → `base.metadata-location`. Load `metadata.json` via
    the block adapter.

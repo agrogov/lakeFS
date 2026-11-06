@@ -254,6 +254,25 @@ is inside `<storage_namespace>/_iceberg/` or below it; a location outside that a
 because the server writes the initial metadata there with its own credentials and because a table must
 not point into another repository or bucket.
 
+The URI is in the **blockstore's Iceberg spelling**, which is not always the namespace text the
+repository stores:
+
+| Blockstore | Table location of `<repo>` |
+|---|---|
+| S3, GS, mem, local | `<storage_namespace>/_iceberg/<table-uuid>/` as stored (`s3://bucket/path/…`) |
+| Azure Blob Storage | `abfs[s]://<container>@<account>.<dfs host>/<path>/_iceberg/<table-uuid>/…` |
+
+On Azure the namespace is stored as `https://<account>.<blob domain>/<container>/<path>` and the
+catalog translates it (`https` → `abfss`, `http` → `abfs`), because no Iceberg `FileIO` - Iceberg
+Java's `ADLSFileIO`, Trino's native Azure file system, PyIceberg's `adlfs`, DuckDB's `azure`
+extension or iceberg-go's `io/gocloud/azure` - opens the `https://…blob.core.windows.net` form. The
+pointers, the manifests and every response carry the translated form; the lakeFS entries that record
+a file's physical address keep the block adapter's own spelling, because GC, `stat` and the S3 gateway
+read them through that adapter. `iceberg.azure.location_host: blob` selects
+`abfss://<container>@<account>.blob.core.windows.net/…` for an engine whose Hadoop ABFS driver refuses
+a non-HNS account over the `dfs` host; the scheme stays `abfs[s]` either way. `wasb[s]://` is never
+emitted and is not accepted as a new location.
+
 ## Views
 
 An Iceberg **view** is a named, versioned SQL query: it has a schema, a set of view versions (each a
@@ -666,7 +685,9 @@ unreachable or refuses, the load or create still succeeds without `storage-crede
 credentials endpoint answers an empty `storage-credentials` list, so the client falls back to its
 own `FileIO`. **Both served modes are S3 only in this
 build**: an Azure or GCS blockstore gets neither endpoint, and the client's own credentials is the mode
-to use there (see [Not supported in OSS](#not-supported-in-oss)). The delegation header is always safe to
+to use there (see [Not supported in OSS](#not-supported-in-oss)). A table on an Azure blockstore is
+addressed by an `abfs[s]://<container>@<account>.<dfs host>/…` location, which the client's own Azure
+`FileIO` opens, so that mode needs no vending at all. The delegation header is always safe to
 send: the catalog may choose any or none of the requested mechanisms, and a client that asks for
 `vended-credentials` or `remote-signing` and does not receive the matching member falls back to its
 own credentials.
@@ -843,17 +864,36 @@ policy scoped to the table's prefix. An Azure or GCS deployment has no credentia
 the handler is refused with `501 NotImplementedException`. Nothing is vended for a table whose own
 location is not an S3 URI either.
 
+The **location** is not S3-only, and on Azure that is what makes the default mode work: the catalog
+hands out and accepts `abfs[s]://<container>@<account>.<dfs host>/<path>/…`, never the block adapter's
+`https://…blob.core.windows.net/…` spelling (see [What is stored, and where](#what-is-stored-and-where)),
+and a legacy table whose stored location is still `https://…` stays readable, and takes the new spelling when it
+is committed (see [What is stored, and where](#what-is-stored-and-where)). The host
+is the Data Lake Storage Gen2 (`dfs`) endpoint of the account by default; `iceberg.azure.location_host:
+blob` puts the Blob endpoint there instead, for an engine whose Hadoop ≥ 3.4 ABFS driver refuses a
+non-HNS account over `dfs` (Hadoop expects `abfss://…@<account>.blob.core.windows.net` with
+`fs.azure.account.hns.enabled=false`). It is a server-wide setting: it changes the spelling for every
+engine and every table. `wasbs://` is deliberately never emitted - Microsoft deprecates WASB and Trino
+does not accept it.
+
 Use one of these instead:
 
 - **The client's own storage credentials (the default).** Configure the client's `FileIO` with
   credentials for the storage namespace (Azure or GCS), exactly as for any non-catalog table. The
-  catalog returns an empty `config`, so the client keeps its own credentials anyway.
+  catalog returns an empty `config`, so the client keeps its own credentials anyway. On Azure the
+  FileIO is `org.apache.iceberg.azure.adlsv2.ADLSFileIO` (Spark, from the `iceberg-azure-bundle`
+  jar), Trino's native Azure file system (`fs.azure.enabled=true` / `fs.native-azure.enabled=true`
+  with `azure.auth-type`), `adlfs` (PyIceberg, `adls.*`) and DuckDB's `azure` extension (`CREATE
+  SECRET (TYPE azure, …)`); [`metadata-search.md`](metadata-search.md) has the snippets for each.
 - **Remote signing**, where the deployment supports it. `POST …/tables/{t}/sign` lets the server
   sign the client's data requests with the server's own credentials, so no long-lived client
   credential is needed. In this OSS build remote signing is likewise **S3 only**: the endpoint is
   mounted only for an S3 blockstore with a working pre-signer, and an Azure or GCS blockstore gets
   no signing endpoint. An S3 deployment that is asked to sign an `abfs://` or `gs://` URI refuses
   it with `400 BadRequestException` naming the scheme, before the pre-signer is called.
+
+For Azure this means the engines and the indexer always bring their own credentials; a user-delegation
+SAS handed back in `storage-credentials` is backlog, not built.
 
 ### Tables Cleanup
 
@@ -894,7 +934,10 @@ that calls one gets the catalog's `404`. Multi-table transaction commit (`POST
   trip, the staged metadata entries, a replace over HTTP, the any-ref read of a tag, the
   namespace-emptiness rule and the drop. Both were run against SeaweedFS (`blockstore.type: s3`, path
   style) with the `esti-iceberg-client` image, and all six tests pass; the exact command and output are
-  in the commit that added the view suite. The **iceberg-go external conformance suite is green** — 18
+  in the commit that added the view suite. The Metadata Search table on an Azure blockstore is covered
+  separately, end to end, by `esti/mds_azure_test.go` against Azurite (locations, the indexer's Azure
+  IO and two Azure `FileIO` recipes); see
+  [`metadata-search.md`](metadata-search.md#what-was-verified). The **iceberg-go external conformance suite is green** — 18
   of 18 subtests, 0 skipped — through the `relative_to` URI against a `lakefs-sso` server built from
   this tree; that run is recorded in `pkg/icebergcatalog/conformance/RESULTS.md`. Apache RCK was not
   run (no JDK/Gradle on the host), and S3 presigning, credential vending and remote signing remain
@@ -920,6 +963,8 @@ iceberg:
   uncommitted_gc_grace: 24h         # 0 protects every _iceberg/ object regardless of age
   max_staged_files: 50000           # cap on the table files one commit may stage
   ignore_compaction_commits: true    # auto-resolve compaction-only conflicts at merge (see "Merge")
+  azure:
+    location_host: dfs              # dfs (default) or blob; the service part of a translated abfs[s] URI
   metadata_search:
     enabled: false                  # serve the virtual table of "Metadata Search" (default false)
 

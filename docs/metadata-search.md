@@ -214,6 +214,10 @@ metadata_search:
     s3.access-key-id: ...
     s3.secret-access-key: ...
     s3.path-style-access: "true"
+  azure:                                       # optional; Azure blockstore, see "Azure Blob Storage"
+    storage_account: myaccount
+    storage_access_key: ...                    # or use_managed_identity: true
+    endpoint: blob.core.windows.net            # required off the public cloud, and for Azurite
   repositories:                                # at least one
     my-repo:
       branches: [main, "dev-*"]                # at least one; exact or trailing-* glob
@@ -244,6 +248,7 @@ Every key, its default and its meaning:
 | `compaction.max_delete_files` | int | `200` | Compact a branch's table when it has more delete files than this. `0` disables this trigger. |
 | `compaction.every_commits` | int | `500` | Compact a branch's table after this many indexed commits. `0` disables this trigger. The count is read back from the first-parent commit log of the companion branch, so a restart neither defers nor advances a compaction. |
 | `storage` | map | empty | iceberg-go IO properties used when the catalog does not vend write credentials. See below. |
+| `azure` | section | unset | Azure credentials and endpoint of the indexer's IO when the blockstore is Azure. Every key of it is also a `LAKEFS_METADATA_SEARCH_AZURE_*` environment variable. See [`Azure Blob Storage`](#azure-blob-storage). |
 | `repositories` | map | — (required) | The data repositories to index, by name. At least one entry. |
 | `repositories.<R>.branches` | list | — (required) | Branch selectors: exact names, or a prefix with a single trailing `*` (`dev-*`). At least one. |
 | `repositories.<R>.storage_namespace` | string | derived | Storage namespace of `R-metadata`. See [`Limits`](#limits-and-known-deviations). |
@@ -251,7 +256,9 @@ Every key, its default and its meaning:
 `metadata_search` is read with viper, so scalar keys can also be set through the lakeFS environment
 conventions: prefix `LAKEFS_`, replace every `.` with `_`, upper-case. For example
 `LAKEFS_METADATA_SEARCH_SECRET_KEY` and `LAKEFS_METADATA_SEARCH_LAKEFS_MDS_ENDPOINT`. The `repositories`
-and `storage` maps are read from the file.
+and `storage` maps are read from the file. The `azure` section is scalar end to end, so every key of it
+is also an environment variable (`LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCESS_KEY`, …), which is what
+makes a Kubernetes secret usable as the indexer's Azure credential.
 
 The command validates the section before the first tick and reports **one error per problem**, so a
 bad file is fixed in one pass. Startup fails when:
@@ -264,7 +271,10 @@ bad file is fixed in one pass. Startup fails when:
 - a repository name ends in `-metadata`, or is longer than 54 characters;
 - a branch selector contains a `*` that is not the final character, or is empty;
 - `since` is not an RFC 3339 timestamp;
-- `tag_retention`, `compaction.max_delete_files` or `compaction.every_commits` is negative.
+- `tag_retention`, `compaction.max_delete_files` or `compaction.every_commits` is negative;
+- `azure.storage_access_key` is set without `azure.storage_account` (iceberg-go builds the container
+  URL from the account name, and would refuse the pair only at the first write);
+- `azure.protocol` is neither `http` nor `https`.
 
 `0` is a valid value, not a mistake: `tag_retention: 0s` keeps every `mds-*` tag forever, and
 `compaction.max_delete_files: 0` / `compaction.every_commits: 0` turn that compaction trigger off. The
@@ -280,23 +290,124 @@ other repositories continue.
 #### Credentials for writing files
 
 The indexer writes Parquet and Avro files for the table, so it needs write access to the companion
-repository's object-store prefix. There are two modes (design §4.6):
+repository's object-store prefix. There are three modes (design §4.6):
 
 - **Vended credentials.** If the catalog vends write credentials (S3 blockstore with
   `blockstore.s3.credentials_vending.role_arn` set), the indexer requests them the way any Iceberg
   client does (`X-Iceberg-Access-Delegation: vended-credentials`) and needs no object-store keys of
-  its own.
+  its own. Vending is S3-only; an Azure blockstore never vends.
 - **Static storage properties.** Otherwise, set `metadata_search.storage` to the iceberg-go IO
   properties for the object store: `s3.endpoint`, `s3.region`, `s3.access-key-id`,
   `s3.secret-access-key`, `s3.path-style-access`. These are the same keys an Iceberg client uses.
-  This is the mode the esti suite runs with (SeaweedFS and static keys).
+  This is the mode the S3 esti suite runs with (SeaweedFS and static keys). On Azure the properties
+  are the `adls.*` ones, which the `metadata_search.azure` section below writes for you.
+- **`metadata_search.azure`.** On an Azure blockstore, set that section instead of the `storage`
+  map: every key of it is also a `LAKEFS_METADATA_SEARCH_AZURE_*` environment variable, so a
+  Kubernetes secret can carry the credential. An explicit key in `metadata_search.storage` wins over
+  the translated one.
 
-Azure and GCS are out of scope for this version: there is no credential vending and no remote
-signer, so those deployments must supply static properties for their scheme and are not tested.
+GCS is out of scope for this version (`METADATA_SEARCH_AZURE.md` N2): the indexer registers no `gs://`
+IO, so a GCS companion namespace cannot be written. Azure credential vending and remote signing do
+not exist either (N1) - the indexer and the engines use their own Azure credentials - and the web UI
+object search stays S3-only (N3).
 
 The indexer does not use `storage` to read the catalog: catalog requests are authenticated with
 `access_key_id`/`secret_key`. A deployment that vends credentials does not need the `storage`
 section at all.
+
+#### Azure Blob Storage
+
+On an Azure blockstore (`blockstore.type: azure`) the companion repository of `my-repo` lives in the
+same container as `my-repo` - its derived namespace is a sibling prefix - and the catalog hands out
+its table's files under
+`abfs[s]://<container>@<account>.<dfs domain>/<path>/_iceberg/<table-uuid>/…`
+(`https://acct.blob.core.windows.net/c/p` becomes `abfss://c@acct.dfs.core.windows.net/p`, and an
+`http` namespace becomes `abfs://`). No Iceberg FileIO opens the blockstore's own `https://`
+spelling, so this translation is what lets the indexer and an engine read the table. It is a pure
+function of the repository's namespace; an `https://` host this installation does not serve is left
+in the blockstore's own spelling, exactly as before, rather than mapped to a location no client could
+open.
+
+The catalog spells the location on the Data Lake Storage Gen2 (`dfs`) endpoint. If an engine reads
+through Hadoop's ABFS driver (Hadoop ≥ 3.4) and the storage account is not HNS-enabled, that driver
+refuses the `dfs` host: set `iceberg.azure.location_host: blob` on the **server** and the locations
+become `abfss://c@acct.blob.core.windows.net/…` instead. It is one setting for the whole
+installation, not a per-engine one, and the scheme stays `abfs[s]`.
+
+Because `metadata_search.storage` is a map and is read from the file only, an Azure deployment whose
+key lives in an environment variable configures the indexer through `metadata_search.azure`. Each
+key of that section is translated into the iceberg-go `adls.*` IO property of the same meaning, so an
+explicit key in `metadata_search.storage` is the escape hatch when you need a property the section
+does not name:
+
+| Key | Environment variable | iceberg-go property |
+|---|---|---|
+| `storage_account` | `LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCOUNT` | `adls.auth.shared-key.account.name` |
+| `storage_access_key` | `LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCESS_KEY` | `adls.auth.shared-key.account.key` |
+| `use_managed_identity` | `LAKEFS_METADATA_SEARCH_AZURE_USE_MANAGED_IDENTITY` | `adls.auth.managed-identity.enabled` |
+| `client_id` | `LAKEFS_METADATA_SEARCH_AZURE_CLIENT_ID` | `adls.client-id` |
+| `endpoint` | `LAKEFS_METADATA_SEARCH_AZURE_ENDPOINT` | `adls.endpoint` |
+| `protocol` | `LAKEFS_METADATA_SEARCH_AZURE_PROTOCOL` | `adls.protocol` |
+
+- With **none** of them set, iceberg-go falls back to `DefaultAzureCredential`: workload identity
+  (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE`), then a managed identity,
+  then the Azure CLI. That is the mode for a pod with a federated identity and no secret at all.
+- `use_managed_identity: true` selects a managed identity instead of the chain; add `client_id` for a
+  user-assigned one.
+- `endpoint` and `protocol` describe the service URL iceberg-go builds. `endpoint` is required for
+  any cloud but the public one and for Azurite, because iceberg-go ignores the storage domain of the
+  table location; `protocol` is `https` when unset.
+- The indexer does **not** read `blockstore.azure.*`. It is a separate process with its own lakeFS
+  credentials and its own Azure identity, and silently borrowing the server's storage key would hide
+  a misconfiguration of that identity. Mount the same secret under both names instead:
+
+```yaml
+# One secret, two names: the server reads it as blockstore.azure.*, the indexer as
+# metadata_search.azure.*. Neither configuration file carries the key.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: azure-storage
+type: Opaque
+stringData:
+  storage_account: myaccount
+  storage_access_key: "<storage account key>"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lakefs
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: lakefs } }
+  template:
+    metadata: { labels: { app: lakefs } }
+    spec:
+      containers:
+        - name: lakefs
+          image: <the lakefs-sso image you deploy>
+          args: ["run", "--config", "/etc/lakefs/config.yaml"]
+          env:
+            - name: LAKEFS_BLOCKSTORE_TYPE
+              value: azure
+            - name: LAKEFS_BLOCKSTORE_AZURE_STORAGE_ACCOUNT
+              valueFrom: { secretKeyRef: { name: azure-storage, key: storage_account } }
+            - name: LAKEFS_BLOCKSTORE_AZURE_STORAGE_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: azure-storage, key: storage_access_key } }
+        - name: mds-indexer    # or its own Deployment; one replica, see "Run the indexer"
+          image: <the lakefs-sso image you deploy>
+          args: ["mds", "run", "--config", "/etc/lakefs/config.yaml"]
+          env:
+            - name: LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCOUNT
+              valueFrom: { secretKeyRef: { name: azure-storage, key: storage_account } }
+            - name: LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: azure-storage, key: storage_access_key } }
+```
+
+A container-root namespace (`https://myaccount.blob.core.windows.net/my-container`) has no derivable
+companion namespace, exactly like an S3 bucket root: set
+`metadata_search.repositories.my-repo.storage_namespace` explicitly, to a prefix in the same
+container. The indexer's refusal names the container.
 
 ### 4. Run the indexer
 
@@ -406,7 +517,9 @@ Every snippet below assumes:
 - the lakeFS server is at `http://lakefs:8000`;
 - the data repository is `my-repo` and the ref is `main`;
 - the examples pass S3 credentials explicitly for reading data files. Omit those properties when the
-  catalog vends read credentials.
+  catalog vends read credentials. On an Azure blockstore the catalog never vends (its credentials
+  endpoint is not mounted), the table's location is `abfs[s]://<container>@<account>.<dfs domain>/…`,
+  and the snippet's FileIO is the engine's Azure one - each subsection below shows it.
 
 A query principal needs read access to `my-repo` (through the catalog) and nothing on
 `my-repo-metadata`; see [`Permissions`](#permissions).
@@ -463,6 +576,28 @@ table.scan(
 ).to_pandas()
 ```
 
+On an Azure blockstore, PyIceberg's FileIO is `adlfs` and its properties are the `adls.*` ones; the
+`warehouse` is the data repository's storage namespace, in the form lakeFS stores it:
+
+```python
+catalog = RestCatalog(
+    "lakefs",
+    uri="http://lakefs:8000/mds/iceberg/api",
+    credential="<access_key_id>:<secret_access_key>",
+    warehouse="https://myaccount.blob.core.windows.net/my-container/my-repo",
+    **{
+        "adls.account-name": "myaccount",
+        "adls.account-key": "<storage account key>",
+        # Or instead of the pair: "adls.connection-string": "...",
+        # or "adls.sas-token.<account>.dfs.core.windows.net": "...".
+    },
+)
+table = catalog.load_table(("my-repo", "main", "system", "object_metadata"))
+table.scan().to_pandas()
+```
+
+The `/iceberg/relative_to` form takes the same `adls.*` properties with the shorter identifier.
+
 ### DuckDB
 
 DuckDB uses the `relative_to` form, because its `ENDPOINT` is a base URL that fixes the warehouse.
@@ -516,6 +651,37 @@ WHERE commit_id = '<full source commit ID>';
 For `/mds/iceberg/api`, the OAuth token URI is
 `http://lakefs:8000/mds/iceberg/api/v1/oauth/tokens`. To use a lakeFS JWT instead of a key pair,
 `ATTACH ... (TYPE iceberg, ENDPOINT '…', TOKEN '<lakefs-jwt>')` works for a short-lived read.
+
+On an Azure blockstore, load the `azure` extension and create a `TYPE azure` secret for the data
+files; the catalog secret is unchanged and the `ATTACH` takes the same form, with the repository's
+`https://` namespace as its warehouse:
+
+```sql
+INSTALL azure; LOAD azure;
+INSTALL iceberg; LOAD iceberg;
+
+-- Or AccountName/AccountKey, a SAS token, or a service principal instead of the connection string.
+CREATE OR REPLACE SECRET lakefs_data (
+  TYPE azure,
+  CONNECTION_STRING 'DefaultEndpointsProtocol=https;AccountName=myaccount;AccountKey=<key>;EndpointSuffix=core.windows.net'
+);
+
+CREATE OR REPLACE SECRET lakefs_catalog (
+  TYPE iceberg,
+  CLIENT_ID '<access_key_id>',
+  CLIENT_SECRET '<secret_access_key>',
+  OAUTH2_SERVER_URI 'http://lakefs:8000/iceberg/api/v1/oauth/tokens'
+);
+
+ATTACH 'https://myaccount.blob.core.windows.net/my-container/my-repo' AS lakefs (
+  TYPE iceberg,
+  ENDPOINT 'http://lakefs:8000/iceberg/relative_to/my-repo.main/api'
+);
+
+SELECT path, size_bytes, commit_id
+FROM lakefs."system"."object_metadata"
+WHERE path LIKE 'orders/%';
+```
 
 ### Spark
 
@@ -582,6 +748,30 @@ it one namespace level, and the catalog rejects it with
 Iceberg 1.8 takes the AWS region from `client.region`; older Spark runtimes take it from
 `s3.region` (or from `AWS_REGION`). Set the key the runtime you use reads.
 
+On an Azure blockstore, the FileIO is Iceberg's `ADLSFileIO`, which comes in the
+`iceberg-azure-bundle` jar (`--packages org.apache.iceberg:iceberg-azure-bundle:1.8.1`, or the jar
+that matches your Iceberg runtime). Everything the catalog side needs is unchanged:
+
+```properties
+spark.sql.defaultCatalog=lakefs
+spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+spark.sql.catalog.lakefs=org.apache.iceberg.spark.SparkCatalog
+spark.sql.catalog.lakefs.type=rest
+spark.sql.catalog.lakefs.uri=http://lakefs:8000/mds/iceberg/api
+spark.sql.catalog.lakefs.rest.auth.type=basic
+spark.sql.catalog.lakefs.credential=<access_key_id>:<secret_access_key>
+spark.sql.catalog.lakefs.warehouse=https://myaccount.blob.core.windows.net/my-container/my-repo
+# ADLSFileIO reads the data files; the class is in the iceberg-azure-bundle jar:
+spark.sql.catalog.lakefs.io-impl=org.apache.iceberg.azure.adlsv2.ADLSFileIO
+spark.sql.catalog.lakefs.adls.auth.shared-key.account.name=myaccount
+spark.sql.catalog.lakefs.adls.auth.shared-key.account.key=<storage account key>
+```
+
+Omit the two `adls.auth.shared-key.*` keys to use ADLSFileIO's default credential chain (the
+`AZURE_*` environment, a managed identity, or the Azure CLI). The table's files are read from the
+location the catalog returns for the table (`abfs[s]://…`), not from `warehouse`, which is set to the
+repository's namespace only as in the S3 snippets above.
+
 ### Trino
 
 Trino's Iceberg connector speaks the same REST protocol. The snippets below are for Trino 484 and
@@ -642,6 +832,31 @@ FROM lakefs.system.object_metadata
 WHERE path LIKE 'orders/%';
 ```
 
+On an Azure blockstore, Trino reads the data files with its native Azure file system instead of the
+S3 one; the catalog properties are the same as above.
+
+```properties
+connector.name=iceberg
+iceberg.catalog.type=rest
+iceberg.rest-catalog.uri=http://lakefs:8000/mds/iceberg/api
+iceberg.rest-catalog.security=OAUTH2
+iceberg.rest-catalog.oauth2.credential=<access_key_id>:<secret_access_key>
+iceberg.rest-catalog.oauth2.server-uri=http://lakefs:8000/mds/iceberg/api/v1/oauth/tokens
+iceberg.rest-catalog.vended-credentials-enabled=false
+iceberg.rest-catalog.nested-namespace-enabled=true
+# Trino's native Azure file system reads the files when the catalog does not vend credentials:
+fs.azure.enabled=true          # the newer name of the same switch is fs.native-azure.enabled
+azure.auth-type=ACCESS_KEY
+azure.access-key=<storage account key>
+# azure.endpoint=https://myaccount.blob.core.windows.net   # only for a non-public cloud
+```
+
+`azure.auth-type=ACCESS_KEY` takes the account from the table location
+(`abfss://<container>@<account>.dfs.core.windows.net/…`), so it needs no account property.
+`MANAGED_IDENTITY` (with `azure.managed-identity.client-id` for a user-assigned one) and `OAUTH`
+(with `azure.oauth2.*`) are the other auth types; `azure.endpoint` is required for a non-public
+cloud, as it is for the indexer.
+
 ### What was verified
 
 The end-to-end suite [`../esti/mds_test.go`](../esti/mds_test.go) runs the PyIceberg and DuckDB
@@ -674,6 +889,23 @@ columns - path, `size_bytes`, `commit_id` and `user_metadata` - so a row or a st
 other part file carries cannot pass, and `run-spark.sh --self-test` proves the gate on fabricated
 multi-file layouts without docker. The scripts' README records the exact commands and
 the environment they expect.
+
+On an **Azure blockstore** the suite [`../esti/mds_azure_test.go`](../esti/mds_azure_test.go) runs the
+same shape against Azurite (the `azurite` service of `esti/ops/docker-compose-mds.yaml`): three
+`orders/` objects in one commit, read back by PyIceberg with `adls.connection-string` and by DuckDB
+with a `TYPE azure` secret, on both catalog mounts, the four reads required to agree on path,
+`commit_id`, `etag` and `size_bytes`; the table's metadata location is asserted to be the
+`abfs://` form of the repository's namespace; a container-root namespace is refused with an error
+naming the container and no companion repository is created; and the R3S-3 spelling case is repeated
+with the `http`/`https` pair of one companion namespace. The indexer of that run is configured through
+`LAKEFS_METADATA_SEARCH_AZURE_*` environment variables alone (the generated configuration carries no
+Azure key), which is the Kubernetes pattern shown under [Azure Blob Storage](#azure-blob-storage).
+
+The **Azure snippets for Spark and Trino are not verified**: Trino's native Azure file system has no
+emulator mode, so neither could run against Azurite. They are documented from the engines' own
+configuration references, and verifying them against a real account is the operator step AZ7 in
+[`../METADATA_SEARCH_AZURE.md`](../METADATA_SEARCH_AZURE.md), which must run before the Azure support
+is called done. The PyIceberg and DuckDB Azure snippets are covered by the emulator case above.
 
 ## Columns and semantics
 
@@ -802,8 +1034,8 @@ reports `lag_commits` per branch.
 |---|---|
 | Repository name length | A data repository name is at most **54** characters. `R-metadata` must fit lakeFS's 63-character repository ID limit, and configuration validation rejects a longer name at startup. |
 | The `-metadata` suffix | A data repository whose name ends in `-metadata` cannot be indexed: `icebergcatalog.IsMetadataRepository` treats it as a companion repository. Validation rejects it. A repository that already exists under such a name is treated as a companion only when its data repository (the name without the suffix) exists; otherwise it stays an ordinary repository, and neither policy grants the indexer writes on it nor denies its users theirs (design §8). |
-| Bucket-root namespace | If `R`'s storage namespace is a bucket root (`s3://bucket`), the companion namespace cannot be derived. Set `metadata_search.repositories.<R>.storage_namespace` explicitly, for example `s3://bucket/metadata/my-repo`. |
-| Non-overlapping namespaces | `R-metadata`'s namespace must not be inside `R`'s namespace, nor `R`'s inside it. `R`'s uncommitted GC sweeps every unreferenced object under `R`'s prefix and would delete the metadata files. The indexer checks the pair on every tick, not only when it creates the companion repository, refuses such a configuration and marks the repository failed. |
+| Bucket-root namespace | If `R`'s storage namespace is a bucket root (`s3://bucket`), the companion namespace cannot be derived. Set `metadata_search.repositories.<R>.storage_namespace` explicitly, for example `s3://bucket/metadata/my-repo`. On Azure the first path segment is the **container**, so the same holds for a container root (`https://myaccount.blob.core.windows.net/data`) and the refusal names the container; a prefix inside a container derives a companion name inside that container (`…/data/esti-metadata`). |
+| Non-overlapping namespaces | `R-metadata`'s namespace must not be inside `R`'s namespace, nor `R`'s inside it. `R`'s uncommitted GC sweeps every unreferenced object under `R`'s prefix and would delete the metadata files. The indexer checks the pair on every tick, not only when it creates the companion repository, refuses such a configuration and marks the repository failed. On Azure the `http://` and `https://` spellings of one container and prefix are the same prefix, and the check normalises the scheme, so a companion cannot hide behind the other spelling. |
 | First-parent only | Only first-parent history is indexed and addressable. A commit that exists only on a merged side branch has no `mds-*` tag. |
 | Indexed branches only | Branches that do not match `branches` have no rows and no virtual table. Adding a branch to the configuration later indexes it from its head (or history, per `backfill`/`since`). |
 | One row per object | No change history is stored in the table; `commit_id` is the last change. |
@@ -815,7 +1047,8 @@ reports `lag_commits` per branch.
 | Structured metadata only | There is no full-text, vector or JSON-path search. `user_metadata` is a map of strings, queryable with the engine's map functions. |
 | Companion table identity | The catalog serves `my-repo.<ref>.system.object_metadata` only when **both** proofs hold: the companion table's `lakefs.mds.repository` property names `my-repo`, and the served ref's first-parent history carries the indexer's `mds: init` commit (`lakefs.mds.init=true`), committed by `mds-indexer` and positioned as the first commit directly above the repository's root commit — or, for a companion repository created **bare**, as the root commit itself. The property alone is a document anyone who can create `my-repo-metadata` can write, and the message and metadata of a commit are supplied by its author; the committer and the position are what the indexer's own initialisation has and a look-alike commit does not. A repository named `my-repo-metadata` that the indexer did not create — the name is taken by an ordinary repository — answers `404 NoSuchTableException` on the virtual address instead of serving someone else's rows (design §5.1). A bare companion is served like a non-bare one: its `mds: init` commit is the branch's first commit and has no parent, which the indexer always accepted (design §4.8) and the catalog now accepts too (commit `30af7b3a5`); an init commit by a committer other than `mds-indexer`, and an init commit with another commit between it and the root, are still refused. **The committer is reserved:** the commit-record API answers `403` to a caller other than `mds-indexer` that asks for a commit record whose committer is `mds-indexer` (commit `2a822c719`), so a principal holding `fs:CreateCommit` on the repository ARN can no longer mint the proof; the boundary that remains is `LoadCommits`, which `lakectl refs-restore` uses and which copies commit records verbatim without going through that endpoint (design §5.1). The history check walks the first-parent log newest to root, one 256-commit page at a time (the initialisation commit is the oldest non-root commit, or the root of a bare companion); the commit it finds is cached per companion repository, and a later head is checked only back to that commit or to a head already verified, so an unchanged branch pays nothing and a branch that moved pays for its new commits. The cache holds at most 1024 repositories. |
 | Companion repository must be writable | `my-repo-metadata` must not be created with `read_only: true`, and a branch-protection rule must not block `COMMIT` or `STAGING_WRITE` on its branches. A read-only companion repository is detected from the repository record and fails at the repository level, once per tick (design §3.3). A protection rule is not reported on the repository record, so it is diagnosed at the first write the tick attempts — the catalog's `CreateTable` during the initialisation included — and is reported **per branch**: `/my-repo/_health` stays `503`, each refused branch carries a `last_error` naming the family and increments `errors_total{stage="branch"}`, and the repository's own `last_error` stays empty. The message names branch protection and the read-only flag only when lakeFS's own wording is in the cause; an authorization refusal (for example a companion repository the policy refresher has not covered yet) keeps the same family with neutral wording that names branch protection, `read_only` and the indexer's permissions as the candidates, instead of the bare `403` this used to be. |
-| Azure and GCS | Out of scope for this version: no credential vending and no remote signing. Static `storage` properties may work; they are not tested. |
+| Azure Blob Storage | Supported, with limits that are decisions: a table's location is `abfs[s]://<container>@<account>.<dfs domain>/…` - `wasb[s]://` is never emitted and not accepted as a new location (N4) - the indexer writes it with its own Azure credentials, and the `http`/`https` spellings of one namespace are treated as the same prefix. Credential vending and remote signing are **S3-only** (N1) - an engine uses its own Azure `FileIO` - the web UI object search is **S3-only** (N3), and `iceberg.azure.location_host: blob` is the server-wide switch for an engine whose Hadoop ABFS driver refuses a non-HNS account on the `dfs` host. See [Azure Blob Storage](#azure-blob-storage). |
+| GCS | Out of scope (N2): `gs://` needs no location translation, but the indexer registers no GCS IO, so a GCS blockstore cannot be indexed in this version. |
 | One indexer replica | Run exactly one. A second replica does duplicate work and gets `409` responses; it does not corrupt the table. |
 | No UI, no server-side SQL | OSS has no Metadata Search tab and no SQL endpoint. Queries run in the engine that connects to the catalog (PyIceberg, DuckDB, Spark, Trino). Option B is future work (see [`Option B`](#option-b-outlook)). |
 

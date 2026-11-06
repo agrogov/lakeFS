@@ -30,6 +30,12 @@ The catalog is off by default. `iceberg.enabled: true` mounts `/iceberg/api` and
   `<repo>.<ref>.system.object_metadata`, reserve the `system` namespace of data repositories, and
   mount the catalog at `/mds/iceberg/api`. The server reads no other Metadata Search key; the
   indexer reads no other server key. Environment: `LAKEFS_ICEBERG_METADATA_SEARCH_ENABLED`.
+* `iceberg.azure.location_host` `(one of ["dfs"|"blob"] : "dfs")` - the service part of the host of
+  a translated Azure table location: `abfss://<container>@<account>.dfs.core.windows.net/…` by
+  default, or `…@<account>.blob.core.windows.net/…` when set to `blob`, for an engine whose Hadoop
+  ABFS driver refuses a non-HNS account over the `dfs` host. The scheme stays `abfs[s]`. It changes
+  what every engine sees, so it is one server-wide setting.
+  Environment: `LAKEFS_ICEBERG_AZURE_LOCATION_HOST`.
 
 ## Metadata Search indexer (`metadata_search`)
 
@@ -75,7 +81,28 @@ are required; every other key has a default.
 * `metadata_search.storage` `(map<string,string> : )` - Optional iceberg-go IO properties used when
   the catalog does not vend write credentials. Recognised keys for S3:
   `s3.endpoint`, `s3.region`, `s3.access-key-id`, `s3.secret-access-key`, `s3.path-style-access`.
-  Azure and GCS are out of scope for this version.
+  For Azure, an explicit `adls.*` key wins over the one `metadata_search.azure` translates; GCS is
+  not supported (no GCS IO is registered).
+* `metadata_search.azure` `(section : )` - Optional. Azure credentials and endpoint of the indexer's
+  IO when the blockstore is Azure. Scalar end to end, so every key below is also an environment
+  variable, which is what makes a Kubernetes secret usable; the indexer never reads
+  `blockstore.azure.*`. With none of them set, iceberg-go uses `DefaultAzureCredential` (workload
+  identity, managed identity, Azure CLI).
+  * `metadata_search.azure.storage_account` `(string : )` - storage account name; required for the
+    shared key. Environment: `LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCOUNT`.
+  * `metadata_search.azure.storage_access_key` `(string : )` - the account's shared key. Setting it
+    without `storage_account` is a validation error. Environment:
+    `LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCESS_KEY`.
+  * `metadata_search.azure.use_managed_identity` `(bool : false)` - use a managed identity instead of
+    the credential chain. Environment: `LAKEFS_METADATA_SEARCH_AZURE_USE_MANAGED_IDENTITY`.
+  * `metadata_search.azure.client_id` `(string : )` - user-assigned managed identity client ID.
+    Environment: `LAKEFS_METADATA_SEARCH_AZURE_CLIENT_ID`.
+  * `metadata_search.azure.endpoint` `(string : )` - storage domain iceberg-go builds its service URL
+    from (for example `blob.core.windows.net`). Required for any cloud but the public one, and for
+    Azurite, because iceberg-go ignores the domain in the table location. Environment:
+    `LAKEFS_METADATA_SEARCH_AZURE_ENDPOINT`.
+  * `metadata_search.azure.protocol` `(one of ["http"|"https"] : "https")` - the scheme of that
+    service URL. Environment: `LAKEFS_METADATA_SEARCH_AZURE_PROTOCOL`.
 * `metadata_search.repositories` `(map<string,RepositoryConfig> : )` - **Required.** Data
   repositories to index, by repository name. At least one entry.
 * `metadata_search.repositories.<R>.branches` `(list<string> : )` - **Required.** Branch selectors:
@@ -113,6 +140,10 @@ metadata_search:
     s3.access-key-id: ...
     s3.secret-access-key: ...
     s3.path-style-access: "true"
+  # azure:                                   # on an Azure blockstore, instead of line-for-line adls.* keys
+  #   storage_account: myaccount
+  #   storage_access_key: ...                # or use_managed_identity: true
+  #   endpoint: blob.core.windows.net        # required off the public cloud, and for Azurite
   repositories:
     my-repo:
       branches: [main, "dev-*"]
@@ -128,7 +159,8 @@ per problem. Invalid: an empty endpoint, access key or secret; `period`, `concur
 `max_commits`, `seed_lookback` or `rebuild_threshold` not positive; an unknown `backfill`; an empty
 `repositories` map or empty `branches` list; a data repository name that ends in `-metadata` or is
 longer than 54 characters; a branch selector that is empty or has a `*` that is not trailing; a
-`since` that is not RFC 3339.
+`since` that is not RFC 3339; an `azure.storage_access_key` without `azure.storage_account`; an
+`azure.protocol` that is neither `http` nor `https`.
 
 Per-repository runtime errors (repository missing, `R-metadata` namespace not derivable or
 overlapping) are reported in `/_health` and the metrics, and the remaining repositories continue.

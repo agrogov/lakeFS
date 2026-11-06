@@ -138,9 +138,9 @@ Every snapshot the indexer produces also carries `lakefs.mds.source-commit` in i
 | Name | `R + "-metadata"` (`icebergcatalog.MetadataRepositorySuffix`). `R` longer than 54 characters cannot be indexed (repository IDs are at most 63 characters); config validation rejects it. A data repository whose own name ends in `-metadata` cannot be indexed either (`icebergcatalog.IsMetadataRepository` treats it as a companion). |
 | Default branch | same name as `R`'s default branch |
 | Storage ID | same as `R` |
-| Storage namespace | `repositories.<R>.storage_namespace` if set; else `<R namespace without trailing "/">-metadata` **only if** `R`'s namespace has a path component (`s3://bucket/path` → `s3://bucket/path-metadata`). A bucket-root namespace (`s3://bucket`) requires an explicit value. The namespace must **not** be inside `R`'s namespace (nor `R`'s inside it): `R`'s uncommitted GC sweeps every unreferenced object under `R`'s prefix and would delete `R-metadata`'s files. Checked on every tick, not only when the companion repository is created, with the same `"/"`-normalised prefix test the GC uses (`normalizeStorageNamespace`): a companion repository that already exists with an overlapping namespace (created earlier, by hand, by a replica with another namespace, or because `R`'s namespace moved) is refused - that repository is marked failed in `/_health` and metrics - instead of indexed (commit `7ec4ebec7`). |
+| Storage namespace | `repositories.<R>.storage_namespace` if set; else `<R namespace without trailing "/">-metadata` **only if** `R`'s namespace has a path component (`s3://bucket/path` → `s3://bucket/path-metadata`). A bucket-root namespace (`s3://bucket`) requires an explicit value. **Azure** (`METADATA_SEARCH_AZURE.md` D4): the first path segment is the container, so `https://acct.blob.core.windows.net/data` is a container root and requires the explicit value too - the derived name would be a container that does not exist - while `…/data/esti` derives `…/data/esti-metadata`, in the same container. The split is `block.NamespaceRoot(namespace)`, the one helper the indexer and the bootstrap's deny both call, so they cannot disagree about where a namespace's root is. The namespace must **not** be inside `R`'s namespace (nor `R`'s inside it): `R`'s uncommitted GC sweeps every unreferenced object under `R`'s prefix and would delete `R-metadata`'s files. Checked on every tick, not only when the companion repository is created, with the same `"/"`-normalised prefix test the GC uses (`normalizeStorageNamespace`): a companion repository that already exists with an overlapping namespace (created earlier, by hand, by a replica with another namespace, or because `R`'s namespace moved) is refused - that repository is marked failed in `/_health` and metrics - instead of indexed (commit `7ec4ebec7`). On Azure an `http://` and an `https://` spelling name the same container and prefix, and the overlap test normalises the scheme before it compares, so a companion cannot hide behind the other spelling. |
 | Read-only flag | **not** set: catalog writes never pass `graveler.WithForce`, so a read-only repository would also block the indexer. User writes are blocked by a deny policy instead (section 8). The indexer requires the flag to be false: a companion repository lakeFS reports read-only is refused at the repository level - once per tick, with `ErrReadOnlyMetadataRepository`, before any branch is touched (commit `f884a0627`). Branch protection is diagnosed separately, because the lakeFS API does not report protection rules on the repository record: a rule that blocks `COMMIT` or `STAGING_WRITE` on a companion branch is answered at the first write the tick attempts (`Commit`, `ResetBranch` and `HardResetBranch`, and the catalog's table writes, the initialisation's `CreateTable` included) with the same `ErrReadOnlyMetadataRepository` family, so a bare 403 never reaches `/_health` (commits `da24d421f`, `2ae794038`). The refusal is reported **per branch**, not per repository: every branch whose first write lakeFS refuses carries the family in its `last_error` and increments `errors_total{stage="branch"}`, the repository's own `last_error` stays empty and `/_health` is 503 either way - three protected branches are three branch errors per tick, not one repository-level error (MDS_REVIEW_3 R3I-4, commit `2ae794038`). The message claims branch protection and the read-only flag only when lakeFS's own wording is in the wrapped cause (`cannot commit to protected branch`, `cannot write to protected branch`, `read-only repository`); any other forbidden answer - an authorization failure is answered 401 by default, and the mds client collapses 401 and 403 into one sentinel - stays in the family but names the three candidates (the branch's protection rules, the repository's `read_only` flag and the indexer principal's own permissions) without the destructive "create the repository with read_only=false" advice (MDS_REVIEW_3 R3I-1, commit `2ae794038`). A `STAGING_WRITE` rule present before the first tick is refused one step **before** the initialisation commit, at the catalog's `CreateTable`, and is mapped into the same family and message there (MDS_REVIEW_3 R3I-2, commit `2ae794038`). |
-| Contents | namespace `system`, table `system.object_metadata` (pointer under `_lakefs_iceberg/tables/…`, files under `<ns>/_iceberg/<table-uuid>/`). No other bookkeeping objects. |
+| Contents | namespace `system`, table `system.object_metadata` (pointer under `_lakefs_iceberg/tables/…`, files under `<ns>/_iceberg/<table-uuid>/`). No other bookkeeping objects. On an Azure blockstore `<ns>/_iceberg/…` is spelled `abfs[s]://<container>@<account>.<dfs host>/…`, the Iceberg form the catalog derives from the namespace (D1, §4.6); the pointer carries that form as its `iceberg.metadata-location`, while the lakeFS entries that record a file's physical address keep the block adapter's `http(s)://` spelling (D2). |
 | Commits | one lakeFS commit per indexed commit of `R`, message `mds: index <R>@<commit>`, metadata `lakefs.mds.source-commit=<commit>`, `lakefs.mds.source-repository=<R>`. |
 | Initialisation | the initialisation commit carries message `mds: init` and metadata `lakefs.mds.init=true`. It is the first commit after lakeFS's automatic `Repository created` root that a non-bare `CreateRepository` writes; for a companion repository created bare it is the root itself. A repository whose whole history is that automatic root is initialised by adding the namespace, table and `mds: init` commit on top (section 4.8). |
 | Tags | `mds-<full commit ID of R>` on the lakeFS commit that recorded it (section 6). |
@@ -357,10 +357,44 @@ The catalog stages client-written files; the indexer must write Parquet and Avro
   `X-Iceberg-Access-Delegation: vended-credentials` (the iceberg-go REST default) and needs nothing else.
 - Otherwise `metadata_search.storage` supplies iceberg-go IO properties (`s3.endpoint`, `s3.region`,
   `s3.access-key-id`, `s3.secret-access-key`, `s3.path-style-access`), passed with `rest.WithAdditionalProps`.
-  This is the mode used by esti (SeaweedFS, static keys).
+  This is the mode used by esti (SeaweedFS, static keys). An explicit key here wins over the translated one below.
+- On an Azure blockstore, `metadata_search.azure` supplies them (next paragraph).
 
-Azure/GCS are out of scope for A (no vending, no signer); with static `storage` properties for those schemes it may
-work, but it is not tested.
+**Azure (`METADATA_SEARCH_AZURE.md` D3).** The companion table's location on an Azure blockstore is
+`abfs[s]://<container>@<account>.<dfs host>/…` (§3.3), so the indexer needs an IO backend that opens
+that scheme: `pkg/mds/table/catalog.go` blank-imports iceberg-go's `io/gocloud/azure` next to
+`…/s3`, which registers `abfs`, `abfss`, `wasb` and `wasbs`. Without it the client would answer
+"unsupported scheme" for a location the catalog itself just handed out.
+
+`metadata_search.storage` keeps its meaning (raw iceberg-go IO properties; an explicit key wins). What
+is new is the scalar section `metadata_search.azure`, read through the env overrides of
+`applyViperOverrides` so that every key is also a `LAKEFS_METADATA_SEARCH_AZURE_*` environment
+variable - `storage` is a map and is read from the file only, and an Azure deployment's key usually
+lives in a Kubernetes secret. Each key is translated into the `adls.*` IO property of the same
+meaning, and only a key that is set is translated (an empty value means iceberg-go's own default):
+
+| Key | Env var | iceberg-go property |
+|---|---|---|
+| `storage_account` | `LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCOUNT` | `adls.auth.shared-key.account.name` |
+| `storage_access_key` | `LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCESS_KEY` | `adls.auth.shared-key.account.key` |
+| `use_managed_identity` | `LAKEFS_METADATA_SEARCH_AZURE_USE_MANAGED_IDENTITY` | `adls.auth.managed-identity.enabled` |
+| `client_id` | `LAKEFS_METADATA_SEARCH_AZURE_CLIENT_ID` | `adls.client-id` |
+| `endpoint` | `LAKEFS_METADATA_SEARCH_AZURE_ENDPOINT` | `adls.endpoint` |
+| `protocol` | `LAKEFS_METADATA_SEARCH_AZURE_PROTOCOL` | `adls.protocol` |
+
+With none of them set, iceberg-go falls back to `DefaultAzureCredential` (workload identity,
+`AZURE_CLIENT_ID`/`AZURE_TENANT_ID`/`AZURE_FEDERATED_TOKEN_FILE`, a managed identity, CLI), so a pod
+with a federated identity needs no secret at all. `endpoint` is required for any cloud but the public
+one and for Azurite, because iceberg-go ignores the storage domain in the location and builds its
+service URL from `adls.endpoint` (apache/iceberg-go#2311). `Validate` refuses `storage_access_key`
+without `storage_account` - iceberg-go would refuse the pair later, at the first write, with a less
+useful error - and refuses a `protocol` other than `http`/`https`. The indexer deliberately does
+**not** read `blockstore.azure.*`: it is a separate process with its own lakeFS credentials and its
+own Azure identity, and silently borrowing the server's storage key would hide a misconfiguration of
+that identity. The deployment mounts the same secret under both name sets instead.
+
+GCS is out of scope (N2): `gs://` needs no location translation and every FileIO opens it, but this
+build registers no GCS IO on the indexer and nothing here is tested on GCS.
 
 ### 4.7 History rewrites (hard reset, revert-by-reset, force-moved branches)
 
@@ -847,7 +881,8 @@ Two further write paths into a companion repository are covered explicitly (comm
 - `fs:AttachStorageNamespace` is denied on the `arn:lakefs:fs:::namespace/<namespace>` ARNs of every companion
   repository that exists in the catalog: the namespace's stored spelling and the trailing-slash spellings
   `CreateRepository` accepts for the same physical prefix, up to three ARNs per companion and four for a
-  bucket-root namespace. `CreateRepository` checks `fs:CreateRepository` on the repository ARN and
+  bucket-root namespace - and, on Azure, four per companion prefix and six for a container root (see below).
+  `CreateRepository` checks `fs:CreateRepository` on the repository ARN and
   `fs:AttachStorageNamespace` on the namespace, the ARN is the raw string the client sent, lakeFS does not require
   a namespace to be unique, and the block layer resolves a trailing `/` away, so a single exact ARN of the stored
   spelling left the other spellings of the same prefix to a guard-group member with `fs:*`, who could create
@@ -857,6 +892,16 @@ Two further write paths into a companion repository are covered explicitly (comm
   namespace below the companion's - the over-match the exact ARNs avoid (MDS_REVIEW_3 R3S-3, commit `9135602ea`).
   The pattern `namespace/*-metadata` stays in the allow, because a companion that does not exist yet has no
   namespace to name.
+
+  **Azure (METADATA_SEARCH_AZURE.md D4)** grows that enumeration two ways. (a) Every spelling above also gets its
+  **other-scheme twin**: the adapter's validity regex accepts `http://` and `https://`, and both name the same
+  container and prefix, so a deny that named only the stored spelling would leave the same physical prefix to a
+  guard-group member with `fs:*`. (b) The `//` bucket-root spelling belongs to the **container root**, not to the
+  host, because `block.NamespaceRoot` treats the first path segment of an Azure namespace as the container: a
+  companion prefix gets **four** ARNs (two normalised spellings times two schemes), a container root **six** (the
+  three spellings of each scheme). `block.NamespaceRoot` is the one split this deny and the indexer's
+  `metadataNamespace` both call, so they cannot disagree about where a namespace's root is, and the overlap test of
+  §3.3 normalises the scheme the same way. S3, GS, mem and local keep exactly the ARNs they had.
 
 The catalog's ownership proof trusts the committer `mds-indexer` (§5.1), so the API reserves that name rather
 than leaving it to the deny above: `POST /repositories/{repository}/commits` (`CreateCommitRecord`) authorizes
