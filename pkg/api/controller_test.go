@@ -42,6 +42,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/config"
 	"github.com/treeverse/lakefs/pkg/graveler"
 	"github.com/treeverse/lakefs/pkg/httputil"
+	"github.com/treeverse/lakefs/pkg/ident"
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/permissions"
 	"github.com/treeverse/lakefs/pkg/stats"
@@ -7041,6 +7042,97 @@ func TestController_CreateCommitRecord(t *testing.T) {
 		if resp.StatusCode() != http.StatusConflict {
 			t.Fatalf("Expected 409 (conflict) response, got %s", resp.Status())
 		}
+	})
+}
+
+// TestController_CreateCommitRecordReservedIndexerCommitter pins MDS_REVIEW_3 R3S-1's residual:
+// the catalog's ownership proof for a companion repository trusts the commit's committer
+// (pkg/icebergcatalog/resolver.go isMetadataSearchInitCommit), and CreateCommitRecord takes that
+// committer from the request body. A principal that holds only fs:CreateCommit on a repository -
+// not the indexer's own credentials - must not be able to mint a commit record attributed to
+// mds-indexer. The indexer itself, and an ordinary principal recording its own committer, must
+// still be able to.
+func TestController_CreateCommitRecordReservedIndexerCommitter(t *testing.T) {
+	_, deps := setupHandler(t)
+	ctx := t.Context()
+	repo := testUniqueRepoName()
+	_, err := deps.catalog.CreateRepository(ctx, repo, config.SingleBlockstoreID, onBlock(deps, repo), "main", false)
+	testutil.Must(t, err)
+
+	// A real ACL service is the only in-repo auth service that stores several users: the legacy
+	// BasicAuthService keeps one administrator, so it cannot represent a non-indexer principal
+	// alongside the indexer.
+	authService := newACLAuthService(t)
+	const (
+		nonIndexer = "commit-record-writer"
+		indexer    = "mds-indexer"
+	)
+	// Deliberately only fs:CreateCommit on the repository ARN: that is the exact grant
+	// CreateCommitRecord checks, and no indexer policy is involved.
+	scopedWrite := model.Statements{{
+		Effect:   model.StatementEffectAllow,
+		Action:   []string{permissions.CreateCommitAction},
+		Resource: permissions.RepoArn(repo),
+	}}
+	createUserWithPolicy(t, authService, nonIndexer, "CommitRecordWriter", scopedWrite)
+	createUserWithPolicy(t, authService, indexer, "CommitRecordIndexer", scopedWrite)
+	controller := internalACLController(t, deps, authService)
+
+	const (
+		forgedMetadataKey = "lakefs.mds.init"
+		forgedMessage     = "mds: init"
+		forgedMetaRangeID = "metarangeId"
+	)
+	// Commit records are content-addressed (pkg/graveler/graveler.go Commit.Identity), so the
+	// request's CommitId has to be the address of the rest of the request body.
+	commitRecordID := func(committer string) string {
+		return ident.NewHexAddressProvider().ContentAddress(graveler.Commit{
+			Committer:    committer,
+			Message:      forgedMessage,
+			MetaRangeID:  forgedMetaRangeID,
+			CreationDate: time.Unix(1e9, 0).UTC(),
+			Metadata:     map[string]string{forgedMetadataKey: "true"},
+			Parents:      graveler.CommitParents{},
+		})
+	}
+	newCommit := func(commitID, committer string) apigen.CreateCommitRecordJSONRequestBody {
+		return apigen.CreateCommitRecordJSONRequestBody{
+			CommitId:     commitID,
+			Committer:    committer,
+			CreationDate: 1e9,
+			Generation:   1,
+			Message:      forgedMessage,
+			Metadata: &apigen.CommitRecordCreation_Metadata{
+				AdditionalProperties: map[string]string{forgedMetadataKey: "true"},
+			},
+			MetarangeId: forgedMetaRangeID,
+			Parents:     []string{},
+			Version:     1,
+		}
+	}
+	createRecord := func(username, commitID, committer string) int {
+		req := httptest.NewRequest(http.MethodPost, "/repositories/"+repo+"/commits", nil)
+		req = req.WithContext(auth.WithUser(req.Context(), &model.User{Username: username}))
+		recorder := httptest.NewRecorder()
+		controller.CreateCommitRecord(recorder, req, newCommit(commitID, committer), repo)
+		return recorder.Code
+	}
+
+	forgedCommitID := commitRecordID(indexer)
+	t.Run("non-indexer cannot mint the indexer's committer", func(t *testing.T) {
+		require.Equal(t, http.StatusForbidden, createRecord(nonIndexer, forgedCommitID, indexer))
+		_, err := deps.catalog.GetCommit(ctx, repo, forgedCommitID)
+		require.Error(t, err, "a refused commit record must not be stored")
+	})
+
+	t.Run("indexer can record its own committer", func(t *testing.T) {
+		require.Equal(t, http.StatusNoContent, createRecord(indexer, forgedCommitID, indexer),
+			"the refusal must not have stored the forged record, and the indexer itself is not refused")
+	})
+
+	t.Run("non-indexer can record its own committer", func(t *testing.T) {
+		ownCommitID := commitRecordID(nonIndexer)
+		require.Equal(t, http.StatusNoContent, createRecord(nonIndexer, ownCommitID, nonIndexer))
 	})
 }
 

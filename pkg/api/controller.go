@@ -3533,6 +3533,18 @@ func (c *Controller) Commit(w http.ResponseWriter, r *http.Request, body apigen.
 	commitResponse(w, r, newCommit)
 }
 
+// metadataSearchIndexerPrincipal is the user the Metadata Search indexer commits as
+// (METADATA_SEARCH_DESIGN.md §8). The catalog's ownership proof for a companion repository
+// (pkg/icebergcatalog/resolver.go, isMetadataSearchInitCommit) trusts the committer of the
+// initialisation commit, while CreateCommitRecord takes that committer from the request body.
+// The check below reserves the name for that principal only, so holding fs:CreateCommit on a
+// repository is not enough to mint a commit attributed to the indexer and satisfy the proof.
+//
+// The literal is restated here rather than imported: pkg/api cannot import pkg/mds/bootstrap,
+// because bootstrap imports cmd/lakefs/cmd, which imports this package. Design §8 pins the
+// spelling.
+const metadataSearchIndexerPrincipal = "mds-indexer"
+
 func (c *Controller) CreateCommitRecord(w http.ResponseWriter, r *http.Request, body apigen.CreateCommitRecordJSONRequestBody, repository string) {
 	if !c.authorize(w, r, permissions.Node{
 		Permission: permissions.Permission{
@@ -3544,9 +3556,23 @@ func (c *Controller) CreateCommitRecord(w http.ResponseWriter, r *http.Request, 
 	}
 	ctx := r.Context()
 	c.LogAction(ctx, "create_commit_record", r, repository, body.CommitId, "")
-	_, err := auth.GetUser(ctx)
+	user, err := auth.GetUser(ctx)
 	if err != nil {
 		writeError(w, r, http.StatusUnauthorized, "missing user")
+		return
+	}
+	// The committer is client-supplied and the indexer's name is load-bearing for authorization
+	// (see the constant above), MDS_REVIEW_3 R3S-1's residual. Refuse that name to every other
+	// caller; other committers are not checked, so recording historical commits is unchanged.
+	if body.Committer == metadataSearchIndexerPrincipal &&
+		(user == nil || user.Username != metadataSearchIndexerPrincipal) {
+		username := ""
+		if user != nil {
+			username = user.Username
+		}
+		writeError(w, r, http.StatusForbidden, fmt.Sprintf(
+			"committer %q is reserved for that principal; authenticated user %q may not create a commit record attributed to it",
+			metadataSearchIndexerPrincipal, username))
 		return
 	}
 	err = c.Catalog.CreateCommitRecord(ctx, repository, body.CommitId, body.Version, body.Committer, body.Message, body.MetarangeId, body.CreationDate, body.Parents, body.Metadata.AdditionalProperties, int32(body.Generation), graveler.WithForce(swag.BoolValue(body.Force))) //nolint:gosec

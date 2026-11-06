@@ -148,10 +148,11 @@ const (
 	// write the marker and the message. The literal is restated here for the same reason as the
 	// marker above: this package must not import pkg/mds.
 	//
-	// Residual, and deliberately not closed here: a principal with fs:CreateCommit on R-metadata
-	// can call lakeFS's CreateCommitRecord with any committer string, so it can still forge an
-	// init commit attributed to this principal. Closing that is a lakeFS authorization design
-	// decision, not something the catalog can prove from the commit record.
+	// CreateCommitRecord now reserves this committer for this principal: pkg/api/controller.go
+	// refuses a commit record whose committer is this literal unless the authenticated caller is
+	// `mds-indexer`, so holding only fs:CreateCommit on R-metadata no longer mints the proof. The
+	// catalog still cannot tell how a commit record was written; a path that does not pass through
+	// CreateCommitRecord (refs-restore's LoadCommits) is outside that check.
 	MetadataSearchIndexerPrincipal = "mds-indexer"
 
 	metadataSearchInitPageSize = 256
