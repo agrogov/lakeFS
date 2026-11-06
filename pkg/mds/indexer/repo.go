@@ -14,9 +14,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/apache/iceberg-go/catalog/rest"
+	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/mds/client"
@@ -519,7 +521,11 @@ func (x *Indexer) walkFirstParent(ctx context.Context, repository, branch string
 //
 //   - an explicit metadata_search.repositories.<R>.storage_namespace is used as it is;
 //   - otherwise R's namespace with "-metadata" appended, and only when R's namespace has a path
-//     component: a bucket-root namespace (s3://bucket) needs the explicit value;
+//     component below its root: a bucket-root namespace (s3://bucket) needs the explicit value, and
+//     so does an Azure container-root namespace (https://acct.blob.core.windows.net/container), whose
+//     first path segment is the container and not a prefix to derive from
+//     (METADATA_SEARCH_AZURE D4, block.NamespaceRoot). The derived companion stays in the same
+//     container, because the suffix is appended to R's own path;
 //   - the result must not be inside R's namespace nor contain it, because R's uncommitted GC
 //     sweeps every unreferenced object under R's prefix and would delete R-metadata's files.
 func metadataNamespace(repository, dataNamespace, configured string) (string, error) {
@@ -529,7 +535,15 @@ func metadataNamespace(repository, dataNamespace, configured string) (string, er
 		if dataNamespace == "" {
 			return "", fmt.Errorf("%w: repository %q has no storage namespace", ErrBucketRootNamespace, repository)
 		}
-		if !namespaceHasPath(dataNamespace) {
+		root, path, err := block.NamespaceRoot(dataNamespace)
+		if err != nil {
+			return "", fmt.Errorf("storage namespace %q of repository %q: %w", dataNamespace, repository, err)
+		}
+		if path == "" {
+			if container, ok := azureContainerOfRoot(root); ok {
+				return "", fmt.Errorf("%w: %q of repository %q is a container root (container %q), set metadata_search.repositories.%s.storage_namespace",
+					ErrBucketRootNamespace, dataNamespace, repository, container, repository)
+			}
 			return "", fmt.Errorf("%w: %q of repository %q is a bucket root, set metadata_search.repositories.%s.storage_namespace",
 				ErrBucketRootNamespace, dataNamespace, repository, repository)
 		}
@@ -540,6 +554,26 @@ func metadataNamespace(repository, dataNamespace, configured string) (string, er
 			ErrOverlappingNamespace, namespace, metadataRepository(repository), dataNamespace, repository)
 	}
 	return namespace, nil
+}
+
+// azureContainerOfRoot returns the container an Azure root names, for the refusal above to name it.
+// block.NamespaceRoot returns "<scheme>://<host>/<container>" for an Azure namespace and
+// "<scheme>://<host>" for every other blockstore, so a root is Azure's when it parses to the Azure
+// storage type, and its container is then its only path segment.
+func azureContainerOfRoot(root string) (string, bool) {
+	parsed, err := url.Parse(root)
+	if err != nil {
+		return "", false
+	}
+	storageType, err := block.GetStorageType(parsed)
+	if err != nil || storageType != block.StorageTypeAzure {
+		return "", false
+	}
+	container := strings.Trim(parsed.Path, "/")
+	if container == "" {
+		return "", false
+	}
+	return container, true
 }
 
 // verifyMetadataNamespace refuses a companion repository whose existing storage namespace overlaps
@@ -553,30 +587,35 @@ func verifyMetadataNamespace(repository, metadata, dataNamespace, metaNamespace 
 		ErrOverlappingNamespace, metaNamespace, metadata, dataNamespace, repository)
 }
 
-// namespaceHasPath reports whether a storage namespace has a path component after its bucket or
-// host: s3://bucket has none, s3://bucket/path has "path".
-func namespaceHasPath(namespace string) bool {
-	rest := namespace
-	if scheme := strings.Index(rest, "://"); scheme >= 0 {
-		rest = rest[scheme+len("://"):]
-	}
-	slash := strings.IndexByte(rest, '/')
-	if slash < 0 {
-		return false
-	}
-	return strings.Trim(rest[slash:], "/") != ""
-}
-
 // overlapsStorageNamespace reports whether one storage namespace contains the other, with the
 // "/"-normalised prefix test the uncommitted GC uses (pkg/catalog/gc_write_uncommitted.go,
 // normalizeStorageNamespace): a prefix only counts when it ends on a path boundary.
+//
+// On Azure the scheme is not part of the physical address: the block adapter accepts http and https
+// for the same container and prefix (METADATA_SEARCH_AZURE D4), so an http companion namespace and
+// an https data namespace over the same prefix do overlap, and the comparison drops the scheme of
+// both before it tests the prefix. The namespaces themselves stay as stored; only the comparison is
+// scheme-neutral, and only for http(s) - every other blockstore's scheme is part of its address.
 func overlapsStorageNamespace(namespace, other string) bool {
 	if namespace == "" || other == "" {
 		return false
 	}
-	normalized := normalizeNamespace(namespace)
-	otherNormalized := normalizeNamespace(other)
+	normalized := normalizeNamespace(schemeNeutralNamespace(namespace))
+	otherNormalized := normalizeNamespace(schemeNeutralNamespace(other))
 	return strings.HasPrefix(normalized, otherNormalized) || strings.HasPrefix(otherNormalized, normalized)
+}
+
+// schemeNeutralNamespace drops the scheme of an Azure (http or https) namespace, whose two
+// spellings name the same container and prefix. Any other namespace is returned as it is.
+func schemeNeutralNamespace(namespace string) string {
+	switch {
+	case strings.HasPrefix(namespace, "https://"):
+		return strings.TrimPrefix(namespace, "https://")
+	case strings.HasPrefix(namespace, "http://"):
+		return strings.TrimPrefix(namespace, "http://")
+	default:
+		return namespace
+	}
 }
 
 // normalizeNamespace appends the path delimiter the GC's prefix test expects.

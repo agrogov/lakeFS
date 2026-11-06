@@ -93,6 +93,39 @@ func TestMetadataNamespace(t *testing.T) {
 			configured:    "s3://bucket/data-metadata",
 			want:          "s3://bucket/data-metadata",
 		},
+		{
+			name:          "azure path derives the companion in the same container",
+			dataNamespace: "https://acct.blob.core.windows.net/data/repo",
+			want:          "https://acct.blob.core.windows.net/data/repo-metadata",
+		},
+		{
+			name:          "azure container root cannot be derived",
+			dataNamespace: "https://acct.blob.core.windows.net/data",
+			wantErr:       indexer.ErrBucketRootNamespace,
+		},
+		{
+			name:          "azure container root with the http scheme cannot be derived",
+			dataNamespace: "http://acct.azurite.test/data",
+			wantErr:       indexer.ErrBucketRootNamespace,
+		},
+		{
+			name:          "azure container root with an explicit namespace is fine",
+			dataNamespace: "https://acct.blob.core.windows.net/data",
+			configured:    "https://acct.blob.core.windows.net/index/repo-metadata",
+			want:          "https://acct.blob.core.windows.net/index/repo-metadata",
+		},
+		{
+			name:          "azure companion that contains the data namespace overlaps",
+			dataNamespace: "https://acct.blob.core.windows.net/data/repo",
+			configured:    "https://acct.blob.core.windows.net/data",
+			wantErr:       indexer.ErrOverlappingNamespace,
+		},
+		{
+			name:          "azure companion on the other scheme of the data prefix overlaps",
+			dataNamespace: "https://acct.blob.core.windows.net/data/repo",
+			configured:    "http://acct.blob.core.windows.net/data/repo/metadata",
+			wantErr:       indexer.ErrOverlappingNamespace,
+		},
 	}
 
 	for _, test := range tests {

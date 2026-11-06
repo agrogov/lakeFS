@@ -139,9 +139,10 @@ var (
 	ErrForeignRepository = errors.New("the companion repository was not created by the indexer")
 
 	// ErrBucketRootNamespace is reported for a data repository whose storage namespace is a bucket
-	// root and whose metadata repository has no explicit storage_namespace (§3.3): deriving
-	// "-metadata" would need a path component that does not exist.
-	ErrBucketRootNamespace = errors.New("a bucket-root storage namespace cannot be derived, set storage_namespace")
+	// root - or, on Azure, a container root - and whose metadata repository has no explicit
+	// storage_namespace (§3.3, METADATA_SEARCH_AZURE D4): deriving "-metadata" would need a path
+	// component that does not exist.
+	ErrBucketRootNamespace = errors.New("a bucket-root or container-root storage namespace cannot be derived, set storage_namespace")
 
 	// ErrOverlappingNamespace is reported when R-metadata's storage namespace is inside R's or
 	// contains it (§3.3): R's uncommitted GC sweeps every unreferenced object under R's prefix and

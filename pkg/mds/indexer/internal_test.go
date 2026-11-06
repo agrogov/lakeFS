@@ -50,20 +50,60 @@ func TestAPIBaseURL(t *testing.T) {
 	}
 }
 
-// TestNamespaceHasPath pins the bucket-root rule of §3.3.
-func TestNamespaceHasPath(t *testing.T) {
-	tests := map[string]bool{
-		"s3://bucket":             false,
-		"s3://bucket/":            false,
-		"s3://bucket/data":        true,
-		"s3://bucket/data/":       true,
-		"local:///var/lib/lakefs": true,
-		"gs://bucket/a/b":         true,
-		"relative/path":           true,
-		"noscheme":                false,
+// TestMetadataNamespaceRoots pins the bucket-root and container-root rules of §3.3 on the helper
+// itself (METADATA_SEARCH_AZURE D4): a namespace with a path component derives the companion in the
+// same bucket, and on Azure in the same container, while a bucket root - and an Azure container
+// root, whose first path segment is the container - is refused with an error that names the
+// container to set an explicit storage_namespace for.
+func TestMetadataNamespaceRoots(t *testing.T) {
+	tests := []struct {
+		name          string
+		dataNamespace string
+		want          string
+		wantErr       bool
+		wantContainer string
+	}{
+		{name: "s3 path derives", dataNamespace: "s3://bucket/data", want: "s3://bucket/data-metadata"},
+		{name: "s3 bucket root is refused", dataNamespace: "s3://bucket", wantErr: true},
+		{
+			name:          "azure path derives in the same container",
+			dataNamespace: "https://acct.blob.core.windows.net/data/repo",
+			want:          "https://acct.blob.core.windows.net/data/repo-metadata",
+		},
+		{
+			name:          "azure container root is refused",
+			dataNamespace: "https://acct.blob.core.windows.net/data",
+			wantErr:       true,
+			wantContainer: "data",
+		},
+		{
+			name:          "azure container root with the http scheme is refused",
+			dataNamespace: "http://acct.blob.core.windows.net/data",
+			wantErr:       true,
+			wantContainer: "data",
+		},
+		{
+			name:          "azure container root with a trailing slash is refused",
+			dataNamespace: "https://acct.blob.core.windows.net/data/",
+			wantErr:       true,
+			wantContainer: "data",
+		},
 	}
-	for namespace, want := range tests {
-		require.Equal(t, want, namespaceHasPath(namespace), "namespace %q", namespace)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := metadataNamespace("repo", test.dataNamespace, "")
+			if test.wantErr {
+				require.ErrorIs(t, err, ErrBucketRootNamespace)
+				require.Empty(t, got)
+				if test.wantContainer != "" {
+					require.Contains(t, err.Error(), fmt.Sprintf("container %q", test.wantContainer),
+						"the refusal names the container to set a storage namespace under")
+				}
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, test.want, got)
+		})
 	}
 }
 
@@ -82,6 +122,34 @@ func TestOverlapsStorageNamespace(t *testing.T) {
 		{namespace: "s3://bucket/data2", other: "s3://bucket/data", want: false},
 		{namespace: "s3://bucket/data-metadata", other: "s3://bucket/data", want: false},
 		{namespace: "", other: "s3://bucket/data", want: false},
+		// On Azure http and https name the same container and prefix (METADATA_SEARCH_AZURE D4), so a
+		// companion on one scheme overlaps a data namespace on the other.
+		{
+			namespace: "http://acct.blob.core.windows.net/data/repo-metadata",
+			other:     "https://acct.blob.core.windows.net/data/repo",
+			want:      false,
+		},
+		{
+			namespace: "http://acct.blob.core.windows.net/data/repo/metadata",
+			other:     "https://acct.blob.core.windows.net/data/repo",
+			want:      true,
+		},
+		{
+			namespace: "https://acct.blob.core.windows.net/data/repo-metadata",
+			other:     "https://acct.blob.core.windows.net/data/repo",
+			want:      false,
+		},
+		// Another Azure account or container is a different physical prefix, whatever the scheme.
+		{
+			namespace: "http://acct.blob.core.windows.net/data/repo",
+			other:     "https://other.blob.core.windows.net/data/repo",
+			want:      false,
+		},
+		{
+			namespace: "http://acct.blob.core.windows.net/other/repo",
+			other:     "https://acct.blob.core.windows.net/data/repo",
+			want:      false,
+		},
 	}
 	for _, test := range tests {
 		require.Equal(t, test.want, overlapsStorageNamespace(test.namespace, test.other),

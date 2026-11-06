@@ -262,3 +262,88 @@ func TestFormatQualifiedKey(t *testing.T) {
 		})
 	}
 }
+
+// TestNamespaceRoot pins the (root, path) split of METADATA_SEARCH_AZURE D4 for every blockstore:
+// the root is "<scheme>://<host>" for s3, gs, mem and local, and "<scheme>://<host>/<container>" for
+// Azure, where the first path segment is the container and not a prefix inside a bucket.
+func TestNamespaceRoot(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		Name        string
+		Namespace   string
+		Expected    string
+		ExpectedErr bool
+		Path        string
+	}{
+		{Name: "s3_bucket_root", Namespace: "s3://bucket", Expected: "s3://bucket", Path: ""},
+		{Name: "s3_bucket_root_trailing_slash", Namespace: "s3://bucket/", Expected: "s3://bucket", Path: ""},
+		{Name: "s3_prefix", Namespace: "s3://bucket/data", Expected: "s3://bucket", Path: "data"},
+		{Name: "s3_nested_prefix_trailing_slash", Namespace: "s3://bucket/data/inner/", Expected: "s3://bucket", Path: "data/inner"},
+		{Name: "gs_prefix", Namespace: "gs://bucket/a/b", Expected: "gs://bucket", Path: "a/b"},
+		{Name: "mem_bucket_root", Namespace: "mem://analytics", Expected: "mem://analytics", Path: ""},
+		{Name: "local", Namespace: "local:///var/lib/lakefs", Expected: "local://", Path: "var/lib/lakefs"},
+		{
+			Name:      "azure_path",
+			Namespace: "https://acct.blob.core.windows.net/c/p",
+			Expected:  "https://acct.blob.core.windows.net/c",
+			Path:      "p",
+		},
+		{
+			Name:      "azure_nested_path_trailing_slash",
+			Namespace: "https://acct.blob.core.windows.net/c/p/q/",
+			Expected:  "https://acct.blob.core.windows.net/c",
+			Path:      "p/q",
+		},
+		{
+			Name:      "azure_path_http",
+			Namespace: "http://acct.azurite.test/c/p",
+			Expected:  "http://acct.azurite.test/c",
+			Path:      "p",
+		},
+		{
+			Name:      "azure_container_root",
+			Namespace: "https://acct.blob.core.windows.net/c",
+			Expected:  "https://acct.blob.core.windows.net/c",
+			Path:      "",
+		},
+		{
+			Name:      "azure_container_root_trailing_slash",
+			Namespace: "https://acct.blob.core.windows.net/c/",
+			Expected:  "https://acct.blob.core.windows.net/c",
+			Path:      "",
+		},
+		{
+			Name:      "azure_container_root_http",
+			Namespace: "http://acct.azurite.test/c",
+			Expected:  "http://acct.azurite.test/c",
+			Path:      "",
+		},
+		{Name: "empty", Namespace: "", ExpectedErr: true},
+		{Name: "no_scheme", Namespace: "noscheme", ExpectedErr: true},
+		{Name: "relative_path", Namespace: "relative/path", ExpectedErr: true},
+		{Name: "unknown_scheme", Namespace: "ftp://bucket/data", ExpectedErr: true},
+		{Name: "azure_without_container", Namespace: "https://acct.blob.core.windows.net", ExpectedErr: true},
+		{Name: "azure_without_container_trailing_slash", Namespace: "https://acct.blob.core.windows.net/", ExpectedErr: true},
+	}
+	for _, cas := range cases {
+		t.Run(cas.Name, func(t *testing.T) {
+			t.Parallel()
+			root, path, err := block.NamespaceRoot(cas.Namespace)
+			if cas.ExpectedErr {
+				if err == nil {
+					t.Fatalf("NamespaceRoot(%q) got (%q, %q), expected an error", cas.Namespace, root, path)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NamespaceRoot(%q): %v", cas.Namespace, err)
+			}
+			if root != cas.Expected {
+				t.Fatalf("NamespaceRoot(%q) root got %q, expected %q", cas.Namespace, root, cas.Expected)
+			}
+			if path != cas.Path {
+				t.Fatalf("NamespaceRoot(%q) path got %q, expected %q", cas.Namespace, path, cas.Path)
+			}
+		})
+	}
+}

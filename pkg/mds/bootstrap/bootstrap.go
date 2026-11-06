@@ -88,7 +88,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
 	"reflect"
 	"slices"
 	"strconv"
@@ -99,6 +98,7 @@ import (
 	cmdpkg "github.com/treeverse/lakefs/cmd/lakefs/cmd"
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/model"
+	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"github.com/treeverse/lakefs/pkg/logging"
@@ -660,17 +660,26 @@ func indexerChunkPolicies(chunks companionChunkPlan, ts time.Time) []*model.Poli
 // metadata_search.repositories.<R>.storage_namespace) has one more: resolveRelative trims one "/", so
 // "s3://bucket//" also resolves to the bucket root. That spelling is emitted for a bucket root only.
 //
+// Azure (http and https, block.StorageTypeAzure) adds two rules, both from METADATA_SEARCH_AZURE D4:
+//
+//   - the adapter's validity regex accepts a namespace with either scheme, and both name the same
+//     container and prefix, so every spelling above is kept and its http <-> https twin is added.
+//     S3, GS, mem and local keep exactly the spellings they had.
+//   - a "bucket root" is an Azure container root ("https://acct.blob.core.windows.net/data"), because
+//     block.NamespaceRoot treats the first path segment as the container and not as a path, so the
+//     container root gets the "//" spelling and a prefix inside the container does not. S3 and GS
+//     keep the bucket root they had.
+//
 // The enumeration stops there because a further trailing slash is a different physical prefix for S3
 // and GS, whose path is used verbatim as the key prefix. The dev-only mem and local adapters clean the
 // path (formatPathWithNamespace, filepath.Join), so there "…//" and "…///" happen to be the same
 // prefix too; covering that would need a trailing-* pattern on namespace/<ns>/*, which also denies
 // every namespace below the companion's - the over-match the exact ARNs of §8 exist to avoid.
 func storageNamespaceDenyResources(namespace string) []string {
-	var resources []string
+	var spellings []string
 	add := func(spelling string) {
-		resource := permissions.StorageNamespace(spelling)
-		if !slices.Contains(resources, resource) {
-			resources = append(resources, resource)
+		if !slices.Contains(spellings, spelling) {
+			spellings = append(spellings, spelling)
 		}
 	}
 	add(namespace)
@@ -680,18 +689,43 @@ func storageNamespaceDenyResources(namespace string) []string {
 	if isBucketRootNamespace(trimmed) {
 		add(trimmed + "//")
 	}
+	for _, spelling := range slices.Clone(spellings) {
+		if other, ok := otherSchemeSpelling(spelling); ok {
+			add(other)
+		}
+	}
+	resources := make([]string, 0, len(spellings))
+	for _, spelling := range spellings {
+		resources = append(resources, permissions.StorageNamespace(spelling))
+	}
 	return resources
 }
 
-// isBucketRootNamespace reports whether namespace addresses the root of its bucket: a scheme, a host
-// and no path. url.Parse separates the bucket (the host) from the path, which a plain string test
-// cannot do for a namespace such as "mem://analytics-metadata".
+// otherSchemeSpelling returns the other scheme's spelling of an Azure storage namespace: the block
+// adapter's validity regex accepts http and https, and both address the same container and prefix
+// (METADATA_SEARCH_AZURE D4). A spelling of any other scheme has no such twin.
+func otherSchemeSpelling(spelling string) (string, bool) {
+	switch {
+	case strings.HasPrefix(spelling, "https://"):
+		return "http://" + strings.TrimPrefix(spelling, "https://"), true
+	case strings.HasPrefix(spelling, "http://"):
+		return "https://" + strings.TrimPrefix(spelling, "http://"), true
+	default:
+		return "", false
+	}
+}
+
+// isBucketRootNamespace reports whether namespace addresses the root of its bucket - or, on Azure,
+// of its container: block.NamespaceRoot splits the namespace into root and path per blockstore, so
+// "https://acct.blob.core.windows.net/data" is a container root just like "s3://bucket" is a bucket
+// root, and its first path segment is not a path to derive from (METADATA_SEARCH_AZURE D4). A
+// namespace that block.NamespaceRoot refuses has no root and is not a bucket root.
 func isBucketRootNamespace(namespace string) bool {
-	parsed, err := url.Parse(namespace)
-	if err != nil || parsed.Host == "" {
+	_, path, err := block.NamespaceRoot(namespace)
+	if err != nil {
 		return false
 	}
-	return strings.Trim(parsed.Path, "/") == ""
+	return path == ""
 }
 
 // MetadataRepoProtectPolicies builds the mds-metadata-repo-protect deny policies of §8 for

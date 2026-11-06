@@ -1428,6 +1428,117 @@ func TestCompanionStorageNamespaceDenySpellings(t *testing.T) {
 	})
 }
 
+// TestStorageNamespaceDenyResources pins the exact ARN list of the AttachStorageNamespace deny
+// resource by resource (R3S-3, METADATA_SEARCH_AZURE D4). The S3, GS and mem lists are the ones the
+// function produced before the Azure work, so the Azure rules cannot change them silently; the Azure
+// lists add the other scheme's spelling of every spelling and give the container root - not the
+// host - the "//" spelling.
+func TestStorageNamespaceDenyResources(t *testing.T) {
+	arns := func(spellings ...string) []string {
+		resources := make([]string, 0, len(spellings))
+		for _, spelling := range spellings {
+			resources = append(resources, permissions.StorageNamespace(spelling))
+		}
+		return resources
+	}
+	tests := []struct {
+		name      string
+		namespace string
+		want      []string
+	}{
+		{
+			name:      "s3 prefix",
+			namespace: "s3://bucket/analytics-metadata",
+			want: arns(
+				"s3://bucket/analytics-metadata",
+				"s3://bucket/analytics-metadata/"),
+		},
+		{
+			name:      "s3 prefix, stored with a trailing slash",
+			namespace: "s3://bucket/analytics-metadata/",
+			want: arns(
+				"s3://bucket/analytics-metadata/",
+				"s3://bucket/analytics-metadata"),
+		},
+		{
+			name:      "s3 bucket root",
+			namespace: "s3://index-bucket",
+			want: arns(
+				"s3://index-bucket",
+				"s3://index-bucket/",
+				"s3://index-bucket//"),
+		},
+		{
+			name:      "gs prefix",
+			namespace: "gs://bucket/analytics-metadata",
+			want: arns(
+				"gs://bucket/analytics-metadata",
+				"gs://bucket/analytics-metadata/"),
+		},
+		{
+			name:      "gs bucket root",
+			namespace: "gs://bucket",
+			want: arns(
+				"gs://bucket",
+				"gs://bucket/",
+				"gs://bucket//"),
+		},
+		{
+			name:      "mem bucket root",
+			namespace: "mem://analytics-metadata",
+			want: arns(
+				"mem://analytics-metadata",
+				"mem://analytics-metadata/",
+				"mem://analytics-metadata//"),
+		},
+		{
+			name:      "azure prefix, https stored",
+			namespace: "https://acct.blob.core.windows.net/data/analytics-metadata",
+			want: arns(
+				"https://acct.blob.core.windows.net/data/analytics-metadata",
+				"https://acct.blob.core.windows.net/data/analytics-metadata/",
+				"http://acct.blob.core.windows.net/data/analytics-metadata",
+				"http://acct.blob.core.windows.net/data/analytics-metadata/"),
+		},
+		{
+			name:      "azure prefix, http stored",
+			namespace: "http://acct.blob.core.windows.net/data/analytics-metadata",
+			want: arns(
+				"http://acct.blob.core.windows.net/data/analytics-metadata",
+				"http://acct.blob.core.windows.net/data/analytics-metadata/",
+				"https://acct.blob.core.windows.net/data/analytics-metadata",
+				"https://acct.blob.core.windows.net/data/analytics-metadata/"),
+		},
+		{
+			name:      "azure container root, https stored",
+			namespace: "https://acct.blob.core.windows.net/index",
+			want: arns(
+				"https://acct.blob.core.windows.net/index",
+				"https://acct.blob.core.windows.net/index/",
+				"https://acct.blob.core.windows.net/index//",
+				"http://acct.blob.core.windows.net/index",
+				"http://acct.blob.core.windows.net/index/",
+				"http://acct.blob.core.windows.net/index//"),
+		},
+		{
+			name:      "azure container root, http stored",
+			namespace: "http://acct.azurite.test/index",
+			want: arns(
+				"http://acct.azurite.test/index",
+				"http://acct.azurite.test/index/",
+				"http://acct.azurite.test/index//",
+				"https://acct.azurite.test/index",
+				"https://acct.azurite.test/index/",
+				"https://acct.azurite.test/index//"),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, test.want, storageNamespaceDenyResources(test.namespace))
+		})
+	}
+}
+
 // TestOrdinaryMetadataSuffixRepository is R2S-4: a repository named x-metadata is a companion only
 // when its data repository x exists. An ordinary x-metadata repository stays writable for its users
 // and gets no indexer grant.

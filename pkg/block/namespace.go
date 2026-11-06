@@ -114,6 +114,42 @@ func ValidateStorageType(uri *url.URL, expectedStorage StorageType) error {
 	return nil
 }
 
+// NamespaceRoot splits a storage namespace into the root of its storage location and the path below
+// it (METADATA_SEARCH_AZURE D4).
+//
+// The root is what a namespace shares with every other namespace of the same bucket - or, on Azure,
+// of the same container. For the s3, gs, mem and local blockstores it is "<scheme>://<host>"; for
+// Azure (the http and https schemes, block.StorageTypeAzure) it is "<scheme>://<host>/<container>",
+// because on Azure the first path segment names the container and not a prefix inside a bucket.
+//
+// The path is the rest of the namespace with its "/" delimiters trimmed: "" addresses the bucket
+// root (on Azure, the container root), "data" a prefix inside it. The caller decides what a bucket
+// root means for it - the indexer refuses to derive a companion namespace from one, the deny policy
+// adds the "//" spelling only to one.
+//
+// Malformed input is an error rather than a best guess: an unknown or missing scheme, and an Azure
+// namespace that names no container, have no root to return. Both the indexer's namespace rules and
+// the bootstrap's deny call this function, so they cannot disagree about where a namespace's root is.
+func NamespaceRoot(namespace string) (root, path string, err error) {
+	parsed, err := url.Parse(namespace)
+	if err != nil {
+		return "", "", fmt.Errorf("parse storage namespace %q: %w", namespace, ErrInvalidNamespace)
+	}
+	storageType, err := GetStorageType(parsed)
+	if err != nil {
+		return "", "", fmt.Errorf("storage namespace %q: %w", namespace, err)
+	}
+	if storageType != StorageTypeAzure {
+		return fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host), strings.Trim(parsed.Path, "/"), nil
+	}
+	// In Azure the first part of the path is the container (pkg/block/azure.ResolveBlobURLInfoFromURL).
+	segments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if segments[0] == "" {
+		return "", "", fmt.Errorf("azure storage namespace %q names no container: %w", namespace, ErrInvalidNamespace)
+	}
+	return fmt.Sprintf("%s://%s/%s", parsed.Scheme, parsed.Host, segments[0]), strings.Join(segments[1:], "/"), nil
+}
+
 func formatPathWithNamespace(namespacePath, keyPath string) string {
 	namespacePath = strings.Trim(namespacePath, "/")
 	if len(namespacePath) == 0 {
