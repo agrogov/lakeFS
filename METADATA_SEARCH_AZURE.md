@@ -355,9 +355,19 @@ Run on `8a28450`:
 - `go build ./...` and `go vet` on the touched packages pass.
 - `go test -count=1 -race` passes in `pkg/icebergcatalog/...`, `pkg/mds`, `pkg/mds/bootstrap`,
   `pkg/mds/client`, `pkg/mds/indexer`, `pkg/mds/refmap` and `pkg/block`.
-- The Azurite tests pass with Docker reachable (colima, `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock`):
-  `pkg/mds/table` `TestAzureObjectMetadataRoundTrip` (http and https) and `pkg/block/azure`.
-  Without `DOCKER_HOST` set, `pkg/block/azure` panics in `TestMain` instead of skipping.
+- The Azurite tests need a reachable Docker daemon. On colima the daemon socket is not Docker's
+  default, so pass it explicitly:
+
+  ```bash
+  DOCKER_HOST=unix://$HOME/.colima/default/docker.sock \
+    go test -count=1 ./pkg/block/azure/ ./pkg/mds/table/
+  ```
+
+  That runs `pkg/mds/table` `TestAzureObjectMetadataRoundTrip` (http and https) and the
+  `pkg/block/azure` Azurite tests. When Docker is unreachable (including `DOCKER_HOST` unset on
+  colima), `pkg/block/azure` now skips `TestAzureAdapter` and `TestAdapterNamespace` through
+  `requireAzurite` instead of panicking in `TestMain`; its pure tests still run. The skip path is
+  pinned by `TestDockerUnavailableSkips`.
 
 ### Open items after AZ1–AZ6 (2026-11-09)
 

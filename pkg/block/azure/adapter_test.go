@@ -13,6 +13,7 @@ import (
 )
 
 func TestAzureAdapter(t *testing.T) {
+	requireAzurite(t)
 	t.Parallel()
 	basePath, err := url.JoinPath(blockURL, containerName)
 	require.NoError(t, err)
@@ -32,6 +33,7 @@ func TestAzureAdapter(t *testing.T) {
 }
 
 func TestAdapterNamespace(t *testing.T) {
+	requireAzurite(t)
 	t.Parallel()
 	tests := []struct {
 		Name          string
