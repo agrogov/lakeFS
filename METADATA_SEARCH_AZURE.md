@@ -359,13 +359,26 @@ Run on `8a28450`:
   `pkg/mds/table` `TestAzureObjectMetadataRoundTrip` (http and https) and `pkg/block/azure`.
   Without `DOCKER_HOST` set, `pkg/block/azure` panics in `TestMain` instead of skipping.
 
-Open items, not caused by AZ1–AZ6:
+### Open items after AZ1–AZ6 (2026-11-09)
 
+- **`golangci-lint` on AZ1–AZ6: closed.** The earlier run stopped at type-checking ("export data
+  version 5 is greater than maximum supported version 4"): the packages had been compiled by Go
+  1.27.2, whose export data the linter's Go 1.26 parser cannot read. Running both the compiler and
+  the linter on the module's Go 1.26.4 toolchain works:
+
+  ```bash
+  export PATH="$HOME/sdk/go1.25.8/bin:$PATH" GOTOOLCHAIN=auto   # go.mod selects go1.26.4
+  go version                                              # go1.26.4 darwin/arm64
+  go tool golangci-lint version                           # v2.7.2 built with go1.26.4
+  go tool golangci-lint run ./pkg/icebergcatalog/... ./pkg/mds/... ./pkg/block/... ./esti/...
+  # 0 issues
+  ```
+
+  The only finding was `pkg/icebergcatalog/azure_location.go:130` `goconst` (the `"https"`
+  literal was repeated three times in the package), fixed by naming the two accepted URL schemes
+  instead of silencing the check.
 - `pkg/mds/table` `TestVendedCredentials` fails with an S3 403 (`InvalidAccessKeyId` on PutObject).
   It fails the same way on `8047321`, the commit before the Azure work.
-- `golangci-lint` has not run on AZ1–AZ6: with the local Go 1.27.2 toolchain it stops at
-  type-checking ("export data version 5 is greater than maximum supported version 4"). Needs a
-  linter built for Go 1.27, or the module's Go 1.26 toolchain.
 - esti AZ5 was run by the task's agent only; it was not rerun independently.
 
 ## 6. Verification rules (every task)

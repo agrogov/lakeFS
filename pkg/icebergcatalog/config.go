@@ -455,7 +455,7 @@ func (c CredentialsVendingConfig) Validate() error {
 	}
 	if c.Endpoint != "" {
 		endpoint, err := url.Parse(c.Endpoint)
-		if err != nil || endpoint.Host == "" || (endpoint.Scheme != "http" && endpoint.Scheme != "https") {
+		if err != nil || endpoint.Host == "" || (endpoint.Scheme != urlSchemeHTTP && endpoint.Scheme != urlSchemeHTTPS) {
 			return fmt.Errorf("%w: %s.endpoint %q is not an http(s) URL",
 				ErrInvalidConfig, CredentialsVendingSectionKey, c.Endpoint)
 		}

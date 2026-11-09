@@ -54,6 +54,12 @@ const (
 
 	// DefaultAzureLocationHost is the documented default of iceberg.azure.location_host.
 	DefaultAzureLocationHost = AzureLocationHostDFS
+
+	// urlSchemeHTTP and urlSchemeHTTPS are the two URL schemes the Azure namespace and the
+	// vended-credentials endpoint accept. They are constants so the checks that reject every
+	// other scheme cannot drift apart.
+	urlSchemeHTTP  = "http"
+	urlSchemeHTTPS = "https"
 )
 
 // ErrInvalidAzureNamespace is wrapped when a storage namespace cannot be translated into an
@@ -127,7 +133,7 @@ func icebergNamespaceLocationForHost(storageNamespace, hostKind string) (string,
 	if err != nil {
 		return "", fmt.Errorf("%w: %q cannot be parsed: %w", ErrInvalidAzureNamespace, storageNamespace, err)
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+	if parsed.Scheme != urlSchemeHTTP && parsed.Scheme != urlSchemeHTTPS {
 		return "", fmt.Errorf("%w: %q is not an http(s) Azure storage namespace",
 			ErrInvalidAzureNamespace, storageNamespace)
 	}
@@ -152,7 +158,7 @@ func icebergNamespaceLocationForHost(storageNamespace, hostKind string) (string,
 		serviceDomain = blobDomain
 	}
 	scheme := "abfs"
-	if parsed.Scheme == "https" {
+	if parsed.Scheme == urlSchemeHTTPS {
 		scheme = "abfss"
 	}
 	location := scheme + "://" + info.ContainerName + "@" + info.StorageAccountName + "." + serviceDomain
