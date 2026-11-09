@@ -377,8 +377,30 @@ Run on `8a28450`:
   The only finding was `pkg/icebergcatalog/azure_location.go:130` `goconst` (the `"https"`
   literal was repeated three times in the package), fixed by naming the two accepted URL schemes
   instead of silencing the check.
-- `pkg/mds/table` `TestVendedCredentials` fails with an S3 403 (`InvalidAccessKeyId` on PutObject).
-  It fails the same way on `8047321`, the commit before the Azure work.
+- **`pkg/mds/table` `TestVendedCredentials` 403: closed as an environment failure, not a defect.**
+  The test's fake STS vends the fixture identity plus the session token `mds-vended-session`; the
+  test depends on SeaweedFS ignoring that token. SeaweedFS 4.48 validates it and answers
+  `InvalidAccessKeyId` on the PutObject, the exact 403 that was recorded:
+
+  ```bash
+  # SeaweedFS 4.48 (fails)
+  docker run -d --name seaweedfs-448 -p 8337:8333 \
+    -v "$PWD/esti/ops/seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro" \
+    chrislusf/seaweedfs:4.48 server -s3 -dir=/data -s3.config=/etc/seaweedfs/s3.json
+  LAKEFS_MDS_VENDED_S3_ENDPOINT=http://127.0.0.1:8337 \
+    go test -count=1 -run '^TestVendedCredentials$' ./pkg/mds/table/
+  # FAIL ... api error InvalidAccessKeyId ... on PutObject
+
+  # SeaweedFS 4.50/4.53 (passes), on this branch and on 8047321
+  LAKEFS_MDS_VENDED_S3_ENDPOINT=http://127.0.0.1:8338 \
+    go test -count=1 -run '^TestVendedCredentials$' ./pkg/mds/table/
+  # ok github.com/treeverse/lakefs/pkg/mds/table
+  ```
+
+  The same failure reproduces at `8047321`, the commit before the Azure work, which rules out the
+  Azure changes. The fix is in the fixture, not the catalog: `esti/ops/docker-compose-mds.yaml`
+  pins SeaweedFS 4.53 (verified) instead of `latest`, and the test's header records the 4.50
+  boundary. A long-running container from an older image must be recreated.
 - esti AZ5 was run by the task's agent only; it was not rerun independently.
 
 ## 6. Verification rules (every task)

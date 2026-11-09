@@ -31,9 +31,11 @@ package table_test
 //
 // The object store is SeaweedFS (esti/ops/docker-compose-mds.yaml), skipped when it is not
 // running, because vending is S3 only (§8) and the catalog must stage the files the client wrote.
-// SeaweedFS ignores the session token, so the token doubles as the marker of the vended session:
-// the object store knows one identity (estiaccesskey/estisecretkey) and nothing else in the fixture
-// supplies a token.
+// SeaweedFS 4.50 and later ignore the session token, so the token doubles as the marker of the
+// vended session: the object store knows one identity (estiaccesskey/estisecretkey) and nothing
+// else in the fixture supplies a token. SeaweedFS 4.48 rejects the unknown token with
+// InvalidAccessKeyId on PutObject, which is an environment failure, not a catalog defect (see
+// METADATA_SEARCH_AZURE.md §5); the compose file pins the verified version.
 //
 // Two server-side pieces make this work, and the test fails without either one:
 //

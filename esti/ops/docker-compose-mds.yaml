@@ -46,7 +46,10 @@
 # python:3.12-slim installs them when it is unset.
 services:
   seaweedfs:
-    image: chrislusf/seaweedfs:latest
+    # Pinned: pkg/mds/table TestVendedCredentials writes through a vended session whose token
+    # SeaweedFS must ignore. 4.48 rejects that token with InvalidAccessKeyId on PutObject; 4.50
+    # and later pass, and 4.53 is the version verified with this file.
+    image: chrislusf/seaweedfs:4.53
     # The S3 gateway listens on 8333 (design §4.6 examples use the same port); the S3 credentials
     # come from seaweedfs-s3.json, the identity set the test environment also uses.
     command: ["server", "-s3", "-dir=/data", "-s3.config=/etc/seaweedfs/s3.json"]

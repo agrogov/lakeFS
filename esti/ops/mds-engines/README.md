@@ -28,7 +28,7 @@ The scripts do not edit or import the esti suite; they write the same layout int
   ```bash
   docker run -d --name esti-seaweedfs -p 8333:8333 \
     -v "$PWD/esti/ops/seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro" \
-    -v esti-seaweedfs:/data chrislusf/seaweedfs:latest \
+    -v esti-seaweedfs:/data chrislusf/seaweedfs:4.53 \
     server -s3 -dir=/data -s3.config=/etc/seaweedfs/s3.json
   ```
 
