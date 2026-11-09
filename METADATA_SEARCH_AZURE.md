@@ -1,7 +1,7 @@
 # Metadata Search on Azure Blob Storage — design and plan
 
-Branch: `feature/metadata-search`. Status: **AZ1–AZ6 done**; AZ7 - verification on a real Azure account - is
-an operator step that has not run, and it is the gate before the Azure support is called done. This document is
+Branch: `feature/metadata-search`. Status: **AZ1–AZ7 done**, including the verification on a real Azure
+account (AZ7), so the Azure support is called done. This document is
 self-contained; the design sections it changes are named by number (`METADATA_SEARCH_DESIGN.md`
 §x, `ICEBERG_CATALOG_PLAN.md` §x).
 
@@ -317,44 +317,36 @@ the non-goals N1–N4, the `abfs[s]://` locations and the `iceberg.azure.locatio
 
 ### AZ7 — real Azure verification (operator, not CI)
 
-**Not run.** This is the gate before the Azure support is called done.
+**Done** (this commit, docs only): run 2026-11-09 on the hr2 cluster against the real storage account
+`cpaasailakefs`; recorded in `esti/ops/mds-engines/README.md` §"Azure (hr2)".
 
-- On the hr2 cluster (Azure blockstore, shared key): deploy the image, run the indexer with the
-  AZ6 Kubernetes example, run the guide's Spark and Trino snippets against one repository. Record
-  versions and the observed rows in `esti/ops/mds-engines/README.md`, as for SeaweedFS. If the
-  account is FNS and Trino or Spark fails on the `dfs` host, switch `iceberg.azure.location_host`
-  to `blob` and record which engine needed it.
-
-**Blocked on access (2026-11-07).** The hr2 cluster can be reached only from the office network,
-so AZ7 waits until then. The self-contained runbook for the office machine is
-[`AZ7_OFFICE_HANDOFF.md`](AZ7_OFFICE_HANDOFF.md). Nothing was deployed and nothing was committed for it. Its Kanban task
-(`21ca9`) is in Review, in plan mode. It needs these inputs before any step that changes the
-cluster, and an explicit approval for each such step:
-
-| Input | Why |
-|---|---|
-| kubectl context for hr2 and the lakeFS namespace | deploy or restart the server and start the indexer |
-| image of this branch's `lakefs-sso` build (registry/repo:tag), or approval to build one | only `cmd/lakefs-sso` wires the catalog and Metadata Search (`cmd/lakefs-sso/main.go`, `mds.go`); the repository `Dockerfile` builds `cmd/lakefs` and has no `lakefs-sso` target |
-| storage account, container, prefix, and whether the account is FNS or HNS | path-form namespace (not a container root); decides whether the `dfs`→`blob` switch can apply |
-| lakeFS ingress URL that reaches `/mds/iceberg/api`, and an admin key pair | catalog URI for Spark and Trino; create the repository, the `orders/` objects and the `mds-indexer` credentials |
-
-Steps once the inputs are there:
-
-1. Build `lakefs-sso` at branch head and record the SHA. Deploy with `blockstore.type: azure`
-   (shared key), `iceberg.enabled`, `iceberg.metadata_search.enabled`, and `location_host` left at
-   its default `dfs`.
-2. Run the indexer from the AZ6 Kubernetes example. It gets its Azure credentials only from
-   `LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCOUNT` and `…_STORAGE_ACCESS_KEY`.
-3. Create one repository on `https://<account>.blob.core.windows.net/<container>/<prefix>` with
-   three `orders/` objects, the same shape as the SeaweedFS record. Wait until the indexer's
-   `/_health` reports `last_indexed` equal to the head.
-4. Run the guide's Spark snippet (ADLSFileIO, the `iceberg-azure-bundle` jar; the same
-   `tabulario/spark-iceberg` digest as the SeaweedFS record) and the Trino snippet (pin the image
-   digest, check whether that version takes `fs.azure.enabled` or `fs.native-azure.enabled`).
-5. If the account is FNS and an engine fails on the `dfs` host, set
-   `iceberg.azure.location_host: blob`, rerun, and record which engine needed the switch.
-6. Record the versions, the exact properties and the observed rows in
-   `esti/ops/mds-engines/README.md`, in one docs-only commit.
+- What ran: the lakeFS Deployment `lakefs` (namespace `lakefs`, blockstore `azure` with the shared key,
+  `iceberg.enabled`, `iceberg.metadata_search.enabled`, `iceberg.azure.location_host` unset) serving
+  `docker.ib-ci.com/lakefs@sha256:038fdf36…2dab759`, the indexer `mds-indexer` on the same image with
+  its Azure credentials from `LAKEFS_METADATA_SEARCH_AZURE_*` alone, one repository `mds-az7` at
+  `https://cpaasailakefs.blob.core.windows.net/lakefs/mds-az7-e1f13de` with three `orders/` objects
+  (head `53c0d597…95bb9`, indexed 33 s after the commit, `lag_commits: 0`), then the guide's Azure
+  Spark and Trino snippets on both mounts: **4/4 runs returned the three expected rows exactly**, on
+  Spark 3.5.5 + Iceberg 1.8.1 (the `iceberg-azure-bundle`, `ADLSFileIO`) and Trino 484 (native Azure
+  FS), on `/mds/iceberg/api` and `/iceberg/relative_to/mds-az7.main/api`.
+- The FNS gate did not apply: the account is **HNS**, both engines worked on the `dfs` host and
+  `iceberg.azure.location_host` stayed unset, so no cluster change was made for this task. Recorded
+  consequence: D1's `blob` branch stays **unexercised on real Azure**.
+- D5's Trino parenthetical, which asked to be verified here: Trino 484's `@Config` name is
+  `fs.azure.enabled`, and `fs.native-azure.enabled` is its `@LegacyConfig` alias - the parenthetical
+  reads backwards as written. The run used `fs.azure.enabled`. `docs/metadata-search.md`'s property
+  line is right and its inline comment ("the newer name … is `fs.native-azure.enabled`") is wrong;
+  recorded here and in the README record, not corrected in this close-out.
+- Snippet changes the run did require (all in the README record): the Trino switch comment, the
+  relative-to Trino block, and the `oauth2-server-uri` key the Spark block omits.
+- Not covered by the run: writes through either mount, a non-empty `user_metadata` (the `orders/`
+  objects carry `{}`, as on SeaweedFS), the `location_host: blob` branch, the `fs.native-azure.enabled`
+  legacy alias (read from the bytecode), in-cluster service DNS, and Iceberg tables in the data
+  repository's own namespace.
+- Two facts about the installation, recorded and not worked around: the running reference is the
+  mutable tag `dev-mds` (the image carries no labels or annotations, so no commit SHA is recoverable
+  from it - the digest is the identifier), and the office network MITMs `*.dfs.core.windows.net`, so
+  the engine harness trusts a corporate CA. Neither is a property of Azure support.
 
 ### Verification after AZ1–AZ6 (2026-11-07)
 
