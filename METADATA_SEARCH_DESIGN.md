@@ -630,9 +630,7 @@ a write that resolves into a reserved namespace becomes a read session (5.3).
 ### 5.3 Read-only `system` namespace (landed)
 
 On a data repository, writes under `system` answer 403 `ForbiddenException` (`ReservedNamespaceError`).
-`GET`/`HEAD` of the namespace is 404 (no marker). Listings show `system` and `object_metadata` only where the
-virtual table resolves (an indexed repository, a mirrored ref); an unindexed repository lists neither and the
-namespace stays reserved. The catalog has no
+`GET`/`HEAD` of the namespace is 404 (no marker). Listings show `system` and `object_metadata`. The catalog has no
 rename endpoint, so there is nothing to block there. In `R-metadata`, `system` is a normal namespace.
 
 The rule covers the data plane as well as the catalog API. A remote-signature request for a write (`PUT`,
