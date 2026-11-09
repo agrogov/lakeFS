@@ -689,8 +689,12 @@ func TestMetadataSearchDefaultNoop(t *testing.T) {
 			require.NoError(t, f.store.RequireWritableNamespace(addr), "no namespace is reserved")
 		}
 		require.Nil(t, f.store.Resolver())
-		require.Empty(t, f.store.VirtualTables(resolverVirtualAddress(tablesTestRef)))
-		require.Empty(t, f.store.VirtualNamespaces(Address{Repo: tablesTestRepo, Ref: tablesTestRef}))
+		tables, err := f.store.VirtualTables(f.ctx, resolverVirtualAddress(tablesTestRef))
+		require.NoError(t, err)
+		require.Empty(t, tables)
+		namespaces, err := f.store.VirtualNamespaces(f.ctx, Address{Repo: tablesTestRepo, Ref: tablesTestRef})
+		require.NoError(t, err)
+		require.Empty(t, namespaces)
 	})
 
 	t.Run("the virtual table is not there", func(t *testing.T) {
@@ -929,6 +933,63 @@ func TestMetadataSearchCompanionRepositoryProof(t *testing.T) {
 	t.Run("a companion table that names the data repository and has the init commit is served", func(t *testing.T) {
 		f := newResolverFixture(t)
 		require.Equal(t, http.StatusOK, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", "").Code)
+	})
+}
+
+// requireVirtualTableUnlisted pins that a data repository whose virtual table does not resolve lists
+// neither the system namespace nor object_metadata, so a client browsing the catalog is never shown a
+// table whose load answers 404.
+func requireVirtualTableUnlisted(t *testing.T, f *resolverFixture, ref string) {
+	t.Helper()
+	rec := f.request(t, http.MethodGet, listTarget([]string{tablesTestRepo, ref}, nil), "alice", "")
+	require.NotContains(t, decodeListNamespaces(t, rec).Namespaces, Namespace{tablesTestRepo, ref, SystemNamespace})
+	// Nothing is left in the namespace: no marker and no table, so it does not exist (§5).
+	requireEnvelope(t, f.request(t, http.MethodGet, virtualNamespaceTablesTarget(ref), "alice", ""),
+		http.StatusNotFound, ErrTypeNoSuchNamespace)
+
+	tables, err := f.store.VirtualTables(f.ctx, Address{Repo: tablesTestRepo, Ref: ref, Namespace: Namespace{SystemNamespace}})
+	require.NoError(t, err)
+	require.Empty(t, tables)
+	namespaces, err := f.store.VirtualNamespaces(f.ctx, Address{Repo: tablesTestRepo, Ref: ref})
+	require.NoError(t, err)
+	require.Empty(t, namespaces)
+}
+
+// TestMetadataSearchVirtualTableListedOnlyWhenIndexed covers the listing half of §5.2: system and
+// object_metadata are listed on a data repository only while the virtual table resolves, and the
+// namespace stays reserved either way.
+func TestMetadataSearchVirtualTableListedOnlyWhenIndexed(t *testing.T) {
+	t.Run("a data repository without a companion lists neither", func(t *testing.T) {
+		f := newResolverFixture(t)
+		require.NoError(t, f.catalog.DeleteRepository(f.ctx, resolverMetaRepo), "the repository is not indexed")
+		requireEnvelope(t, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", ""),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+		requireVirtualTableUnlisted(t, f, tablesTestRef)
+
+		// Unindexed is not unreserved: the namespace still refuses writes (§5.4).
+		body := fmt.Sprintf(`{"namespace":[%q,%q,%q]}`, tablesTestRepo, tablesTestRef, SystemNamespace)
+		requireEnvelope(t, f.request(t, http.MethodPost, "/v1/"+CatalogPrefix+"/namespaces", "carol", body),
+			http.StatusForbidden, ErrorTypeForbidden)
+	})
+
+	t.Run("a companion that is not proven lists neither", func(t *testing.T) {
+		f := newResolverFixtureWithoutInitCommit(t)
+		requireVirtualTableUnlisted(t, f, tablesTestRef)
+	})
+
+	t.Run("an unindexed tag lists neither", func(t *testing.T) {
+		f := newResolverFixture(t)
+		requireVirtualTableUnlisted(t, f, tablesTestTag)
+	})
+
+	t.Run("an indexed branch lists both", func(t *testing.T) {
+		f := newResolverFixture(t)
+		namespaces, err := f.store.VirtualNamespaces(f.ctx, Address{Repo: tablesTestRepo, Ref: tablesTestRef})
+		require.NoError(t, err)
+		require.Equal(t, []string{SystemNamespace}, namespaces)
+		tables, err := f.store.VirtualTables(f.ctx, resolverVirtualAddress(tablesTestRef))
+		require.NoError(t, err)
+		require.Equal(t, []string{resolverObjectMetadataTable}, tables)
 	})
 }
 

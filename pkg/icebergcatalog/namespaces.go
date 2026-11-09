@@ -986,10 +986,13 @@ func (n *namespaceService) listChildNamespaces(ctx context.Context, caller Calle
 	}
 	// A resolver may own child namespaces that have no marker (resolver.go, §5.4): the system
 	// namespace of a Metadata Search data repository is one, and it is listed only while the
-	// resolver that declares it is registered. The order of the listing is by name, so the added
-	// levels are merged into it rather than appended after it.
-	namespaces = withVirtualNamespaces(parent, namespaces, n.store.VirtualNamespaces(parent))
-	return namespaces, nil
+	// resolver that declares it is registered and its table resolves. The order of the listing is by
+	// name, so the added levels are merged into it rather than appended after it.
+	virtual, err := n.store.VirtualNamespaces(ctx, parent)
+	if err != nil {
+		return nil, err
+	}
+	return withVirtualNamespaces(parent, namespaces, virtual), nil
 }
 
 // allRepositories walks the repository listing to the end. The catalog lists repositories in

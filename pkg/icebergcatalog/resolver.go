@@ -75,8 +75,10 @@ package icebergcatalog
 //
 // The same capability answers what a listing shows (§5.4): ListNamespaces on a data repository
 // reports system, and ListTables in it reports object_metadata, only while a resolver that declares
-// them is registered. Both listings run the ordinary authorization filter afterwards, so a caller
-// without a grant on the namespace does not see them either.
+// them is registered and the table resolves on that ref - a data repository that is not indexed has
+// no companion table, so it lists neither, though system stays reserved. Both listings run the
+// ordinary authorization filter afterwards, so a caller without a grant on the namespace does not
+// see them either.
 //
 // # What the hook does not do
 //
@@ -869,22 +871,58 @@ func (s *Store) ResolveAuthorized(ctx context.Context, addr Address, authorize A
 
 // VirtualNamespaces returns the child namespaces the registered resolver adds to the listing of
 // addr. It is empty while no resolver - or no VirtualTableSource - is registered.
-func (s *Store) VirtualNamespaces(addr Address) []string {
+//
+// A declared namespace is listed only while at least one of its declared tables is served (see
+// VirtualTables): a data repository the indexer does not index has no companion table, and listing
+// system there would show a namespace whose only table answers 404 on load. The namespace stays
+// reserved either way (ReservedNamespace does not depend on the index).
+func (s *Store) VirtualNamespaces(ctx context.Context, addr Address) ([]string, error) {
 	source, ok := s.virtualSource()
 	if !ok {
-		return nil
+		return nil, nil
 	}
-	return source.VirtualNamespaces(addr)
+	var listed []string
+	for _, name := range source.VirtualNamespaces(addr) {
+		child := Address{Repo: addr.Repo, Ref: addr.Ref, Namespace: append(slices.Clone(addr.Namespace), name)}
+		tables, err := s.VirtualTables(ctx, child)
+		if err != nil {
+			return nil, err
+		}
+		if len(tables) > 0 {
+			listed = append(listed, name)
+		}
+	}
+	return listed, nil
 }
 
 // VirtualTables returns the table names the registered resolver adds to the listing of
 // addr.Namespace. It is empty while no resolver - or no VirtualTableSource - is registered.
-func (s *Store) VirtualTables(addr Address) []string {
+//
+// A declared table is listed only when it resolves: the same Resolve a load runs, including the
+// resolver's verification of the target (MDS-SEC-3). A table that resolves to NoSuchTable or to a
+// missing warehouse - no companion repository, no table on the mirrored ref, an unindexed tag, a
+// companion the indexer did not create - is left out, so a listing never shows a table its load
+// would refuse. Any other failure is returned: hiding it would make an outage look like an empty
+// index.
+func (s *Store) VirtualTables(ctx context.Context, addr Address) ([]string, error) {
 	source, ok := s.virtualSource()
 	if !ok {
-		return nil
+		return nil, nil
 	}
-	return source.VirtualTables(addr)
+	var listed []string
+	for _, name := range source.VirtualTables(addr) {
+		table := Address{Repo: addr.Repo, Ref: addr.Ref, Namespace: addr.Namespace, Table: name}
+		_, err := s.Resolve(ctx, table)
+		var noTable *NoSuchTableException
+		switch {
+		case err == nil:
+			listed = append(listed, name)
+		case errors.As(err, &noTable), isMissingWarehouse(err):
+		default:
+			return nil, fmt.Errorf("resolve the virtual table %q of %s@%s: %w", name, addr.Repo, addr.Ref, err)
+		}
+	}
+	return listed, nil
 }
 
 // RequireWritableNamespace returns *ReservedNamespaceError when addr.Namespace is reserved by the

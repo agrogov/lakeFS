@@ -1116,8 +1116,10 @@ Other permission facts:
   prints a warning naming that consequence. Do not rely on the deny in that mode.
 - The `system` namespace of a data repository is read-only for clients while the feature is enabled:
   creates, commits, registers, drops and namespace changes under `system` answer `403
-  ForbiddenException`, and `GET`/`HEAD` of the namespace is `404`. Listings still show `system` and
-  `object_metadata`. In `my-repo-metadata` it is an ordinary namespace.
+  ForbiddenException`, and `GET`/`HEAD` of the namespace is `404`. Listings show `system` and
+  `object_metadata` only on a ref where the table is served (the repository is indexed and the
+  companion branch has the table); on any other repository or ref the namespace is not listed but
+  stays reserved. In `my-repo-metadata` it is an ordinary namespace.
 - An explicit `storage_namespace` that does not itself end in `-metadata` falls outside the
   namespace grant of the bootstrap's `mds-indexer` policy. Put the extra `fs:AttachStorageNamespace`
   (and the matching `fs:CreateRepository`) in a policy of your own, for example

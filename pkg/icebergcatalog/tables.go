@@ -482,8 +482,13 @@ func (s *tableService) handleListTables(w http.ResponseWriter, r *http.Request) 
 	// A resolver may own tables that have no pointer entry at all (resolver.go, §5.4): they are
 	// added to the walk's answer before the emptiness check below and before the per-table
 	// authorization filter, so a virtual table is listed - and authorized - exactly like a walked
-	// one. Nothing is added while no resolver is registered.
-	names = mergeListings(names, s.store.VirtualTables(addr))
+	// one. Nothing is added while no resolver is registered, nor for a table that does not resolve.
+	virtual, err := s.store.VirtualTables(r.Context(), addr)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	names = mergeListings(names, virtual)
 
 	// A namespace that has no table and no marker does not exist: the spec's listTables answers
 	// 404 NoSuchNamespaceException for it. A namespace with markers of its own but no table is an
