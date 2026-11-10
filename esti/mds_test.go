@@ -812,6 +812,97 @@ func TestMetadataSearchEndToEnd(t *testing.T) {
 	})
 }
 
+// TestMetadataSearchRepositoryDeletion is A7 of REPO_DELETE_STORAGE_SPEC.md: deleting the indexed
+// data repository R with delete_storage=true removes R, its proven Metadata Search companion
+// R-metadata and both storage namespaces, and the indexer neither recreates the companion nor stops
+// reporting R as missing.
+//
+// The cascade of R17 is what makes one request enough; R18 is the control that a plain delete leaves
+// the companion alone (covered by the indexer's own unit tests, not here). The wait after the
+// deletion spans several indexer periods on purpose: a tick that read R just before the delete must
+// have been refused by the create-time conflict check (R16) and the next tick must see R missing, so
+// a companion recreated in that window is removed or never created at all.
+func TestMetadataSearchRepositoryDeletion(t *testing.T) {
+	env := newMDSEnv(t)
+	env.startIndexer(t)
+	cl := env.admin
+	ctx := t.Context()
+
+	env.uploadObject(t, mdsBranch, "data/with-the-repository.txt", "data that must go with R")
+	head := env.commitBranch(t, cl, mdsBranch, "mds test: data indexed before the storage deletion")
+	env.waitIndexed(t, mdsBranch, head)
+
+	// The init commit makes R-metadata the companion the cascade may delete (R17): a user's own
+	// "<R>-metadata" without it is not one.
+	companion, err := cl.GetRepositoryWithResponse(ctx, env.metadataRepo)
+	require.NoErrorf(t, err, "get the companion repository %s", env.metadataRepo)
+	require.Equalf(t, http.StatusOK, companion.StatusCode(),
+		"the indexer must have created %s before the cascade is tested: %s", env.metadataRepo, companion.Body)
+
+	deleteRepositoryWithStorage(ctx, t, cl, env.repo)
+
+	// One request covers both repositories, so both records are writable from here on (R17).
+	for _, repository := range []string{env.repo, env.metadataRepo} {
+		deletion := waitForRepositoryDeletion(ctx, t, cl, repository)
+		require.Equal(t, "done", deletion.State, "the storage deletion of %s must finish", repository)
+		require.NotZero(t, deletion.ObjectsDeleted, "the deletion of %s must delete its namespace's objects", repository)
+	}
+
+	// The indexer must now report R as missing. This also proves several ticks ran after the
+	// deletion, which is the window in which a stale tick could recreate the companion.
+	deadline := time.Now().Add(6 * mdsIndexerPeriodDuration)
+	lastError := ""
+	for {
+		env.exitedWhileRunning(t, env.indexer, "waiting for the indexer to report R missing")
+		if report, ok := env.indexerHealth(t); ok {
+			if repository, found := report.Repositories[env.repo]; found {
+				lastError = repository.LastError
+				if strings.Contains(lastError, "not found") {
+					break
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the indexer must report %s as missing after its storage deletion; last error: %q",
+				env.repo, lastError)
+		}
+		time.Sleep(mdsIndexerPeriodDuration)
+	}
+
+	// Give the indexer another tick after the first "not found" report, so the final state is the
+	// one the regression is about and not a momentary one.
+	time.Sleep(2 * mdsIndexerPeriodDuration)
+
+	for _, repository := range []string{env.repo, env.metadataRepo} {
+		res, err := cl.GetRepositoryWithResponse(ctx, repository)
+		require.NoErrorf(t, err, "get repository %s after the deletion", repository)
+		require.Equalf(t, http.StatusNotFound, res.StatusCode(),
+			"A7: %s must be gone: %s", repository, res.Body)
+	}
+	require.Emptyf(t, env.namespaceKeys(t, env.storageNamespace),
+		"A7: the namespace of %s must be empty", env.repo)
+	require.Emptyf(t, env.namespaceKeys(t, env.storageNamespace+"-metadata"),
+		"A7: the namespace of %s must be empty", env.metadataRepo)
+}
+
+// namespaceKeys returns the keys under namespace, relative to it. The listing prefix ends in "/",
+// so the sibling companion namespace is not part of it.
+func (e *mdsEnv) namespaceKeys(t *testing.T, namespace string) []string {
+	t.Helper()
+	key, err := e.objectKey(namespace)
+	require.NoErrorf(t, err, "the namespace %q must address the run's bucket", namespace)
+	prefix := strings.TrimRight(key, "/") + "/"
+	var keys []string
+	for object := range e.s3Client(t).ListObjects(t.Context(), e.bucket, minio.ListObjectsOptions{
+		Prefix:    prefix,
+		Recursive: true,
+	}) {
+		require.NoErrorf(t, object.Err, "list %s", namespace)
+		keys = append(keys, strings.TrimPrefix(object.Key, prefix))
+	}
+	return keys
+}
+
 // TestMetadataSearchBackfill times the first indexing of a 100k-object branch: the full listing and
 // rebuild of METADATA_SEARCH_DESIGN.md §4.5 step 2 and §4.3 step 2.
 //
@@ -1030,7 +1121,17 @@ func (e *mdsEnv) waitForDatabase(t *testing.T) {
 		output, _ = exec.Command("docker", "exec", e.database,
 			"pg_isready", "-U", mdsPostgresUser, "-d", mdsPostgresDatabase).CombinedOutput()
 		if strings.Contains(string(output), "accepting connections") {
-			return
+			// The entrypoint of the image starts a temporary server to run initdb and then shuts it
+			// down before starting the real one; pg_isready answers "accepting connections" for the
+			// temporary server too. A server process that starts in that gap gets "unexpected EOF"
+			// opening the KV store, so require the acceptance to survive the restart.
+			time.Sleep(icebergHealthInterval * 5)
+			output, _ = exec.Command("docker", "exec", e.database,
+				"pg_isready", "-U", mdsPostgresUser, "-d", mdsPostgresDatabase).CombinedOutput()
+			if strings.Contains(string(output), "accepting connections") {
+				return
+			}
+			continue
 		}
 		if time.Now().After(deadline) {
 			logs, _ := exec.Command("docker", "logs", e.database).CombinedOutput()
