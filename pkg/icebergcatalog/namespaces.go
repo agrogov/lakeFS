@@ -761,11 +761,11 @@ func (n *namespaceService) authorizeWrite(w http.ResponseWriter, r *http.Request
 	return true
 }
 
-// requireWritableNamespace refuses a namespace write into a namespace a table resolver reserves on
-// a data repository (resolver.go, METADATA_SEARCH_DESIGN.md §5.4). It is the namespace endpoint's
-// use of the same rule the table and view writes apply: create, update-properties and drop under a
-// reserved namespace are 403 ForbiddenException, and in <repo>-metadata the namespace is ordinary.
-// Nothing is refused while no resolver is registered.
+// requireWritableNamespace refuses a namespace write into the reserved root `system` repository
+// (resolver.go, METADATA_SEARCH_REALIGN.md RA1). It is the namespace endpoint's use of the same rule
+// the table and view writes apply: create, update-properties and drop under the tree are 403
+// ForbiddenException. Nothing below `<repo>.<ref>` is reserved (RA3), and nothing is refused while
+// no resolver is registered.
 //
 // It runs after the permission decision, so an unauthorized caller gets its permission refusal
 // rather than a description of a namespace it could not reach anyway.
@@ -1036,10 +1036,10 @@ func (n *namespaceService) listChildNamespaces(ctx context.Context, caller Calle
 		}
 		namespaces = append(namespaces, fullNamespace(parent, child))
 	}
-	// A resolver may own child namespaces that have no marker (resolver.go, §5.4): the system
-	// namespace of a Metadata Search data repository is one, and it is listed only while the
-	// resolver that declares it is registered. The order of the listing is by name, so the added
-	// levels are merged into it rather than appended after it.
+	// A resolver may add child namespaces that have no marker (resolver.go): the deprecated Metadata
+	// Search catalog lists the system namespace of a data repository that way, and it is listed only
+	// while the resolver that declares it is registered. The order of the listing is by name, so the
+	// added levels are merged into it rather than appended after it.
 	namespaces = withVirtualNamespaces(parent, namespaces, n.store.VirtualNamespaces(parent))
 	return namespaces, nil
 }
@@ -1268,9 +1268,9 @@ func childNamespace(parent Namespace, entryPath string) (string, error) {
 }
 
 // withVirtualNamespaces merges the child namespaces a resolver adds into the child namespaces a
-// listing discovered, keeping the listing in name order (resolver.go, §5.4). With nothing to add
-// the discovered namespaces are returned as they are, so a listing of a catalog without a resolver
-// is unchanged.
+// listing discovered, keeping the listing in name order (resolver.go). With nothing to add the
+// discovered namespaces are returned as they are, so a listing of a catalog without a resolver - or
+// of the lakeFS catalog, which adds nothing below `<repo>.<ref>` - is unchanged.
 func withVirtualNamespaces(parent Address, discovered []Namespace, virtual []string) []Namespace {
 	if len(virtual) == 0 {
 		return discovered
@@ -1350,7 +1350,8 @@ func (n *namespaceService) writeError(w http.ResponseWriter, err error) {
 	case errors.As(err, &readOnly):
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, readOnly.Message())
 	case errors.As(err, &reserved):
-		// A write into a namespace a table resolver owns (resolver.go, §5.4).
+		// A write into the reserved root `system` repository (resolver.go, METADATA_SEARCH_REALIGN.md
+		// RA1).
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, reserved.Error())
 	case errors.As(err, &denied):
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, denied.Error())

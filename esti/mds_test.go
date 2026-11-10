@@ -48,15 +48,13 @@
 //	                         commit is recovered, with no replay and no leftover staging (§4.4)
 //	user without R access    403 on the virtual table
 //	user with R-metadata only  200 on R-metadata's own table, 403 through R.<ref>.system.object_metadata
+//	                            (the deprecated catalog's identifier; the lakeFS catalog's system
+//	                            namespace of R is the user's like any other, RA3)
 //	non-indexer write        admin cannot write R-metadata (the deny of §8 is in force)
 //	guard-group attach        a member of a base group cannot CreateRepository, bare or not, on
 //	                          either accepted spelling of R-metadata's storage namespace: each is
 //	                          403 from the deny (R3S-3), while an ordinary namespace is created
 //	                          and deleted by the same principal
-//	system on R rejects writes  a principal that may write R (not the admin) cannot create,
-//	                            commit, rename or drop system.object_metadata on R, nor create or
-//	                            drop the system namespace, through either mount (§5.3); the
-//	                            virtual table still reads afterwards
 //
 // TestMetadataSearchBackfill pushes a 100k-object commit into R and times the first indexing of the
 // branch - the full-listing rebuild of §4.5 step 2 - reporting the number. It is a measurement, not
@@ -824,136 +822,6 @@ func TestMetadataSearchEndToEnd(t *testing.T) {
 					"a refused CreateRepository must not create %s: %s", name, found.Body)
 			}
 		}
-	})
-
-	t.Run("system on R rejects writes", func(t *testing.T) {
-		// The last row of the security tests of §9, with §5.3: on a data repository the system
-		// namespace belongs to the virtual table, so no client may create, commit, rename or drop
-		// anything in it, nor create or drop it as a namespace. The rule must hold on both
-		// addressing forms - /mds/iceberg/api, where the client names the repository and the ref
-		// in the identifier, and /iceberg/relative_to/{repo}.{ref}/api, where its URL fixes them
-		// (and where DuckDB and Starburst send it).
-		//
-		// The principal is deliberately not the administrator: it holds a write grant on R and on
-		// R only (fs:* on the repository, catalog:* on its namespace and table ARNs), which is
-		// what a query user who also writes tables has. Every refusal below is therefore the
-		// reservation of §5.3 and not a missing permission - the positive control at the end of
-		// each form creates and drops an ordinary namespace and table with the same credentials,
-		// so a 403 caused by a broken grant cannot pass for the rule.
-		writer := env.createPrincipal(t, "esti-mds-writer", []apigen.Statement{
-			{Effect: "allow", Action: []string{"fs:*"}, Resource: mdsRepoPattern(env.repo)},
-			{Effect: "allow", Action: []string{"fs:*"}, Resource: mdsRepoPattern(env.repo) + "/*"},
-			{Effect: "allow", Action: []string{"catalog:*"}, Resource: "arn:lakefs:catalog:::namespace/" + env.repo + "/*"},
-			{Effect: "allow", Action: []string{"catalog:*"}, Resource: "arn:lakefs:catalog:::table/" + env.repo + "/*"},
-		})
-
-		// The table every refusal must leave alone, read before and after the writes.
-		before := env.readRows(t, mdsBranch)
-		status, body := env.loadTableAs(t, writer.key, writer.secret, mdsBranch)
-		require.Equalf(t, http.StatusOK, status,
-			"%s must be able to read the virtual table before the refused writes, or the 403s below "+
-				"could be its read grant instead: %s", writer.username, body)
-
-		const (
-			createTableBody = `{"name":"clients_table","schema":{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"x","required":true,"type":"long"}]}}`
-			commitBody      = `{"requirements":[],"updates":[{"action":"set-properties","updates":{"owner":"mallory"}}]}`
-			controlNS       = "inventory"
-			controlTable    = "clients_table"
-		)
-
-		for _, mount := range env.systemMounts(mdsBranch) {
-			t.Run(mount.name, func(t *testing.T) {
-				systemNS := mount.namespace(icebergcatalog.SystemNamespace)
-				tablesURL := mount.url("/namespaces/" + systemNS + "/tables")
-				systemTable := tablesURL + "/" + url.PathEscape(icebergcatalog.ObjectMetadataTable)
-
-				t.Run("create table", func(t *testing.T) {
-					status, body := env.catalogAs(t, writer, http.MethodPost, tablesURL, createTableBody)
-					requireMDSReservedNamespace(t, status, body,
-						"creating a table in "+icebergcatalog.SystemNamespace+" of "+env.repo)
-				})
-
-				t.Run("commit", func(t *testing.T) {
-					status, body := env.catalogAs(t, writer, http.MethodPost, systemTable, commitBody)
-					requireMDSReservedNamespace(t, status, body,
-						"committing to "+icebergcatalog.SystemNamespace+"."+icebergcatalog.ObjectMetadataTable+" of "+env.repo)
-				})
-
-				t.Run("rename", func(t *testing.T) {
-					// §5.3: the catalog serves no rename operation at all (it is a v1 non-goal and
-					// http.go refuses to advertise one), so there is nothing to block and the answer
-					// is the unknown-endpoint 404 - the same on both forms. What matters here is that a
-					// rename cannot move the virtual table's pointer; the read at the end of the case
-					// proves it did not.
-					renameBody, err := json.Marshal(map[string]any{
-						"source": map[string]any{"namespace": mount.levels(icebergcatalog.SystemNamespace), "name": icebergcatalog.ObjectMetadataTable},
-						"dest":   map[string]any{"namespace": mount.levels(icebergcatalog.SystemNamespace), "name": "object_metadata_renamed"},
-					})
-					require.NoError(t, err, "marshal the rename request")
-					status, body := env.catalogAs(t, writer, http.MethodPost, mount.url("/tables/rename"), string(renameBody))
-					requireMDSRefusal(t, status, body, http.StatusNotFound, icebergcatalog.ErrTypeNotFound,
-						"renaming "+icebergcatalog.SystemNamespace+"."+icebergcatalog.ObjectMetadataTable+" of "+env.repo)
-				})
-
-				t.Run("drop table", func(t *testing.T) {
-					status, body := env.catalogAs(t, writer, http.MethodDelete, systemTable, "")
-					requireMDSReservedNamespace(t, status, body,
-						"dropping "+icebergcatalog.SystemNamespace+"."+icebergcatalog.ObjectMetadataTable+" of "+env.repo)
-				})
-
-				t.Run("create namespace", func(t *testing.T) {
-					namespaceBody, err := json.Marshal(map[string]any{"namespace": mount.levels(icebergcatalog.SystemNamespace)})
-					require.NoError(t, err, "marshal the create namespace request")
-					status, body := env.catalogAs(t, writer, http.MethodPost, mount.url("/namespaces"), string(namespaceBody))
-					requireMDSReservedNamespace(t, status, body,
-						"creating namespace "+icebergcatalog.SystemNamespace+" on "+env.repo)
-				})
-
-				t.Run("drop namespace", func(t *testing.T) {
-					status, body := env.catalogAs(t, writer, http.MethodDelete, mount.url("/namespaces/"+systemNS), "")
-					requireMDSReservedNamespace(t, status, body,
-						"dropping namespace "+icebergcatalog.SystemNamespace+" on "+env.repo)
-				})
-
-				t.Run("an ordinary namespace is writable", func(t *testing.T) {
-					// The control for the refusals above: on the same mount and with the same
-					// credentials, an ordinary namespace and its table are created and dropped. If
-					// the grant was wrong, this fails and the 403s above are not evidence of
-					// anything; if it passes, they are the reservation of §5.3.
-					namespaceBody, err := json.Marshal(map[string]any{"namespace": mount.levels(controlNS)})
-					require.NoError(t, err, "marshal the control create namespace request")
-					status, body := env.catalogAs(t, writer, http.MethodPost, mount.url("/namespaces"), string(namespaceBody))
-					require.Equalf(t, http.StatusOK, status,
-						"%s may write %s, so creating namespace %s must succeed: %s", writer.username, env.repo, controlNS, body)
-
-					controlTableURL := mount.url("/namespaces/" + mount.namespace(controlNS) + "/tables/" + url.PathEscape(controlTable))
-					status, body = env.catalogAs(t, writer, http.MethodPost,
-						mount.url("/namespaces/"+mount.namespace(controlNS)+"/tables"), createTableBody)
-					require.Equalf(t, http.StatusOK, status,
-						"%s may write %s, so creating table %s.%s must succeed: %s", writer.username, env.repo, controlNS, controlTable, body)
-
-					status, body = env.catalogAs(t, writer, http.MethodDelete, controlTableURL, "")
-					require.Equalf(t, http.StatusNoContent, status,
-						"the control table %s.%s must drop: %s", controlNS, controlTable, body)
-					status, body = env.catalogAs(t, writer, http.MethodDelete, mount.url("/namespaces/"+mount.namespace(controlNS)), "")
-					require.Equalf(t, http.StatusNoContent, status,
-						"the control namespace %s must drop: %s", controlNS, body)
-				})
-			})
-		}
-
-		// Nothing above may have reached the table: it still reads, through both published engines,
-		// and it still reports the commit the indexer recorded before the writes.
-		after := env.readRows(t, mdsBranch)
-		require.Equal(t, mdsPaths(before.PyIceberg.Rows), mdsPaths(after.PyIceberg.Rows),
-			"a refused write must not change the rows of the virtual table")
-		require.Equal(t, before.PyIceberg.SourceCommit, after.PyIceberg.SourceCommit,
-			"a refused write must not move %s", mdsTableSourceCommit)
-		require.Equal(t, mdsPaths(after.PyIceberg.Rows), mdsPaths(after.DuckDB.Rows),
-			"DuckDB must still read the virtual table through relative_to after the refusals")
-		status, body = env.loadTableAs(t, writer.key, writer.secret, mdsBranch)
-		require.Equalf(t, http.StatusOK, status,
-			"the virtual table must still load for %s after the refused writes: %s", writer.username, body)
 	})
 
 	t.Run("indexer still owns R-metadata", func(t *testing.T) {
@@ -2258,113 +2126,6 @@ func (e *mdsEnv) tableURLFor(mountPath, repo, ref string) string {
 	return e.baseURL + mountPath + "/v1/" + icebergcatalog.CatalogPrefix + "/namespaces/" +
 		strings.Join(encoded, icebergcatalog.EncodedNamespaceSeparator) +
 		"/tables/" + url.PathEscape(icebergcatalog.ObjectMetadataTable)
-}
-
-// systemMount is one of the two ways a client addresses the catalog of a data repository: the
-// upstream endpoint /mds/iceberg/api (§5.5), where the client names the repository and the ref in
-// the identifier, and /iceberg/relative_to/{repo}.{ref}/api, where its URL fixes them and the
-// client's own levels start at the namespace (relative.go). The rules of §5.3 must hold on both.
-type systemMount struct {
-	// name is how a failure message names the form.
-	name string
-	// base is the mount the /v1/{prefix}/... paths of the REST spec hang from.
-	base string
-	// namespace turns the client's own levels into the {namespace} path parameter of this form.
-	namespace func(levels ...string) string
-	// levels turns the client's own levels into the namespace member of a CreateNamespace body.
-	levels func(levels ...string) []string
-}
-
-// url is the URL of one catalog operation on this mount: path starts at the operation, i.e. with
-// "/namespaces" or "/tables".
-func (m systemMount) url(path string) string {
-	return m.base + "/v1/" + icebergcatalog.CatalogPrefix + path
-}
-
-// systemMounts returns both addressing forms of the catalog that serves the virtual table of a
-// repository at ref.
-func (e *mdsEnv) systemMounts(ref string) []systemMount {
-	encode := func(levels []string) string {
-		encoded := make([]string, 0, len(levels))
-		for _, level := range levels {
-			encoded = append(encoded, url.PathEscape(level))
-		}
-		return strings.Join(encoded, icebergcatalog.EncodedNamespaceSeparator)
-	}
-	abstract := func(levels ...string) []string {
-		return append([]string{e.repo, ref}, levels...)
-	}
-	return []systemMount{
-		{
-			name:      icebergcatalog.MetadataSearchBasePath,
-			base:      e.baseURL + icebergcatalog.MetadataSearchBasePath,
-			namespace: func(levels ...string) string { return encode(abstract(levels...)) },
-			levels:    abstract,
-		},
-		{
-			name: icebergcatalog.RelativeToBasePath + "/" + e.repo + "." + ref + "/api",
-			base: e.baseURL + icebergcatalog.RelativeToBasePath + "/" +
-				url.PathEscape(e.repo+"."+ref) + "/api",
-			namespace: func(levels ...string) string { return encode(levels) },
-			levels: func(levels ...string) []string {
-				return append([]string(nil), levels...)
-			},
-		},
-	}
-}
-
-// catalogAs issues one authenticated catalog request as an arbitrary principal and returns the
-// status and body. body is the JSON payload, empty for a request without one.
-func (e *mdsEnv) catalogAs(t *testing.T, p mdsPrincipal, method, rawURL, body string) (int, []byte) {
-	t.Helper()
-	req, err := http.NewRequestWithContext(e.ctx, method, rawURL, strings.NewReader(body))
-	require.NoErrorf(t, err, "%s %s", method, rawURL)
-	req.SetBasicAuth(p.key, p.secret)
-	if body != "" {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := (&http.Client{Timeout: mdsRequestTimeout}).Do(req)
-	require.NoErrorf(t, err, "%s %s", method, rawURL)
-	defer func() { _ = resp.Body.Close() }()
-	var out bytes.Buffer
-	_, err = out.ReadFrom(resp.Body)
-	require.NoErrorf(t, err, "read %s %s", method, rawURL)
-	return resp.StatusCode, out.Bytes()
-}
-
-// mdsCatalogEnvelope is the Iceberg REST error envelope (the spec's ErrorResponse): every catalog
-// refusal names its reason in error.type.
-type mdsCatalogEnvelope struct {
-	Error struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-		Code    int    `json:"code"`
-	} `json:"error"`
-}
-
-// requireMDSReservedNamespace asserts that a catalog write into the system namespace of a data
-// repository is refused by the reservation of §5.3: the status and type the design names, answered
-// with the message that names the namespace as reserved. A 403 from a permission rule has the same
-// status and the same type, and the message is what tells them apart: the positive control of the
-// case rules out a missing grant, and this rules out any other 403 in the same envelope.
-func requireMDSReservedNamespace(t *testing.T, status int, body []byte, what string) {
-	t.Helper()
-	requireMDSRefusal(t, status, body, http.StatusForbidden, icebergcatalog.ErrorTypeForbidden, what)
-	require.Containsf(t, strings.ToLower(string(body)), "reserved",
-		"%s must be refused by the reservation of %s, not by another 403: %s",
-		what, icebergcatalog.SystemNamespace, body)
-}
-
-// requireMDSRefusal asserts that a catalog answer is the refusal the design names - the status and
-// the Iceberg error type - and not a 404, a 409 or a 500 that would pass for one in a green run.
-func requireMDSRefusal(t *testing.T, status int, body []byte, wantStatus int, wantType, what string) {
-	t.Helper()
-	var envelope mdsCatalogEnvelope
-	require.NoErrorf(t, json.Unmarshal(body, &envelope),
-		"%s must answer the Iceberg error envelope, got %d: %s", what, status, body)
-	require.Equalf(t, wantStatus, status, "%s must be refused with %d %s: %s", what, wantStatus, wantType, body)
-	require.Equalf(t, wantType, envelope.Error.Type,
-		"%s must be refused with %d %s: %s", what, wantStatus, wantType, body)
 }
 
 // ---------------------------------------------------------------------------------------------

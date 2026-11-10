@@ -498,10 +498,12 @@ func (s *tableService) handleListTables(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, err)
 		return
 	}
-	// A resolver may own tables that have no pointer entry at all (resolver.go, §5.4): they are
+	// A resolver may add tables that have no pointer entry at all (resolver.go): the deprecated
+	// Metadata Search catalog lists object_metadata in the system namespace that way. They are
 	// added to the walk's answer before the emptiness check below and before the per-table
-	// authorization filter, so a virtual table is listed - and authorized - exactly like a walked
-	// one. Nothing is added while no resolver is registered.
+	// authorization filter, so such a table is listed - and authorized - exactly like a walked one.
+	// The lakeFS catalog adds nothing: it lists the pointers of the namespace and nothing else
+	// (METADATA_SEARCH_REALIGN.md §2, RA3).
 	names = mergeListings(names, s.store.VirtualTables(addr))
 
 	// A namespace that has no table and no marker does not exist: the spec's listTables answers
@@ -1015,20 +1017,21 @@ func (s *tableService) isBranchRef(ctx context.Context, addr Address) (bool, err
 	}
 }
 
-// requireWritableNamespace refuses a catalog write into a namespace a table resolver reserves on a
-// data repository (resolver.go, METADATA_SEARCH_DESIGN.md §5.4): on a Metadata Search installation
-// the system namespace of a data repository belongs to the virtual table, so a client cannot create,
-// commit, register, drop or rename anything in it - 403 ForbiddenException. In <repo>-metadata the
-// same namespace is ordinary, which is where the indexer writes.
+// requireWritableNamespace refuses a catalog write into the reserved root `system` repository
+// (resolver.go, METADATA_SEARCH_REALIGN.md RA1): on a Metadata Search installation the root tree
+// belongs to the catalog, so a client cannot create, commit, register or drop anything in it - 403
+// ForbiddenException. Nothing below `<repo>.<ref>` is reserved: the lakeFS catalog treats every
+// address there the same way (RA3), and in <repo>-metadata the system namespace is ordinary, which
+// is where the indexer writes.
 //
 // It runs after the permission decision: a caller who may not write the repository gets its
 // permission refusal, not a description of a namespace it could not reach anyway. Nothing is
 // refused while no resolver is registered.
 //
 // Every catalog write that reaches a handler calls it - create, commit, register, drop, the view
-// writes and the namespace writes. Rename is on the same list in §5.4 and needs no check here: this
-// catalog serves no rename operation at all (it is a v1 non-goal and http.go refuses to advertise
-// one), so a rename request is answered as the unknown endpoint it is rather than by a handler.
+// writes and the namespace writes. Rename needs no check here: this catalog serves no rename
+// operation at all (it is a v1 non-goal and http.go refuses to advertise one), so a rename request
+// is answered as the unknown endpoint it is rather than by a handler.
 func (s *tableService) requireWritableNamespace(w http.ResponseWriter, addr Address) bool {
 	if err := s.store.RequireWritableNamespace(addr); err != nil {
 		s.writeError(w, err)
@@ -1472,8 +1475,8 @@ func (s *tableService) writeError(w http.ResponseWriter, err error) {
 	case errors.As(err, &readOnly):
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, readOnly.Message())
 	case errors.As(err, &reserved):
-		// A write into a namespace a table resolver owns (resolver.go, §5.4): the caller may write
-		// the repository, just not the namespace the catalog serves from it.
+		// A write into the reserved root `system` repository (resolver.go, METADATA_SEARCH_REALIGN.md
+		// RA1): the caller may write the repository, just not the tree the catalog serves.
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, reserved.Error())
 	case errors.As(err, &denied):
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, denied.Error())

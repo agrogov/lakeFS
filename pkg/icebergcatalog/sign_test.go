@@ -671,26 +671,26 @@ func (r signRedirectResolver) ReservedNamespace(addr Address) bool {
 		addr.Namespace.Dotted() == r.reserved.Namespace.Dotted()
 }
 
-// TestRemoteSigningReservedNamespace pins the third check of the signing endpoint (§5.4,
-// resolver.go): a write signature is refused for a namespace a table resolver reserved, both on the
-// address the caller named and on the address the resolver redirects it to, while a read signature
-// for the same virtual table and a write signature for an ordinary table are still granted. The
-// first case fails before the fix: the write used to be authorized on the data repository and then
-// signed under the companion repository's location.
+// TestRemoteSigningReservedNamespace pins the third check of the signing endpoint (resolver.go): a
+// write signature is refused for the reserved root system tree (METADATA_SEARCH_REALIGN.md RA1),
+// both on the address the caller named and on the address a resolver redirects it to, while a read
+// signature for the same metadata table and a write signature for an ordinary table are still
+// granted. Nothing below `<repo>.<ref>` is reserved any more (RA3), so the address these cases name
+// is the tree's.
 func TestRemoteSigningReservedNamespace(t *testing.T) {
 	f := newSignResolverFixture(t)
-	virtualTarget := signTargetFor(nodes(tablesTestRepo, tablesTestRef, SystemNamespace),
-		resolverObjectMetadataTable)
+	treeTarget := signTargetFor(nodes(SystemNamespace, MetadataNamespace, tablesTestRepo, tablesTestRef),
+		ObjectsTable)
 	reservedMessage := (&ReservedNamespaceError{
-		Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{SystemNamespace},
+		Repo: SystemNamespace, Ref: MetadataNamespace, Namespace: Namespace{tablesTestRepo, tablesTestRef},
 	}).Error()
 
-	t.Run("a write sign on the reserved virtual address is refused", func(t *testing.T) {
+	t.Run("a write sign on the reserved tree address is refused", func(t *testing.T) {
 		// Every write method of the spec, not only the one the adapter can sign: the refusal is the
 		// namespace, so it precedes "the blockstore cannot sign this".
 		for _, method := range []string{http.MethodPut, http.MethodPost, http.MethodDelete, http.MethodPatch} {
 			f.adapter.calls = nil
-			rec := postSignAt(t, f.router, virtualTarget, "carol", f.metaDataURI, method, RemoteSigningDelegation)
+			rec := postSignAt(t, f.router, treeTarget, "carol", f.metaDataURI, method, RemoteSigningDelegation)
 			apiError := requireEnvelope(t, rec, http.StatusForbidden, ErrorTypeForbidden)
 			require.Equal(t, reservedMessage, apiError.Message, "method %s", method)
 			require.Empty(t, f.adapter.calls,
@@ -698,9 +698,9 @@ func TestRemoteSigningReservedNamespace(t *testing.T) {
 		}
 	})
 
-	t.Run("a read sign on the reserved virtual address is still granted", func(t *testing.T) {
+	t.Run("a read sign on the reserved tree address is still granted", func(t *testing.T) {
 		f.adapter.calls = nil
-		rec := postSignAt(t, f.router, virtualTarget, "alice", f.metaDataURI, http.MethodGet, RemoteSigningDelegation)
+		rec := postSignAt(t, f.router, treeTarget, "alice", f.metaDataURI, http.MethodGet, RemoteSigningDelegation)
 		requireSigned(t, rec)
 		require.Equal(t, []signingCall{{identifier: f.metaDataURI, mode: block.PreSignModeRead}}, f.adapter.calls,
 			"§5.4: the virtual table is readable; only writes are refused")

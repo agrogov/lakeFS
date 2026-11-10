@@ -817,14 +817,19 @@ func TestCredentialVendingReservedTarget(t *testing.T) {
 }
 
 // TestCredentialVendingMetadataSearchVirtualTable is the same rule through the real built-in
-// MetadataSearchResolver rather than a synthetic redirect: a branch write request for
-// R.<ref>.system.object_metadata resolves to R-metadata's system namespace, which is reserved, so
-// the request falls back to a read session and its policy never contains s3:PutObject.
+// MetadataSearchResolver rather than a synthetic redirect: a branch write request for the
+// deprecated catalog's address, R.<ref>.system.object_metadata, resolves to R-metadata's
+// system namespace, so the request falls back to a read session and its policy never contains
+// s3:PutObject. The redirect alone is the reason: the old identifier's namespace is ordinary in
+// the lakeFS catalog now (METADATA_SEARCH_REALIGN.md RA3), and a metadata table is always
+// read-only (G8).
 func TestCredentialVendingMetadataSearchVirtualTable(t *testing.T) {
 	f := newSignResolverFixture(t)
 	virtual := resolverVirtualAddress(tablesTestRef)
+	store := NewStore(f.catalog, f.objects,
+		WithTableResolver(NewDeprecatedMetadataSearchResolver(f.catalog, nil)))
 	stsFake := &credsFakeSTS{}
-	service := NewCredentialService(f.store, NewAuthorizer(f.authz.svc), f.catalog,
+	service := NewCredentialService(store, NewAuthorizer(f.authz.svc), f.catalog,
 		&Config{Prefix: CatalogPrefix, CredentialsVending: credsTestVending()}, stsFake, nil)
 	require.True(t, service.Enabled(), "the fake object store can vend")
 
@@ -832,12 +837,12 @@ func TestCredentialVendingMetadataSearchVirtualTable(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, credentials, 1)
 	require.Equal(t, f.metaTableLocation, credentials[0].Prefix,
-		"the read session is scoped to the companion table the virtual address resolves to")
+		"the read session is scoped to the companion table the deprecated address resolves to")
 	require.Equal(t, 1, stsFake.calls, "the write attempt must not reach STS")
 
 	document := policyOf(t, stsFake.input)
 	require.NotContains(t, document.Statement[0].Action, "s3:PutObject",
-		"a virtual table is read-only even when the caller writes the data repository's branch")
+		"a metadata table is read-only even when the caller writes the data repository's branch")
 	require.Contains(t, document.Statement[0].Action, "s3:GetObject")
 }
 

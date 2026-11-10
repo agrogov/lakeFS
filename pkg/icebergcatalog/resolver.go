@@ -3,19 +3,22 @@ package icebergcatalog
 // The table-resolution hook (METADATA_SEARCH_DESIGN.md §5.1-5.4, task R10-1).
 //
 // Metadata Search puts the system metadata of a data repository R into an ordinary companion
-// repository R-metadata, one Iceberg table per mirrored branch, and lets a user query it as if it
-// lived in R:
-//
-//	R.<ref>.system.object_metadata  →  <R>-metadata.<mapped ref>.system.object_metadata
-//
-// The current guide has moved that address to the root of the catalog, and this file serves both
-// forms of it:
+// repository R-metadata, one Iceberg table per mirrored branch, and lets a user query it from the
+// root of the catalog:
 //
 //	system.metadata.<R>.<ref>.objects  →  <R>-metadata.<mapped ref>.system.object_metadata
 //
 // The root tree - its nodes, its listings, its permissions and its reservation - is the section
-// "The root `system.metadata` tree" at the end of this file; the per-repository form above is the
-// one the guide deprecates (METADATA_SEARCH_REALIGN.md G5, removed by RA3).
+// "The root `system.metadata` tree" at the end of this file. It is the only thing the lakeFS
+// catalog (`/iceberg/api` and `relative_to`) serves: there is no `system` namespace, no virtual
+// table and no reservation below `<repo>.<ref>` (METADATA_SEARCH_REALIGN.md §2, RA3).
+//
+// The identifier of the older guide, `<R>.<ref>.system.object_metadata`, still resolves - to the
+// same companion table - but only in the guide's deprecated Metadata Search catalog at
+// `/mds/iceberg/api`, which is a catalog of its own (NewDeprecatedMetadataSearchResolver). It is
+// never an alias of the lakeFS catalog and its clients' addresses are ordinary addresses of the
+// lakeFS catalog: there they mean what they say, and `system.object_metadata` of a data repository
+// is the 404 of a table nobody created.
 //
 // The catalog is the only place that knows those mappings, so it is the only place that has to
 // change: this file is a hook, not a feature. A TableResolver is registered by the server
@@ -36,7 +39,7 @@ package icebergcatalog
 //
 // Both addresses in a ResolvedTable are complete Addresses, so a resolver can move a read across
 // repositories, refs, namespaces and table names in one step. Authorization is deliberately a
-// separate field: the virtual table of §5.2 is read by a caller who has no access to R-metadata at
+// separate field: the metadata table of §5.2 is read by a caller who has no access to R-metadata at
 // all, and the rule of §5.3 is one catalog:ReadTable (or catalog:ReadTableData) check on the
 // *data* repository. The redirected read itself runs with the server's own identity - the catalog
 // reads metadata.json through its block adapter, not with the caller's credentials - which is what
@@ -55,9 +58,12 @@ package icebergcatalog
 //
 // # The virtual table (§5.2)
 //
-// MetadataSearchResolver implements the one virtual table the design fixes:
+// MetadataSearchResolver implements the one virtual table the design fixes, at the address the
+// current guide names (or, built by NewDeprecatedMetadataSearchResolver, at the address of the
+// older one):
 //
-//	R.<ref>.system.object_metadata → <R>-metadata.<mapped ref>.system.object_metadata
+//	system.metadata.<R>.<ref>.objects → <R>-metadata.<mapped ref>.system.object_metadata
+//	R.<ref>.system.object_metadata    → <R>-metadata.<mapped ref>.system.object_metadata  (deprecated catalog only)
 //
 // <ref> is resolved by the table's own rules:
 //
@@ -75,25 +81,29 @@ package icebergcatalog
 //
 // # The reserved namespace (§5.4)
 //
-// On a *data* repository the system namespace belongs to the resolver, not to clients: it has no
-// markers and no pointers a client wrote, and a client that created a table or a namespace there
-// would either shadow the virtual table or write into a namespace nothing reads. So on a data
-// repository every catalog write into system is refused with 403 ForbiddenException
-// (*ReservedNamespaceError) - create, commit, register, drop, rename, and namespace create and
-// drop - while in R-metadata itself system is an ordinary namespace.
+// The only reserved namespace left is the root `system` repository of RA1, and it belongs to the
+// root tree, not to any data repository: every catalog write into it - create, commit, register,
+// rename, drop, and namespace create, update and drop - is refused with 403 ForbiddenException
+// (*ReservedNamespaceError). Nothing below `<repo>.<ref>` is reserved any more
+// (METADATA_SEARCH_REALIGN.md §2, RA3): a client may address `system` in its own repository like
+// any other namespace name, and nothing the catalog does is hidden behind it.
 //
-// The same capability answers what a listing shows (§5.4): ListNamespaces on a data repository
-// reports system, and ListTables in it reports object_metadata, only while a resolver that declares
-// them is registered. Both listings run the ordinary authorization filter afterwards, so a caller
-// without a grant on the namespace does not see them either.
+// The deprecated catalog has no reservation at all: it serves the old identifier and nothing else,
+// so there is no tree of its own to protect.
+//
+// The listing capability stays because the deprecated catalog needs it: it lists the `system`
+// namespace of a data repository and the `object_metadata` table inside it, so an upstream client's
+// browse keeps answering what it answered before (G5). Both listings run the ordinary
+// authorization filter afterwards, so a caller without a grant on the namespace does not see them
+// either.
 //
 // # What the hook does not do
 //
-// Nothing else in the catalog changes. A resolver cannot make a table writable through the virtual
-// address (writes never resolve: the reserved namespace refuses them first), cannot change what a
-// commit compares, and cannot reach the catalog's staging area except by naming an address the
-// caller could have named. The interface is a read path, and the four methods of
-// VirtualTableSource are listing and refusal rules - not data.
+// Nothing else in the catalog changes. A resolver cannot make a table writable through a virtual
+// address (writes never resolve: the root tree refuses them first, and the deprecated catalog
+// mounts read operations only), cannot change what a commit compares, and cannot reach the
+// catalog's staging area except by naming an address the caller could have named. The interface is
+// a read path, and the four methods of VirtualTableSource are listing and refusal rules - not data.
 
 import (
 	"context"
@@ -110,13 +120,16 @@ import (
 )
 
 const (
-	// SystemNamespace is the namespace the virtual metadata-search table lives in. On a data
-	// repository it is reserved for the resolver (§5.4); in the companion repository it is an
-	// ordinary namespace.
+	// SystemNamespace is the root repository of the Metadata Search tree, and the name of the
+	// physical namespace of the companion repository. At the root it is reserved (every write is
+	// refused); inside a data repository it is an ordinary namespace name like any other
+	// (METADATA_SEARCH_REALIGN.md §2, RA3).
 	SystemNamespace = "system"
 
-	// ObjectMetadataTable is the name of the virtual table: the system metadata of every object
-	// of the data repository, indexed per branch (§3.1).
+	// ObjectMetadataTable is the name of the table the indexer writes: the system metadata of every
+	// object of the data repository, indexed per branch (§3.1). Inside a data repository the name
+	// is not reserved: the table is served at the root tree as `objects`, and only the deprecated
+	// catalog still answers it at `<R>.<ref>.system.object_metadata`.
 	ObjectMetadataTable = "object_metadata"
 
 	// MetadataNamespace and ObjectsTable name the root tree of the current Metadata Search guide
@@ -271,14 +284,13 @@ type RefMapper interface {
 	MapRef(ctx context.Context, dataRepo, ref string) (metadataRef string, err error)
 }
 
-// VirtualTableSource is the optional half of a TableResolver that owns a namespace of the data
-// repository rather than a single address: it declares the names a listing adds and the namespace
+// VirtualTableSource is the optional half of a TableResolver that owns a namespace of a data
+// repository rather than a single address: it declares the names a listing adds and the names
 // clients may not write.
 //
 // It is separate from TableResolver because both are rules about addresses the resolver does *not*
-// redirect: the namespace of §5.4 and its table are listed without a pointer entry, and a write to
-// them is refused instead of resolved. A resolver that only redirects reads does not have to
-// implement it, and the catalog then lists and refuses nothing.
+// redirect. Only the deprecated catalog's resolver implements it: the lakeFS catalog has nothing
+// virtual, listed or reserved below `<repo>.<ref>` (METADATA_SEARCH_REALIGN.md §2, RA3).
 type VirtualTableSource interface {
 	// VirtualNamespaces returns the child namespaces the resolver adds below addr, a data
 	// repository ref (ListNamespaces with parent <repo><sep><ref>). Empty for an address that is
@@ -361,13 +373,14 @@ func IsMetadataRepository(repo string) bool {
 	return strings.HasSuffix(repo, MetadataRepositorySuffix) && len(repo) > len(MetadataRepositorySuffix)
 }
 
-// MetadataSearchResolver is the built-in TableResolver of METADATA_SEARCH_DESIGN.md §5.2: it
-// serves R.<ref>.system.object_metadata and system.metadata.R.<ref>.objects out of R-metadata, and
-// reserves the system namespace of every data repository and the whole root system tree (§5.4,
-// METADATA_SEARCH_REALIGN.md RA1).
+// MetadataSearchResolver is the built-in TableResolver of METADATA_SEARCH_DESIGN.md §5.2. In the
+// lakeFS catalog it serves system.metadata.R.<ref>.objects out of R-metadata and reserves the root
+// system tree (§5.4, METADATA_SEARCH_REALIGN.md RA1); built by NewDeprecatedMetadataSearchResolver
+// it serves R.<ref>.system.object_metadata out of R-metadata instead and lists it where the older
+// guide said it lived, for the separate /mds/iceberg/api catalog only (G5, RA3).
 //
 // Register it only while the Metadata Search feature is enabled (iceberg.metadata_search.enabled,
-// §5.5): the resolver is what makes the virtual table and the reserved namespace exist, so a
+// §5.5): the resolver is what makes the metadata table and the reserved root namespace exist, so a
 // catalog that does not register it is exactly the catalog of every other release.
 type MetadataSearchResolver struct {
 	// branches tells a branch from a tag or a commit. A nil lister treats every ref as a branch,
@@ -377,6 +390,11 @@ type MetadataSearchResolver struct {
 	// mapper maps a tag or a commit to a ref of the companion repository (§5.2). A nil mapper
 	// refuses those refs with NoSuchTableException instead of guessing.
 	mapper RefMapper
+
+	// deprecated serves the guide's deprecated catalog: the per-repository identifier
+	// R.<ref>.system.object_metadata, its listing, and nothing of the root tree. It is never active
+	// in the lakeFS catalog (METADATA_SEARCH_REALIGN.md G5, RA3).
+	deprecated bool
 
 	// initMu guards initCache, the found initialisation commit of each repository and the heads
 	// whose first-parent history was already proven to contain it. The init commit is immutable
@@ -395,10 +413,11 @@ type metadataSearchInitCacheEntry struct {
 	heads    []string
 }
 
-// NewMetadataSearchResolver builds the built-in resolver. branches answers "is this ref a branch?"
-// (the catalog implements it); mapper is the optional RefMapper that gives tags and commits a
-// meaning in the companion repository. Both may be nil: no lister means every ref is treated as a
-// branch, no mapper means a tag or a commit is not indexed and therefore NoSuchTable.
+// NewMetadataSearchResolver builds the built-in resolver of the lakeFS catalog. branches answers
+// "is this ref a branch?" (the catalog implements it); mapper is the optional RefMapper that gives
+// tags and commits a meaning in the companion repository. Both may be nil: no lister means every
+// ref is treated as a branch, no mapper means a tag or a commit is not indexed and therefore
+// NoSuchTable.
 func NewMetadataSearchResolver(branches BranchLister, mapper RefMapper) *MetadataSearchResolver {
 	return &MetadataSearchResolver{
 		branches:  branches,
@@ -407,16 +426,36 @@ func NewMetadataSearchResolver(branches BranchLister, mapper RefMapper) *Metadat
 	}
 }
 
-// Resolve answers the virtual-table address of §5.2 and leaves every other address alone.
+// NewDeprecatedMetadataSearchResolver builds the resolver of the guide's deprecated, separate
+// Metadata Search catalog at /mds/iceberg/api (METADATA_SEARCH_REALIGN.md G5, RA3). It is the same
+// resolver with the old per-repository address in place of the root tree:
 //
-// The three answers:
+//	R.<ref>.system.object_metadata  →  <R>-metadata.<mapped ref>.system.object_metadata
 //
-//   - an address that is not <data repo>.<ref>.system.object_metadata is not handled (false, nil),
-//     so the rest of the catalog is untouched. R-metadata itself is one of those addresses, which
-//     is what lets the indexer own its system namespace.
+// It serves load, head and list of that one identifier and resolves nothing else. Because the
+// deprecated catalog is a catalog of its own, the identifier is not an alias of anything in the
+// lakeFS catalog: the same address there is an ordinary address and answers 404.
+func NewDeprecatedMetadataSearchResolver(branches BranchLister, mapper RefMapper) *MetadataSearchResolver {
+	resolver := NewMetadataSearchResolver(branches, mapper)
+	resolver.deprecated = true
+	return resolver
+}
+
+// Resolve answers the address of §5.2 and leaves every other address alone.
+//
+// In the lakeFS catalog the only address it answers is the root tree's table,
+// system.metadata.<data repo>.<ref>.objects; in the deprecated catalog the only address it answers
+// is <data repo>.<ref>.system.object_metadata. Everything else - including the other form - is not
+// handled (false, nil), so the rest of the catalog is untouched: R-metadata itself is one of those
+// addresses, which is what lets the indexer own its system namespace, and so is any address below
+// `<repo>.<ref>` of a data repository, which the lakeFS catalog treats like every other address
+// (METADATA_SEARCH_REALIGN.md §2, RA3).
+//
+// For the handled address:
+//
 //   - a branch of the data repository maps to the branch of the same name in R-metadata. The
-//     authorization address is the address the caller named: one catalog:ReadTable check on the
-//     data repository, and nothing on R-metadata (§5.3).
+//     authorization address is the data repository the caller named: one catalog:ReadTable check
+//     on it, and nothing on R-metadata (§5.3).
 //   - a tag or a commit goes to the RefMapper. Without one it is refused with
 //     NoSuchTableException: the index mirrors branches, and the snapshot a tag or a commit names is
 //     the RefMapper's question, not this resolver's (§5.2).
@@ -425,23 +464,33 @@ func NewMetadataSearchResolver(branches BranchLister, mapper RefMapper) *Metadat
 // so the client gets the 404 NoSuchWarehouseException (or the 500) the same address would answer
 // without the hook.
 func (r *MetadataSearchResolver) Resolve(ctx context.Context, addr Address) (ResolvedTable, bool, error) {
-	if dataRepo, ref, ok := systemObjectsAddress(addr); ok {
-		// The root tree's table: system.metadata.<R>.<ref>.objects → the companion table of R.
-		mapped, err := r.objectsRef(ctx, dataRepo, ref, addr)
-		if err != nil {
-			return ResolvedTable{}, true, err
-		}
-		authz, _ := systemTreeAuthz(addr)
-		return ResolvedTable{
-			Target: Address{
-				Repo:      MetadataRepository(dataRepo),
-				Ref:       mapped,
-				Namespace: Namespace{SystemNamespace},
-				Table:     ObjectMetadataTable,
-			},
-			Authz: authz,
-		}, true, nil
+	if r.deprecated {
+		return r.resolveDataRepository(ctx, addr)
 	}
+	dataRepo, ref, ok := systemObjectsAddress(addr)
+	if !ok {
+		return ResolvedTable{}, false, nil
+	}
+	// The root tree's table: system.metadata.<R>.<ref>.objects → the companion table of R.
+	mapped, err := r.objectsRef(ctx, dataRepo, ref, addr)
+	if err != nil {
+		return ResolvedTable{}, true, err
+	}
+	authz, _ := systemTreeAuthz(addr)
+	return ResolvedTable{
+		Target: Address{
+			Repo:      MetadataRepository(dataRepo),
+			Ref:       mapped,
+			Namespace: Namespace{SystemNamespace},
+			Table:     ObjectMetadataTable,
+		},
+		Authz: authz,
+	}, true, nil
+}
+
+// resolveDataRepository answers the deprecated catalog's address, <R>.<ref>.system.object_metadata,
+// and leaves everything else alone (G5).
+func (r *MetadataSearchResolver) resolveDataRepository(ctx context.Context, addr Address) (ResolvedTable, bool, error) {
 	if !isObjectMetadataAddress(addr) {
 		return ResolvedTable{}, false, nil
 	}
@@ -462,8 +511,8 @@ func (r *MetadataSearchResolver) Resolve(ctx context.Context, addr Address) (Res
 
 // objectsRef maps the ref of the data repository onto a ref of the companion repository: the same
 // name for a branch (§5.2), the RefMapper's answer for a tag or a commit. It is the mapping of both
-// addressing forms: the old per-repository table and the root system tree name the same companion
-// table, so they must not be able to disagree.
+// addressing forms: the deprecated catalog's per-repository table and the root system tree name the
+// same companion table, so they must not be able to disagree.
 //
 // A ref the catalog cannot look up is returned as the missing warehouse it is, never silently
 // treated as "not a branch": the difference decides between 404 NoSuchWarehouseException and 404
@@ -796,54 +845,55 @@ func (r *MetadataSearchResolver) evictInitCacheLocked() {
 	}
 }
 
-// VirtualNamespaces implements VirtualTableSource: a data repository ref lists system as its one
-// virtual child namespace (§5.4). The parent of a listing is an Address with a repository and a ref
-// and no namespace levels; a deeper parent lists what its markers say and nothing else.
+// VirtualNamespaces implements VirtualTableSource: the deprecated catalog's client sees system as
+// the one virtual child namespace of a data repository ref, as it did before the guide moved the
+// tables to the root (G5). The parent of a listing is an Address with a repository and a ref and no
+// namespace levels; a deeper parent lists what its markers say and nothing else.
+//
+// The lakeFS catalog adds nothing: ListNamespaces on a data repository answers its markers only
+// (METADATA_SEARCH_REALIGN.md §2, RA3).
 func (r *MetadataSearchResolver) VirtualNamespaces(addr Address) []string {
-	if !reservesSystemNamespace(addr) || addr.Ref == "" || len(addr.Namespace) != 0 {
+	if !r.deprecated || !isDataRepositoryAddress(addr) || addr.Ref == "" || len(addr.Namespace) != 0 {
 		return nil
 	}
 	return []string{SystemNamespace}
 }
 
-// VirtualTables implements VirtualTableSource: the system namespace of a data repository lists
-// object_metadata even though no pointer entry exists for it (§5.4).
+// VirtualTables implements VirtualTableSource: in the deprecated catalog the system namespace of a
+// data repository lists object_metadata even though no pointer entry exists for it (G5). It lists
+// nothing in the lakeFS catalog.
 func (r *MetadataSearchResolver) VirtualTables(addr Address) []string {
-	if !reservesSystemNamespace(addr) || addr.Namespace.Dotted() != SystemNamespace {
+	if !r.deprecated || !isDataRepositoryAddress(addr) || addr.Namespace.Dotted() != SystemNamespace {
 		return nil
 	}
 	return []string{ObjectMetadataTable}
 }
 
-// ReservedNamespace implements VirtualTableSource: system is read-only for clients on a data
-// repository (§5.4), and the whole root tree is read-only on the reserved root repository. In the
-// companion repository the namespace is ordinary, which is what lets the indexer create, commit and
-// drop tables there.
+// ReservedNamespace implements VirtualTableSource: the whole root `system` repository is read-only
+// for clients (METADATA_SEARCH_REALIGN.md RA1). Nothing below `<repo>.<ref>` is reserved: the
+// deprecated catalog has no reservation at all, and in a data repository `system` is an ordinary
+// namespace name whose contents the catalog serves like any other (RA3).
 func (r *MetadataSearchResolver) ReservedNamespace(addr Address) bool {
-	if addr.Repo == SystemNamespace {
-		// The root tree (METADATA_SEARCH_REALIGN.md RA1): every write into the reserved root
-		// repository is refused, at every level and with or without a namespace below it.
-		return true
-	}
-	return reservesSystemNamespace(addr) && len(addr.Namespace) > 0 && addr.Namespace[0] == SystemNamespace
+	return !r.deprecated && addr.Repo == SystemNamespace
 }
 
-// reservesSystemNamespace reports whether addr names a data repository, i.e. one that has a
-// companion repository and whose system namespace therefore belongs to the resolver. An empty
-// repository is not one, and neither is the reserved root repository: the tree there is not a data
-// repository's virtual namespace but the root tree itself, which has its own rules.
-func reservesSystemNamespace(addr Address) bool {
+// isDataRepositoryAddress reports whether addr names a repository that can have a companion
+// repository: not the reserved root repository and not a companion itself. It is the question the
+// deprecated catalog's listing rules ask, because only there does a data repository still own a
+// virtual namespace.
+func isDataRepositoryAddress(addr Address) bool {
 	return addr.Repo != "" && addr.Repo != SystemNamespace && !IsMetadataRepository(addr.Repo)
 }
 
-// isObjectMetadataAddress reports whether addr is the virtual table of §5.2: the system namespace,
-// the object_metadata table, a repository and a ref - and not a view, which has its own namespace
-// tree and its own endpoints.
+// isObjectMetadataAddress reports whether addr is the deprecated catalog's table: the system
+// namespace, the object_metadata table, a data repository and a ref - and not a view, which has its
+// own namespace tree and its own endpoints. The lakeFS catalog never answers an address this
+// predicate accepts: it is an ordinary address there (RA3).
 func isObjectMetadataAddress(addr Address) bool {
 	if addr.HasView() || addr.Table != ObjectMetadataTable {
 		return false
 	}
-	if addr.Repo == "" || addr.Ref == "" || IsMetadataRepository(addr.Repo) {
+	if !isDataRepositoryAddress(addr) || addr.Ref == "" {
 		return false
 	}
 	return addr.Namespace.Dotted() == SystemNamespace
@@ -951,7 +1001,8 @@ func (s *Store) VirtualTables(addr Address) []string {
 // RequireWritableNamespace returns *ReservedNamespaceError when addr.Namespace is reserved by the
 // registered resolver, and nil otherwise (§5.4). Every catalog write that names a namespace calls
 // it after it authorized the caller: a reserved namespace is refused to a caller who may write the
-// repository, which is the only caller that gets far enough to read the message.
+// repository, which is the only caller that gets far enough to read the message. The root `system`
+// repository of RA1 is the only reserved address; nothing below `<repo>.<ref>` is.
 func (s *Store) RequireWritableNamespace(addr Address) error {
 	source, ok := s.virtualSource()
 	if !ok || !source.ReservedNamespace(addr) {
@@ -1177,12 +1228,13 @@ type SystemMetadataRepository struct {
 	Branches []string
 }
 
-// hasSystemTree reports whether this store's registered resolver is the built-in Metadata Search
-// resolver, i.e. whether the catalog serves the root system tree. A custom resolver does not create
-// the tree: it is the built-in one's capability.
+// hasSystemTree reports whether this store's registered resolver is the root system tree of the
+// lakeFS catalog, i.e. the built-in Metadata Search resolver in its non-deprecated form. The
+// deprecated catalog's resolver is a separate catalog and has no tree; a custom resolver does not
+// create the tree either: it is the built-in one's capability.
 func (s *Store) hasSystemTree() bool {
-	_, ok := s.resolver.(*MetadataSearchResolver)
-	return ok
+	resolver, ok := s.resolver.(*MetadataSearchResolver)
+	return ok && !resolver.deprecated
 }
 
 // systemTreeLister returns the listing surface of the resolver the tree is served by.

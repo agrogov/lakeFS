@@ -450,21 +450,24 @@ func (s *credentialService) Vend(ctx context.Context, caller Caller, req Request
 	if err != nil {
 		return nil, err
 	}
-	// A write session is scoped to the table that was actually read. When a table resolver
-	// redirects the write, the requested namespace may be ordinary while the target is reserved
-	// (§5.4): the session must not write the companion repository's files. The requested address is
-	// checked too, so the root system.metadata tree - whose target is an ordinary namespace of the
-	// hidden companion repository - is never given a write session (G8: metadata tables are always
-	// read-only). TableCredentials turns this refusal into a read session, exactly as it does for a
-	// write denial; a direct write Vend gets the refusal.
+	// A write session is scoped to the table that was actually read, so a redirected read must never
+	// produce one: the metadata tables are always read-only (METADATA_SEARCH_REALIGN.md G8). The
+	// root system.metadata tree is refused by two independent facts - its address is in the reserved
+	// root repository, and the resolver redirects it to an ordinary namespace of the hidden
+	// companion repository - and the deprecated catalog's older identifier is refused by the
+	// redirect alone (<R>.<ref>.system is an ordinary namespace there, RA3). TableCredentials turns
+	// this refusal into a read session, exactly as it does for a write denial; a direct write Vend
+	// gets the refusal.
 	if req.Op == OpWriteTableData {
-		for _, addr := range []Address{req.Address, scope.Target} {
-			if !s.writableNamespace(addr) {
-				return nil, &ReservedNamespaceError{
-					Repo:      addr.Repo,
-					Ref:       addr.Ref,
-					Namespace: addr.Namespace,
-				}
+		// scope.Target is empty for a scope that only knows where the table lives (a create, and the
+		// test scopes); a scope that read the table through the resolver always names its target, so
+		// an address that resolves to another one is recognized here.
+		redirected := scope.Target.Repo != "" && !sameAddress(scope.Target, req.Address)
+		if !s.writableNamespace(req.Address) || redirected {
+			return nil, &ReservedNamespaceError{
+				Repo:      req.Address.Repo,
+				Ref:       req.Address.Ref,
+				Namespace: req.Address.Namespace,
 			}
 		}
 	}
@@ -472,14 +475,15 @@ func (s *credentialService) Vend(ctx context.Context, caller Caller, req Request
 }
 
 // TableCredentials vends the session a client gets for a table that exists on addr.Ref: a write
-// session when the ref is a branch, the namespace is not reserved (§5.4) and the caller is allowed
-// catalog:WriteTableData, and a read session otherwise. A write denial, a read-only ref, or a
-// redirect whose resolved target is a reserved namespace falls back to the read session; any other
+// session when the ref is a branch, the caller may write the namespace and the caller is allowed
+// catalog:WriteTableData, and a read session otherwise. A write denial, a read-only ref, or an
+// address the resolver redirects to another table falls back to the read session; any other
 // failure, and a read denial, is Vend's.
 //
-// The reserved-namespace check is what keeps a write session away from a virtual table: the
-// resolver reads it from the companion repository, and a caller who may write the data repository
-// must not get credentials that write the companion's files.
+// The two checks are what keeps a write session away from a metadata table: a redirected read is
+// never given one (G8), and neither is the reserved root `system` repository. Nothing below
+// `<repo>.<ref>` is reserved any more (RA3), so an ordinary table in an ordinary namespace gets the
+// write session its caller asked for.
 func (s *credentialService) TableCredentials(ctx context.Context, caller Caller, addr Address, isBranch bool) ([]StorageCredential, error) {
 	if isBranch && s.writableNamespace(addr) {
 		credentials, err := s.Vend(ctx, caller, Request{Op: OpWriteTableData, Address: addr, RefIsBranch: true})
@@ -541,8 +545,10 @@ func (s *credentialService) CreatedTableCredentials(ctx context.Context, caller 
 	return s.vendScope(ctx, caller, addr, scope, access)
 }
 
-// writableNamespace reports whether a client may write addr's namespace (§5.4). A service built
-// without a store has no resolver, so nothing is reserved.
+// writableNamespace reports whether a client may write addr's namespace: only the root `system`
+// repository of RA1 is reserved (METADATA_SEARCH_REALIGN.md §2, RA3), so every other address is
+// writable as far as the resolver is concerned. A service built without a store has no resolver, so
+// nothing is reserved.
 func (s *credentialService) writableNamespace(addr Address) bool {
 	return s.store == nil || s.store.RequireWritableNamespace(addr) == nil
 }
@@ -565,8 +571,8 @@ func (s *credentialService) refIsBranch(ctx context.Context, addr Address) (bool
 }
 
 // isWriteRefusal reports whether err is a refusal of a write session - the authorizer's denial, the
-// Q-I4 read-only ref, or a resolved target in a namespace the resolver reserved (§5.4) - which a
-// caller answers with a read session instead.
+// Q-I4 read-only ref, or a read of a table the resolver redirects (a metadata table is always
+// read-only, G8) - which a caller answers with a read session instead.
 func isWriteRefusal(err error) bool {
 	return errors.Is(err, ErrPermissionDenied) || errors.Is(err, ErrRefReadOnly) ||
 		errors.Is(err, ErrReservedNamespace)
@@ -950,9 +956,9 @@ func (s *credentialService) writeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrCredentialVendingDisabled):
 		writeIcebergError(w, http.StatusNotImplemented, ErrTypeNotImplemented, err.Error())
 	case errors.As(err, &reserved):
-		// A write session for a namespace the resolver reserved - the root system.metadata tree is
-		// one, at every level (resolver.go, METADATA_SEARCH_REALIGN.md): metadata tables are always
-		// read-only (G8).
+		// A write session for a metadata table - the reserved root system.metadata tree, or an address
+		// the resolver redirects to the companion repository: metadata tables are always read-only
+		// (METADATA_SEARCH_REALIGN.md G8).
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, reserved.Error())
 	case errors.As(err, &readOnly):
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, readOnly.Message())

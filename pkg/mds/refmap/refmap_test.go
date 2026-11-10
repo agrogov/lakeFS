@@ -261,13 +261,16 @@ func TestMapRef(t *testing.T) {
 	}
 }
 
-// objectMetadataAddress is the virtual table of a data repository (§5.2).
+// objectMetadataAddress is the metadata table of a data repository ref at the root of the lakeFS
+// catalog, system.metadata.<repo>.<ref>.objects (METADATA_SEARCH_REALIGN.md G1). It is the address
+// the indexer's RefMapper serves; the older per-repository identifier belongs to the deprecated,
+// separate catalog only (G5).
 func objectMetadataAddress(repo, ref string) icebergcatalog.Address {
 	return icebergcatalog.Address{
-		Repo:      repo,
-		Ref:       ref,
-		Namespace: icebergcatalog.Namespace{icebergcatalog.SystemNamespace},
-		Table:     icebergcatalog.ObjectMetadataTable,
+		Repo:      icebergcatalog.SystemNamespace,
+		Ref:       icebergcatalog.MetadataNamespace,
+		Namespace: icebergcatalog.Namespace{repo, ref},
+		Table:     icebergcatalog.ObjectsTable,
 	}
 }
 
@@ -291,7 +294,14 @@ func TestMetadataSearchResolverWiring(t *testing.T) {
 			Namespace: icebergcatalog.Namespace{icebergcatalog.SystemNamespace},
 			Table:     icebergcatalog.ObjectMetadataTable,
 		}, resolved.Target)
-		require.Equal(t, addr, resolved.Authz, "authorization stays on the data repository (§5.3)")
+		// The tree address authorizes at the guide's ARN of the data repository (§5.3, G7), never at
+		// the tree itself and never at the companion repository.
+		require.Equal(t, icebergcatalog.Address{
+			Repo:      "lakehouse",
+			Ref:       "v1.0",
+			Namespace: icebergcatalog.Namespace{icebergcatalog.SystemNamespace},
+			Table:     icebergcatalog.ObjectMetadataTable,
+		}, resolved.Authz)
 	})
 
 	t.Run("a branch of R is served by the branch of R-metadata without the mapper", func(t *testing.T) {

@@ -546,14 +546,14 @@ func postTokenForm(t *testing.T, handler http.Handler, path string, form url.Val
 	return rec
 }
 
-// TestRoutesBuilderMountsMetadataSearchAlias is the wiring test of METADATA_SEARCH_DESIGN.md §5.5
-// (R10-2): while iceberg.metadata_search.enabled is true the catalog handler is mounted a second
-// time at /mds/iceberg/api, the endpoint upstream Metadata Search clients are configured with. The
-// alias is the same handler behind the same authentication and the same "lakefs" prefix, so both
-// the negotiation endpoint and the OAuth token endpoint answer exactly as they do under
-// /iceberg/api, and there is no relative_to form under the alias. While the feature is disabled the
-// prefix stays unclaimed and answers a plain 404.
-func TestRoutesBuilderMountsMetadataSearchAlias(t *testing.T) {
+// TestRoutesBuilderMountsDeprecatedMetadataSearchCatalog is the wiring test of
+// METADATA_SEARCH_REALIGN.md G5 (RA3): while iceberg.metadata_search.enabled is true the guide's
+// deprecated Metadata Search catalog is mounted at /mds/iceberg/api as a catalog of its own - its
+// own store and resolver, the same authentication and the same "lakefs" prefix - and it serves the
+// read operations only. It is not an alias of /iceberg/api: its GET /v1/config advertises the read
+// half of the operation list and no write operation, and a write is answered as the unknown
+// endpoint it is. While the feature is disabled the prefix stays unclaimed and answers a plain 404.
+func TestRoutesBuilderMountsDeprecatedMetadataSearchCatalog(t *testing.T) {
 	tokenForm := url.Values{
 		"grant_type":    {grantTypeClientCredentials},
 		"client_id":     {testAccessKeyID},
@@ -567,53 +567,64 @@ func TestRoutesBuilderMountsMetadataSearchAlias(t *testing.T) {
 		mux := coreRouter()
 		require.NoError(t, RoutesBuilder(t.Context(), deps, mux))
 
-		t.Run("GET /v1/config answers like /iceberg/api", func(t *testing.T) {
+		t.Run("GET /v1/config answers with the catalog prefix", func(t *testing.T) {
 			direct := do(t, mux, http.MethodGet, APIBasePath+configPath, testAccessKeyID, testSecretAccessKey)
-			alias := do(t, mux, http.MethodGet, MetadataSearchBasePath+configPath, testAccessKeyID, testSecretAccessKey)
+			deprecated := do(t, mux, http.MethodGet, MetadataSearchBasePath+configPath, testAccessKeyID, testSecretAccessKey)
 			require.Equal(t, http.StatusOK, direct.Code, "body: %s", direct.Body.String())
-			require.Equal(t, http.StatusOK, alias.Code, "body: %s", alias.Body.String())
-			require.JSONEq(t, direct.Body.String(), alias.Body.String())
+			require.Equal(t, http.StatusOK, deprecated.Code, "body: %s", deprecated.Body.String())
 
-			var response CatalogConfig
-			require.NoError(t, json.Unmarshal(alias.Body.Bytes(), &response))
-			require.Equal(t, map[string]string{"prefix": CatalogPrefix}, response.Overrides,
-				"the alias keeps the lakefs prefix; it does not add a warehouse to the path")
+			var catalog, deprecatedCatalog CatalogConfig
+			require.NoError(t, json.Unmarshal(direct.Body.Bytes(), &catalog))
+			require.NoError(t, json.Unmarshal(deprecated.Body.Bytes(), &deprecatedCatalog))
+			require.Equal(t, map[string]string{"prefix": CatalogPrefix}, deprecatedCatalog.Overrides,
+				"the deprecated catalog keeps the lakefs prefix; it does not add a warehouse to the path")
+			require.Equal(t, catalog.Overrides, deprecatedCatalog.Overrides)
+		})
+
+		t.Run("a write is not served", func(t *testing.T) {
+			// The deprecated catalog mounts the read operations only (newReadOnlyRouter): a write
+			// operation has no route at all, so it is answered as the unknown endpoint it is rather
+			// than by the write handler of /iceberg/api.
+			rec := do(t, mux, http.MethodPost,
+				MetadataSearchBasePath+"/v1/"+CatalogPrefix+"/namespaces/"+nodes("repo", "main", "system")+"/tables",
+				testAccessKeyID, testSecretAccessKey)
+			requireEnvelope(t, rec, http.StatusNotFound, ErrTypeNotFound)
 		})
 
 		t.Run("POST /v1/oauth/tokens answers like /iceberg/api", func(t *testing.T) {
 			direct := postTokenForm(t, mux, APIBasePath+OAuthTokenPath, tokenForm)
-			alias := postTokenForm(t, mux, MetadataSearchBasePath+OAuthTokenPath, tokenForm)
+			deprecated := postTokenForm(t, mux, MetadataSearchBasePath+OAuthTokenPath, tokenForm)
 			require.Equal(t, http.StatusOK, direct.Code, "body: %s", direct.Body.String())
-			require.Equal(t, http.StatusOK, alias.Code, "body: %s", alias.Body.String())
+			require.Equal(t, http.StatusOK, deprecated.Code, "body: %s", deprecated.Body.String())
 
-			var directResponse, aliasResponse OAuthTokenResponse
+			var directResponse, deprecatedResponse OAuthTokenResponse
 			require.NoError(t, json.Unmarshal(direct.Body.Bytes(), &directResponse))
-			require.NoError(t, json.Unmarshal(alias.Body.Bytes(), &aliasResponse))
-			require.NotEmpty(t, aliasResponse.AccessToken)
-			require.Equal(t, directResponse.TokenType, aliasResponse.TokenType)
-			require.Equal(t, directResponse.IssuedTokenType, aliasResponse.IssuedTokenType)
-			require.Equal(t, directResponse.ExpiresIn, aliasResponse.ExpiresIn)
+			require.NoError(t, json.Unmarshal(deprecated.Body.Bytes(), &deprecatedResponse))
+			require.NotEmpty(t, deprecatedResponse.AccessToken)
+			require.Equal(t, directResponse.TokenType, deprecatedResponse.TokenType)
+			require.Equal(t, directResponse.IssuedTokenType, deprecatedResponse.IssuedTokenType)
+			require.Equal(t, directResponse.ExpiresIn, deprecatedResponse.ExpiresIn)
 
-			// The token minted at the alias is an ordinary catalog token: it authenticates the
-			// /iceberg/api mount and the alias itself.
+			// The token minted at the deprecated catalog is an ordinary catalog token: it
+			// authenticates the /iceberg/api mount and the deprecated catalog itself.
 			require.Equal(t, http.StatusOK,
-				bearerRequest(t, mux, http.MethodGet, APIBasePath+configPath, aliasResponse.AccessToken).Code)
+				bearerRequest(t, mux, http.MethodGet, APIBasePath+configPath, deprecatedResponse.AccessToken).Code)
 			require.Equal(t, http.StatusOK,
-				bearerRequest(t, mux, http.MethodGet, MetadataSearchBasePath+configPath, aliasResponse.AccessToken).Code)
+				bearerRequest(t, mux, http.MethodGet, MetadataSearchBasePath+configPath, deprecatedResponse.AccessToken).Code)
 		})
 
-		t.Run("the alias requires authentication", func(t *testing.T) {
+		t.Run("the deprecated catalog requires authentication", func(t *testing.T) {
 			requireEnvelope(t, do(t, mux, http.MethodGet, MetadataSearchBasePath+configPath, "", ""),
 				http.StatusUnauthorized, ErrTypeNotAuthorized)
 		})
 
-		t.Run("there is no relative_to form under the alias", func(t *testing.T) {
+		t.Run("there is no relative_to form under the deprecated catalog", func(t *testing.T) {
 			rec := do(t, mux, http.MethodGet, MetadataSearchBasePath+"/repo.main/api"+configPath,
 				testAccessKeyID, testSecretAccessKey)
 			require.Equal(t, http.StatusNotFound, rec.Code, "body: %s", rec.Body.String())
 		})
 
-		t.Run("the core placeholder does not shadow the alias", func(t *testing.T) {
+		t.Run("the core placeholder does not shadow the deprecated catalog", func(t *testing.T) {
 			require.NotPanics(t, func() { api.MountNotImplementedServices(mux) })
 			rec := do(t, mux, http.MethodGet, MetadataSearchBasePath+configPath, testAccessKeyID, testSecretAccessKey)
 			require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())

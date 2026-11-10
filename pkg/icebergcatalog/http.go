@@ -25,11 +25,13 @@ const (
 	// <RelativeToBasePath>/{repo}[.{branch}]/api/v1/... (§5, §1.1 goal 2).
 	RelativeToBasePath = "/iceberg/relative_to"
 
-	// MetadataSearchBasePath is the upstream Metadata Search endpoint: while
-	// iceberg.metadata_search.enabled is true the same catalog handler is mounted here as well, so
-	// an upstream client configured for <lakefs>/mds/iceberg/api works unchanged apart from the
-	// host (METADATA_SEARCH_DESIGN.md §5.5, task R10-2). The prefix, the authentication schemes and
-	// the routes are the ones of APIBasePath; there is no relative_to alias under this path.
+	// MetadataSearchBasePath is the guide's deprecated, separate Metadata Search catalog
+	// (METADATA_SEARCH_REALIGN.md G5, RA3). While iceberg.metadata_search.enabled is true it is
+	// mounted as a catalog of its own - its own store, its own resolver, read operations only -
+	// that serves the older identifier `<repo>.<ref>.system.object_metadata` and resolves nothing
+	// else. It is not an alias of APIBasePath and there is no relative_to form under this path:
+	// the lakeFS catalog has nothing virtual below `<repo>.<ref>`, and this one has nothing of the
+	// root `system.metadata` tree.
 	MetadataSearchBasePath = "/mds/iceberg/api"
 
 	// relativeToPattern is the route under RelativeToBasePath. chi mounts it as
@@ -146,43 +148,16 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 	// mounts GET /v1/config only, and then advertises nothing but itself: advertisedEndpoints is
 	// derived from the mounted routes, so an empty endpoint list is the true statement that this
 	// router serves no catalog operation. The lakefs-sso binary always supplies both.
-	var services []routeSource
-	if deps.Catalog != nil && deps.BlockAdapter != nil && deps.AuthService != nil {
-		// The store is built with the operator's settings, and - only while Metadata Search is
-		// enabled - with the built-in table resolver (resolver.go, METADATA_SEARCH_DESIGN.md §5.1,
-		// §5.5). Registering it is what makes R.<ref>.system.object_metadata resolvable and the
-		// system namespace of a data repository read-only; without it the catalog behaves exactly
-		// as it did before the hook existed.
-		storeOptions := cfg.StoreOptions()
-		if cfg.MetadataSearchEnabled() {
-			storeOptions = append(storeOptions, WithTableResolver(
-				NewMetadataSearchResolver(deps.Catalog, metadataSearchRefMapper(deps.Catalog))))
-		}
-		store := NewStore(deps.Catalog, deps.BlockAdapter, storeOptions...)
-		authorizer := NewAuthorizer(deps.AuthService)
-		// The table service hands out the credential service's sessions in its load and create
-		// answers (§8), which is where iceberg-go takes them from; the endpoint only refreshes them.
-		credentials := NewCredentialService(store, authorizer, deps.Catalog, cfg, nil, deps.Logger)
-		services = append(services,
-			NewNamespaceService(store, authorizer, deps.Catalog, cfg),
-			// The table reads of I1-9, the staged create of I2-4, and the drop and metrics sink
-			// of I2-5.
-			NewTableService(store, authorizer, deps.Catalog, cfg).WithCredentials(credentials),
-			// The view surface: list, load, exists, create, replace and drop (views.go,
-			// views_http.go). It is a service of its own so its six endpoints are advertised
-			// exactly when the routes are mounted, like every other operation.
-			NewViewService(store, authorizer, deps.Catalog, cfg),
-			// Register (register.go): adopting a metadata.json written outside the catalog. It is its
-			// own service, so its endpoint is advertised exactly when it is mounted.
-			NewRegisterService(store, authorizer, deps.Catalog, cfg),
-			// The two data-plane services of §8. Each is enabled only by what it needs - remote
-			// signing by an S3 blockstore whose pre-signer is available, credential vending by an
-			// S3 blockstore plus a configured blockstore.s3.credentials_vending.role_arn - and a
-			// disabled service contributes neither a route nor an endpoint, so GET /v1/config
-			// advertises exactly the data-plane operations that are actually mounted.
-			NewRemoteSigningService(store, authorizer, deps.BlockAdapter, deps.Catalog, cfg),
-			credentials)
+	//
+	// The lakeFS catalog registers the built-in resolver only while Metadata Search is enabled
+	// (iceberg.metadata_search.enabled, METADATA_SEARCH_DESIGN.md §5.1, §5.5): registering it is
+	// what makes the root system.metadata tree resolvable and read-only. Its services are the whole
+	// catalog surface.
+	var resolver TableResolver
+	if cfg.MetadataSearchEnabled() && deps.Catalog != nil {
+		resolver = NewMetadataSearchResolver(deps.Catalog, metadataSearchRefMapper(deps.Catalog))
 	}
+	services := catalogServices(deps, cfg, resolver)
 	s := newServer(cfg, services...)
 	// Responses to a request that carries an Idempotency-Key are kept in the server's KV. Only
 	// when there is a KV to keep them in does the catalog wrap its mutations and advertise
@@ -214,15 +189,67 @@ func RoutesBuilder(ctx context.Context, deps cmdpkg.ServerDeps, r *chi.Mux) erro
 	relativeTo.Mount(relativeToPattern, RelativeTo(handler))
 	r.Mount(RelativeToBasePath, relativeTo)
 
-	// The Metadata Search alias (METADATA_SEARCH_DESIGN.md §5.5, R10-2) is mounted only while the
-	// feature is enabled: the upstream endpoint advertises the virtual table's catalog, and a
-	// server that has no metadata to search must not grow a second catalog at this path. When it
-	// is disabled the prefix stays unclaimed, so MountNotImplementedServices keeps answering it
-	// with its placeholder rather than this handler.
+	// The deprecated Metadata Search catalog (METADATA_SEARCH_REALIGN.md G5, RA3) is mounted only
+	// while the feature is enabled: a server that has no metadata to search must not grow a second
+	// catalog at this path. When it is disabled the prefix stays unclaimed, so
+	// MountNotImplementedServices keeps answering it with its placeholder rather than this handler.
+	//
+	// It is a catalog of its own, never an alias of the one above: its store carries the resolver
+	// that answers the older identifier, it serves the read operations only, and it has none of
+	// the root system.metadata tree. An upstream client configured for
+	// <lakefs>/mds/iceberg/api keeps working, and the lakeFS catalog never answers an address below
+	// `<repo>.<ref>` differently from any other (G4, G5).
 	if cfg.MetadataSearchEnabled() {
-		r.Mount(MetadataSearchBasePath, handler)
+		var deprecatedResolver TableResolver
+		if deps.Catalog != nil {
+			deprecatedResolver = NewDeprecatedMetadataSearchResolver(deps.Catalog, metadataSearchRefMapper(deps.Catalog))
+		}
+		deprecated := newServer(cfg, catalogServices(deps, cfg, deprecatedResolver)...)
+		deprecatedHandler, err := newReadOnlyRouter(authMiddleware, cfg, deprecated)
+		if err != nil {
+			return err
+		}
+		r.Mount(MetadataSearchBasePath, deprecatedHandler)
 	}
 	return nil
+}
+
+// catalogServices builds the store and the operation tables of one catalog over the server
+// dependencies. resolver is the table resolver the store is built with, or nil for a catalog with
+// none. Every store is built with the operator's settings (cfg.StoreOptions).
+func catalogServices(deps cmdpkg.ServerDeps, cfg *Config, resolver TableResolver) []routeSource {
+	if deps.Catalog == nil || deps.BlockAdapter == nil || deps.AuthService == nil {
+		return nil
+	}
+	storeOptions := cfg.StoreOptions()
+	if resolver != nil {
+		storeOptions = append(storeOptions, WithTableResolver(resolver))
+	}
+	store := NewStore(deps.Catalog, deps.BlockAdapter, storeOptions...)
+	authorizer := NewAuthorizer(deps.AuthService)
+	// The table service hands out the credential service's sessions in its load and create
+	// answers (§8), which is where iceberg-go takes them from; the endpoint only refreshes them.
+	credentials := NewCredentialService(store, authorizer, deps.Catalog, cfg, nil, deps.Logger)
+	return []routeSource{
+		NewNamespaceService(store, authorizer, deps.Catalog, cfg),
+		// The table reads of I1-9, the staged create of I2-4, and the drop and metrics sink
+		// of I2-5.
+		NewTableService(store, authorizer, deps.Catalog, cfg).WithCredentials(credentials),
+		// The view surface: list, load, exists, create, replace and drop (views.go,
+		// views_http.go). It is a service of its own so its six endpoints are advertised
+		// exactly when the routes are mounted, like every other operation.
+		NewViewService(store, authorizer, deps.Catalog, cfg),
+		// Register (register.go): adopting a metadata.json written outside the catalog. It is its
+		// own service, so its endpoint is advertised exactly when it is mounted.
+		NewRegisterService(store, authorizer, deps.Catalog, cfg),
+		// The two data-plane services of §8. Each is enabled only by what it needs - remote
+		// signing by an S3 blockstore whose pre-signer is available, credential vending by an
+		// S3 blockstore plus a configured blockstore.s3.credentials_vending.role_arn - and a
+		// disabled service contributes neither a route nor an endpoint, so GET /v1/config
+		// advertises exactly the data-plane operations that are actually mounted.
+		NewRemoteSigningService(store, authorizer, deps.BlockAdapter, deps.Catalog, cfg),
+		credentials,
+	}
 }
 
 // newAuthMiddleware builds the catalog's authentication middleware from the server dependencies
@@ -242,8 +269,8 @@ func newAuthMiddleware(deps cmdpkg.ServerDeps, cfg *Config) (func(http.Handler) 
 // MountDisabled mounts the catalog's 501 answer at both catalog prefixes. The prefixes are
 // claimed even though the catalog is off: a client that asks for it must be told it is
 // disabled, and the answer is a catalog error like any other (§12). MetadataSearchBasePath is
-// deliberately not claimed here: it is a Metadata Search alias and stays a plain 404 while the
-// feature is off.
+// deliberately not claimed here: it is the deprecated Metadata Search catalog, a catalog of its
+// own, and stays a plain 404 while the feature is off.
 func MountDisabled(r *chi.Mux) {
 	disabled := DisabledHandler()
 	r.Mount(APIBasePath, disabled)
@@ -261,9 +288,8 @@ func DisabledHandler() http.Handler {
 }
 
 // NewRouter builds the catalog sub-router. It is mounted at APIBasePath (and, with a warehouse
-// segment in between, at RelativeToBasePath, and - while Metadata Search is enabled - unchanged at
-// MetadataSearchBasePath) by RoutesBuilder, so its routes are relative to that mount point.
-// services are the operation tables of the catalog's own services (namespaces
+// segment in between, at RelativeToBasePath) by RoutesBuilder, so its routes are relative to that
+// mount point. services are the operation tables of the catalog's own services (namespaces
 // and tables): every operation they carry is mounted and, through the route table, advertised in
 // GET /v1/config.
 //
@@ -301,6 +327,27 @@ func NewRouter(authMiddleware func(http.Handler) http.Handler, cfg *Config, serv
 // decodes a body - or one that advertises a §1.2 non-goal - in front of the same middleware
 // stack before the read-path handlers land (I1-8, I1-9).
 func newRouter(authMiddleware func(http.Handler) http.Handler, cfg *Config, s *server) (http.Handler, error) {
+	return newRouterWithMount(authMiddleware, cfg, s.mount)
+}
+
+// newReadOnlyRouter is newRouter for the guide's deprecated Metadata Search catalog
+// (METADATA_SEARCH_REALIGN.md G5, RA3): the same middleware stack and catalog configuration, but
+// only the read operations are mounted. The deprecated catalog serves load, head and list of
+// `<repo>.<ref>.system.object_metadata`; a write there is answered as the unknown endpoint it is,
+// exactly like a write to a catalog that implements no such operation.
+//
+// Reads are GET and HEAD, which is every operation of the guide's list plus the credentials
+// refresh a load with vended credentials uses. POST /v1/oauth/tokens is not in the route table at
+// all: the authentication middleware serves it (oauth.go), so a client can still log in.
+func newReadOnlyRouter(authMiddleware func(http.Handler) http.Handler, cfg *Config, s *server) (http.Handler, error) {
+	return newRouterWithMount(authMiddleware, cfg, s.mountReadOnly)
+}
+
+// newRouterWithMount builds a catalog sub-router over the middleware stack and the mount function
+// that registers the route table. mount is a parameter rather than a boolean so the deprecated
+// catalog's read-only surface is one function and the two routers cannot drift apart on
+// middleware or on the error envelope.
+func newRouterWithMount(authMiddleware func(http.Handler) http.Handler, cfg *Config, mount func(chi.Router) error) (http.Handler, error) {
 	router := chi.NewRouter()
 
 	// The tenant refusal is the first middleware on the chain: it is answered before the
@@ -324,7 +371,7 @@ func newRouter(authMiddleware func(http.Handler) http.Handler, cfg *Config, s *s
 		writeIcebergError(w, http.StatusMethodNotAllowed, ErrTypeMethodNotAllowed,
 			fmt.Sprintf("%s is not supported for %s", r.Method, r.URL.Path))
 	})
-	if err := s.mount(router); err != nil {
+	if err := mount(router); err != nil {
 		return nil, err
 	}
 	return router, nil
@@ -545,9 +592,28 @@ func advertisedEndpoints(routes []route) []string {
 // response instead of running the operation again. Read operations (GET, HEAD, OPTIONS) are
 // never wrapped: they have no effect to repeat, and the spec defines the key for mutations.
 func (s *server) mount(r chi.Router) error {
+	return s.mountFiltered(r, func(route) bool { return true })
+}
+
+// mountReadOnly registers only the read half of the route table. It is what the guide's deprecated
+// Metadata Search catalog mounts (METADATA_SEARCH_REALIGN.md G5, RA3): a catalog that serves load,
+// head and list of one identifier, and no write at all. The endpoints it does not mount are not
+// advertised either, because advertisedEndpoints derives the list from the mounted routes.
+func (s *server) mountReadOnly(r chi.Router) error {
+	return s.mountFiltered(r, func(rt route) bool {
+		return rt.method == http.MethodGet || rt.method == http.MethodHead
+	})
+}
+
+// mountFiltered registers the routes keep accepts. A route that advertises a §1.2 non-goal is
+// refused while the router is built, whether or not it is kept.
+func (s *server) mountFiltered(r chi.Router, keep func(route) bool) error {
 	for _, rt := range s.routes {
 		if err := checkEndpointScope(rt.endpoint); err != nil {
 			return err
+		}
+		if !keep(rt) {
+			continue
 		}
 		handler := rt.handler
 		if s.idempotency != nil && isMutatingMethod(rt.method) {

@@ -133,14 +133,20 @@ type resolverCredential struct {
 }
 
 // resolverFixture is the catalog with Metadata Search enabled: the data repository of
-// tables_test.go, its companion repository, and the router RoutesBuilder mounts when
-// iceberg.metadata_search.enabled is true.
+// tables_test.go, its companion repository, and the routers RoutesBuilder mounts when
+// iceberg.metadata_search.enabled is true - the lakeFS catalog at /iceberg/api (and
+// /iceberg/relative_to) and the guide's deprecated, separate catalog at /mds/iceberg/api.
 type resolverFixture struct {
 	*tablesFixture
 
-	// store is a second store over the same catalog, built with the built-in resolver. It is what
-	// the credentials and signing redirection is asserted against (resolveScope, tableLocation).
+	// store is a second store over the same catalog, built with the built-in resolver of the
+	// lakeFS catalog. It is what the credentials and signing redirection is asserted against
+	// (resolveScope, tableLocation).
 	store *Store
+
+	// deprecated is the store of the deprecated catalog: the same catalog and the per-repository
+	// identifier of the older guide (NewDeprecatedMetadataSearchResolver).
+	deprecated *Store
 
 	mux         *chi.Mux
 	credentials map[string]resolverCredential
@@ -292,6 +298,7 @@ func newResolverFixtureWithCompanionAndInit(t *testing.T, repositoryProperty str
 	return &resolverFixture{
 		tablesFixture:        base,
 		store:                NewStore(base.catalog, base.catalog.BlockAdapter, WithTableResolver(NewMetadataSearchResolver(base.catalog, nil))),
+		deprecated:           NewStore(base.catalog, base.catalog.BlockAdapter, WithTableResolver(NewDeprecatedMetadataSearchResolver(base.catalog, nil))),
 		mux:                  mux,
 		credentials:          credentials,
 		metaStorageNamespace: metaStorageNamespace,
@@ -310,9 +317,10 @@ func (f *resolverFixture) request(t *testing.T, method, target, user, body strin
 	if body != "" {
 		reader = strings.NewReader(body)
 	}
-	// The catalog is mounted at APIBasePath, like it is in the binary; a test names the catalog
-	// path itself, so the mount prefix is added here.
-	if !strings.HasPrefix(target, "/iceberg") {
+	// The lakeFS catalog is mounted at APIBasePath and the deprecated Metadata Search catalog at
+	// MetadataSearchBasePath, like they are in the binary; a test names the catalog path itself, so
+	// the default mount prefix is added only when the target names neither.
+	if !strings.HasPrefix(target, "/iceberg") && !strings.HasPrefix(target, MetadataSearchBasePath) {
 		target = APIBasePath + target
 	}
 	req := httptest.NewRequest(method, target, reader)
@@ -444,16 +452,25 @@ func rewriteResolverCompanionAsBare(t *testing.T, cat *catalog.Catalog, reposito
 		"move %s@%s to its root initialisation commit", repository, branch)
 }
 
-// virtualTarget is the /iceberg/api load/head URL of the virtual table on one ref of the data
-// repository.
-func virtualTarget(ref string) string {
-	return tablesLoadTarget(nodes(tablesTestRepo, ref, SystemNamespace), resolverObjectMetadataTable, nil)
+// deprecatedCatalogTarget is the /mds/iceberg/api load/head URL of the deprecated catalog's table
+// on one ref of the data repository: the identifier of the older guide, served by the separate
+// catalog only (METADATA_SEARCH_REALIGN.md G5, RA3).
+func deprecatedCatalogTarget(ref string) string {
+	return MetadataSearchBasePath +
+		tablesLoadTarget(nodes(tablesTestRepo, ref, SystemNamespace), resolverObjectMetadataTable, nil)
 }
 
-// virtualNamespaceTablesTarget is the /iceberg/api table listing URL of the system namespace of the
-// data repository.
-func virtualNamespaceTablesTarget(ref string) string {
-	return tablesListTarget(nodes(tablesTestRepo, ref, SystemNamespace), nil)
+// deprecatedCatalogNamespaceTablesTarget is the /mds/iceberg/api table listing URL of the system
+// namespace of the data repository.
+func deprecatedCatalogNamespaceTablesTarget(ref string) string {
+	return MetadataSearchBasePath + tablesListTarget(nodes(tablesTestRepo, ref, SystemNamespace), nil)
+}
+
+// virtualTarget is the /iceberg/api load/head URL of the address the lakeFS catalog no longer
+// resolves: `<R>.<ref>.system.object_metadata` is an ordinary, absent table there
+// (METADATA_SEARCH_REALIGN.md §2, RA3).
+func virtualTarget(ref string) string {
+	return tablesLoadTarget(nodes(tablesTestRepo, ref, SystemNamespace), resolverObjectMetadataTable, nil)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -504,10 +521,133 @@ func resolverVirtualAddress(ref string) Address {
 	}
 }
 
-// TestMetadataSearchResolverRedirect pins the answer of the built-in resolver for every kind of
-// address it is asked about (§5.2): a branch maps to the branch of the same name, a tag or a commit
-// is the RefMapper's question, and everything that is not the virtual table is not handled at all.
+// resolverTreeObjectsAddress is the root tree's table address of dataRepo on one ref:
+// system.metadata.<repo>.<ref>.objects.
+func resolverTreeObjectsAddress(dataRepo, ref string) Address {
+	return Address{
+		Repo:      SystemNamespace,
+		Ref:       MetadataNamespace,
+		Namespace: Namespace{dataRepo, ref},
+		Table:     ObjectsTable,
+	}
+}
+
+// TestMetadataSearchResolverRedirect pins the answer of the lakeFS catalog's resolver (§5.2): the
+// root tree's table resolves to the companion repository, a branch maps to the branch of the same
+// name, a tag or a commit is the RefMapper's question - and every address below `<repo>.<ref>` is
+// left alone, the deprecated identifier included (METADATA_SEARCH_REALIGN.md §2, RA3).
 func TestMetadataSearchResolverRedirect(t *testing.T) {
+	branches := resolverBranchLister{branches: map[string]bool{
+		tablesTestRepo + "/" + tablesTestRef: true,
+	}}
+	wantTarget := Address{
+		Repo:      resolverMetaRepo,
+		Ref:       tablesTestRef,
+		Namespace: Namespace{SystemNamespace},
+		Table:     resolverObjectMetadataTable,
+	}
+	wantAuthz, ok := systemTreeAuthz(resolverTreeObjectsAddress(tablesTestRepo, tablesTestRef))
+	require.True(t, ok, "the tree's table has a catalog ARN")
+
+	t.Run("a branch maps to the branch of the same name", func(t *testing.T) {
+		resolver := NewMetadataSearchResolver(branches, nil)
+		resolved, handled, err := resolver.Resolve(t.Context(), resolverTreeObjectsAddress(tablesTestRepo, tablesTestRef))
+		require.NoError(t, err)
+		require.True(t, handled, "the root tree's table is the resolver's to answer")
+		require.Equal(t, wantTarget, resolved.Target)
+		require.Equal(t, wantAuthz, resolved.Authz,
+			"§5.3: the authorization address is the guide's ARN on the data repository, never the companion")
+	})
+
+	t.Run("a tag is refused while no RefMapper is registered", func(t *testing.T) {
+		resolver := NewMetadataSearchResolver(branches, nil)
+		_, handled, err := resolver.Resolve(t.Context(), resolverTreeObjectsAddress(tablesTestRepo, tablesTestTag))
+		require.True(t, handled)
+		var noTable *NoSuchTableException
+		require.ErrorAs(t, err, &noTable, "a tag has no mirrored branch, and guessing one would answer the wrong table")
+		require.Equal(t, ObjectsTable, noTable.Table)
+	})
+
+	t.Run("a commit is refused while no RefMapper is registered", func(t *testing.T) {
+		resolver := NewMetadataSearchResolver(branches, nil)
+		_, _, err := resolver.Resolve(t.Context(), resolverTreeObjectsAddress(tablesTestRepo, "a1b2c3d4e5f6"))
+		var noTable *NoSuchTableException
+		require.ErrorAs(t, err, &noTable)
+	})
+
+	t.Run("the RefMapper maps a tag", func(t *testing.T) {
+		resolver := NewMetadataSearchResolver(branches, resolverRefMapper{
+			refs: map[string]string{tablesTestTag: "indexed-" + tablesTestTag},
+		})
+		resolved, handled, err := resolver.Resolve(t.Context(), resolverTreeObjectsAddress(tablesTestRepo, tablesTestTag))
+		require.NoError(t, err)
+		require.True(t, handled)
+		require.Equal(t, "indexed-"+tablesTestTag, resolved.Target.Ref)
+		require.Equal(t, resolverMetaRepo, resolved.Target.Repo)
+		tagAuthz, ok := systemTreeAuthz(resolverTreeObjectsAddress(tablesTestRepo, tablesTestTag))
+		require.True(t, ok)
+		require.Equal(t, tagAuthz, resolved.Authz)
+	})
+
+	t.Run("the RefMapper may refuse a ref", func(t *testing.T) {
+		resolver := NewMetadataSearchResolver(branches, resolverRefMapper{
+			err: &NoSuchTableException{
+				Repo: tablesTestRepo, Ref: tablesTestTag,
+				Namespace: Namespace{SystemNamespace}, Table: resolverObjectMetadataTable,
+			},
+		})
+		_, handled, err := resolver.Resolve(t.Context(), resolverTreeObjectsAddress(tablesTestRepo, tablesTestTag))
+		require.True(t, handled)
+		var noTable *NoSuchTableException
+		require.ErrorAs(t, err, &noTable)
+	})
+
+	t.Run("an address below a data repository ref is not handled", func(t *testing.T) {
+		// The rule of METADATA_SEARCH_REALIGN.md §2: the lakeFS catalog has nothing virtual below
+		// `<repo>.<ref>`. The deprecated identifier is an ordinary address there - an absent table
+		// the read path answers with its own 404 - and so is every other name, including one spelled
+		// like the tree's.
+		resolver := NewMetadataSearchResolver(branches, nil)
+		for _, addr := range []Address{
+			resolverVirtualAddress(tablesTestRef),
+			resolverVirtualAddress(tablesTestTag),
+			{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{"inventory", "books"}, Table: "orders"},
+			{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{SystemNamespace}, Table: "something_else"},
+			{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{"system", "nested"}, Table: resolverObjectMetadataTable},
+			{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{SystemNamespace}},
+			// The companion repository itself: its system namespace is ordinary, which is what
+			// lets the indexer write there (in the test fixture it already has).
+			{Repo: resolverMetaRepo, Ref: tablesTestRef, Namespace: Namespace{SystemNamespace}, Table: resolverObjectMetadataTable},
+			// A view in the system namespace is not a table: it has its own tree and endpoints.
+			{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{SystemNamespace}, View: resolverObjectMetadataTable},
+			// A tree-shaped address that is not the table.
+			{Repo: SystemNamespace, Ref: MetadataNamespace, Namespace: Namespace{tablesTestRepo}},
+		} {
+			_, handled, err := resolver.Resolve(t.Context(), addr)
+			require.NoErrorf(t, err, "address %v", addr)
+			require.Falsef(t, handled, "address %v must be left alone", addr)
+		}
+	})
+
+	t.Run("a repository that does not exist is the missing warehouse it is", func(t *testing.T) {
+		resolver := NewMetadataSearchResolver(resolverBranchLister{err: graveler.ErrRepositoryNotFound}, nil)
+		_, _, err := resolver.Resolve(t.Context(), resolverTreeObjectsAddress(tablesTestRepo, tablesTestRef))
+		require.True(t, isMissingWarehouse(err), "a read of an unknown repository must stay the 404 it was")
+	})
+
+	t.Run("a nil BranchLister treats every ref as a branch", func(t *testing.T) {
+		resolver := NewMetadataSearchResolver(nil, nil)
+		resolved, handled, err := resolver.Resolve(t.Context(), resolverTreeObjectsAddress(tablesTestRepo, tablesTestTag))
+		require.NoError(t, err)
+		require.True(t, handled)
+		require.Equal(t, tablesTestTag, resolved.Target.Ref)
+	})
+}
+
+// TestDeprecatedMetadataSearchResolverRedirect pins the answer of the deprecated catalog's resolver
+// (METADATA_SEARCH_REALIGN.md G5): the older per-repository identifier and nothing else. The ref
+// rules are the same as the root tree's, because both name the same companion table.
+func TestDeprecatedMetadataSearchResolverRedirect(t *testing.T) {
 	branches := resolverBranchLister{branches: map[string]bool{
 		tablesTestRepo + "/" + tablesTestRef: true,
 	}}
@@ -519,115 +659,91 @@ func TestMetadataSearchResolverRedirect(t *testing.T) {
 	}
 
 	t.Run("a branch maps to the branch of the same name", func(t *testing.T) {
-		resolver := NewMetadataSearchResolver(branches, nil)
+		resolver := NewDeprecatedMetadataSearchResolver(branches, nil)
 		resolved, handled, err := resolver.Resolve(t.Context(), resolverVirtualAddress(tablesTestRef))
 		require.NoError(t, err)
-		require.True(t, handled, "the virtual table is the resolver's to answer")
+		require.True(t, handled, "the deprecated identifier is this catalog's to answer")
 		require.Equal(t, wantTarget, resolved.Target)
 		require.Equal(t, resolverVirtualAddress(tablesTestRef), resolved.Authz,
 			"§5.3: the authorization address is the data repository, never the companion")
 	})
 
-	t.Run("a tag is refused while no RefMapper is registered", func(t *testing.T) {
-		resolver := NewMetadataSearchResolver(branches, nil)
+	t.Run("a tag is the RefMapper's question", func(t *testing.T) {
+		resolver := NewDeprecatedMetadataSearchResolver(branches, nil)
 		_, handled, err := resolver.Resolve(t.Context(), resolverVirtualAddress(tablesTestTag))
 		require.True(t, handled)
 		var noTable *NoSuchTableException
-		require.ErrorAs(t, err, &noTable, "a tag has no mirrored branch, and guessing one would answer the wrong table")
-		require.Equal(t, tablesTestTag, noTable.Ref)
-	})
-
-	t.Run("a commit is refused while no RefMapper is registered", func(t *testing.T) {
-		resolver := NewMetadataSearchResolver(branches, nil)
-		_, _, err := resolver.Resolve(t.Context(), resolverVirtualAddress("a1b2c3d4e5f6"))
-		var noTable *NoSuchTableException
 		require.ErrorAs(t, err, &noTable)
-	})
 
-	t.Run("the RefMapper maps a tag", func(t *testing.T) {
-		resolver := NewMetadataSearchResolver(branches, resolverRefMapper{
+		mapped := NewDeprecatedMetadataSearchResolver(branches, resolverRefMapper{
 			refs: map[string]string{tablesTestTag: "indexed-" + tablesTestTag},
 		})
-		resolved, handled, err := resolver.Resolve(t.Context(), resolverVirtualAddress(tablesTestTag))
+		resolved, handled, err := mapped.Resolve(t.Context(), resolverVirtualAddress(tablesTestTag))
 		require.NoError(t, err)
 		require.True(t, handled)
 		require.Equal(t, "indexed-"+tablesTestTag, resolved.Target.Ref)
-		require.Equal(t, resolverMetaRepo, resolved.Target.Repo)
-		require.Equal(t, resolverVirtualAddress(tablesTestTag), resolved.Authz)
 	})
 
-	t.Run("the RefMapper may refuse a ref", func(t *testing.T) {
-		resolver := NewMetadataSearchResolver(branches, resolverRefMapper{
-			err: &NoSuchTableException{
-				Repo: tablesTestRepo, Ref: tablesTestTag,
-				Namespace: Namespace{SystemNamespace}, Table: resolverObjectMetadataTable,
-			},
-		})
-		_, handled, err := resolver.Resolve(t.Context(), resolverVirtualAddress(tablesTestTag))
-		require.True(t, handled)
-		var noTable *NoSuchTableException
-		require.ErrorAs(t, err, &noTable)
-	})
-
-	t.Run("an address that is not the virtual table is not handled", func(t *testing.T) {
-		resolver := NewMetadataSearchResolver(branches, nil)
+	t.Run("the root tree is not handled", func(t *testing.T) {
+		// The deprecated catalog keeps serving the old identifier and nothing of the new tree: the
+		// two catalogs are separate (G5).
+		resolver := NewDeprecatedMetadataSearchResolver(branches, nil)
 		for _, addr := range []Address{
+			resolverTreeObjectsAddress(tablesTestRepo, tablesTestRef),
+			{Repo: SystemNamespace},
+			{Repo: SystemNamespace, Ref: MetadataNamespace},
+			{Repo: SystemNamespace, Ref: MetadataNamespace, Namespace: Namespace{tablesTestRepo}},
 			{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{"inventory", "books"}, Table: "orders"},
-			{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{SystemNamespace}, Table: "something_else"},
-			{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{"system", "nested"}, Table: resolverObjectMetadataTable},
-			{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{SystemNamespace}},
-			// The companion repository itself: its system namespace is ordinary, which is what
-			// lets the indexer write there (in the test fixture it already has).
-			{Repo: resolverMetaRepo, Ref: tablesTestRef, Namespace: Namespace{SystemNamespace}, Table: resolverObjectMetadataTable},
-			// A view in the system namespace is not a table: it has its own tree and endpoints.
-			{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{SystemNamespace}, View: resolverObjectMetadataTable},
 		} {
 			_, handled, err := resolver.Resolve(t.Context(), addr)
 			require.NoErrorf(t, err, "address %v", addr)
 			require.Falsef(t, handled, "address %v must be left alone", addr)
 		}
 	})
-
-	t.Run("a repository that does not exist is the missing warehouse it is", func(t *testing.T) {
-		resolver := NewMetadataSearchResolver(resolverBranchLister{err: graveler.ErrRepositoryNotFound}, nil)
-		_, _, err := resolver.Resolve(t.Context(), resolverVirtualAddress(tablesTestRef))
-		require.True(t, isMissingWarehouse(err), "a read of an unknown repository must stay the 404 it was")
-	})
-
-	t.Run("a nil BranchLister treats every ref as a branch", func(t *testing.T) {
-		resolver := NewMetadataSearchResolver(nil, nil)
-		resolved, handled, err := resolver.Resolve(t.Context(), resolverVirtualAddress(tablesTestTag))
-		require.NoError(t, err)
-		require.True(t, handled)
-		require.Equal(t, tablesTestTag, resolved.Target.Ref)
-	})
 }
 
-// TestMetadataSearchResolverCapabilities pins the listing and read-only rules of §5.4 as the
-// resolver states them, for the data repository and for the companion one.
+// TestMetadataSearchResolverCapabilities pins the listing and reservation rules as the two resolvers
+// state them. The lakeFS catalog adds nothing to a listing below `<repo>.<ref>` and reserves only
+// the root `system` repository (METADATA_SEARCH_REALIGN.md §2, RA1, RA3); the deprecated catalog
+// still lists the system namespace of a data repository, because its clients browse there (G5), and
+// has no tree to reserve.
 func TestMetadataSearchResolverCapabilities(t *testing.T) {
 	resolver := NewMetadataSearchResolver(nil, nil)
 
-	require.Equal(t, []string{SystemNamespace},
-		resolver.VirtualNamespaces(Address{Repo: tablesTestRepo, Ref: tablesTestRef}),
-		"the ref level of a data repository lists the system namespace")
-	require.Empty(t, resolver.VirtualNamespaces(Address{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{"inventory"}}),
-		"a deeper namespace lists its markers and nothing else")
-	require.Empty(t, resolver.VirtualNamespaces(Address{Repo: resolverMetaRepo, Ref: tablesTestRef}),
-		"the companion repository lists its own markers")
+	require.Empty(t, resolver.VirtualNamespaces(Address{Repo: tablesTestRepo, Ref: tablesTestRef}),
+		"a data repository lists its own markers and nothing else")
+	require.Empty(t, resolver.VirtualTables(resolverVirtualAddress(tablesTestRef)),
+		"the system namespace of a data repository has no virtual table in the lakeFS catalog")
 
-	require.Equal(t, []string{resolverObjectMetadataTable},
-		resolver.VirtualTables(resolverVirtualAddress(tablesTestRef)))
-	require.Empty(t, resolver.VirtualTables(Address{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{"inventory"}}))
-	require.Empty(t, resolver.VirtualTables(Address{Repo: resolverMetaRepo, Ref: tablesTestRef, Namespace: Namespace{SystemNamespace}}),
-		"the companion repository's system namespace is an ordinary namespace, listed by its pointers")
-
-	require.True(t, resolver.ReservedNamespace(resolverVirtualAddress(tablesTestRef)))
-	require.True(t, resolver.ReservedNamespace(Address{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{SystemNamespace, "child"}}),
-		"the whole subtree is reserved, not just its first level")
+	require.True(t, resolver.ReservedNamespace(Address{Repo: SystemNamespace}),
+		"the root tree is reserved")
+	require.True(t, resolver.ReservedNamespace(resolverTreeObjectsAddress(tablesTestRepo, tablesTestRef)),
+		"every level of the root tree is reserved")
+	require.False(t, resolver.ReservedNamespace(resolverVirtualAddress(tablesTestRef)),
+		"the deprecated identifier is an ordinary address in the lakeFS catalog")
+	require.False(t, resolver.ReservedNamespace(Address{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{SystemNamespace, "child"}}),
+		"nothing below a data repository ref is reserved, at any depth")
 	require.False(t, resolver.ReservedNamespace(Address{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{"inventory"}}))
 	require.False(t, resolver.ReservedNamespace(Address{Repo: resolverMetaRepo, Ref: tablesTestRef, Namespace: Namespace{SystemNamespace}}))
 	require.False(t, resolver.ReservedNamespace(Address{}))
+
+	deprecated := NewDeprecatedMetadataSearchResolver(nil, nil)
+	require.Equal(t, []string{SystemNamespace},
+		deprecated.VirtualNamespaces(Address{Repo: tablesTestRepo, Ref: tablesTestRef}),
+		"the deprecated catalog lists the system namespace an upstream client browses")
+	require.Empty(t, deprecated.VirtualNamespaces(Address{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{"inventory"}}),
+		"a deeper namespace lists its markers and nothing else")
+	require.Empty(t, deprecated.VirtualNamespaces(Address{Repo: resolverMetaRepo, Ref: tablesTestRef}),
+		"the companion repository lists its own markers")
+	require.Equal(t, []string{resolverObjectMetadataTable},
+		deprecated.VirtualTables(resolverVirtualAddress(tablesTestRef)))
+	require.Empty(t, deprecated.VirtualTables(Address{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{"inventory"}}))
+	require.Empty(t, deprecated.VirtualTables(Address{Repo: resolverMetaRepo, Ref: tablesTestRef, Namespace: Namespace{SystemNamespace}}),
+		"the companion repository's system namespace is an ordinary namespace, listed by its pointers")
+	require.False(t, deprecated.ReservedNamespace(Address{Repo: SystemNamespace}),
+		"the deprecated catalog has no tree to reserve")
+	require.False(t, deprecated.ReservedNamespace(resolverVirtualAddress(tablesTestRef)),
+		"the 403 on writes under a data repository's system namespace is gone (RA3)")
 
 	require.True(t, IsMetadataRepository(resolverMetaRepo))
 	require.False(t, IsMetadataRepository("metadata"), "a repository that is only the suffix is not a companion")
@@ -719,7 +835,8 @@ func TestMetadataSearchDefaultNoop(t *testing.T) {
 			http.StatusNotFound, ErrTypeNoSuchTable)
 		// The system namespace has no marker either, so its listing is the 404 a namespace without
 		// one always answers (§5).
-		requireEnvelope(t, request(t, http.MethodGet, virtualNamespaceTablesTarget(tablesTestRef), "alice", ""),
+		requireEnvelope(t, request(t, http.MethodGet,
+			tablesListTarget(nodes(tablesTestRepo, tablesTestRef, SystemNamespace), nil), "alice", ""),
 			http.StatusNotFound, ErrTypeNoSuchNamespace)
 	})
 
@@ -741,17 +858,116 @@ func TestMetadataSearchDefaultNoop(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The virtual table over HTTP (§5.2, §5.3)
+// The lakeFS catalog has nothing virtual below `<repo>.<ref>`; the deprecated catalog has only the
+// old identifier (METADATA_SEARCH_REALIGN.md §2, G4, G5; RA3)
 // ---------------------------------------------------------------------------------------------
 
-// TestMetadataSearchVirtualTableRead covers the read half: the load and head of the virtual table,
-// its listing, and the promise of §5.3 that the caller's only permission is on the data repository.
-func TestMetadataSearchVirtualTableRead(t *testing.T) {
+// TestMetadataSearchDataRepositoryIsOrdinary is the lakeFS catalog's half of RA3: with R indexed,
+// `/iceberg/api` and `relative_to` treat every address below `<repo>.<ref>` the way they treat any
+// other. A listing shows what the user created and nothing else, the deprecated identifier is the
+// 404 of an absent table, and the root tree still serves the indexed table.
+func TestMetadataSearchDataRepositoryIsOrdinary(t *testing.T) {
+	f := newResolverFixture(t)
+
+	t.Run("the deprecated identifier answers 404 like any absent table", func(t *testing.T) {
+		for _, ref := range []string{tablesTestRef, tablesTestTag} {
+			requireEnvelope(t, f.request(t, http.MethodGet, virtualTarget(ref), "alice", ""),
+				http.StatusNotFound, ErrTypeNoSuchTable)
+			requireEnvelope(t, f.request(t, http.MethodHead, virtualTarget(ref), "alice", ""),
+				http.StatusNotFound, ErrTypeNoSuchTable)
+		}
+		// The relative_to form is the same catalog, so it answers the same 404.
+		relative := warehouseTarget(tablesTestRepo+"."+tablesTestRef,
+			tablesLoadTarget(nodes(SystemNamespace), resolverObjectMetadataTable, nil))
+		requireEnvelope(t, f.request(t, http.MethodGet, relative, "alice", ""),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+	})
+
+	t.Run("a listing shows only what the user created", func(t *testing.T) {
+		// The fixture created namespaces on main and never one called system, so that is exactly
+		// the list - the listing adds nothing.
+		namespaces := decodeListNamespaces(t, f.request(t, http.MethodGet,
+			listTarget([]string{tablesTestRepo, tablesTestRef}, nil), "alice", "")).Namespaces
+		// A namespace listing answers one level, so these are the immediate children the fixture
+		// created; deeper levels are listed by naming their parent.
+		require.Equal(t, []Namespace{
+			{tablesTestRepo, tablesTestRef, "inventory"},
+			{tablesTestRepo, tablesTestRef, "legacy"},
+			{tablesTestRepo, tablesTestRef, "sales"},
+		}, namespaces, "the namespace listing of R.main is the user's own namespaces, in name order")
+
+		// The relative_to form of the same catalog answers its own client's view of that listing:
+		// the levels below the warehouse, and nothing added.
+		relative := decodeListNamespaces(t, f.request(t, http.MethodGet,
+			warehouseTarget(tablesTestRepo+"."+tablesTestRef, listTarget(nil, nil)), "alice", "")).Namespaces
+		require.Equal(t, []Namespace{{"inventory"}, {"legacy"}, {"sales"}}, relative,
+			"the relative_to namespace listing of R.main is the user's own namespaces")
+
+		// The system namespace was not created either, so listing its tables is the 404 an absent
+		// namespace answers - not an empty page and not a virtual table.
+		requireEnvelope(t, f.request(t, http.MethodGet,
+			tablesListTarget(nodes(tablesTestRepo, tablesTestRef, SystemNamespace), nil), "alice", ""),
+			http.StatusNotFound, ErrTypeNoSuchNamespace)
+		requireEnvelope(t, f.request(t, http.MethodGet,
+			tablesListTarget(nodes(tablesTestRepo, tablesTestRef, SystemNamespace), nil), "carol", ""),
+			http.StatusNotFound, ErrTypeNoSuchNamespace)
+	})
+
+	t.Run("the root tree still serves the indexed table", func(t *testing.T) {
+		body := decodeLoadTable(t, f.request(t, http.MethodGet,
+			resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""))
+		require.Equal(t, f.metaLocation, body.MetadataLocation)
+		require.Equal(t, http.StatusNoContent, f.request(t, http.MethodHead,
+			resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", "").Code)
+		// And it is still read-only at every level (the full write matrix is
+		// TestMetadataSearchSystemTreeWrites).
+		requireEnvelope(t, f.request(t, http.MethodPost,
+			resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "carol",
+			`{"requirements":[],"updates":[{"action":"set-properties","updates":{"owner":"mallory"}}]}`),
+			http.StatusForbidden, ErrorTypeForbidden)
+	})
+
+	t.Run("system is an ordinary namespace of a data repository", func(t *testing.T) {
+		// The reservation of the data repository's system namespace is gone: a caller who may write
+		// the repository creates a namespace called system and a table in it, lists them, and drops
+		// them again. Nothing about the tree changes, and the companion repository is untouched.
+		f := newResolverFixture(t)
+		createNamespace := fmt.Sprintf(`{"namespace":[%q,%q,%q]}`, tablesTestRepo, tablesTestRef, SystemNamespace)
+		require.Equal(t, http.StatusOK, f.request(t, http.MethodPost,
+			"/v1/"+CatalogPrefix+"/namespaces", "carol", createNamespace).Code,
+			"a data repository's system namespace is the client's to create")
+
+		createTable := `{"name":"audit_log","schema":{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"x","required":true,"type":"long"}]}}`
+		require.Equal(t, http.StatusOK, f.request(t, http.MethodPost,
+			tablesListTarget(nodes(tablesTestRepo, tablesTestRef, SystemNamespace), nil), "carol", createTable).Code,
+			"a table in it is an ordinary table")
+
+		listing := decodeListTables(t, f.request(t, http.MethodGet,
+			tablesListTarget(nodes(tablesTestRepo, tablesTestRef, SystemNamespace), nil), "carol", ""))
+		require.Equal(t, []string{"audit_log"}, tableNamesOf(listing),
+			"the listing of that namespace is the table the user created and nothing else")
+
+		require.Equal(t, http.StatusNoContent, f.request(t, http.MethodDelete,
+			tablesLoadTarget(nodes(tablesTestRepo, tablesTestRef, SystemNamespace), "audit_log", nil),
+			"carol", "").Code)
+		require.Equal(t, http.StatusNoContent, f.request(t, http.MethodDelete,
+			"/v1/"+CatalogPrefix+"/namespaces/"+nodes(tablesTestRepo, tablesTestRef, SystemNamespace),
+			"carol", "").Code)
+
+		// The table the deprecated catalog still serves was never touched.
+		require.Equal(t, f.metaLocation, decodeLoadTable(t, f.request(t, http.MethodGet,
+			deprecatedCatalogTarget(tablesTestRef), "alice", "")).MetadataLocation)
+	})
+}
+
+// TestDeprecatedMetadataSearchCatalogRead covers the guide's deprecated, separate catalog at
+// /mds/iceberg/api (G5): it serves load, head and list of `<repo>.<ref>.system.object_metadata`,
+// resolved to the same companion table as the root tree, and it resolves nothing else.
+func TestDeprecatedMetadataSearchCatalogRead(t *testing.T) {
 	f := newResolverFixture(t)
 
 	t.Run("a branch load reads the companion repository's table", func(t *testing.T) {
-		rec := f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", "")
-		body := decodeLoadTable(t, rec)
+		body := decodeLoadTable(t, f.request(t, http.MethodGet, deprecatedCatalogTarget(tablesTestRef), "alice", ""))
 		require.Equal(t, f.metaLocation, body.MetadataLocation,
 			"the table is the one the indexer wrote into the companion repository")
 		require.True(t, strings.HasPrefix(body.MetadataLocation, strings.TrimRight(f.metaStorageNamespace, "/")+"/"),
@@ -760,88 +976,96 @@ func TestMetadataSearchVirtualTableRead(t *testing.T) {
 
 		// HEAD is the same authorized read, so it cannot report a table the load would refuse.
 		require.Equal(t, http.StatusNoContent,
-			f.request(t, http.MethodHead, virtualTarget(tablesTestRef), "alice", "").Code)
-	})
+			f.request(t, http.MethodHead, deprecatedCatalogTarget(tablesTestRef), "alice", "").Code)
 
-	t.Run("the relative_to mount answers the same table", func(t *testing.T) {
-		target := warehouseTarget(tablesTestRepo+"."+tablesTestRef,
-			tablesLoadTarget(nodes(SystemNamespace), resolverObjectMetadataTable, nil))
-		body := decodeLoadTable(t, f.request(t, http.MethodGet, target, "alice", ""))
-		require.Equal(t, f.metaLocation, body.MetadataLocation)
+		// The root tree serves the same table under the new address.
+		require.Equal(t, body.MetadataLocation, decodeLoadTable(t, f.request(t, http.MethodGet,
+			resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", "")).MetadataLocation)
 	})
 
 	t.Run("a caller without access to the data repository is refused", func(t *testing.T) {
-		// mds-meta may read the companion repository and nothing else: the virtual table must not
-		// hand it the data repository's metadata.
-		requireEnvelope(t, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "mds-meta", ""),
+		// mds-meta may read the companion repository and nothing else: the deprecated address must
+		// not hand it the data repository's metadata.
+		requireEnvelope(t, f.request(t, http.MethodGet, deprecatedCatalogTarget(tablesTestRef), "mds-meta", ""),
 			http.StatusForbidden, ErrorTypeForbidden)
-		requireEnvelope(t, f.request(t, http.MethodHead, virtualTarget(tablesTestRef), "bob", ""),
+		requireEnvelope(t, f.request(t, http.MethodHead, deprecatedCatalogTarget(tablesTestRef), "bob", ""),
 			http.StatusForbidden, ErrorTypeForbidden)
 	})
 
 	t.Run("the caller needs no access to the companion repository", func(t *testing.T) {
 		// alice holds catalog read actions on the data repository only (resolverCatalogReadStatements
 		// is the shape of its grant), so reading the companion repository's table directly is
-		// refused while the virtual table above was served to her.
+		// refused while the deprecated address above was served to her.
 		direct := tablesLoadTarget(nodes(resolverMetaRepo, tablesTestRef, SystemNamespace), resolverObjectMetadataTable, nil)
 		requireEnvelope(t, f.request(t, http.MethodGet, direct, "alice", ""),
 			http.StatusForbidden, ErrorTypeForbidden)
 	})
 
 	t.Run("a tag is not indexed and answers NoSuchTable", func(t *testing.T) {
-		requireEnvelope(t, f.request(t, http.MethodGet, virtualTarget(tablesTestTag), "alice", ""),
+		requireEnvelope(t, f.request(t, http.MethodGet, deprecatedCatalogTarget(tablesTestTag), "alice", ""),
 			http.StatusNotFound, ErrTypeNoSuchTable)
 	})
 
 	t.Run("the snapshots query parameter applies to the redirected document", func(t *testing.T) {
 		body := decodeLoadTable(t, f.request(t, http.MethodGet,
-			tablesLoadTarget(nodes(tablesTestRepo, tablesTestRef, SystemNamespace), resolverObjectMetadataTable,
-				map[string][]string{"snapshots": {SnapshotsRefs}}), "alice", ""))
+			MetadataSearchBasePath+tablesLoadTarget(nodes(tablesTestRepo, tablesTestRef, SystemNamespace),
+				resolverObjectMetadataTable, map[string][]string{"snapshots": {SnapshotsRefs}}), "alice", ""))
 		require.Equal(t, f.metaLocation, body.MetadataLocation)
 		require.ElementsMatch(t, []int64{tablesTestTagSnapshot, tablesTestCurrentSnapshot},
 			snapshotIDsOf(t, body.Metadata), "refs mode filters the redirected document, not another one")
 	})
 
 	t.Run("the system namespace and its table are listed", func(t *testing.T) {
-		rec := f.request(t, http.MethodGet, listTarget([]string{tablesTestRepo, tablesTestRef}, nil), "alice", "")
+		// The deprecated catalog keeps browsing the way its clients browse: the namespace exists in
+		// the listing and holds the one table the guide names.
+		rec := f.request(t, http.MethodGet,
+			MetadataSearchBasePath+listTarget([]string{tablesTestRepo, tablesTestRef}, nil), "alice", "")
 		require.Contains(t, decodeListNamespaces(t, rec).Namespaces,
 			Namespace{tablesTestRepo, tablesTestRef, SystemNamespace})
 
-		listing := decodeListTables(t, f.request(t, http.MethodGet, virtualNamespaceTablesTarget(tablesTestRef), "alice", ""))
+		listing := decodeListTables(t, f.request(t, http.MethodGet,
+			deprecatedCatalogNamespaceTablesTarget(tablesTestRef), "alice", ""))
 		require.Equal(t, []string{resolverObjectMetadataTable}, tableNamesOf(listing))
 		require.Equal(t, Namespace{tablesTestRepo, tablesTestRef, SystemNamespace},
 			listing.Identifiers[0].Namespace, "the identifier is the full address a client can load")
 	})
 
-	t.Run("the companion repository's system namespace is listed from its pointers", func(t *testing.T) {
-		listing := decodeListTables(t, f.request(t, http.MethodGet,
-			tablesListTarget(nodes(resolverMetaRepo, tablesTestRef, SystemNamespace), nil), "mds-meta-writer", ""))
-		require.Equal(t, []string{resolverObjectMetadataTable}, tableNamesOf(listing))
-	})
-
 	t.Run("a caller that may not list the namespace does not see the table", func(t *testing.T) {
 		// dana may list only inventory.books (catalog:TableName condition), so the system namespace
 		// is not hers to list: the filter refuses rather than returning an empty page (§7.2).
-		requireEnvelope(t, f.request(t, http.MethodGet, virtualNamespaceTablesTarget(tablesTestRef), "dana", ""),
+		requireEnvelope(t, f.request(t, http.MethodGet, deprecatedCatalogNamespaceTablesTarget(tablesTestRef), "dana", ""),
 			http.StatusForbidden, ErrorTypeForbidden)
 	})
 
-	t.Run("the metrics report resolves the redirected table", func(t *testing.T) {
-		rec := f.request(t, http.MethodPost,
-			tableMetricsTarget(nodes(tablesTestRepo, tablesTestRef, SystemNamespace), resolverObjectMetadataTable),
-			"alice", `{"report-type":"scan-report"}`)
-		// The metrics sink's §7.2 row is catalog:UpdateTable, which alice does not hold; the point
-		// of this subtest is that an authorized caller reaches the redirected table (carol), and an
-		// unauthorized one is refused before anything is resolved.
-		requireEnvelope(t, rec, http.StatusForbidden, ErrorTypeForbidden)
-		require.Equal(t, http.StatusNoContent, f.request(t, http.MethodPost,
-			tableMetricsTarget(nodes(tablesTestRepo, tablesTestRef, SystemNamespace), resolverObjectMetadataTable),
-			"carol", `{"report-type":"scan-report"}`).Code)
+	t.Run("nothing else resolves there", func(t *testing.T) {
+		// The root tree belongs to the lakeFS catalog: the deprecated catalog is not an alias of it.
+		requireEnvelope(t, f.request(t, http.MethodGet, MetadataSearchBasePath+resolverTreeLoadTarget(tablesTestRepo, tablesTestRef),
+			"alice", ""), http.StatusNotFound, ErrTypeNoSuchTable)
+		// A table name the guide does not name is not resolved either.
+		requireEnvelope(t, f.request(t, http.MethodGet,
+			MetadataSearchBasePath+tablesLoadTarget(nodes(tablesTestRepo, tablesTestRef, SystemNamespace), "audit_log", nil),
+			"alice", ""), http.StatusNotFound, ErrTypeNoSuchTable)
+		// An ordinary table of the data repository is read from where it lives, as everywhere else.
+		ordinary := f.request(t, http.MethodGet,
+			MetadataSearchBasePath+tablesLoadTarget(nodes(tablesTestRepo, tablesTestRef, "inventory", "books"), "orders", nil),
+			"alice", "")
+		require.Equal(t, http.StatusOK, ordinary.Code, "body: %s", ordinary.Body.String())
+		require.NotEqual(t, f.metaLocation, decodeLoadTable(t, ordinary).MetadataLocation,
+			"an ordinary table is not redirected to the companion repository")
+	})
+
+	t.Run("a write is not served", func(t *testing.T) {
+		// The deprecated catalog mounts the read operations only (newReadOnlyRouter): the path
+		// exists for the read, so the method is what is refused.
+		requireEnvelope(t, f.request(t, http.MethodPost,
+			MetadataSearchBasePath+tablesListTarget(nodes(tablesTestRepo, tablesTestRef, SystemNamespace), nil), "carol",
+			`{"name":"clients_table","schema":{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"x","required":true,"type":"long"}]}}`),
+			http.StatusMethodNotAllowed, ErrTypeMethodNotAllowed)
 	})
 }
 
-// TestMetadataSearchCompanionRepositoryProof is MDS-SEC-3: a companion repository is only R's
-// index when its table says so. The indexer writes lakefs.mds.repository = R into the
+// TestMetadataSearchCompanionRepositoryProof is MDS-SEC-3 at the root tree's address: a companion
+// repository is only R's index when its table says so. The indexer writes lakefs.mds.repository = R into the
 // object_metadata table it creates (METADATA_SEARCH_DESIGN.md §3.1), and the catalog checks that
 // property before it serves the redirected table. Anything else - a table that names another
 // repository, or a table with no property at all - is the 404 NoSuchTableException an unindexed
@@ -850,13 +1074,13 @@ func TestMetadataSearchVirtualTableRead(t *testing.T) {
 func TestMetadataSearchCompanionRepositoryProof(t *testing.T) {
 	t.Run("a companion table that names another repository is not served", func(t *testing.T) {
 		f := newResolverFixtureWithTableProperty(t, "another-repo")
-		requireEnvelope(t, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", ""),
+		requireEnvelope(t, f.request(t, http.MethodGet, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
 			http.StatusNotFound, ErrTypeNoSuchTable)
-		requireEnvelope(t, f.request(t, http.MethodHead, virtualTarget(tablesTestRef), "alice", ""),
+		requireEnvelope(t, f.request(t, http.MethodHead, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
 			http.StatusNotFound, ErrTypeNoSuchTable)
 		// The data-plane paths resolve the same table, so a vended session or a signature must not
-		// be scoped to a location the virtual table does not read.
-		_, err := newTableScopeResolver(f.store)(t.Context(), resolverVirtualAddress(tablesTestRef),
+		// be scoped to a location the metadata table does not read.
+		_, err := newTableScopeResolver(f.store)(t.Context(), resolverTreeObjectsAddress(tablesTestRepo, tablesTestRef),
 			func(context.Context, Address) error { return nil })
 		var noTable *NoSuchTableException
 		require.ErrorAs(t, err, &noTable)
@@ -864,20 +1088,20 @@ func TestMetadataSearchCompanionRepositoryProof(t *testing.T) {
 
 	t.Run("a companion table with no repository property is not served", func(t *testing.T) {
 		f := newResolverFixtureWithTableProperty(t, "")
-		requireEnvelope(t, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", ""),
+		requireEnvelope(t, f.request(t, http.MethodGet, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
 			http.StatusNotFound, ErrTypeNoSuchTable)
-		requireEnvelope(t, f.request(t, http.MethodHead, virtualTarget(tablesTestRef), "alice", ""),
+		requireEnvelope(t, f.request(t, http.MethodHead, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
 			http.StatusNotFound, ErrTypeNoSuchTable)
 	})
 
 	t.Run("a companion table with the property but no init commit is not served", func(t *testing.T) {
 		f := newResolverFixtureWithoutInitCommit(t)
-		requireEnvelope(t, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", ""),
+		requireEnvelope(t, f.request(t, http.MethodGet, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
 			http.StatusNotFound, ErrTypeNoSuchTable)
-		requireEnvelope(t, f.request(t, http.MethodHead, virtualTarget(tablesTestRef), "alice", ""),
+		requireEnvelope(t, f.request(t, http.MethodHead, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
 			http.StatusNotFound, ErrTypeNoSuchTable)
 		// A forged property is not proof for the data plane either.
-		_, err := newTableScopeResolver(f.store)(t.Context(), resolverVirtualAddress(tablesTestRef),
+		_, err := newTableScopeResolver(f.store)(t.Context(), resolverTreeObjectsAddress(tablesTestRepo, tablesTestRef),
 			func(context.Context, Address) error { return nil })
 		var noTable *NoSuchTableException
 		require.ErrorAs(t, err, &noTable)
@@ -887,11 +1111,11 @@ func TestMetadataSearchCompanionRepositoryProof(t *testing.T) {
 		// The marker and the message are not proof of who wrote the commit: anyone with
 		// fs:CreateCommit on R-metadata can copy them. The genuine indexer principal is mds-indexer.
 		f := newResolverFixtureWithInitCommitter(t, "mallory")
-		requireEnvelope(t, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", ""),
+		requireEnvelope(t, f.request(t, http.MethodGet, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
 			http.StatusNotFound, ErrTypeNoSuchTable)
-		requireEnvelope(t, f.request(t, http.MethodHead, virtualTarget(tablesTestRef), "alice", ""),
+		requireEnvelope(t, f.request(t, http.MethodHead, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
 			http.StatusNotFound, ErrTypeNoSuchTable)
-		_, err := newTableScopeResolver(f.store)(t.Context(), resolverVirtualAddress(tablesTestRef),
+		_, err := newTableScopeResolver(f.store)(t.Context(), resolverTreeObjectsAddress(tablesTestRepo, tablesTestRef),
 			func(context.Context, Address) error { return nil })
 		var noTable *NoSuchTableException
 		require.ErrorAs(t, err, &noTable)
@@ -908,11 +1132,11 @@ func TestMetadataSearchCompanionRepositoryProof(t *testing.T) {
 		require.NoError(t, err)
 		require.Empty(t, head.Parents, "the fixture is the bare shape: the init commit is the root")
 		require.Equal(t, MetadataSearchIndexerPrincipal, head.Committer)
-		require.Equal(t, http.StatusOK, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", "").Code)
+		require.Equal(t, http.StatusOK, f.request(t, http.MethodGet, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", "").Code)
 		require.Equal(t, http.StatusNoContent,
-			f.request(t, http.MethodHead, virtualTarget(tablesTestRef), "alice", "").Code)
+			f.request(t, http.MethodHead, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", "").Code)
 		// The data plane resolves the same table, so a vended session or a signature is scoped to it.
-		_, err = newTableScopeResolver(f.store)(t.Context(), resolverVirtualAddress(tablesTestRef),
+		_, err = newTableScopeResolver(f.store)(t.Context(), resolverTreeObjectsAddress(tablesTestRepo, tablesTestRef),
 			func(context.Context, Address) error { return nil })
 		require.NoError(t, err)
 	})
@@ -923,9 +1147,9 @@ func TestMetadataSearchCompanionRepositoryProof(t *testing.T) {
 		// (pkg/api/controller.go, Commit takes the committer from the authenticated user), so a root
 		// mds: init commit that is not the indexer's is still not proof.
 		f := newResolverFixtureWithBareCompanion(t, "mallory")
-		requireEnvelope(t, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", ""),
+		requireEnvelope(t, f.request(t, http.MethodGet, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
 			http.StatusNotFound, ErrTypeNoSuchTable)
-		requireEnvelope(t, f.request(t, http.MethodHead, virtualTarget(tablesTestRef), "alice", ""),
+		requireEnvelope(t, f.request(t, http.MethodHead, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
 			http.StatusNotFound, ErrTypeNoSuchTable)
 	})
 
@@ -939,15 +1163,15 @@ func TestMetadataSearchCompanionRepositoryProof(t *testing.T) {
 		require.NoError(t, err, "commit the table before the forged init commit")
 		commitResolverInitAs(t, f.catalog, resolverMetaRepo, tablesTestRef, tablesTestRepo,
 			MetadataSearchIndexerPrincipal, true)
-		requireEnvelope(t, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", ""),
+		requireEnvelope(t, f.request(t, http.MethodGet, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
 			http.StatusNotFound, ErrTypeNoSuchTable)
-		requireEnvelope(t, f.request(t, http.MethodHead, virtualTarget(tablesTestRef), "alice", ""),
+		requireEnvelope(t, f.request(t, http.MethodHead, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
 			http.StatusNotFound, ErrTypeNoSuchTable)
 	})
 
 	t.Run("a companion table that names the data repository and has the init commit is served", func(t *testing.T) {
 		f := newResolverFixture(t)
-		require.Equal(t, http.StatusOK, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", "").Code)
+		require.Equal(t, http.StatusOK, f.request(t, http.MethodGet, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", "").Code)
 	})
 }
 
@@ -1182,111 +1406,14 @@ func mustMarshalRaw(t *testing.T, document map[string]json.RawMessage) []byte {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The reserved namespace (§5.4)
-// ---------------------------------------------------------------------------------------------
-
-// TestMetadataSearchReservedNamespace covers §5.4 on the data repository: every catalog write into
-// system answers 403 ForbiddenException for a caller that may write the repository - and the same
-// writes succeed in the companion repository, where system is an ordinary namespace.
-func TestMetadataSearchReservedNamespace(t *testing.T) {
-	f := newResolverFixture(t)
-
-	// A valid create request, so a refusal cannot be a validation error in disguise.
-	createTableBody := fmt.Sprintf(`{"name":%q,"schema":{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"x","required":true,"type":"long"}]}}`,
-		"clients_table")
-
-	t.Run("create table", func(t *testing.T) {
-		requireEnvelope(t, f.request(t, http.MethodPost,
-			tablesCreateTarget(nodes(tablesTestRepo, tablesTestRef, SystemNamespace)), "carol", createTableBody),
-			http.StatusForbidden, ErrorTypeForbidden)
-	})
-
-	t.Run("register", func(t *testing.T) {
-		body := fmt.Sprintf(`{"name":%q,"metadata-location":%q}`, "clients_table", f.metaLocation)
-		requireEnvelope(t, f.request(t, http.MethodPost,
-			"/v1/"+CatalogPrefix+"/namespaces/"+nodes(tablesTestRepo, tablesTestRef, SystemNamespace)+"/register",
-			"carol", body),
-			http.StatusForbidden, ErrorTypeForbidden)
-	})
-
-	t.Run("drop table", func(t *testing.T) {
-		requireEnvelope(t, f.request(t, http.MethodDelete,
-			tablesLoadTarget(nodes(tablesTestRepo, tablesTestRef, SystemNamespace), resolverObjectMetadataTable, nil),
-			"carol", ""),
-			http.StatusForbidden, ErrorTypeForbidden)
-		// Nothing was dropped: the virtual table still loads.
-		require.Equal(t, http.StatusOK, f.request(t, http.MethodGet, virtualTarget(tablesTestRef), "alice", "").Code)
-	})
-
-	t.Run("commit", func(t *testing.T) {
-		body := `{"requirements":[],"updates":[{"action":"set-properties","updates":{"owner":"mallory"}}]}`
-		requireEnvelope(t, f.request(t, http.MethodPost,
-			tablesLoadTarget(nodes(tablesTestRepo, tablesTestRef, SystemNamespace), resolverObjectMetadataTable, nil),
-			"carol", body),
-			http.StatusForbidden, ErrorTypeForbidden)
-	})
-
-	t.Run("create view", func(t *testing.T) {
-		body := `{"name":"clients_view"}`
-		requireEnvelope(t, f.request(t, http.MethodPost,
-			"/v1/"+CatalogPrefix+"/namespaces/"+nodes(tablesTestRepo, tablesTestRef, SystemNamespace)+"/views",
-			"carol", body),
-			http.StatusForbidden, ErrorTypeForbidden)
-	})
-
-	t.Run("create namespace", func(t *testing.T) {
-		body := fmt.Sprintf(`{"namespace":[%q,%q,%q,%q]}`, tablesTestRepo, tablesTestRef, SystemNamespace, "child")
-		requireEnvelope(t, f.request(t, http.MethodPost, "/v1/"+CatalogPrefix+"/namespaces", "carol", body),
-			http.StatusForbidden, ErrorTypeForbidden)
-	})
-
-	t.Run("update namespace properties", func(t *testing.T) {
-		body := `{"updates":{"owner":"mallory"}}`
-		requireEnvelope(t, f.request(t, http.MethodPost,
-			"/v1/"+CatalogPrefix+"/namespaces/"+nodes(tablesTestRepo, tablesTestRef, SystemNamespace)+"/properties",
-			"carol", body),
-			http.StatusForbidden, ErrorTypeForbidden)
-	})
-
-	t.Run("drop namespace", func(t *testing.T) {
-		requireEnvelope(t, f.request(t, http.MethodDelete,
-			"/v1/"+CatalogPrefix+"/namespaces/"+nodes(tablesTestRepo, tablesTestRef, SystemNamespace), "carol", ""),
-			http.StatusForbidden, ErrorTypeForbidden)
-	})
-
-	t.Run("the companion repository's system namespace stays writable", func(t *testing.T) {
-		// The indexer writes system.object_metadata in R-metadata directly, so system there is an
-		// ordinary namespace: a create answers 200, and a create of the existing table answers the
-		// 409 a duplicate name always answers - never the 403 of §5.4.
-		body := fmt.Sprintf(`{"name":%q,"schema":{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"x","required":true,"type":"long"}]}}`,
-			"indexer_scratch")
-		require.Equal(t, http.StatusOK, f.request(t, http.MethodPost,
-			tablesCreateTarget(nodes(resolverMetaRepo, tablesTestRef, SystemNamespace)), "mds-meta-writer", body).Code)
-
-		duplicate := fmt.Sprintf(`{"name":%q,"schema":{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"x","required":true,"type":"long"}]}}`,
-			resolverObjectMetadataTable)
-		requireEnvelope(t, f.request(t, http.MethodPost,
-			tablesCreateTarget(nodes(resolverMetaRepo, tablesTestRef, SystemNamespace)), "mds-meta-writer", duplicate),
-			http.StatusConflict, ErrTypeAlreadyExists)
-	})
-
-	t.Run("a caller without the write grant never reaches the reservation", func(t *testing.T) {
-		// bob holds nothing: the answer is the permission refusal, not a description of the
-		// namespace.
-		requireEnvelope(t, f.request(t, http.MethodPost,
-			tablesCreateTarget(nodes(tablesTestRepo, tablesTestRef, SystemNamespace)), "bob", createTableBody),
-			http.StatusForbidden, ErrorTypeForbidden)
-	})
-}
-
-// ---------------------------------------------------------------------------------------------
 // The data-plane paths and the authorization address (§5.1, §5.3)
 // ---------------------------------------------------------------------------------------------
 
 // TestMetadataSearchDataPlaneRedirect pins that the two §8 paths that resolve a table - vended
 // credentials and remote signing - resolve it through the hook too: a session or a signature for
-// the virtual table is scoped to where the table actually lives, and the caller was authorized on
-// the data repository alone.
+// the deprecated catalog's table is scoped to where the table actually lives, and the caller was
+// authorized on the data repository alone. The lakeFS catalog's own data plane is
+// TestMetadataSearchSystemTreeDataPlane.
 func TestMetadataSearchDataPlaneRedirect(t *testing.T) {
 	f := newResolverFixture(t)
 	ctx := t.Context()
@@ -1300,7 +1427,7 @@ func TestMetadataSearchDataPlaneRedirect(t *testing.T) {
 
 	t.Run("credentials are scoped to the companion repository's table", func(t *testing.T) {
 		authorized = nil
-		scope, err := newTableScopeResolver(f.store)(ctx, virtual, authorize)
+		scope, err := newTableScopeResolver(f.deprecated)(ctx, virtual, authorize)
 		require.NoError(t, err)
 		require.Empty(t, authorized,
 			"§5.3: the redirect is not a second authorization question - the requested address was already checked")
@@ -1312,7 +1439,7 @@ func TestMetadataSearchDataPlaneRedirect(t *testing.T) {
 	t.Run("signing resolves the companion repository's table location", func(t *testing.T) {
 		authorized = nil
 		adapter := &signingAdapter{blockstoreType: block.BlockstoreTypeS3, preSignSupported: true}
-		service := NewRemoteSigningService(f.store, NewAuthorizer(f.authz.svc), adapter, f.catalog, &Config{Prefix: CatalogPrefix})
+		service := NewRemoteSigningService(f.deprecated, NewAuthorizer(f.authz.svc), adapter, f.catalog, &Config{Prefix: CatalogPrefix})
 		location, err := service.tableLocation(ctx, virtual, authorize)
 		require.NoError(t, err)
 		require.Equal(t, strings.TrimRight(f.metaStorageNamespace, "/")+"/_iceberg/"+resolverMetaUUID, location)
@@ -1375,14 +1502,14 @@ func TestMetadataSearchRefMapperSeam(t *testing.T) {
 
 	// A resolver built with that mapper resolves a tag, which the default (no mapper) refuses.
 	branches := resolverBranchLister{branches: map[string]bool{tablesTestRepo + "/" + tablesTestRef: true}}
-	resolved, handled, err := NewMetadataSearchResolver(branches, mapper).Resolve(t.Context(), resolverVirtualAddress("v1"))
+	resolved, handled, err := NewMetadataSearchResolver(branches, mapper).Resolve(t.Context(), resolverTreeObjectsAddress(tablesTestRepo, "v1"))
 	require.NoError(t, err)
 	require.True(t, handled)
 	require.Equal(t, "indexed-v1", resolved.Target.Ref)
 }
 
 // TestMetadataSearchErrorMapping pins the status and the Iceberg error type of a reserved-namespace
-// refusal, so the 403 of §5.4 cannot drift into a 404 or a 500.
+// refusal, so the 403 of the root tree (RA1) cannot drift into a 404 or a 500.
 func TestMetadataSearchErrorMapping(t *testing.T) {
 	err := &ReservedNamespaceError{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{SystemNamespace}}
 	require.True(t, errors.Is(err, ErrReservedNamespace))
@@ -1973,8 +2100,8 @@ func TestMetadataSearchSystemTreeAuthzAddress(t *testing.T) {
 	} {
 		require.Truef(t, resolver.ReservedNamespace(addr), "address %v is part of the reserved tree", addr)
 	}
-	require.True(t, resolver.ReservedNamespace(Address{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{"system"}}),
-		"the per-repository reservation is unchanged; RA3 removes it")
+	require.False(t, resolver.ReservedNamespace(Address{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{"system"}}),
+		"nothing below a data repository ref is reserved: RA3 removed the per-repository reservation")
 	require.False(t, resolver.ReservedNamespace(Address{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{"inventory"}}))
 }
 

@@ -531,12 +531,14 @@ the tick instead of re-entering `initialise` (commit `da24d421f`).
 const (
     SystemNamespace          = "system"
     ObjectMetadataTable      = "object_metadata"
+    MetadataNamespace        = "metadata"
+    ObjectsTable             = "objects"
     MetadataRepositorySuffix = "-metadata"
 )
 
 type ResolvedTable struct {
     Target Address // where the pointer is read: R-metadata, mapped ref, system, object_metadata
-    Authz  Address // what authorization is checked against: the data repo address
+    Authz  Address // what authorization is checked against: the data repository's catalog ARN
 }
 type TableResolver interface {
     Resolve(ctx context.Context, addr Address) (ResolvedTable, bool, error)
@@ -550,11 +552,24 @@ var MetadataSearchRefMapper func(branches BranchLister) RefMapper
 
 func IsMetadataRepository(repo string) bool
 func NewMetadataSearchResolver(branches BranchLister, mapper RefMapper) *MetadataSearchResolver
+func NewDeprecatedMetadataSearchResolver(branches BranchLister, mapper RefMapper) *MetadataSearchResolver
 func WithTableResolver(resolver TableResolver) StoreOption
 ```
 
-`http.go` registers the resolver when `iceberg.metadata_search.enabled` is true, with
-`metadataSearchRefMapper(deps.Catalog)`. Resolution: a ref that is a branch of `R`
+`http.go` builds **two** catalogs when `iceberg.metadata_search.enabled` is true, with
+`metadataSearchRefMapper(deps.Catalog)` in both and each with a store of its own: the lakeFS catalog
+(`/iceberg/api` and `relative_to`) registers `NewMetadataSearchResolver`, and the guide's deprecated Metadata
+Search catalog (`/mds/iceberg/api`) registers `NewDeprecatedMetadataSearchResolver` and mounts the read operations
+only (METADATA_SEARCH_REALIGN.md G4, G5; RA3).
+
+The lakeFS catalog resolves `system.metadata.<R>.<ref>.objects` to
+`R-metadata.<mapped ref>.system.object_metadata` and nothing else. There is no `system` namespace, no virtual table
+and no reservation below `<repo>.<ref>`: `R.<ref>.system.object_metadata` is an absent table there, and it answers
+the 404 of one, like every other name nobody created (§5.3). The deprecated catalog resolves the older identifier
+`R.<ref>.system.object_metadata` to the same companion table - it serves load, head and list of it and resolves
+nothing else, and the root address is not its address either.
+
+Resolution of the ref, in both catalogs: a ref that is a branch of `R`
 (`GetBranchReference`) maps to the same name; anything else (`ErrBranchNotFound`, `ErrInvalidBranchID`) goes to
 the mapper. A mapped branch that does not exist in `R-metadata` answers 404 `NoSuchTableException`.
 
@@ -615,7 +630,7 @@ not for its whole history again. The cache holds at most 1024 repository entries
 size follows the repositories served and not the number of indexed commits, and a history that does not carry the
 immutable init commit is refused even when it carries a look-alike marker (MDS_REVIEW_3 R3S-4 and R3S-8, commit
 `db52bd9a7`). A resolver whose `BranchLister` cannot read commit history fails closed -
-the property proves nothing without the commit - so the virtual table answers the 404 an unindexed ref answers
+the property proves nothing without the commit - so the metadata table answers the 404 an unindexed ref answers
 (commit `500a00a37`).
 
 ### 5.2 Authorization (landed)
@@ -623,27 +638,36 @@ the property proves nothing without the commit - so the virtual table answers th
 `Store.ResolveAuthorized` checks the requested address on `R` (`catalog:ReadTable`, plus `catalog:ReadTableData`
 for signing/vending) and `fs:ReadRepository` on `R`. The redirected read of `R-metadata` runs with the server's
 identity. Caveat (upstream too): the grant covers metadata of all objects on all refs of `R`. Path-level or
-branch-level `fs:` policies do not narrow it. Vended credentials and signing for the virtual table are scoped to
-`R-metadata`'s table location (`creds.go`, `sign.go`), and a write session is never vended for the virtual table:
-a write that resolves into a reserved namespace becomes a read session (5.3).
+branch-level `fs:` policies do not narrow it. Vended credentials and signing for a metadata table are scoped to
+`R-metadata`'s table location (`creds.go`, `sign.go`), and a write session is never vended for one: a write that
+the catalog redirects to the companion repository becomes a read session (5.3). The root address authorizes at the
+guide's ARNs of `R` - `table/<R>/system/object_metadata` and `namespace/<R>/system` - which is why the same policy
+covers the root address, the deprecated catalog's identifier and the data plane of both.
 
-### 5.3 Read-only `system` namespace (landed)
+### 5.3 Read-only root `system` tree; nothing reserved below a data repository
 
-On a data repository, writes under `system` answer 403 `ForbiddenException` (`ReservedNamespaceError`).
-`GET`/`HEAD` of the namespace is 404 (no marker). Listings show `system` and `object_metadata`. The catalog has no
-rename endpoint, so there is nothing to block there. In `R-metadata`, `system` is a normal namespace.
+The only reserved namespace is the root `system` repository of METADATA_SEARCH_REALIGN.md RA1. Every write into the
+tree - create, commit, register, drop, and namespace create, update-properties and drop - answers 403
+`ForbiddenException` (`ReservedNamespaceError`), at every level, because the tree is marker-less and the catalog
+serves it. Its `GET`/`HEAD` endpoints do not consult markers: existence is derived from the companion repository
+and its branches (Store.SystemMetadataExists, SystemMetadataRepositories, SystemMetadataBranches,
+SystemObjectsExists) and the ownership proof of §5.1.
 
-The rule covers the data plane as well as the catalog API. A remote-signature request for a write (`PUT`,
-`POST`, `DELETE`, `PATCH` — any method the authorizer classifies as `catalog:WriteTableData`) into a reserved
-namespace is refused with 403 `ForbiddenException` (`*ReservedNamespaceError`); read signs (`GET`, `HEAD`) stay
-allowed, so the virtual table stays readable. The refusal is checked twice - on the address the caller named and,
-after resolution, on the address a table resolver redirects the read to - because a redirect must not turn a
-write the caller may make on `R` into a signature or a session for `R-metadata`'s `metadata.json`, manifests or
-data files. The signing path refuses a redirected write with 403 (commit `d2811fdcc`). The vended-credentials
-path answers a write vend whose resolved target is reserved with `*ReservedNamespaceError`, which
-`TableCredentials` treats as a write refusal and turns into the read session, so a redirect from an ordinary
-address vends read-only credentials (no `s3:PutObject`); a direct write `Vend` is refused rather than silently
-downgraded (commit `500a00a37`; the `pkg/icebergcatalog` comments cite this rule as §5.4).
+Nothing below `<repo>.<ref>` is reserved any more (METADATA_SEARCH_REALIGN.md §2, RA3). A data repository's `system`
+namespace is an ordinary namespace: a client that may write the repository can create it, create tables in it,
+read and drop them, and the catalog lists exactly what the client created. The old per-repository rule - 403 on
+every write under `R.<ref>.system`, listings that showed `system` and `object_metadata` without a pointer entry -
+is deleted, together with the data-plane extension of it (commits `80f6927e2`, `d2811fdcc`, `500a00a37`).
+
+The data plane follows the same split. A remote-signature request for a write (`PUT`, `POST`, `DELETE`, `PATCH` -
+any method the authorizer classifies as `catalog:WriteTableData`) into the reserved tree is refused with 403
+`ForbiddenException` (`*ReservedNamespaceError`); read signs (`GET`, `HEAD`) stay allowed, so the metadata table
+stays readable. The vended-credentials path answers a write vend for an address the resolver redirects to the
+companion repository with `*ReservedNamespaceError`, which `TableCredentials` treats as a write refusal and turns
+into the read session (METADATA_SEARCH_REALIGN.md G8: vended credentials for metadata tables are always
+read-only), so a redirect never hands out a write session for `R-metadata`'s files; a direct write `Vend` is
+refused rather than silently downgraded. The deprecated catalog mounts no write operation at all, so neither path
+exists there.
 
 ### 5.4 Config (landed)
 

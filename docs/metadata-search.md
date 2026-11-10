@@ -6,11 +6,13 @@ indexed branch, tag or commit. There is no separate query service and no new que
 engine connects to the lakeFS Iceberg REST catalog and reads one table:
 
 ```
-my-repo.main.system.object_metadata
+system.metadata.my-repo.main.objects
 ```
 
 The table is **virtual**: it lives in the companion repository `my-repo-metadata` and is kept in
-sync by a background indexer. The catalog resolves the identifier above to the real table of the
+sync by a background indexer. The older identifier `<repo>.<ref>.system.object_metadata` is served
+only by the guide's deprecated, separate catalog at `/mds/iceberg/api`; the lakeFS catalog itself
+has no `system` namespace inside any repository. The catalog resolves the identifier above to the real table of the
 companion repository, on the branch of the same name, and authorizes the read against the *data*
 repository. The feature is off by default, and it is an OSS implementation of the design in
 [`../METADATA_SEARCH_DESIGN.md`](../METADATA_SEARCH_DESIGN.md) and the plan in
@@ -26,7 +28,8 @@ staged commits and authorization model are documented in [`iceberg.md`](iceberg.
 
 - **One table per branch.** For each data repository `R` the indexer maintains a companion
   repository `R-metadata`. Its branches mirror the indexed branches of `R`, and each branch holds
-  the Iceberg table `system.object_metadata`.
+  one Iceberg table: physically `system.object_metadata` of the companion repository, served by the
+  catalog at the root of the namespace tree as `system.metadata.<R>.<ref>.objects`.
 - **One row per object per branch.** A commit that adds or changes an object replaces its row; a
   commit that removes it deletes the row. The row carries the commit that last changed the object
   (`commit_id`), so a query can join metadata back to history.
@@ -56,12 +59,16 @@ iceberg:
 The second key is the only Metadata Search setting the server itself reads (design §5.4). While
 `iceberg.enabled` is true and `iceberg.metadata_search.enabled` is true:
 
-- `<repo>.<ref>.system.object_metadata` resolves to the companion repository;
-- the `system` namespace of every data repository is reserved and read-only for clients;
-- the catalog is mounted a second time at `/mds/iceberg/api`, the upstream endpoint
-  ([`iceberg.md` § The upstream endpoint](iceberg.md#the-upstream-endpoint-mdsicebergapi)).
+- the metadata table of every indexed ref is served at the root of the catalog as
+  `system.metadata.<repo>.<ref>.objects`, resolved to the companion repository;
+- the root `system` namespace is reserved and read-only for clients, while nothing below
+  `<repo>.<ref>` is virtual or reserved: a data repository's addresses - `system` included - mean
+  what they say;
+- the guide's deprecated, separate Metadata Search catalog is mounted at `/mds/iceberg/api`, where
+  the older identifier `<repo>.<ref>.system.object_metadata` still resolves (and nothing else).
+  It serves read operations only.
 
-While either switch is false the virtual table does not resolve, no namespace is reserved and
+While either switch is false the metadata table does not resolve, no namespace is reserved and
 `/mds/iceberg/api` is not mounted: the request falls through to the core router's not-implemented
 placeholder and answers **`501 Not Implemented`**, the same answer a plain `lakefs` binary gives at
 `/iceberg/api` (design §5.5; `pkg/api/services.go`, mounted by `cmd/lakefs/cmd/run.go`). It is not a
@@ -501,16 +508,28 @@ healthy branch never reports `-1`.
 
 ## Querying
 
-The table is addressed in the two ways the catalog supports. Both serve the same data.
+The table is addressed at the root of the lakeFS catalog, in the reserved `system` namespace:
 
 | Form | URL | Identifier |
 |---|---|---|
-| `relative_to` | `http://lakefs:8000/iceberg/relative_to/my-repo.main/api` | `system.object_metadata` |
-| upstream endpoint | `http://lakefs:8000/mds/iceberg/api` | `my-repo.main.system.object_metadata` |
+| `lakeFS catalog` | `http://lakefs:8000/iceberg/api` | `system.metadata.my-repo.main.objects` |
+| `relative_to`, root tree | `http://lakefs:8000/iceberg/relative_to/system.metadata/api` | `my-repo.main.objects` |
+| `relative_to`, one repository | `http://lakefs:8000/iceberg/relative_to/system.metadata.my-repo/api` | `main.objects` |
+| deprecated catalog | `http://lakefs:8000/mds/iceberg/api` | `my-repo.main.system.object_metadata` |
 
-The `/iceberg/api` form also serves `my-repo.main.system.object_metadata`; `/mds/iceberg/api` is
-the same catalog mounted at the prefix upstream clients use. There is no `relative_to` form under
-`/mds/iceberg/api`: the repository and ref stay in the identifier.
+`/iceberg/api` is the lakeFS catalog and the supported address: `system` is a repository level
+there, `metadata` its ref, and the next two levels are the data repository and its ref.
+
+The `relative_to` form carries a warehouse in the URL and prefixes it to every identifier. A
+data-repository warehouse - `<repo>[.<ref>]` - addresses ordinary tables of that repository; the two
+root-tree warehouses fix `system.metadata`, or `system.metadata.<repo>`, and let the client name the
+rest: `<repo>.<ref>.objects` and `<ref>.objects`, which is the addressing a DuckDB `ATTACH` on the
+warehouse uses.
+
+`/mds/iceberg/api` is the guide's deprecated, separate Metadata Search catalog: it serves load, head
+and list of `<repo>.<ref>.system.object_metadata` and nothing else, resolved to the same companion
+table as the root address. It is not an alias of `/iceberg/api` and has no `relative_to` form. The
+recipes below are shown on both, the deprecated one marked as such.
 
 Every snippet below assumes:
 
@@ -526,14 +545,14 @@ A query principal needs read access to `my-repo` (through the catalog) and nothi
 
 ### PyIceberg
 
-`/mds/iceberg/api`, the identifier form:
+`/iceberg/api`, the lakeFS catalog:
 
 ```python
 from pyiceberg.catalog.rest import RestCatalog
 
 catalog = RestCatalog(
     "lakefs",
-    uri="http://lakefs:8000/mds/iceberg/api",
+    uri="http://lakefs:8000/iceberg/api",
     credential="<access_key_id>:<secret_access_key>",
     warehouse="s3://my-bucket",          # the data repository's storage namespace
     **{
@@ -542,31 +561,25 @@ catalog = RestCatalog(
         "s3.region": "us-east-1",
     },
 )
-table = catalog.load_table(("my-repo", "main", "system", "object_metadata"))
+table = catalog.load_table(("system", "metadata", "my-repo", "main", "objects"))
 table.scan().to_pandas()
 ```
 
-`/iceberg/relative_to`, where the URL fixes both the repository and the ref:
+The guide's deprecated catalog serves the older identifier; it takes the same client:
 
 ```python
 catalog = RestCatalog(
     "lakefs",
-    uri="http://lakefs:8000/iceberg/relative_to/my-repo.main/api",
+    uri="http://lakefs:8000/mds/iceberg/api",
     credential="<access_key_id>:<secret_access_key>",
     warehouse="s3://my-bucket",
-    **{
-        "s3.access-key-id": "<key>",
-        "s3.secret-access-key": "<secret>",
-        "s3.region": "us-east-1",
-    },
 )
-table = catalog.load_table("system.object_metadata")
+table = catalog.load_table(("my-repo", "main", "system", "object_metadata"))
 ```
 
-For a tag or a commit, put it in the place of `main`:
-`http://lakefs:8000/iceberg/relative_to/my-repo.v1.0/api`, or load
-`("my-repo", "v1.0", "system", "object_metadata")` through `/mds/iceberg/api`. A filtered scan is
-pushed down as Iceberg expressions:
+For a tag or a commit, put it in the place of `main`: `system.metadata.my-repo.v1.0.objects` through
+`/iceberg/api`, or `("my-repo", "v1.0", "system", "object_metadata")` through the deprecated
+catalog. A filtered scan is pushed down as Iceberg expressions:
 
 ```python
 from pyiceberg.expressions import GreaterThan, StartsWith
@@ -582,7 +595,7 @@ On an Azure blockstore, PyIceberg's FileIO is `adlfs` and its properties are the
 ```python
 catalog = RestCatalog(
     "lakefs",
-    uri="http://lakefs:8000/mds/iceberg/api",
+    uri="http://lakefs:8000/iceberg/api",
     credential="<access_key_id>:<secret_access_key>",
     warehouse="https://myaccount.blob.core.windows.net/my-container/my-repo",
     **{
@@ -592,17 +605,17 @@ catalog = RestCatalog(
         # or "adls.sas-token.<account>.dfs.core.windows.net": "...".
     },
 )
-table = catalog.load_table(("my-repo", "main", "system", "object_metadata"))
+table = catalog.load_table(("system", "metadata", "my-repo", "main", "objects"))
 table.scan().to_pandas()
 ```
 
-The `/iceberg/relative_to` form takes the same `adls.*` properties with the shorter identifier.
+The deprecated catalog takes the same `adls.*` properties with the older identifier.
 
 ### DuckDB
 
-DuckDB uses the `relative_to` form, because its `ENDPOINT` is a base URL that fixes the warehouse.
-The catalog secret authenticates the client to lakeFS; the S3 secret lets DuckDB read the data
-files when the catalog does not vend credentials.
+DuckDB attaches a catalog to a base URL, so its `ENDPOINT` is `/iceberg/api` and the identifier
+names the whole address. The catalog secret authenticates the client to lakeFS; the S3 secret lets
+DuckDB read the data files when the catalog does not vend credentials.
 
 ```sql
 INSTALL iceberg; LOAD iceberg;
@@ -624,18 +637,17 @@ CREATE OR REPLACE SECRET lakefs_data (
 
 ATTACH 's3://my-bucket' AS lakefs (
   TYPE iceberg,
-  ENDPOINT 'http://lakefs:8000/iceberg/relative_to/my-repo.main/api'
+  ENDPOINT 'http://lakefs:8000/iceberg/api'
 );
 
 SELECT path, size_bytes, commit_id, user_metadata
-FROM lakefs."system"."object_metadata"
+FROM lakefs."system.metadata.my-repo.main"."objects"
 WHERE path LIKE 'orders/%'
 ORDER BY size_bytes DESC
 LIMIT 20;
 ```
 
-The `/mds/iceberg/api` form keeps the repository and ref in the identifier, so the schema has three
-levels:
+The deprecated `/mds/iceberg/api` catalog keeps the older identifier:
 
 ```sql
 ATTACH 's3://my-bucket' AS lakefs (
@@ -675,11 +687,11 @@ CREATE OR REPLACE SECRET lakefs_catalog (
 
 ATTACH 'https://myaccount.blob.core.windows.net/my-container/my-repo' AS lakefs (
   TYPE iceberg,
-  ENDPOINT 'http://lakefs:8000/iceberg/relative_to/my-repo.main/api'
+  ENDPOINT 'http://lakefs:8000/iceberg/api'
 );
 
 SELECT path, size_bytes, commit_id
-FROM lakefs."system"."object_metadata"
+FROM lakefs."system.metadata.my-repo.main"."objects"
 WHERE path LIKE 'orders/%';
 ```
 
@@ -689,7 +701,7 @@ PySpark with the Iceberg Spark runtime. The catalog name (`lakefs`) is arbitrary
 include `/v1`. The S3 FileIO properties are only needed when the catalog does not vend
 credentials; omit them when it does.
 
-`/mds/iceberg/api`:
+The deprecated catalog, `/mds/iceberg/api`:
 
 ```properties
 spark.sql.defaultCatalog=lakefs
@@ -715,14 +727,14 @@ FROM lakefs.`my-repo`.`main`.`system`.object_metadata
 WHERE path LIKE 'orders/%';
 ```
 
-`/iceberg/relative_to`:
+`/iceberg/api`, the lakeFS catalog:
 
 ```properties
 spark.sql.defaultCatalog=lakefs
 spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
 spark.sql.catalog.lakefs=org.apache.iceberg.spark.SparkCatalog
 spark.sql.catalog.lakefs.type=rest
-spark.sql.catalog.lakefs.uri=http://lakefs:8000/iceberg/relative_to/my-repo.main/api
+spark.sql.catalog.lakefs.uri=http://lakefs:8000/iceberg/api
 spark.sql.catalog.lakefs.rest.auth.type=basic
 spark.sql.catalog.lakefs.credential=<access_key_id>:<secret_access_key>
 spark.sql.catalog.lakefs.warehouse=s3://my-bucket
@@ -736,13 +748,15 @@ spark.sql.catalog.lakefs.client.region=us-east-1
 
 ```sql
 SELECT path, size_bytes, commit_id, user_metadata
-FROM lakefs.system.object_metadata
+FROM lakefs.system.metadata.`my-repo`.main.objects
 WHERE path LIKE 'orders/%';
 ```
 
-There are three namespace levels in the identifier form (`my-repo`, `main`, `system`), so quote
-each level separately, as above. Writing the whole dotted namespace as one backquoted token makes
-it one namespace level, and the catalog rejects it with
+The root address has four namespace levels (`system`, `metadata`, `my-repo`, `main`) and the table
+is `objects`; quote a level that is not a bare identifier, as above for the repository name. The
+deprecated catalog's identifier has three levels (`my-repo`, `main`, `system`) and the table
+`object_metadata`, and each level is quoted separately there: writing the whole dotted namespace as
+one backquoted token makes it one namespace level, and the catalog rejects it with
 `namespace "my-repo.main.system" must start with a repository and a ref`.
 
 Iceberg 1.8 takes the AWS region from `client.region`; older Spark runtimes take it from
@@ -782,7 +796,7 @@ which is the supported mode unless the catalog vends. For Trino before 484, use
 `iceberg.rest-catalog.password` instead of the three `oauth2.*` keys, and
 `fs.native-s3.enabled=true` instead of `fs.s3.enabled=true`.
 
-`/mds/iceberg/api`:
+The deprecated catalog, `/mds/iceberg/api`:
 
 ```properties
 connector.name=iceberg
@@ -808,16 +822,17 @@ FROM lakefs."my-repo.main.system".object_metadata
 WHERE path LIKE 'orders/%';
 ```
 
-`/iceberg/relative_to`:
+`/iceberg/api`, the lakeFS catalog:
 
 ```properties
 connector.name=iceberg
 iceberg.catalog.type=rest
-iceberg.rest-catalog.uri=http://lakefs:8000/iceberg/relative_to/my-repo.main/api
+iceberg.rest-catalog.uri=http://lakefs:8000/iceberg/api
 iceberg.rest-catalog.security=OAUTH2
 iceberg.rest-catalog.oauth2.credential=<access_key_id>:<secret_access_key>
 iceberg.rest-catalog.oauth2.server-uri=http://lakefs:8000/iceberg/api/v1/oauth/tokens
 iceberg.rest-catalog.vended-credentials-enabled=false
+iceberg.rest-catalog.nested-namespace-enabled=true
 fs.s3.enabled=true
 s3.endpoint=http://seaweedfs:8333
 s3.region=us-east-1
@@ -828,7 +843,7 @@ s3.path-style-access=true
 
 ```sql
 SELECT path, size_bytes, commit_id, user_metadata
-FROM lakefs.system.object_metadata
+FROM lakefs."system.metadata.my-repo.main".objects
 WHERE path LIKE 'orders/%';
 ```
 
@@ -858,6 +873,12 @@ azure.access-key=<storage account key>
 cloud, as it is for the indexer.
 
 ### What was verified
+
+The runs below predate the realignment of [`../METADATA_SEARCH_REALIGN.md`](../METADATA_SEARCH_REALIGN.md):
+they exercised the older identifier on `/iceberg/relative_to` as well, which the lakeFS catalog no
+longer serves (RA3), and the recipes above now name the root address. They are the last recorded
+observation of the same table through the same engines, and RA8 re-runs them on the current
+addresses.
 
 The end-to-end suite [`../esti/mds_test.go`](../esti/mds_test.go) runs the PyIceberg and DuckDB
 snippets above against a real `lakefs-sso` and a real indexer on SeaweedFS, on both endpoints: PyIceberg
@@ -982,7 +1003,7 @@ Every snapshot the indexer writes also carries `lakefs.mds.source-commit` and
 Read the property from the engine that loaded the table. With PyIceberg:
 
 ```python
-table = catalog.load_table(("my-repo", "main", "system", "object_metadata"))
+table = catalog.load_table(("system", "metadata", "my-repo", "main", "objects"))
 indexed = table.properties["lakefs.mds.source-commit"]
 print(indexed)
 ```
@@ -990,7 +1011,7 @@ print(indexed)
 With Spark:
 
 ```sql
-SHOW TBLPROPERTIES lakefs.`my-repo`.`main`.`system`.object_metadata;
+SHOW TBLPROPERTIES lakefs.system.metadata.`my-repo`.main.objects;
 ```
 
 Compare it with the head of the branch in lakeFS:
@@ -1016,7 +1037,7 @@ silently.
 The upstream SQL recipe filters by the head commit:
 
 ```sql
-SELECT * FROM lakefs.system.object_metadata WHERE commit_id = '<full head commit ID>';
+SELECT * FROM lakefs."system.metadata.my-repo.main".objects WHERE commit_id = '<full head commit ID>';
 ```
 
 It answers "which objects did the head commit change", which is usually what a data engineer wants,
@@ -1045,7 +1066,7 @@ reports `lag_commits` per branch.
 | Per-tick work | One branch applies at most `max_commits` commits per tick, and the log walk reads at most `max_commits` plus one page; a backlog deeper than that is rebuilt from a full listing at the head (the lag drops to `0`) instead of being paged through. `concurrency` bounds parallel branches, not commits. |
 | Query scale | The table is unpartitioned and sorted by `path` within each file. There is no path-prefix partitioning and no server-side scan planning, so a filtered query is only as selective as the Iceberg expression the engine pushes down. Partitioning by prefix is a later version. |
 | Structured metadata only | There is no full-text, vector or JSON-path search. `user_metadata` is a map of strings, queryable with the engine's map functions. |
-| Companion table identity | The catalog serves `my-repo.<ref>.system.object_metadata` only when **both** proofs hold: the companion table's `lakefs.mds.repository` property names `my-repo`, and the served ref's first-parent history carries the indexer's `mds: init` commit (`lakefs.mds.init=true`), committed by `mds-indexer` and positioned as the first commit directly above the repository's root commit — or, for a companion repository created **bare**, as the root commit itself. The property alone is a document anyone who can create `my-repo-metadata` can write, and the message and metadata of a commit are supplied by its author; the committer and the position are what the indexer's own initialisation has and a look-alike commit does not. A repository named `my-repo-metadata` that the indexer did not create — the name is taken by an ordinary repository — answers `404 NoSuchTableException` on the virtual address instead of serving someone else's rows (design §5.1). A bare companion is served like a non-bare one: its `mds: init` commit is the branch's first commit and has no parent, which the indexer always accepted (design §4.8) and the catalog now accepts too (commit `30af7b3a5`); an init commit by a committer other than `mds-indexer`, and an init commit with another commit between it and the root, are still refused. **The committer is reserved:** the commit-record API answers `403` to a caller other than `mds-indexer` that asks for a commit record whose committer is `mds-indexer` (commit `2a822c719`), so a principal holding `fs:CreateCommit` on the repository ARN can no longer mint the proof; the boundary that remains is `LoadCommits`, which `lakectl refs-restore` uses and which copies commit records verbatim without going through that endpoint (design §5.1). The history check walks the first-parent log newest to root, one 256-commit page at a time (the initialisation commit is the oldest non-root commit, or the root of a bare companion); the commit it finds is cached per companion repository, and a later head is checked only back to that commit or to a head already verified, so an unchanged branch pays nothing and a branch that moved pays for its new commits. The cache holds at most 1024 repositories. |
+| Companion table identity | The catalog serves `system.metadata.my-repo.<ref>.objects` (and the deprecated catalog's `my-repo.<ref>.system.object_metadata`, which names the same table) only when **both** proofs hold: the companion table's `lakefs.mds.repository` property names `my-repo`, and the served ref's first-parent history carries the indexer's `mds: init` commit (`lakefs.mds.init=true`), committed by `mds-indexer` and positioned as the first commit directly above the repository's root commit — or, for a companion repository created **bare**, as the root commit itself. The property alone is a document anyone who can create `my-repo-metadata` can write, and the message and metadata of a commit are supplied by its author; the committer and the position are what the indexer's own initialisation has and a look-alike commit does not. A repository named `my-repo-metadata` that the indexer did not create — the name is taken by an ordinary repository — answers `404 NoSuchTableException` on the virtual address instead of serving someone else's rows (design §5.1). A bare companion is served like a non-bare one: its `mds: init` commit is the branch's first commit and has no parent, which the indexer always accepted (design §4.8) and the catalog now accepts too (commit `30af7b3a5`); an init commit by a committer other than `mds-indexer`, and an init commit with another commit between it and the root, are still refused. **The committer is reserved:** the commit-record API answers `403` to a caller other than `mds-indexer` that asks for a commit record whose committer is `mds-indexer` (commit `2a822c719`), so a principal holding `fs:CreateCommit` on the repository ARN can no longer mint the proof; the boundary that remains is `LoadCommits`, which `lakectl refs-restore` uses and which copies commit records verbatim without going through that endpoint (design §5.1). The history check walks the first-parent log newest to root, one 256-commit page at a time (the initialisation commit is the oldest non-root commit, or the root of a bare companion); the commit it finds is cached per companion repository, and a later head is checked only back to that commit or to a head already verified, so an unchanged branch pays nothing and a branch that moved pays for its new commits. The cache holds at most 1024 repositories. |
 | Companion repository must be writable | `my-repo-metadata` must not be created with `read_only: true`, and a branch-protection rule must not block `COMMIT` or `STAGING_WRITE` on its branches. A read-only companion repository is detected from the repository record and fails at the repository level, once per tick (design §3.3). A protection rule is not reported on the repository record, so it is diagnosed at the first write the tick attempts — the catalog's `CreateTable` during the initialisation included — and is reported **per branch**: `/my-repo/_health` stays `503`, each refused branch carries a `last_error` naming the family and increments `errors_total{stage="branch"}`, and the repository's own `last_error` stays empty. The message names branch protection and the read-only flag only when lakeFS's own wording is in the cause; an authorization refusal (for example a companion repository the policy refresher has not covered yet) keeps the same family with neutral wording that names branch protection, `read_only` and the indexer's permissions as the candidates, instead of the bare `403` this used to be. |
 | Azure Blob Storage | Supported, with limits that are decisions: a table's location is `abfs[s]://<container>@<account>.<dfs domain>/…` - `wasb[s]://` is never emitted and not accepted as a new location (N4) - the indexer writes it with its own Azure credentials, and the `http`/`https` spellings of one namespace are treated as the same prefix. Credential vending and remote signing are **S3-only** (N1) - an engine uses its own Azure `FileIO` - the web UI object search is **S3-only** (N3), and `iceberg.azure.location_host: blob` is the server-wide switch for an engine whose Hadoop ABFS driver refuses a non-HNS account on the `dfs` host. See [Azure Blob Storage](#azure-blob-storage). |
 | GCS | Out of scope (N2): `gs://` needs no location translation, but the indexer registers no GCS IO, so a GCS blockstore cannot be indexed in this version. |
@@ -1071,7 +1092,9 @@ source commit, not indexing it. The CI job keeps `ESTI_MDS_BACKFILL_OBJECTS=1000
 
 The read path is designed so query users need nothing on the companion repository:
 
-- A read of `my-repo.<ref>.system.object_metadata` is authorized with one `catalog:ReadTable` (and
+- A read of `system.metadata.my-repo.<ref>.objects` (or of the deprecated catalog's
+  `my-repo.<ref>.system.object_metadata`, which is the same table) is authorized with one
+  `catalog:ReadTable` (and
   `catalog:ReadTableData` for vended credentials or remote signing) on `my-repo`, plus
   `fs:ReadRepository` on `my-repo` in the catalog's repository checks. The redirected read of
   `my-repo-metadata` runs with the server's identity, so the caller needs no permission there.
@@ -1080,9 +1103,9 @@ The read path is designed so query users need nothing on the companion repositor
   namespace, an object path or a branch does not narrow this virtual table. Grant
   `catalog:ReadTable` on `my-repo` deliberately, and treat it as "may see the object inventory of
   the whole repository".
-- Vended credentials and remote signing for the virtual table are read-only in effect: a write that a
-  table resolver redirects into a reserved namespace is answered with the read session (or a `403` for a
-  remote-signature write), so an engine can read `object_metadata` but cannot use a `catalog:WriteTableData`
+- Vended credentials and remote signing for the metadata table are read-only in effect: a write that
+  the catalog redirects to the companion repository is answered with the read session (or a `403` for
+  a remote-signature write), so an engine can read the table but cannot use a `catalog:WriteTableData`
   grant on `my-repo` to write the companion repository's files.
 
 Other permission facts:
@@ -1114,10 +1137,10 @@ Other permission facts:
   this endpoint.
 - On an auth backend without policies (`auth.basic`), the deny is not enforced and the bootstrap
   prints a warning naming that consequence. Do not rely on the deny in that mode.
-- The `system` namespace of a data repository is read-only for clients while the feature is enabled:
-  creates, commits, registers, drops and namespace changes under `system` answer `403
-  ForbiddenException`, and `GET`/`HEAD` of the namespace is `404`. Listings still show `system` and
-  `object_metadata`. In `my-repo-metadata` it is an ordinary namespace.
+- The root `system` namespace of the catalog is read-only for clients while the feature is enabled:
+  creates, commits, registers, drops and namespace changes under it answer `403 ForbiddenException`.
+  Nothing below `<repo>.<ref>` is reserved - a data repository's `system` namespace is an ordinary
+  namespace a client may create and write, and the metadata table is not in it.
 - An explicit `storage_namespace` that does not itself end in `-metadata` falls outside the
   namespace grant of the bootstrap's `mds-indexer` policy. Put the extra `fs:AttachStorageNamespace`
   (and the matching `fs:CreateRepository`) in a policy of your own, for example
