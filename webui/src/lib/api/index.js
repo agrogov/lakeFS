@@ -572,13 +572,26 @@ class Repositories {
         return response.json();
     }
 
-    async delete(repoId) {
-        const response = await apiRequest(`/repositories/${encodeURIComponent(repoId)}`, {
+    async delete(repoId, { deleteStorage = false, force = false } = {}) {
+        const queryParts = {};
+        if (deleteStorage) {
+            queryParts.delete_storage = true;
+        }
+        if (force) {
+            queryParts.force = true;
+        }
+        const query = qs(queryParts);
+        const response = await apiRequest(`/repositories/${encodeURIComponent(repoId)}${query ? `?${query}` : ''}`, {
             method: 'DELETE',
         });
+        if (response.status === 202) {
+            // The repository metadata is gone; a background job is deleting its objects.
+            return { inBackground: true, deletion: await response.json() };
+        }
         if (response.status !== 204) {
             throw new Error(await extractError(response));
         }
+        return { inBackground: false, deletion: null };
     }
 }
 
