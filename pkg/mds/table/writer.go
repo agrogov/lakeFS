@@ -224,6 +224,59 @@ func snapshotIDOf(tbl *icebergtable.Table) int64 {
 	return 0
 }
 
+// ensureOptionalUserMetadata returns a handle of tbl whose schema declares user_metadata optional,
+// and applies that one schema update to a table whose schema still declares it required.
+//
+// The current guide makes the column optional - "Required: no. If none exists, an empty map is
+// stored" - and rows keep writing an empty map, so the update changes only what the schema allows,
+// never a row (G13, METADATA_SEARCH_REALIGN.md RA7). Iceberg allows a required field to become
+// optional and refuses the reverse, so there is exactly one direction to evolve, and a table this
+// package creates already carries it (Schema). Only a table created before the change carries the
+// required field, and it is evolved here on the next write.
+//
+// It is applied once per table, not once per write: the guard is the loaded schema itself, so a
+// table that already carries the optional field - including the one the previous write returned -
+// costs no request and no commit. iceberg-go's UpdateSchema would also stage nothing for a schema
+// that already matches (BuildUpdates finds the current schema ID and stages no update), so a second
+// attempt could not add a commit even if the guard were missing; the guard is what makes "once" a
+// property of the code and not of a library detail.
+//
+// The update keeps the field ID (7) and the map's key and value IDs (8, 9): it changes the
+// Required flag of an existing field, and never rebuilds the column. Every ID a data file already
+// carries therefore stays the ID this schema gives the column.
+//
+// The commit is metadata-only: it adds no snapshot, so the row set a caller read is the row set the
+// write that follows commits. Writing the schema and the rows into one transaction is not an
+// option - the reader the write appends was built from the schema of one handle, and a table's
+// transaction commits the metadata it was started on - so the two commits are ordered: this one
+// first, then the write's own.
+//
+// Every entry point calls it after ensureNoReplay, so this commit is made with
+// commit.retry.num-retries already pinned to 0 and is never replayed: a lost optimistic-concurrency
+// check here (a concurrent writer evolving the same table) is a conflict the indexer retries, which
+// is the recovery of §4.4.
+func ensureOptionalUserMetadata(ctx context.Context, tbl *icebergtable.Table) (*icebergtable.Table, error) {
+	field, ok := tbl.Schema().FindFieldByName(ColumnUserMetadata)
+	if !ok || !field.Required {
+		// A table without the column is not one this writer evolves: checkKnownSchema refuses it
+		// on the row-building paths with ErrUnknownSchema, which is the honest answer.
+		return tbl, nil
+	}
+	txn := tbl.NewTransaction()
+	if err := txn.UpdateSchema(true, false).
+		UpdateColumn([]string{ColumnUserMetadata}, icebergtable.ColumnUpdate{
+			Required: iceberg.Optional[bool]{Valid: true, Val: false},
+		}).
+		Commit(); err != nil {
+		return nil, fmt.Errorf("make %s optional: %w", ColumnUserMetadata, err)
+	}
+	updated, err := txn.Commit(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("make %s optional: %w", ColumnUserMetadata, err)
+	}
+	return updated, nil
+}
+
 // ApplyDelta applies one commit of a data repository to the table (design §4.3 step 3): the
 // upserts replace the rows of their paths, the deletes remove theirs, and the table property
 // lakefs.mds.source-commit records the commit that was applied.
@@ -262,7 +315,9 @@ func snapshotIDOf(tbl *icebergtable.Table) int64 {
 // delta writes no row and is still applied. The upserts name a path at most once (ErrRowsOutOfOrder
 // otherwise, as a rebuild's source does), because path is the identifier field (§3.1, R4T-5). The
 // write is never replayed: every write pins commit.retry.num-retries to 0 and migrates a table
-// created before the property existed (R2T-3).
+// created before the property existed (R2T-3). A table whose schema still declares user_metadata
+// required - one created before G13 - is evolved to the optional column once, before the write,
+// with a metadata-only commit of its own (ensureOptionalUserMetadata).
 func ApplyDelta(ctx context.Context, tbl *icebergtable.Table, upserts []Row, deletes []string, sourceCommit string, opts ...Option) (*icebergtable.Table, error) {
 	if tbl == nil {
 		return nil, ErrNoTable
@@ -304,6 +359,10 @@ func ApplyDelta(ctx context.Context, tbl *icebergtable.Table, upserts []Row, del
 	tbl, err = ensureNoReplay(ctx, tbl)
 	if err != nil {
 		return nil, fmt.Errorf("make the delta at %s non-replayable: %w", sourceCommit, err)
+	}
+	tbl, err = ensureOptionalUserMetadata(ctx, tbl)
+	if err != nil {
+		return nil, fmt.Errorf("evolve the schema for the delta at %s: %w", sourceCommit, err)
 	}
 	snapshotProps := SnapshotProperties(repository, sourceCommit)
 
@@ -475,7 +534,8 @@ func compactDeleteFiles(ctx context.Context, tbl *icebergtable.Table) (*icebergt
 // existed, so a lost optimistic-concurrency check is a conflict the indexer retries rather than a
 // replayed rewrite that duplicates rows (R2T-3). A table whose schema carries a column this writer
 // does not know is refused with ErrUnknownSchema: a rebuild cannot fill a column it was not given
-// (R2T-1).
+// (R2T-1). A table whose user_metadata is still required is evolved once, before the rows are
+// written (ensureOptionalUserMetadata, G13).
 func Rebuild(ctx context.Context, tbl *icebergtable.Table, rows Rows, sourceCommit string, opts ...Option) (*icebergtable.Table, error) {
 	if tbl == nil {
 		return nil, ErrNoTable
@@ -500,6 +560,10 @@ func Rebuild(ctx context.Context, tbl *icebergtable.Table, rows Rows, sourceComm
 	tbl, err = ensureNoReplay(ctx, tbl)
 	if err != nil {
 		return nil, fmt.Errorf("make the rebuild at %s non-replayable: %w", sourceCommit, err)
+	}
+	tbl, err = ensureOptionalUserMetadata(ctx, tbl)
+	if err != nil {
+		return nil, fmt.Errorf("evolve the schema for the rebuild at %s: %w", sourceCommit, err)
 	}
 	snapshotProps := SnapshotProperties(repository, sourceCommit)
 
@@ -584,7 +648,9 @@ func Rebuild(ctx context.Context, tbl *icebergtable.Table, rows Rows, sourceComm
 // compaction read, and duplicate a path (R2T-3).
 //
 // The caller commits R-metadata afterwards with the "mds: compact" message and without a new tag
-// (§4.9, M4's maintenance task).
+// (§4.9, M4's maintenance task). A table whose user_metadata is still required is evolved once,
+// before the scan that feeds the rewrite (ensureOptionalUserMetadata, G13), so the batches the
+// merge hands to Append carry the schema the transaction commits.
 //
 // Compact takes no Option: it removes and re-adds whole files and writes no delete predicate, so
 // the delete mode and the delete chunk size of a delta do not apply, and the batch size is the
@@ -605,6 +671,10 @@ func Compact(ctx context.Context, tbl *icebergtable.Table, sourceCommit string) 
 	tbl, err = ensureNoReplay(ctx, tbl)
 	if err != nil {
 		return nil, fmt.Errorf("make the compaction at %s non-replayable: %w", sourceCommit, err)
+	}
+	tbl, err = ensureOptionalUserMetadata(ctx, tbl)
+	if err != nil {
+		return nil, fmt.Errorf("evolve the schema for the compaction at %s: %w", sourceCommit, err)
 	}
 	scan := tbl.Scan()
 	defer func() { _ = scan.Close() }()

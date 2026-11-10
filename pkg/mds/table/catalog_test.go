@@ -40,7 +40,7 @@ func TestCreateTableSchema(t *testing.T) {
 		{table.ColumnSizeBytes, "long", true},
 		{table.ColumnLastModified, "timestamptz", true},
 		{table.ColumnETag, "string", true},
-		{table.ColumnUserMetadata, "map", true},
+		{table.ColumnUserMetadata, "map", false},
 		{table.ColumnCommitter, "string", false},
 		{table.ColumnContentType, "string", false},
 		{table.ColumnCreationDate, "timestamptz", false},
@@ -53,6 +53,11 @@ func TestCreateTableSchema(t *testing.T) {
 
 	userMetadata, ok := schema.FindFieldByName(table.ColumnUserMetadata)
 	require.True(t, ok, "user_metadata is a column")
+	// The current guide declares the column optional - "If none exists, an empty map is stored" -
+	// and keeps its ID 7 (G13 of METADATA_SEARCH_REALIGN.md). Rows still write an empty map, never
+	// a null, so the relaxation changes what the schema allows and not what a reader meets.
+	require.False(t, userMetadata.Required, "user_metadata is optional (G13)")
+	require.Equal(t, table.FieldUserMetadata, userMetadata.ID, "the optional field keeps its ID")
 	mapType, ok := userMetadata.Type.(*iceberg.MapType)
 	require.True(t, ok, "user_metadata is a map")
 	require.Equal(t, iceberg.StringType{}, mapType.KeyType)

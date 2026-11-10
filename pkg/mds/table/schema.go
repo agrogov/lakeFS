@@ -10,7 +10,10 @@
 // (design §2: "the indexer is a REST client of lakeFS").
 //
 // The table is unpartitioned, format v2, sorted by path, with a fixed schema whose field IDs are
-// part of the contract: schema changes only ever add optional fields with new IDs (§3.1).
+// part of the contract: schema changes never reuse a field ID, so an added column takes a new one
+// (§3.1). They may also relax a field - the current guide makes user_metadata optional (G13,
+// METADATA_SEARCH_REALIGN.md), which keeps its ID and its meaning - but never tighten one, which
+// Iceberg refuses anyway.
 //
 // Clean-room note: upstream Metadata Search is a lakeFS Enterprise feature. This is an independent
 // OSS implementation written from METADATA_SEARCH_DESIGN.md, the public Metadata Search guide
@@ -71,8 +74,9 @@ const (
 	// FieldUserMetadataKey and FieldUserMetadataValue are the IDs of the map's key and value
 	// types of user_metadata (§3.1). They follow the map field in the catalog's pre-order
 	// renumbering: the key and value are user_metadata's children, so they take IDs 8 and 9 and
-	// the trailing columns continue at 10. The value is optional (§3.1); an empty map - never a
-	// null - is how an object without user metadata is stored.
+	// the trailing columns continue at 10. The value is optional (§3.1), and the map field itself
+	// became optional under G13 while keeping ID 7; an empty map - never a null - is still how an
+	// object without user metadata is stored.
 	FieldUserMetadataKey   = 8
 	FieldUserMetadataValue = 9
 
@@ -98,6 +102,11 @@ const (
 
 	// PropertySchemaVersion is the version of the fixed schema above (§3.1). It is set at
 	// creation and only changes when a schema change is introduced.
+	//
+	// G13's relaxation of user_metadata from required to optional (METADATA_SEARCH_REALIGN.md RA7)
+	// does not bump it: the version names the column set and the field IDs of §3.1, and that change
+	// moves neither - it relaxes a flag on an existing ID, which a reader of version 1 reads exactly
+	// as before. An added column or a change of the numbering is what a new value marks.
 	PropertySchemaVersion = "lakefs.mds.schema-version"
 
 	// PropertyRepository is the data repository the table belongs to, set at creation (§3.1).
@@ -206,13 +215,20 @@ func checkKnownSchema(sc *iceberg.Schema) error {
 //	4  size_bytes     long              required
 //	5  last_modified  timestamptz       required
 //	6  etag           string            required
-//	7  user_metadata  map<string,string> required  (key 8, value 9)
+//	7  user_metadata  map<string,string> optional  (key 8, value 9)
 //	10 committer      string            optional
 //	11 content_type   string            optional
 //	12 creation_date  timestamptz       optional
 //
 // The identifier is the path field alone, as §3.1 fixes it. The returned schema is a fresh value
 // on every call, so a caller may not rely on pointer identity.
+//
+// user_metadata is optional because the current guide declares it so - "If none exists, an empty
+// map is stored" - and not because a row may now carry a null map: rows still write an empty map
+// (appendRow), so a reader never meets a null there (G13, METADATA_SEARCH_REALIGN.md RA7). The
+// field keeps ID 7: Iceberg allows making a required field optional and never the other way, so a
+// table created with the earlier required field is evolved to this schema once by the writer
+// (ensureOptionalUserMetadata in writer.go) instead of being rewritten.
 //
 // These are the IDs of the created table. The catalog assigns them itself when it applies the
 // request (iceberg-go's NewMetadataWithUUID calls AssignFreshSchemaIDs, which renumbers every ID in
@@ -244,7 +260,7 @@ func Schema() *iceberg.Schema {
 			ID: FieldETag, Name: ColumnETag, Type: iceberg.StringType{}, Required: true,
 		},
 		iceberg.NestedField{
-			ID: FieldUserMetadata, Name: ColumnUserMetadata, Required: true,
+			ID: FieldUserMetadata, Name: ColumnUserMetadata, Required: false,
 			Type: &iceberg.MapType{
 				KeyID:     FieldUserMetadataKey,
 				KeyType:   iceberg.StringType{},
