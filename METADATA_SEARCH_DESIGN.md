@@ -1,7 +1,16 @@
 # Metadata Search for lakeFS OSS — design
 
-Status: revised for implementation. Companion: [`METADATA_SEARCH_PLAN.md`](METADATA_SEARCH_PLAN.md).
-Builds on [`ICEBERG_CATALOG_PLAN.md`](ICEBERG_CATALOG_PLAN.md) and `docs/iceberg.md` (section "Metadata Search").
+Status: revised for implementation, realigned with the current guide (`METADATA_SEARCH_REALIGN.md` RA8).
+Companion: [`METADATA_SEARCH_PLAN.md`](METADATA_SEARCH_PLAN.md). Builds on
+[`ICEBERG_CATALOG_PLAN.md`](ICEBERG_CATALOG_PLAN.md) and `docs/iceberg.md` (section "Metadata Search").
+
+Realignment: this document used to describe the guide as it read in 2026-11-03/04. The current guide
+(2026-11-09) moved the tables to the root `system.metadata` tree of the lakeFS catalog, deprecated the
+separate `/mds/iceberg/api` catalog we had implemented, and rewrote the indexer's configuration and sync
+identity. `METADATA_SEARCH_REALIGN.md` is the list of gaps and the card that closed each one; the
+sections below describe the code after those cards, not the earlier build. Where a section still
+mentions a commit of the earlier design, it is there because the behaviour or the residual did not
+change.
 
 Clean-room note: upstream Metadata Search is a lakeFS Team/Enterprise feature. This is an independent OSS
 implementation written only from the public guide (https://docs.lakefs.io/guides/metadata-search/), the
@@ -14,17 +23,21 @@ user metadata, with any Iceberg engine, at any indexed branch, tag or commit of 
 
 Reference behaviour (upstream guide):
 
-- for each data repository `R`, a companion repository `R-metadata` holds the table `system.object_metadata`,
-  with branches named like the indexed branches of `R`;
+- the tables are "served by the lakeFS Iceberg REST catalog at `<lakefs_endpoint>/iceberg/api`, under the
+  reserved `system` namespace: `system.metadata.<repo>.<ref>.objects`";
+- for each data repository `R` a companion repository `R-metadata` holds the table
+  `system.object_metadata`, with branches named like the indexed branches of `R`;
 - a background indexer keeps the table in sync with the commits of `R`;
-- the catalog resolves `R.<ref>.system.object_metadata` to that table in `R-metadata`;
+- the catalog resolves `system.metadata.<R>.<ref>.objects` to that table in `R-metadata`;
+- the separate Metadata Search catalog at `<lakefs_endpoint>/mds/iceberg/api` is deprecated and keeps
+  serving the older identifier `<repo>.<ref>.system.object_metadata` until it is removed;
 - one row per object per branch, eventually consistent, atomic per commit of `R`.
 
 ### Delivery options
 
 | Option | Content | Status |
 |---|---|---|
-| **A** | Indexer, `R-metadata` management, catalog resolution. Users query with DuckDB, Spark, Trino or PyIceberg. | **This design, to be built.** |
+| **A** | Indexer, `R-metadata` management, catalog resolution. Users query with DuckDB, Spark, Trino or PyIceberg. | **Built** (this design; realigned by RA1–RA7, RA9, RA10, RA4b and RA8). |
 | **B** | A + Web UI "Metadata Search" tab + a server-side query service (embedded DuckDB). | Documented for later (section 11). |
 
 Non-goals of A: UI tab, server-side SQL, multi-tenancy, Azure/GCS credential vending, full-text or vector search,
@@ -34,15 +47,18 @@ exact upstream `commit_id` semantics for objects that existed before the first i
 
 | Piece | Where | State |
 |---|---|---|
-| Virtual table resolution, authz on `R`, read-only `system` namespace, `iceberg.metadata_search.enabled` | `pkg/icebergcatalog/resolver.go`, `http.go`, `config.go`, `docs/iceberg.md` | **Done** (R10-1, commit `80f6927e2`). Section 5 records the landed API. |
-| `/mds/iceberg/api` alias of the catalog (upstream endpoint) | `pkg/icebergcatalog/http.go` | **New**, small (task R10-2, section 5.5). |
-| `RefMapper` for tags and commits | new `pkg/mds/refmap`, installed from `cmd/lakefs-sso/main.go` | New (section 6). |
-| Indexer (`lakefs-sso mds run`) | new `pkg/mds/...`, registered in `cmd/lakefs-sso/main.go` | New (sections 4, 7). |
-| Bootstrap of indexer principal and `R-metadata` deny policy | new `pkg/mds/bootstrap/bootstrap.go`, extra routes builder in `cmd/lakefs-sso/main.go` | New (section 8). |
+| Root `system.metadata` tree, authz on `R`, read-only tree, `relative_to` root-tree warehouses | `pkg/icebergcatalog/resolver.go`, `namespaces.go`, `tables.go`, `relative.go`, `http.go` | **Done** (RA1, RA2; sections 5.1–5.3). |
+| Deprecated, separate Metadata Search catalog at `/mds/iceberg/api` | `pkg/icebergcatalog/http.go`, `resolver.go` | **Done** (RA3; section 5.5). |
+| `RefMapper` for tags and commits | `pkg/mds/refmap`, installed from `cmd/lakefs-sso/main.go` | Done (section 6). |
+| Indexer (`lakefs mds run` on the server binary and configuration) | `pkg/mds/...`, `cmd/lakefs-sso/mds.go` | Done (RA4, RA4b; sections 4, 7). |
+| Sync identity `mds-service-user` and `MDSCatalogAccess` | `pkg/mds/bootstrap/bootstrap.go`, extra routes builder in `cmd/lakefs-sso/main.go` | Done (RA5; section 8). |
 
-The indexer is a **REST client** of lakeFS (lakeFS API + the Iceberg REST catalog). It does not import
-`pkg/catalog` or `pkg/graveler` and does not touch KV or the block adapter. The only server-side code is the
-`RefMapper`, the alias mount and bootstrap.
+The indexer runs on the **server binary and configuration** (RA4b): `lakefs mds run --config <file>`
+opens the KV store of `database.*`, builds `pkg/catalog` over the `blockstore.*` adapter, and reads the
+data repositories in process. It does not use the REST API for reads and does not read the
+`metadata_search` section for anything but its own keys (section 7). Its table writes go through the
+lakeFS Iceberg REST catalog at `<lakefs_endpoint>/iceberg/api`, as the guide says, authenticated as
+`mds-service-user` (section 8).
 
 ## 3. Data model
 
@@ -64,13 +80,17 @@ table, never from the constants; the constants only describe the table this pack
 | 4 | `size_bytes` | long | required | object size |
 | 5 | `last_modified` | timestamptz (µs) | required | object mtime (`DBEntry.CreationDate` / diff `right.mtime`) |
 | 6 | `etag` | string | required | object checksum, content only |
-| 7 | `user_metadata` | map<string,string> (key ID 8, value ID 9, value optional) | required | user metadata, empty map when none (never null); the indexer never writes a null value |
+| 7 | `user_metadata` | map<string,string> (key ID 8, value ID 9, value optional) | optional | user metadata, empty map when none (never null); the indexer never writes a null value |
 | 10 | `committer` | string | optional | committer of `commit_id` |
 | 11 | `content_type` | string | optional | content type |
 | 12 | `creation_date` | timestamptz (µs) | optional | creation time of the commit `commit_id` (not of the object) |
 
 The map value is optional because iceberg-go v0.7.0 reads parquet map columns with nullable items; a required
 value makes its own copy-on-write rewrite and compaction fail with "record schema does not match writer's".
+The map **field** is optional too (guide: `user_metadata` is required: no; METADATA_SEARCH_REALIGN.md G13,
+RA7): the indexer still writes an empty map for an object without user metadata, and the writer applies one
+schema update to a table created with the field required, keeping ID 7, which Iceberg allows for
+required → optional.
 
 Schema changes are additive - this section allows an optional column a later version appends with a new ID -
 and a compaction follows them, but a write that has to build rows does not: a table that already carries a
@@ -135,11 +155,11 @@ Every snapshot the indexer produces also carries `lakefs.mds.source-commit` in i
 
 | Property | Value |
 |---|---|
-| Name | `R + "-metadata"` (`icebergcatalog.MetadataRepositorySuffix`). `R` longer than 54 characters cannot be indexed (repository IDs are at most 63 characters); config validation rejects it. A data repository whose own name ends in `-metadata` cannot be indexed either (`icebergcatalog.IsMetadataRepository` treats it as a companion). |
+| Name | `R + "-metadata"` (`icebergcatalog.MetadataRepositorySuffix`). lakeFS's repository ID limit is 63 characters, so `R` longer than 54 characters has no companion name that fits; the guide has no validation for it and the configuration does not fail (X9), the repository is refused when the indexer tries to create the companion. A data repository whose own name ends in `-metadata` is still `icebergcatalog.IsMetadataRepository`'s case, so it cannot be indexed; the configuration accepts it (X9) and the repository reports that refusal. |
 | Default branch | same name as `R`'s default branch |
 | Storage ID | same as `R` |
-| Storage namespace | `repositories.<R>.storage_namespace` if set; else `<R namespace without trailing "/">-metadata` **only if** `R`'s namespace has a path component (`s3://bucket/path` → `s3://bucket/path-metadata`). A bucket-root namespace (`s3://bucket`) requires an explicit value. **Azure** (`METADATA_SEARCH_AZURE.md` D4): the first path segment is the container, so `https://acct.blob.core.windows.net/data` is a container root and requires the explicit value too - the derived name would be a container that does not exist - while `…/data/esti` derives `…/data/esti-metadata`, in the same container. The split is `block.NamespaceRoot(namespace)`, the one helper the indexer and the bootstrap's deny both call, so they cannot disagree about where a namespace's root is. The namespace must **not** be inside `R`'s namespace (nor `R`'s inside it): `R`'s uncommitted GC sweeps every unreferenced object under `R`'s prefix and would delete `R-metadata`'s files. Checked on every tick, not only when the companion repository is created, with the same `"/"`-normalised prefix test the GC uses (`normalizeStorageNamespace`): a companion repository that already exists with an overlapping namespace (created earlier, by hand, by a replica with another namespace, or because `R`'s namespace moved) is refused - that repository is marked failed in `/_health` and metrics - instead of indexed (commit `7ec4ebec7`). On Azure an `http://` and an `https://` spelling name the same container and prefix, and the overlap test normalises the scheme before it compares, so a companion cannot hide behind the other spelling. |
-| Read-only flag | **not** set: catalog writes never pass `graveler.WithForce`, so a read-only repository would also block the indexer. User writes are blocked by a deny policy instead (section 8). The indexer requires the flag to be false: a companion repository lakeFS reports read-only is refused at the repository level - once per tick, with `ErrReadOnlyMetadataRepository`, before any branch is touched (commit `f884a0627`). Branch protection is diagnosed separately, because the lakeFS API does not report protection rules on the repository record: a rule that blocks `COMMIT` or `STAGING_WRITE` on a companion branch is answered at the first write the tick attempts (`Commit`, `ResetBranch` and `HardResetBranch`, and the catalog's table writes, the initialisation's `CreateTable` included) with the same `ErrReadOnlyMetadataRepository` family, so a bare 403 never reaches `/_health` (commits `da24d421f`, `2ae794038`). The refusal is reported **per branch**, not per repository: every branch whose first write lakeFS refuses carries the family in its `last_error` and increments `errors_total{stage="branch"}`, the repository's own `last_error` stays empty and `/_health` is 503 either way - three protected branches are three branch errors per tick, not one repository-level error (MDS_REVIEW_3 R3I-4, commit `2ae794038`). The message claims branch protection and the read-only flag only when lakeFS's own wording is in the wrapped cause (`cannot commit to protected branch`, `cannot write to protected branch`, `read-only repository`); any other forbidden answer - an authorization failure is answered 401 by default, and the mds client collapses 401 and 403 into one sentinel - stays in the family but names the three candidates (the branch's protection rules, the repository's `read_only` flag and the indexer principal's own permissions) without the destructive "create the repository with read_only=false" advice (MDS_REVIEW_3 R3I-1, commit `2ae794038`). A `STAGING_WRITE` rule present before the first tick is refused one step **before** the initialisation commit, at the catalog's `CreateTable`, and is mapped into the same family and message there (MDS_REVIEW_3 R3I-2, commit `2ae794038`). |
+| Storage namespace | `repositories.<R>.storage_namespace` if set; else `-metadata` is appended to `R`'s namespace in **every** case (X10, the guide: "If omitted, lakeFS appends `-metadata` to the repository's storage namespace"): `s3://bucket/path` → `s3://bucket/path-metadata` and a bucket root `s3://bucket` → `s3://bucket-metadata` (a different bucket, which the operator must then create or name explicitly). **Azure** (`METADATA_SEARCH_AZURE.md` D4): the first path segment is the container, so `https://acct.blob.core.windows.net/data` derives `https://acct.blob.core.windows.net/data-metadata` - a container the operator must create - while `…/data/esti` derives `…/data/esti-metadata`, in the same container. The split is `block.NamespaceRoot(namespace)`, the one helper the indexer and the catalog's own namespace checks call, so they cannot disagree about where a namespace's root is. The namespace must **not** be inside `R`'s namespace (nor `R`'s inside it): `R`'s uncommitted GC sweeps every unreferenced object under `R`'s prefix and would delete `R-metadata`'s files. Checked on every tick, not only when the companion repository is created, with the same `"/"`-normalised prefix test the GC uses (`normalizeStorageNamespace`): a companion repository that already exists with an overlapping namespace (created earlier, by hand, by a replica with another namespace, or because `R`'s namespace moved) is refused - that repository is marked failed in `/_health` and metrics - instead of indexed (commit `7ec4ebec7`). On Azure an `http://` and an `https://` spelling name the same container and prefix, and the overlap test normalises the scheme before it compares, so a companion cannot hide behind the other spelling. |
+| Read-only flag | **not** set: catalog writes never pass `graveler.WithForce`, so a read-only repository would also block the indexer. The guide has no companion-repository deny policy and this build installs none (X2, RA5): `R-metadata` is an ordinary repository whose users' own grants apply, and the indexer's writes are the only writes the catalog side makes. The indexer requires the flag to be false: a companion repository lakeFS reports read-only is refused at the repository level - once per tick, with `ErrReadOnlyMetadataRepository`, before any branch is touched (commit `f884a0627`). Branch protection is diagnosed separately, because the lakeFS API does not report protection rules on the repository record: a rule that blocks `COMMIT` or `STAGING_WRITE` on a companion branch is answered at the first write the tick attempts (`Commit`, `ResetBranch` and `HardResetBranch`, and the catalog's table writes, the initialisation's `CreateTable` included) with the same `ErrReadOnlyMetadataRepository` family, so a bare 403 never reaches `/_health` (commits `da24d421f`, `2ae794038`). The refusal is reported **per branch**, not per repository: every branch whose first write lakeFS refuses carries the family in its `last_error` and increments `errors_total{stage="branch"}`, the repository's own `last_error` stays empty and `/_health` is 503 either way - three protected branches are three branch errors per tick, not one repository-level error (MDS_REVIEW_3 R3I-4, commit `2ae794038`). The message claims branch protection and the read-only flag only when lakeFS's own wording is in the wrapped cause (`cannot commit to protected branch`, `cannot write to protected branch`, `read-only repository`); any other forbidden answer - an authorization failure, which the in-process reader reports as its own forbidden sentinel and the catalog client as a 401 or 403 - stays in the family but names the three candidates (the branch's protection rules, the repository's `read_only` flag and the indexer principal's own permissions) without the destructive "create the repository with read_only=false" advice (MDS_REVIEW_3 R3I-1, commit `2ae794038`). A `STAGING_WRITE` rule present before the first tick is refused one step **before** the initialisation commit, at the catalog's `CreateTable`, and is mapped into the same family and message there (MDS_REVIEW_3 R3I-2, commit `2ae794038`). |
 | Contents | namespace `system`, table `system.object_metadata` (pointer under `_lakefs_iceberg/tables/…`, files under `<ns>/_iceberg/<table-uuid>/`). No other bookkeeping objects. On an Azure blockstore `<ns>/_iceberg/…` is spelled `abfs[s]://<container>@<account>.<dfs host>/…`, the Iceberg form the catalog derives from the namespace (D1, §4.6); the pointer carries that form as its `iceberg.metadata-location`, while the lakeFS entries that record a file's physical address keep the block adapter's `http(s)://` spelling (D2). |
 | Commits | one lakeFS commit per indexed commit of `R`, message `mds: index <R>@<commit>`, metadata `lakefs.mds.source-commit=<commit>`, `lakefs.mds.source-repository=<R>`. |
 | Initialisation | the initialisation commit carries message `mds: init` and metadata `lakefs.mds.init=true`. It is the first commit after lakeFS's automatic `Repository created` root that a non-bare `CreateRepository` writes; for a companion repository created bare it is the root itself. A repository whose whole history is that automatic root is initialised by adding the namespace, table and `mds: init` commit on top (section 4.8). |
@@ -152,10 +172,15 @@ the head commit of `R-metadata@b`. It moves atomically with the table, because b
 
 ### 4.1 Process model
 
-`lakefs-sso mds run --config <file>` reads the top-level `metadata_search` section (section 7) and runs until
-SIGTERM. It is a separate process (a goroutine mode inside the server is out of scope for A). It needs only HTTP
-access to lakeFS (`lakefs_mds_endpoint`) and, unless credentials are vended, write access to the object store
-(section 4.6).
+`lakefs mds run --config <file>` runs on the **server binary and the server configuration** (RA4b, X13),
+as the official chart invokes it. It loads the whole lakeFS configuration the way `run` does (the file plus
+`LAKEFS_*`), opens the KV store of `database.*`, builds `pkg/catalog` over the `blockstore.*` adapter, and
+reads the data repositories in process. A missing or unreachable database fails startup, like `run`. It is a
+separate process (a goroutine mode inside the server is out of scope for A); run one replica.
+
+It also needs HTTP access to the catalog at `<lakefs_endpoint>/iceberg/api` (section 7), which is where its
+table writes go, and the object-store credentials of `blockstore.*` for the files of those writes unless the
+catalog vends them (section 4.6).
 
 Per tick (`period`): for each configured repository, list `R`'s branches, match them against `branches`
 (exact names and `prefix*` globs; only a trailing `*` is supported), and process up to `concurrency` branches
@@ -167,11 +192,11 @@ process that meets the first on a freshly created `R-metadata` does not damage i
 commit is made with `allow_empty=false`, so only one of them can commit it, and the loser adopts the winner's
 initialisation commit (4.8, commit `db8172798`).
 
-Every HTTP request either production client sends is bounded by `metadata_search.request_timeout` (default
-60s, section 7): a connection that neither answers nor resets fails its branch, or its repository when the
-call is not attributable to one branch, instead of stalling the tick loop. Without the bound a single wedged
-request stopped every repository from being indexed while `/_health` stayed 200 because the tick was merely
-"in progress" (commit `7f952279b`).
+Every HTTP request of the Iceberg catalog client is bounded by a fixed 60s request timeout (the removed
+`metadata_search.request_timeout`, X6): a connection that neither answers nor resets fails its branch, or its
+repository when the call is not attributable to one branch, instead of stalling the tick loop. Without the
+bound a single wedged request stopped every repository from being indexed while `/_health` stayed 200 because
+the tick was merely "in progress" (commit `7f952279b`).
 
 ### 4.2 Per-branch tick
 
@@ -220,17 +245,17 @@ before it. That is equivalent to the logical order above:
 ### 4.3 Applying one commit `C` of `R`
 
 1. **Change set.** `P` = first parent of `C`. If `C` has no parent, every object of `C` is an upsert
-   (paged `listObjects(R, C)`). Else page `diffRefs(R, left=P, right=C, type=two_dot, include_right_stats=true)`,
-   no delimiter. `added`/`changed` → upsert, `removed` → delete. `include_right_stats` gives `checksum`, `mtime`,
-   `content_type`, `metadata`; `size_bytes` is on the diff. The parameter is marked experimental in the swagger;
-   if a needed field is missing, `statObject(R, C, path)` fills it in. "Missing" means the whole right-side stat
-   absent (`include_right_stats` not honoured), an empty checksum, a zero mtime or a zero size. `content_type` and
-   `metadata` are excluded on purpose: an object may legitimately have neither, so an empty value there is a fact
-   about the object, not a gap in the answer. The size is on the diff and the narrowed client reports a size the
-   server omitted as zero, which is also the size of an empty object, so a zero-size entry is statted: one extra
-   call per empty object, in exchange for never writing a size the server did not confirm (commit `1cb131f13`).
-   `committer` and `creation_date` come from `C` (`getCommit`), the same for every row of the commit.
-2. **Large change sets.** If upserts + deletes > `rebuild_threshold` (default 100 000), skip the delta and do a
+   (a paged listing of `R@C`). Else page the in-process diff `P..C` (`pkg/mds/reader`, `catalog.Diff`), no
+   delimiter. `added`/`changed` → upsert, `removed` → delete. A diff entry of an added or changed object carries
+   the object's checksum, mtime, `content_type` and user metadata, and its size; if a needed field is missing, the
+   entry is statted with `catalog.GetEntry`. "Missing" means the whole right-side stat absent, an empty checksum, a
+   zero mtime or a zero size. `content_type` and `metadata` are excluded on purpose: an object may legitimately
+   have neither, so an empty value there is a fact about the object, not a gap in the answer. The size is on the
+   entry, and a size the reader could not read is zero, which is also the size of an empty object, so a zero-size
+   entry is statted: one extra call per empty object, in exchange for never writing a size lakeFS did not
+   confirm (commit `1cb131f13`). `committer` and `creation_date` come from `C` (the commit record),
+   the same for every row of the commit.
+2. **Large change sets.** If upserts + deletes exceed a fixed threshold of 100 000 (the removed `rebuild_threshold`, X6), skip the delta and do a
    full rebuild of the branch at `C`: rows = paged `listObjects(R, C)`, all with `commit_id = C`, written in one
    transaction as `Transaction.ReplaceFiles` over every live data file and every live delete file of the current
    snapshot, followed by `Append`. `Transaction.Overwrite` (no filter) is not used: iceberg-go's overwrite
@@ -257,7 +282,7 @@ before it. That is equivalent to the logical order above:
    unaffected - its source is the paged lakeFS listing, which is lexicographic - and refusing beats sorting the
    branch in memory, which would break the memory bound of this step.
 3. **Iceberg transaction** on the table, via `iceberg-go` v0.7.0 `catalog/rest` against
-   `<lakefs_mds_endpoint>/iceberg/relative_to/<R>-metadata.<b>/api`, identifier `system.object_metadata`:
+   `<lakefs_endpoint>/iceberg/relative_to/<R>-metadata.<b>/api`, identifier `system.object_metadata`:
    - `tx.Delete(ctx, In("path", upserts ∪ deletes), props)`. With `write.delete.mode=merge-on-read` on a v2 table
      this writes **position delete** files (supported by PyIceberg, DuckDB, Spark, Trino). The `IN` list is
      chunked (≤ 10 000 paths per `Delete` call) inside the same transaction.
@@ -287,12 +312,13 @@ before it. That is equivalent to the logical order above:
      carries delete files and **no** `lakefs.mds.source-commit` was not written by this package and has no
      position the fold could keep it at, so a copy-on-write delta there is refused with `table.ErrNoSourceCommit`;
      a `Rebuild`, which needs no position, fixes such a table (commit `5d68d07af`, MDS_REVIEW_4 R4T-1).
-4. **lakeFS commit** of `R-metadata@b`: `POST /repositories/<R>-metadata/branches/<b>/commits` with the message
-   and metadata of 3.3, `allow_empty=false`. The commit is never legitimately empty: step 3 always moves the
+4. **lakeFS commit** of `R-metadata@b` - in process, through `pkg/catalog` (RA4b; it was
+   `POST /repositories/<R>-metadata/branches/<b>/commits` before) - with the message and metadata of 3.3,
+   `allow_empty=false`. The commit is never legitimately empty: step 3 always moves the
    `lakefs.mds.source-commit` property, even for a change set with no objects. The walk of 4.2 step 5 must
    therefore drop the recorded position itself even though the log API's `stop_at` is inclusive; applying it
    again would stage nothing and fail here with `commit: no changes`.
-5. **Tag** `mds-<C>` → the new commit (`createTag`). lakeFS never overwrites a tag, even with `force`:
+5. **Tag** `mds-<C>` → the new commit, in process as well. lakeFS never overwrites a tag, even with `force`:
    `pkg/graveler/graveler.go` `CreateTag` uses force only to pass the read-only check and returns
    `ErrTagAlreadyExists` for an existing tag, so the indexer deletes a stale tag before creating it (commit
    `30748d488`). A tag whose commit already records `C` is left where it is, even when it does not point at the
@@ -338,14 +364,16 @@ is meant to make an old table non-replayable - reloads and retries instead of fa
 
 When `R-metadata@b` does not exist:
 
-1. **Seed from an indexed ancestor.** Walk the first-parent log of `R@b` from its head (at most `seed_lookback`,
-   default 1000 commits). If a commit `A` with tag `mds-<A>` exists in `R-metadata`, create
+1. **Seed from an indexed ancestor.** Walk the first-parent log of `R@b` from its head (at most a fixed 1000
+   commits, the removed `seed_lookback`, X6). If a commit `A` with tag `mds-<A>` exists in `R-metadata`, create
    `R-metadata@b` from that tag and continue with 4.2 (`last = A`). This makes a new feature branch cheap.
-2. **Else full listing.** `S` = the oldest first-parent commit of `R@b` with `creation_date ≥ since` (or the head
-   if `since` is unset and `backfill: head`, the default; `backfill: history` starts at the branch's oldest
-   first-parent commit, like upstream's "branch creation"). Create `R-metadata@b` from the `R-metadata`
-   initialisation commit (empty table), write all objects of `R@S` with `commit_id = S` (rebuild path of 4.3
-   step 2), commit with `lakefs.mds.source-commit = S`, tag `mds-<S>`. Then continue forward.
+2. **Else full listing.** `S` = the oldest first-parent commit of `R@b` with `creation_date ≥ since` (or the
+   branch's oldest first-parent commit when `since` is unset). That is the guide's rule (X11): "If omitted,
+   metadata is captured from the time the branch was created". There is no `backfill` key any more; the removed
+   `backfill: head` behaviour (index only the head on a branch's first sync) is gone. Create `R-metadata@b` from
+   the `R-metadata` initialisation commit (empty table), write all objects of `R@S` with `commit_id = S`
+   (rebuild path of 4.3 step 2), commit with `lakefs.mds.source-commit = S`, tag `mds-<S>`. Then continue
+   forward.
 
 ### 4.6 Writing files: credentials
 
@@ -355,10 +383,15 @@ The catalog stages client-written files; the indexer must write Parquet and Avro
 
 - If the catalog vends write credentials (S3 blockstore with `credentials_vending.role_arn`), the indexer requests
   `X-Iceberg-Access-Delegation: vended-credentials` (the iceberg-go REST default) and needs nothing else.
-- Otherwise `metadata_search.storage` supplies iceberg-go IO properties (`s3.endpoint`, `s3.region`,
-  `s3.access-key-id`, `s3.secret-access-key`, `s3.path-style-access`), passed with `rest.WithAdditionalProps`.
-  This is the mode used by esti (SeaweedFS, static keys). An explicit key here wins over the translated one below.
-- On an Azure blockstore, `metadata_search.azure` supplies them (next paragraph).
+- Otherwise the indexer writes with the **standard `blockstore.*` configuration of the process** (X6, RA4b):
+  `cmd/lakefs-sso/mds.go` translates `blockstore.s3.*` (region, endpoint, static credentials, path style) or
+  `blockstore.azure.*` (storage account and key) into the iceberg-go IO properties (`s3.*`, `adls.*`) and passes
+  them with `rest.WithAdditionalProps`. This is the mode esti runs in (SeaweedFS, static keys). There is no
+  `metadata_search.storage` or `metadata_search.azure` section any more: the guide has no such keys, and the
+  official chart gives the MDS process the server's own environment (`lakefs.sharedSecretEnv` plus
+  `mds.extraEnvVars`/`extraEnvVarsSecret`), so it reads exactly what the server reads.
+- A blockstore without static credentials (GS, or S3 on an instance role) yields no properties and leaves the
+  client's own credential chain, or the catalog's vended session, in charge.
 
 **Azure (`METADATA_SEARCH_AZURE.md` D3).** The companion table's location on an Azure blockstore is
 `abfs[s]://<container>@<account>.<dfs host>/…` (§3.3), so the indexer needs an IO backend that opens
@@ -366,32 +399,17 @@ that scheme: `pkg/mds/table/catalog.go` blank-imports iceberg-go's `io/gocloud/a
 `…/s3`, which registers `abfs`, `abfss`, `wasb` and `wasbs`. Without it the client would answer
 "unsupported scheme" for a location the catalog itself just handed out.
 
-`metadata_search.storage` keeps its meaning (raw iceberg-go IO properties; an explicit key wins). What
-is new is the scalar section `metadata_search.azure`, read through the env overrides of
-`applyViperOverrides` so that every key is also a `LAKEFS_METADATA_SEARCH_AZURE_*` environment
-variable - `storage` is a map and is read from the file only, and an Azure deployment's key usually
-lives in a Kubernetes secret. Each key is translated into the `adls.*` IO property of the same
-meaning, and only a key that is set is translated (an empty value means iceberg-go's own default):
+The Azure properties come from `blockstore.azure.storage_account` and
+`blockstore.azure.storage_access_key` (RA4b), the same values the server pod gets, so one secret carries both and
+there is no second identity to configure. `blockstore.azure.test_endpoint_url` is **not** translated: it is an
+emulator-only setting of the lakeFS block adapter, and the indexer's iceberg-go client builds its service URL
+from `adls.endpoint` itself (apache/iceberg-go#2311). The removed `metadata_search.azure` section had `endpoint`,
+`protocol`, `use_managed_identity` and `client_id` for that; on a real account the default
+`DefaultAzureCredential` chain (workload identity, managed identity, CLI) is what a pod without a shared key
+uses, and it needs no configuration.
 
-| Key | Env var | iceberg-go property |
-|---|---|---|
-| `storage_account` | `LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCOUNT` | `adls.auth.shared-key.account.name` |
-| `storage_access_key` | `LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCESS_KEY` | `adls.auth.shared-key.account.key` |
-| `use_managed_identity` | `LAKEFS_METADATA_SEARCH_AZURE_USE_MANAGED_IDENTITY` | `adls.auth.managed-identity.enabled` |
-| `client_id` | `LAKEFS_METADATA_SEARCH_AZURE_CLIENT_ID` | `adls.client-id` |
-| `endpoint` | `LAKEFS_METADATA_SEARCH_AZURE_ENDPOINT` | `adls.endpoint` |
-| `protocol` | `LAKEFS_METADATA_SEARCH_AZURE_PROTOCOL` | `adls.protocol` |
-
-With none of them set, iceberg-go falls back to `DefaultAzureCredential` (workload identity,
-`AZURE_CLIENT_ID`/`AZURE_TENANT_ID`/`AZURE_FEDERATED_TOKEN_FILE`, a managed identity, CLI), so a pod
-with a federated identity needs no secret at all. `endpoint` is required for any cloud but the public
-one and for Azurite, because iceberg-go ignores the storage domain in the location and builds its
-service URL from `adls.endpoint` (apache/iceberg-go#2311). `Validate` refuses `storage_access_key`
-without `storage_account` - iceberg-go would refuse the pair later, at the first write, with a less
-useful error - and refuses a `protocol` other than `http`/`https`. The indexer deliberately does
-**not** read `blockstore.azure.*`: it is a separate process with its own lakeFS credentials and its
-own Azure identity, and silently borrowing the server's storage key would hide a misconfiguration of
-that identity. The deployment mounts the same secret under both name sets instead.
+GCS is out of scope (N2): `gs://` needs no location translation and every FileIO opens it, but this
+build registers no GCS IO on the indexer and nothing here is tested on GCS.
 
 GCS is out of scope (N2): `gs://` needs no location translation and every FileIO opens it, but this
 build registers no GCS IO on the indexer and nothing here is tested on GCS.
@@ -424,7 +442,7 @@ Both run the full listing at `head` on a branch hard-reset to the initialisation
 | Event in `R` | Indexer action |
 |---|---|
 | matching branch created | 4.5 |
-| matching branch deleted | delete `R-metadata@b` if `delete_branches` (default true). Its tags stay, so commit/tag reads of its history still work. Its `/_health` entry and lag gauge are removed whatever `delete_branches` says - only the deletion of the mirror depends on the flag, because a failed last attempt of the deleted branch must not keep `/_health` at 503. `R-metadata`'s **default branch is never deleted**, even when its name is no longer a branch of `R` (an `R` default-branch rename): lakeFS refuses a default-branch delete (`pkg/graveler/graveler.go` `DeleteBranch` returns `ErrDeleteDefaultBranch`), so the indexer skips it and logs the skip once per process. |
+| matching branch deleted | delete `R-metadata@b`. The guide has no `delete_branches` key (X6) and the behaviour is fixed at the old default, true. Its tags stay, so commit/tag reads of its history still work. Its `/_health` entry and lag gauge are always removed. `R-metadata`'s **default branch is never deleted**, even when its name is no longer a branch of `R` (an `R` default-branch rename): lakeFS refuses a default-branch delete (`pkg/graveler/graveler.go` `DeleteBranch` returns `ErrDeleteDefaultBranch`), so the indexer skips it and logs the skip once per process. |
 | branch stops matching the config | nothing to the table (left as is); its `/_health` entry and its lag gauge are removed, so a stale error does not keep `/_health` at 503 and a branch dropped from the selector list does not keep reporting its last lag forever. The cleanup is derived from the branches the previous tick followed, not from a listing of `R-metadata`, so it also reaches a branch that failed before its metadata branch existed (commit `98f035d34`). |
 | repository added to config | create `R-metadata` (3.3). lakeFS creates it non-bare, so its default branch starts with the automatic `Repository created` root; create namespace `system` and the table through the catalog on the default branch, then lakeFS commit `mds: init` as the first commit after that root (the **initialisation commit**, metadata `lakefs.mds.init=true`), with `allow_empty=false`. Then 4.5 for each matching branch. |
 | `R-metadata` exists and its history is only lakeFS's automatic `Repository created` root | complete the initialisation on top: create namespace `system` and the table, then the `mds: init` commit (metadata `lakefs.mds.init=true`) with `allow_empty=false`. Only one of two concurrent processes can commit it, because the commit carries the table creation; the loser finds nothing staged, gets `lakefsErrNoChanges`, re-verifies the branch, and adopts the winner's initialisation commit instead of writing a second marker (commit `db8172798`). |
@@ -516,14 +534,12 @@ the tick instead of re-entering `initialise` (commit `da24d421f`).
 - **Snapshot expiry and file sweep** are not done by the indexer: run `lakectl iceberg cleanup -r <R>-metadata`
   on a schedule (`cmd/lakectl/cmd/iceberg_cleanup.go`). It honours lakeFS references (branch heads, tags, commits
   retained by GC), so `mds-*` tags keep their snapshots readable.
-- **Tag retention.** `tag_retention` (default `0` = keep forever) deletes `mds-*` tags whose source commit is
-  older than the duration, then lakeFS GC can reclaim their data. A tag that records the current position (head
-  source commit) of any live branch of `R-metadata` is never retired, however old its source commit is: tag
-  repair (4.4) recreates a missing tag of an indexed position, so retiring it would make the next tick recreate
-  it and the tick after that delete it again (commit `aab9216aa`). A tag whose source commit no longer exists is
-  retired because it can no longer resolve.
+- **Tag retention.** Every `mds-*` tag is kept forever: the guide has no `tag_retention` key (X6), so the
+  retention code is fixed at `0`. The rules it implements while it runs (a tag that records a live position is
+  never retired; a tag whose source commit no longer exists is retired because it can no longer resolve) stay in
+  the code for a future key, and are covered by tests, but no configuration reaches them (commit `aab9216aa`).
 
-## 5. Catalog side (landed in R10-1, plus R10-2)
+## 5. Catalog side (landed; realigned by RA1-RA3 and RA10)
 
 ### 5.1 API as implemented (`pkg/icebergcatalog/resolver.go`)
 
@@ -577,9 +593,10 @@ The resolved table is also **proved** before it is served: `MetadataSearchResolv
 `ResolvedTableVerifier`, and `Store.Resolve` serves `R-metadata`'s `system.object_metadata` only when **two**
 independent facts hold. First, the loaded table's `lakefs.mds.repository` property equals the data repository the
 caller named. Second, the served ref's first-parent history carries the indexer's initialisation commit: message
-`mds: init`, metadata `lakefs.mds.init=true`, committer `mds-indexer`, and position as the first commit directly
-above the repository's root commit, or - for a companion repository created bare - the root commit itself
-(§4.8). The property alone proves nothing: it lives in
+`mds: init`, metadata `lakefs.mds.init=true`, and position as the first commit directly above the repository's
+root commit, or - for a companion repository created bare - the root commit itself (§4.8). The **committer is not
+part of the proof**: the guide lets the sync run "as another user instead" with `MDSCatalogAccess`, so a check
+pinned to one committer name would refuse a legitimate sync (METADATA_SEARCH_REALIGN.md X4, RA5). The property alone proves nothing: it lives in
 `metadata.json`, which anyone who can create `R-metadata` can write, while the initialisation commit is written by
 the indexer after it creates the table, so it also commits the table and is the state a forger cannot reproduce by
 editing a document. A table that names another repository, carries no property, or whose history has no such
@@ -590,16 +607,13 @@ in `Store.Resolve` it also covers `HEAD`, metrics, vended credentials and remote
 come from the resolved table. The proof loads the target's `metadata.json` once in `Store.Resolve` and the read
 path loads it again; correctness, not read count, motivated the placement (commit `4aaf60cb3`).
 
-`Commit` takes the message and the metadata from the client, so those two facts alone prove nothing; the committer
-is the authenticated user and the position is where the commit sits in history, and before both were checked
-(MDS_REVIEW_3 R3S-1) any principal that could commit to `R-metadata` could forge the proof. The
-`CreateCommitRecord` half of that residual is **closed through the API**: the endpoint still authorizes
-`fs:CreateCommit` on the repository ARN, and it now answers **403** when the body's committer is `mds-indexer` and
-the authenticated caller is not that user, so a principal that holds the grant can no longer mint a commit
-attributed to the indexer. The name is reserved on every repository, not only companions, because a record
-attributed to the indexer anywhere could later be copied into a companion and the name is load-bearing only
-because this check compares it exactly; the indexer still records its own committer and every other committer is
-still accepted, so recording historical commits is unchanged (commit `2a822c719`).
+`Commit` takes the message and the metadata from the client, so those two facts alone prove nothing; the position
+is where the commit sits in history, which is what the check reads. The earlier design also checked the committer
+and reserved the `mds-indexer` name in `CreateCommitRecord` (commit `2a822c719`). `pkg/api` still carries that
+reservation as a leftover of the earlier design (`metadataSearchIndexerPrincipal`), but it is no longer
+load-bearing: the resolver does not read the committer, and the guide has no such reservation. `LoadCommits`,
+which `lakectl refs-restore` uses, copies commit records verbatim without going through that endpoint; a caller
+able to write forged metaranges directly into the block store is outside the API trust boundary.
 
 The remaining boundary is `LoadCommits`, not this endpoint. `lakectl refs-restore` restores a repository through
 `RestoreSubmit` → `catalog.LoadCommits`, which copies commit records verbatim from the manifest's metaranges and
@@ -614,11 +628,9 @@ first commit directly above a root commit, **or** the root commit itself when th
 bare - its `mds: init` commit is the branch's first commit and has no parent (§3.3, §4.8). The indexer accepted
 that history before the catalog did, so a bare companion used to be indexed but not served: every read of its
 `system.object_metadata` answered the 404 of an unindexed ref. The catalog now accepts the root form too, with the
-same three facts (message `mds: init`, metadata `lakefs.mds.init=true`, committer `mds-indexer`), so a bare
-companion is served like a non-bare one; a commit with no parents cannot be appended to a history the catalog
-already trusts, and the committer fact still requires the indexer principal. The negative shapes stay refused: an
-init commit by a committer other than `mds-indexer`, and an init commit with another commit between it and the
-root (commit `30af7b3a5`).
+same two facts (message `mds: init`, metadata `lakefs.mds.init=true`), so a bare companion is served like a
+non-bare one; a commit with no parents cannot be appended to a history the catalog already trusts. The negative
+shape stays refused: an init commit with another commit between it and the root (commit `30af7b3a5`).
 
 The history half costs the length of the served history in the worst case, because the initialisation commit is
 the oldest non-root commit (or the root itself on a bare companion): the walk is newest first, one 256-commit
@@ -635,10 +647,13 @@ the property proves nothing without the commit - so the metadata table answers t
 
 ### 5.2 Authorization (landed)
 
-`Store.ResolveAuthorized` checks the requested address on `R` (`catalog:ReadTable`, plus `catalog:ReadTableData`
-for signing/vending) and `fs:ReadRepository` on `R`. The redirected read of `R-metadata` runs with the server's
+`Store.ResolveAuthorized` checks the requested address on `R` with the **catalog action only**:
+`catalog:ReadTable`, plus `catalog:ReadTableData` for signing/vending. There is no `fs:ReadRepository` leaf (X14,
+RA10): the Iceberg docs' example policies grant only `catalog:*` actions on catalog ARNs, state that "Iceberg
+catalog permissions supersede any related object permissions", and the Metadata Search guide's grant "for
+Metadata Search alone" is likewise catalog-only. The redirected read of `R-metadata` runs with the server's
 identity. Caveat (upstream too): the grant covers metadata of all objects on all refs of `R`. Path-level or
-branch-level `fs:` policies do not narrow it. Vended credentials and signing for a metadata table are scoped to
+branch-level `fs:` policies do not narrow it, and an `fs:*` grant without a `catalog:*` one is refused. Vended credentials and signing for a metadata table are scoped to
 `R-metadata`'s table location (`creds.go`, `sign.go`), and a write session is never vended for one: a write that
 the catalog redirects to the companion repository becomes a read session (5.3). The root address authorizes at the
 guide's ARNs of `R` - `table/<R>/system/object_metadata` and `namespace/<R>/system` - which is why the same policy
@@ -646,7 +661,7 @@ covers the root address, the deprecated catalog's identifier and the data plane 
 
 ### 5.3 Read-only root `system` tree; nothing reserved below a data repository
 
-The only reserved namespace is the root `system` repository of METADATA_SEARCH_REALIGN.md RA1. Every write into the
+The only reserved namespace is the root `system` namespace of METADATA_SEARCH_REALIGN.md RA1. Every write into the
 tree - create, commit, register, drop, and namespace create, update-properties and drop - answers 403
 `ForbiddenException` (`ReservedNamespaceError`), at every level, because the tree is marker-less and the catalog
 serves it. Its `GET`/`HEAD` endpoints do not consult markers: existence is derived from the companion repository
@@ -671,25 +686,36 @@ exists there.
 
 ### 5.4 Config (landed)
 
-`iceberg.metadata_search.enabled` (default false). When it is false, nothing changes. It **requires**
-`iceberg.enabled`: Metadata Search is a mode of the catalog - the catalog mount serves the virtual table and owns
-the §5.5 alias - so `enabled: false` with `metadata_search.enabled: true` is a startup error,
-"metadata_search.enabled requires enabled: Metadata Search is served by the Iceberg catalog, which is off".
-Without the check startup succeeded, the §8 principals and deny were installed, and the documented endpoint
-answered 501 (commit `4aaf60cb3`).
+`iceberg.metadata_search.enabled` (default false) is the server switch of this build: when it is false, nothing
+changes - no tree, no deprecated catalog, no ownership proof. It **requires** `iceberg.enabled`: Metadata Search is
+a mode of the catalog, so `enabled: false` with `metadata_search.enabled: true` is a startup error,
+"metadata_search.enabled requires enabled: Metadata Search is served by the Iceberg catalog, which is off"
+(commit `4aaf60cb3`).
 
-### 5.5 Upstream endpoint alias (R10-2, new)
+The guide describes activation differently - "Metadata search activates when this map is non-empty", the map being
+`metadata_search.repositories`. The server does not read that map for this purpose any more (RA5 made
+`MDSCatalogAccess` installation-wide), so the flag above is what turns the catalog side on. That is a deviation
+from the guide's text, and it is the one the build has; the card that removes the flag is X5, which is not
+implemented.
 
-Upstream clients point at `<lakefs>/mds/iceberg/api` (warehouse/prefix `lakefs`, OAuth at
-`<lakefs>/mds/iceberg/api/v1/oauth/tokens`). When `iceberg.metadata_search.enabled` is true, `RoutesBuilder`
-also mounts the same `/iceberg/api` handler at `/mds/iceberg/api`. Same auth, same prefix (`CatalogPrefix = "lakefs"`).
-No `relative_to` alias. Upstream configs then work unchanged apart from the host.
+### 5.5 Deprecated, separate Metadata Search catalog (RA3)
 
-While `iceberg.metadata_search.enabled` is false the alias is not mounted, and the prefix is left to the core
+`<lakefs>/mds/iceberg/api` is the guide's deprecated catalog: it serves load, head and list of
+`<repo>.<ref>.system.object_metadata` and nothing else, resolved to the same companion table as
+`system.metadata.<repo>.<ref>.objects`. It is a **catalog of its own**, not an alias of `/iceberg/api` (G4, G5):
+`http.go` builds two catalogs with two stores when `iceberg.metadata_search.enabled` is true, the lakeFS catalog
+with `NewMetadataSearchResolver` and this one with `NewDeprecatedMetadataSearchResolver`, and it mounts the read
+operations only. It has no `relative_to` form and no root tree. Same auth, same prefix (`CatalogPrefix = "lakefs"`),
+OAuth at `<lakefs>/mds/iceberg/api/v1/oauth/tokens`.
+
+G5's rule is why the lakeFS catalog never answers the old identifier: `<repo>.<ref>.system.object_metadata` on
+`/iceberg/api` or on a `relative_to` warehouse is an absent table there, exactly like any other name nobody
+created. The one place the identifier still resolves is this mount.
+
+While `iceberg.metadata_search.enabled` is false neither catalog is mounted, and the prefix is left to the core
 router's not-implemented placeholder: `/mds/iceberg/api/…` answers **501** (`http.StatusNotImplemented`), not a
 plain 404. The placeholder is `notImplementedMounts` in `pkg/api/services.go`, mounted by `cmd/lakefs/cmd/run.go`
-after the extra-routes builders, so a plain `lakefs` binary (no `lakefs-sso` hook) answers the same 501. Only a
-wrapper binary that claims the prefix with the real handler replaces it.
+after the extra-routes builders, so a plain `lakefs` binary answers the same 501.
 
 ## 6. Ref mapping (`pkg/mds/refmap`, server side)
 
@@ -724,225 +750,92 @@ Errors other than not-found are returned as is (500).
 
 ## 7. Indexer configuration
 
-Read by `lakefs-sso mds run` from the top-level key `metadata_search` (upstream-compatible name). The server reads
-`iceberg.metadata_search.enabled` and, for the §8 policies, the repository names in `metadata_search.repositories`
-(never the rest of the section). Both processes can read the same file.
+Read by `lakefs mds run` from the top-level key `metadata_search` of the **server** configuration (RA4b). The
+server itself reads only `iceberg.metadata_search.enabled`; the rest of the configuration of that process is the
+ordinary lakeFS one (`database.*`, `blockstore.*`, `auth.encrypt.secret_key`). The guide's key list (G10, G11, X6)
+is exactly this:
 
 ```yaml
 metadata_search:
-  lakefs_mds_endpoint: http://lakefs:8000       # required; lakeFS base URL (API at /api/v1, catalog at /iceberg)
-  access_key_id: AKIA...                       # required; the mds-indexer user's key
-  secret_key: ...                              # required
-  listen_address: 0.0.0.0:8080                 # /_health, /metrics, /_pprof/
-  period: 60s                                  # > 0
-  request_timeout: 60s                         # bound on one HTTP request, > 0
-  concurrency: 25                              # branches in parallel, > 0
-  max_commits: 1000                            # per branch per tick, > 0
-  since: 2026-01-01T00:00:00Z                  # optional, RFC 3339; with backfill: history
-  backfill: head                               # head | history
-  seed_lookback: 1000
-  rebuild_threshold: 100000
-  delete_branches: true
-  tag_retention: 0s
-  compaction:
-    max_delete_files: 200
-    every_commits: 500
-  storage:                                     # optional iceberg-go IO props when no vended credentials
-    s3.endpoint: http://seaweedfs:8333
-    s3.region: us-east-1
-    s3.access-key-id: ...
-    s3.secret-access-key: ...
-    s3.path-style-access: "true"
-  repositories:                                # at least one
+  lakefs_endpoint: http://lakefs:8000       # required; lakeFS base URL (catalog at /iceberg/api)
+  access_key_id: AKIA...                    # optional, together with secret_key
+  secret_key: ...                           # optional, together with access_key_id
+  listen_address: 0.0.0.0:8080              # /_health, /metrics, /_pprof/
+  period: 60s                               # > 0
+  concurrency: 25                           # branches in parallel, >= 1
+  max_commits: 1000                         # per branch per tick, >= 1
+  since: 2026-01-01T00:00:00Z               # optional, RFC 3339
+  repositories:                             # an empty map disables Metadata Search
     my-repo:
-      branches: [main, "dev-*"]                # at least one; exact or trailing-* glob
+      branches: [main, "dev-*"]             # exact or trailing-* glob
       storage_namespace: s3://bucket/metadata/my-repo   # optional (3.3)
 ```
 
-`request_timeout` bounds every HTTP request the indexer's lakeFS API client and its Iceberg catalog client send,
-including the catalog's `GET /v1/config`. It does not cover data-plane file reads and writes, which go through
-the object-store client's own timeouts. A request that exceeds the bound fails its branch, or its repository
-when the call is not attributable to one branch, and `/_health` answers 503 rather than staying 200 while the
-tick hangs (commit `7f952279b`). `0` is rejected: the bound is not disableable.
+- **`lakefs_endpoint`** is the base URL, required. Table writes go to `<lakefs_endpoint>/iceberg/api`.
+- **`lakefs_mds_endpoint`** is the deprecated spelling (G10). It is accepted **only** when it ends in
+  `/mds/iceberg/api`, which is stripped with a warning; a value without that suffix is a base URL and is refused
+  with a message that names the rename to `lakefs_endpoint`. An installation that used the old key, as this one's
+  old configs did, must rename it.
+- **`access_key_id`/`secret_key`** are optional, and both-or-neither (G11, X7). With neither, the sync
+  authenticates as `mds-service-user` with a login token it signs itself (section 8).
+- **Validation** is exactly the guide's: `lakefs_endpoint` set, the key pair both set or both empty, `period > 0`,
+  `concurrency >= 1`, `max_commits >= 1`. Nothing else fails startup (X7, X9): an empty `repositories` map
+  disables Metadata Search instead of failing, a repository name that ends in `-metadata` or is longer than 54
+  characters is accepted, and a branch selector that matches nothing is not an error.
+- **`since`** bounds a backfill of a branch; unset means "from the time the branch was created" (X11).
 
-Startup fails with one error per problem when: the endpoint or keys are empty; `period`,
-`request_timeout`, `concurrency`, `max_commits`, `seed_lookback` or `rebuild_threshold` are not positive;
-`backfill` is unknown; `repositories`
-or a `branches` list is empty; a repository name ends in `-metadata` or is longer than 54 characters; a glob has a
-`*` that is not trailing; `since` does not parse; or `tag_retention`, `compaction.max_delete_files` or
-`compaction.every_commits` is negative. Per-repository runtime errors (repository missing, namespace
-not derivable or overlapping, companion repository read-only, or a branch-protection rule the first write
-meets) mark that repository failed in `/_health` and metrics, and the others continue.
+Everything the removed keys of X6 used to configure is fixed behaviour now: the catalog client's request bound is
+60s, the seed lookback is 1000 commits, the rebuild threshold is 100 000, compaction fires above 200 delete files
+or every 500 indexed commits, `mds-*` tags are kept forever, and a deleted data branch loses its metadata branch.
+The object-store credentials of a write come from the process's `blockstore.*` configuration (section 4.6), not
+from a `metadata_search` key.
 
-`tag_retention` and both `compaction` thresholds treat **`0` as "disabled"**: `0` keeps every `mds-*` tag forever
-and turns the corresponding compaction trigger off. The documented defaults (`0s`, 200, 500) apply only when the
-key is absent; a negative value is refused at startup instead of being silently replaced by the default (commit
-`98f035d34`).
+Per-repository runtime errors (repository missing, namespace not derivable or overlapping, companion repository
+read-only, or a branch-protection rule the first write meets) mark that repository failed in `/_health` and
+metrics, and the others continue.
 
 Environment overrides follow lakeFS conventions (`LAKEFS_METADATA_SEARCH_SECRET_KEY`, …).
 
 ## 8. Principals, policies, bootstrap
 
-Two principals, as upstream separates indexing from querying:
+The guide provisions one sync identity on every lakeFS start. `pkg/mds/bootstrap` does it as an extra routes
+builder of `lakefs-sso` that mounts no route: it has to exist before the first indexer request is authorized,
+whether or not a request ever arrives.
 
 | Principal | Created by | Permissions |
 |---|---|---|
-| `mds-indexer` (group `MetadataSearchIndexers`, policy `mds-indexer`) | `pkg/mds` bootstrap, an extra routes builder in lakefs-sso that runs when `iceberg.metadata_search.enabled`. It creates user, group and policy idempotently. **Credentials are created by an admin** (`lakectl auth users credentials create --id mds-indexer`) and placed in the indexer config. | On `*` (data repos): `fs:ReadRepository`, `fs:ListObjects`, `fs:ReadObject`, `fs:ListBranches`, `fs:ReadBranch`, `fs:ListCommits`, `fs:ReadCommit`. On each companion repository `R-metadata` and below it (`arn:lakefs:fs:::repository/<R>-metadata` and `…/*`): `fs:*`; on `arn:lakefs:catalog:::table/<R>-metadata/*`, `…/namespace/<R>-metadata/*` and `…/view/<R>-metadata/*`: `catalog:*`. `fs:CreateRepository` on the companion repository ARN and `fs:AttachStorageNamespace` on `arn:lakefs:fs:::namespace/*-metadata` are the pair `CreateRepository` checks. The namespace stays a pattern because the companion repository of a repository the server knows need not exist yet; an explicit `storage_namespace` that does not itself end in `-metadata` needs an operator-owned policy of its own (for example `mds-indexer-extra-storage-namespace`) attached to `MetadataSearchIndexers`, because the repair rewrites `mds-indexer` to its built-in statements and would delete an added statement at the next startup (commit `26a66b633`). |
-| query users | existing users | Through the catalog: only read on `R` (5.2). Engines reading `R-metadata` directly (not through the virtual table) need read on `R-metadata` like any repository. |
+| `mds-service-user` (user, no group) | `pkg/mds` bootstrap on every start | policy `MDSCatalogAccess`: `catalog:*` on `arn:lakefs:catalog:::*` - the catalog permissions the sync needs to create the `system` namespace and the `object_metadata` table in a companion repository and to commit to it, and nothing outside the Iceberg catalog. |
+| query users | existing users | Through the catalog: only read on `R` (5.2). Engines reading `R-metadata` directly (not through the metadata tree) need read on `R-metadata` like any repository. |
 
-The policies name companion repositories explicitly; they do not use a `*-metadata` wildcard for the repository
-name (commit `5b997972e`). `pkg/auth/wildcard.Match` lets `*` span `/`, so
-`arn:lakefs:fs:::repository/*-metadata` also matched `arn:lakefs:fs:::repository/analytics/object/-metadata`, and
-`repository/*-metadata/object/*` matched an object key such as `a/b-metadata/object/c`; the catalog pattern
-`catalog:::*/*-metadata/*` likewise matched a data-repository table whose namespace ended in `-metadata`. That
-gave `mds-indexer` — which §8 limits to reads on data repositories — write actions on such objects and tables, and
-made the deny refuse an ordinary `foo-metadata/data.yml` object inside a data repository to its own guard-group
-members. No resource pattern can express "the repository name ends in `-metadata`", so the fix stops using a
-wildcard for the repository name.
-
-The set of companion repositories is derived on the server from every repository in the catalog plus the names in
-`metadata_search.repositories`, mapped through `R` → `R-metadata`. A repository whose own name already ends in
-`-metadata` is a companion only when its data repository `R` exists - in the catalog or in
-`metadata_search.repositories` - because the suffix alone does not prove it is one: an ordinary repository named
-`team-metadata` that predates Metadata Search stays an ordinary repository, so it is neither granted to
-`mds-indexer` (which cannot index it anyway) nor made unwritable for its own users by the deny. The criterion is
-the data repository's existence rather than the `lakefs.mds.init` marker, which the bootstrap does not otherwise
-read and which would race an indexer that has created the repository but not its commit (commit `26a66b633`).
-Both policies spell the same set, so the indexer's grant and the deny cannot drift. Because an exact ARN
-is a snapshot, the bootstrap starts a refresher bound to the server's context that re-derives the set every minute
-and repairs a policy whose statements changed. A repository created after startup is therefore covered without a
-restart; between its creation and the next refresh the indexer fails closed on that repository (an authorization
-error in `/_health`, never a silent write) and the deny does not yet cover its companion repository. The indexer
-bootstrap requires the server's catalog (`deps.Catalog`, else `ErrMissingDeps`) because that is where the
-repository names come from.
-
-Both policies are chunked so that no single stored policy grows without bound, and only the allow has a base
-policy. `mds-indexer` carries the statements that do not depend on a repository; `mds-indexer-<n>` carries at most
-`companionChunkSize` = 64 companion repositories (the first chunk is `<base>-1`); the deny is
-`mds-metadata-repo-protect-<n>` only, with **no** `mds-metadata-repo-protect` base policy at all, and a repository
-set with no companion repository has no deny policy. The deny has no repository-independent statement, and a
-policy with zero statements is not a policy: `api/authorization.yml` requires `minItems: 1` on `Policy.statement`
-and a spec-validating auth service - `contrib/auth/acl/serve.go` validates request bodies - answers `400`, which
-`auth.APIAuthService` turns into `auth.ErrInvalidRequest`, which the extra-routes hook makes fatal at startup. A
-statement-less base deny left by an earlier version is deleted as a stale owned name (MDS_REVIEW_3 R3S-2, commit
-`9135602ea`). Every chunk is attached where its base is: the allow chunks to `MetadataSearchIndexers`, the deny
-chunks to the guard groups. A
-stored policy is one KV item and DynamoDB rejects an item above 400 KiB: an unchunked set crossed that at roughly
-560 repositories, `WritePolicy` failed, and the server refused to start on a supported backend.
-`MaxPolicyStoredBytes` = 160 KiB is the documented cap on one generated policy (1000 repositories store 33
-policies, the largest 76,904 bytes - one policy fewer than before because the base deny is gone, and a larger
-largest one because the deny names several spellings of each companion's namespace). A set that grows past a chunk boundary gets a new chunk attached, and a chunk
-that is no longer needed - a repository was deleted, or a legacy `*-metadata` repository turned out not to be a
-companion - is deleted, so a shrinking set shrinks the policy set too. The refresher deletes only names this
-package owns (the base name and numeric chunk suffixes), so an operator's policy such as
-`mds-indexer-extra-storage-namespace` is never removed (commit `26a66b633`).
-
-Chunk membership is stable across refreshes and is not compacted. A refresh reads the companions each stored chunk
-names, keeps every companion that is still one in the chunk that already carries it, and puts a companion new to
-the set into the earliest spare capacity, adding a chunk only when every chunk is full (MDS_REVIEW_3 R3S-7, commit
-`9135602ea`). Positional chunking was not safe across two writes: inserting a repository early in the sort order
-moved the former last member of chunk *n* into chunk *n+1*, so rewriting chunk *n* removed that existing
-companion's grant - and its deny - until chunk *n+1* was written, and a failed second write or a crash left the
-gap until the next refresh. The gap fails closed for the indexer (a branch error in `/_health`) and open for the
-deny, and it is a new exposure of an existing companion caused by an unrelated repository, which is why it is
-fixed rather than left inside the accepted window below. A shrunk repository set can leave a chunk sparse, because
-surviving chunks are not compacted; a refresh that only adds repositories never removes an existing companion from
-any chunk.
-
-**Accepted trade-off (owner decision):** that window stays, and it is bounded by the refresher at one minute. The
-policies must name companion repositories exactly - no resource pattern can express "the repository name ends in
-`-metadata`" (see below) - and an exact ARN is a snapshot taken when a statement is written, so the set has to be
-re-derived while the server runs; a repository created in the last minute is the price of the exact naming that
-replaced the over-matching wildcard. During the window the uncovered state is loud and fail-closed rather than
-silent: the indexer's own grant does not reach the new companion repository, so its first tick fails with an
-authorization error in `/_health` and nothing is written, and the deny does not yet protect the companion
-repository, whose first write is therefore possible only for a principal that already holds a broader grant. The
-next refresh, or a restart, closes the window without operator action. The rewrite is visible to authorization at
-once: after rewriting or deleting a policy the bootstrap purges the auth service's per-user effective-policy cache
-(`auth.APIAuthService` caches it for `auth.cache.ttl` and does not purge on `WritePolicy`), so an external-auth
-deployment's window is the refresher's one minute and not one minute plus that TTL, and it purges once more after
-a refresh's attachments: the purge that follows a chunk's write happens *before* the chunk is attached, so a
-request in that window refilled a user's entry without the new chunk and nothing cleared it afterwards - a new
-grant stayed missing (fails closed, loudly) and, worse, a new companion repository's deny stayed missing (fails
-open) until `auth.cache.ttl` expired (MDS_REVIEW_3 R3S-6, commit `9135602ea`). A service without a cache is
-unaffected (commit `26a66b633`).
-
-Write protection of `R-metadata`: the policy set `mds-metadata-repo-protect-<n>` (Deny `fs:Write*`, `fs:Delete*`,
-`fs:Create*`, `fs:Revert*`, `fs:Update*`, `fs:Import*`, `branches:SetBranchProtectionRules`,
-`catalog:Create*`, `catalog:Update*`, `catalog:Delete*`, `catalog:WriteTableData`, and
-`fs:AttachStorageNamespace` on the storage namespace of every companion repository that exists, on the same
-exact ARNs as the allow), attached to the caller's guard groups - `cmd/lakefs-sso/main.go`'s `guardGroups()`, which is
-`datasets.PinsProtectGroups(datasets.immutable_guard_groups)`: the base groups of both group templates plus the
-operator's extras, the same list `iceberg-reserved-prefix-protect` uses - and never to `MetadataSearchIndexers`,
-which the bootstrap drops from the list with a warning even when `datasets.immutable_guard_groups` names it
-(commit `451bca5a1`). `fs:Update*` covers `fs:UpdateRepository` (`SetRepositoryMetadata` / `DeleteRepositoryMetadata`),
-which writes a companion repository and was outside the deny (commit `5b997972e`, review MDS-SEC-5). `fs:Import*`
-is the import pair, decided by the owner and added in commit `9cf0869c8`:
-
-- `ImportCancel` authorizes `fs:ImportCancel` on `arn:lakefs:fs:::repository/<R>-metadata/branch/<b>`, which the
-  companion subtree statement matches, so a guard-group member with an `fs:*` allow can no longer cancel an import
-  on a companion branch.
-- `ImportFromStorage` is authorized on the **source** storage namespace (`arn:lakefs:fs:::namespace/<path>`), never
-  on a repository ARN, so no namespace statement was added, deliberately. An import whose destination is a
-  companion repository was already denied: `ImportStart` also requires `fs:WriteObject` on the destination branch
-  and object and `fs:CreateCommit` on the branch, and `fs:Write*`/`fs:Create*` cover both, whatever the source. An
-  import whose *source* is a companion repository's namespace writes the destination repository, not the companion
-  one: it copies files out, which is what `fs:ReadObject` on the companion repository already allows, and the deny
-  deliberately leaves companion reads open. A namespace statement could not be exact anyway - the narrow
-  `namespace/*-metadata` pattern would also deny an import from an ordinary data repository whose own namespace
-  ends in `-metadata`, the same over-match the exact-ARN change removed - and the server does not read the explicit
-  `metadata_search.repositories.<R>.storage_namespace` override (§7 reads only the names), so it could not name
-  that namespace before the companion repository exists in the catalog.
-
-Two further write paths into a companion repository are covered explicitly (commit `26a66b633`):
-
-- `branches:SetBranchProtectionRules` is denied on a companion repository, because a rule that blocks `COMMIT` or
-  `STAGING_WRITE` on its branches stops the indexer permanently - a write of repository state that decides whether
-  the indexer may write, which is the state §3.3 exists to keep diagnosable. `retention:SetGarbageCollectionRules`
-  and `retention:PrepareGarbageCollectionCommits` stay **allowed** deliberately: neither can remove the live index
-  without deleting the branch first (`fs:DeleteBranch` is denied), and an operator may legitimately set a GC policy
-  for a companion repository.
-- `fs:AttachStorageNamespace` is denied on the `arn:lakefs:fs:::namespace/<namespace>` ARNs of every companion
-  repository that exists in the catalog: the namespace's stored spelling and the trailing-slash spellings
-  `CreateRepository` accepts for the same physical prefix, up to three ARNs per companion and four for a
-  bucket-root namespace - and, on Azure, four per companion prefix and six for a container root (see below).
-  `CreateRepository` checks `fs:CreateRepository` on the repository ARN and
-  `fs:AttachStorageNamespace` on the namespace, the ARN is the raw string the client sent, lakeFS does not require
-  a namespace to be unique, and the block layer resolves a trailing `/` away, so a single exact ARN of the stored
-  spelling left the other spellings of the same prefix to a guard-group member with `fs:*`, who could create
-  another repository on a companion's namespace and let its uncommitted GC sweep the index files (§3.3). The
-  enumeration stops at one extra trailing slash because a second one is a different physical prefix for S3 and GS,
-  which use the path verbatim; covering it would need a `namespace/<ns>/*` pattern, which also denies every
-  namespace below the companion's - the over-match the exact ARNs avoid (MDS_REVIEW_3 R3S-3, commit `9135602ea`).
-  The pattern `namespace/*-metadata` stays in the allow, because a companion that does not exist yet has no
-  namespace to name.
-
-  **Azure (METADATA_SEARCH_AZURE.md D4)** grows that enumeration two ways. (a) Every spelling above also gets its
-  **other-scheme twin**: the adapter's validity regex accepts `http://` and `https://`, and both name the same
-  container and prefix, so a deny that named only the stored spelling would leave the same physical prefix to a
-  guard-group member with `fs:*`. (b) The `//` bucket-root spelling belongs to the **container root**, not to the
-  host, because `block.NamespaceRoot` treats the first path segment of an Azure namespace as the container: a
-  companion prefix gets **four** ARNs (two normalised spellings times two schemes), a container root **six** (the
-  three spellings of each scheme). `block.NamespaceRoot` is the one split this deny and the indexer's
-  `metadataNamespace` both call, so they cannot disagree about where a namespace's root is, and the overlap test of
-  §3.3 normalises the scheme the same way. S3, GS, mem and local keep exactly the ARNs they had.
-
-The catalog's ownership proof trusts the committer `mds-indexer` (§5.1), so the API reserves that name rather
-than leaving it to the deny above: `POST /repositories/{repository}/commits` (`CreateCommitRecord`) authorizes
-`fs:CreateCommit` on the repository ARN as before, and then answers **403** when the body's committer is
-`mds-indexer` and the authenticated caller is not that user. The indexer still records its own committer and
-every other committer is still accepted, so recording historical commits is unchanged; the name is reserved on
-every repository, not only companions, because a record attributed to the indexer anywhere could later be
-copied into a companion (commit `2a822c719`, closing the residual §5.1 recorded for MDS_REVIEW_3 R3S-1). This
-is the API half only: `LoadCommits`, which `lakectl refs-restore` uses, copies commit records verbatim and is
-unchanged (§5.1), so a caller that can write forged metaranges into the block store is outside it.
-
-As with the reserved-prefix deny, an auth service without policies (`BasicAuthService`) logs a warning naming what
-is not enforced, and startup continues. The refresher reads and deletes stored chunk policies, so an auth backend
-has to answer `ListPolicies` and `DeletePolicy`; the in-repo reference server `contrib/auth/acl` answers both
-(`GET /auth/policies` and `DELETE /auth/policies/{policyId}`) instead of the `501` its controller used to return,
-which `APIAuthService` reported as `auth.ErrUnexpectedStatusCode` and the extra-routes hook made fatal at startup
-(MDS_REVIEW_3 R3S-5, commit `9135602ea`).
+- **Authentication.** With no keys configured, the sync signs its own login token for `mds-service-user` with
+  `auth.encrypt.secret_key` (`pkg/mds/table.SignServiceLoginToken`, the same claims and HMAC as
+  `POST /auth/login`), and the catalog accepts it as a bearer token. There is no credential to create, so the
+  operator configures none. With `access_key_id`/`secret_key`, the sync logs in as that user instead, who needs
+  the same `MDSCatalogAccess` policy attached: the policy is a named, attachable policy for exactly that reason.
+- **No `fs:` grant.** The sync reads the data repositories in process through `pkg/catalog` (RA4b), so it needs
+  nothing on `arn:lakefs:fs:::*`; its one policy is catalog-only.
+- **Idempotence and repair.** Every start creates the user when absent (`auth.ErrAlreadyExists` is success),
+  creates `MDSCatalogAccess` when absent, rewrites it when its statements differ from the built-in ones (a
+  hand-edited or pre-created policy is repaired, not trusted), attaches it tolerating `ErrAlreadyExists`, and
+  detaches `MDSFSReadAccess` when it is still attached (the guide detaches the read-only policy on start; the
+  policy itself is not deleted, it may be attached elsewhere).
+- **What it removes.** The principals, group and policies of the earlier design: user `mds-indexer` (with its
+  credentials), group `MetadataSearchIndexers`, the `mds-indexer` allow policies including their numbered chunks,
+  every `mds-metadata-repo-protect[-<n>]` deny policy, and the Metadata Search part of
+  `iceberg-reserved-prefix-protect` (X1-X3; there was none to remove, that policy reserves `_lakefs_iceberg/`).
+  Only names this package owns are removed.
+- **Degraded auth backends.** `auth.basic` stores one administrator and answers every policy call with
+  `auth.ErrNotImplemented`; creating `mds-service-user` there would rename that administrator, so the bootstrap
+  logs a warning naming what is not in force and continues. The in-process ACL service of `lakefs-sso` and the
+  Enterprise auth service both implement the attachment; a backend that cannot attach a policy to a user fails
+  startup with that answer instead of starting an unauthorized sync.
+- **Startup check** (guide, verbatim): the service "checks that `lakefs_endpoint` answers as the lakeFS Iceberg
+  REST catalog, and stops if it does not or stays unreachable for two minutes. If the catalog rejects the
+  service's token or denies it access, the service logs the likely causes, starts anyway, and retries on every
+  sync cycle." `pkg/mds/bootstrap.CheckCatalog` probes `GET <endpoint>/iceberg/api/v1/config`.
+- **No init-commit proof.** The earlier design's MDS-SEC-3 committer check is gone (X4): the guide's "as another
+  user instead" contradicts a check pinned to one committer, and the ownership proof reads the marker and the
+  position only (5.1).
 
 ## 9. Operations
 
@@ -956,7 +849,7 @@ which `APIAuthService` reported as `auth.ErrUnexpectedStatusCode` and the extra-
   (`indexer.LagUnknown`): the branch then reports the position it recorded (read back from the head of
   `R-metadata@b`) and an unknown lag, instead of `lag_commits: 0` with an empty `last_indexed`, which reported the
   failure mode the lag alert exists for as healthy. A healthy branch never reports `-1` (commit `98f035d34`). A
-  request that exceeds `request_timeout` fails the branch or the repository, so the probe turns 503 instead of
+  request that exceeds the catalog client's fixed 60s bound fails the branch or the repository, so the probe turns 503 instead of
   staying 200 while the tick hangs (commit `7f952279b`). A protection rule, or a companion repository that a write
   finds read-only, lands in each branch whose first write lakeFS refused: `/_health` is 503 with a per-branch
   `last_error`, the repository's own `last_error` stays empty, and `errors_total{stage="branch"}` counts the
@@ -972,14 +865,16 @@ which `APIAuthService` reported as `auth.ErrUnexpectedStatusCode` and the extra-
   covers files between steps 3 and 4 of 4.3.
 - **Size:** one table per branch, unpartitioned, sorted by `path` at write time per file. Partitioning by path prefix
   is a later version.
-- **Security tests:** a user without `fs:ReadRepository` on `R` gets 403 on the virtual table; a user with access to
-  `R-metadata` only gets 403 through `R.<ref>.system.object_metadata`; a non-indexer user cannot write `R-metadata`
-  when the deny is in force; `system` on `R` rejects writes, and a write signature for `R.<ref>.system.object_metadata`
-  is 403 while a read signature on the same address is 200.
+- **Security tests** (esti `mds_test.go`): a user without any grant gets 403 on the metadata tree; a user with
+  access to `R-metadata` only gets 403 through `system.metadata.<repo>.<ref>.objects` while reading `R-metadata`'s
+  own table; the guide's catalog-only grant alone reads and lists the tree; a write signature for an address of
+  the tree is 403 while a read signature is 200; `mds-service-user` carries `MDSCatalogAccess` and the earlier
+  design's principals are gone. The earlier deny-policy cases are gone with the deny (X2).
 
 ## 10. Decisions (former open questions)
 
-1. Indexer runs as the `lakefs-sso mds run` subcommand only. A goroutine mode is out of scope for A.
+1. Indexer runs as the `mds run` subcommand of the server binary, on the server configuration (RA4b). A goroutine
+   mode inside the server is out of scope for A.
 2. `iceberg-go` v0.7.0 writes merge-on-read position deletes (`Transaction.Delete` with `write.delete.mode=merge-on-read`
    on v2), equality deletes (`WriteEqualityDeletes` + `RowDelta`) and copy-on-write (`Overwrite` with filter).
    Position deletes are chosen because PyIceberg does not read equality deletes. M3's spike confirmed the catalog
@@ -987,9 +882,12 @@ which `APIAuthService` reported as `auth.ErrUnexpectedStatusCode` and the extra-
    `Overwrite` leaves the position delete files it rewrites in the snapshot.
 3. Commit/tag mapping: `mds-<commit>` tags in `R-metadata` plus lakeFS commit metadata. No index file, no
    snapshot-summary scan at read time.
-4. Config: top-level `metadata_search` for the indexer, `iceberg.metadata_search.enabled` for the server; the server
-   also reads the repository names in `metadata_search.repositories` to build the §8 policies.
-5. Endpoint: `/mds/iceberg/api` alias plus the existing `/iceberg/api` and `/iceberg/relative_to`.
+4. Config: the guide's top-level `metadata_search` key list (section 7) for the indexer;
+   `iceberg.metadata_search.enabled` for the server (section 5.4). The indexer's object-store credentials are the
+   process's `blockstore.*`.
+5. Endpoints: `/iceberg/api` and `/iceberg/relative_to` serve the root `system.metadata` tree (including
+   `relative_to/system.metadata[.<repo>]/api`); `/mds/iceberg/api` is the deprecated, separate catalog of the old
+   identifier (section 5.5).
 
 ## 11. Future: option B (not built now)
 

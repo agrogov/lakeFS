@@ -84,10 +84,13 @@ spark.sql.catalog.lakefs.s3.secret-access-key ${MDS_S3_SECRET_KEY}
 spark.sql.catalog.lakefs.client.region ${MDS_S3_REGION}
 EOF
 
-  if [ "$variant" = "mds" ]; then
-    from_clause="lakefs.\`${MDS_REPO}\`.\`main\`.\`system\`.object_metadata"
+  if [ "$variant" = "catalog" ]; then
+    # /iceberg/api: the whole address is the identifier, one namespace level per part.
+    from_clause="lakefs.system.metadata.\`${MDS_REPO}\`.main.objects"
   else
-    from_clause="lakefs.system.object_metadata"
+    # /iceberg/relative_to/system.metadata/api: the warehouse fixes system.metadata, so the client
+    # names the data repository, the ref and the table.
+    from_clause="lakefs.\`${MDS_REPO}\`.\`main\`.objects"
   fi
   sql="$RUN_DIR/spark-${variant}.sql"
   # The first statement is the guide's snippet, unchanged. The second writes the snippet's own
@@ -274,9 +277,9 @@ main() {
 
   require_command docker
 
-  run_spark_variant mds "${MDS_DOCKER_SERVER_URL}/mds/iceberg/api"
-  run_spark_variant relative "${MDS_DOCKER_SERVER_URL}/iceberg/relative_to/${MDS_REPO}.main/api"
-  assert_same_rows "$RUN_DIR/spark-mds.rows.tsv" "$RUN_DIR/spark-relative.rows.tsv" "Spark"
+  run_spark_variant catalog "${MDS_DOCKER_SERVER_URL}/iceberg/api"
+  run_spark_variant relative "${MDS_DOCKER_SERVER_URL}/iceberg/relative_to/system.metadata/api"
+  assert_same_rows "$RUN_DIR/spark-catalog.rows.tsv" "$RUN_DIR/spark-relative.rows.tsv" "Spark"
   log "Spark snippets passed"
 }
 

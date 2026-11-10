@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stop the lakefs-sso, indexer and OIDC issuer env-up.sh started.
+# Stop the lakefs-sso, indexer, OIDC issuer and PostgreSQL container env-up.sh started.
 #
 # SeaweedFS is deliberately not touched: esti/ops/docker-compose-mds.yaml owns it and another run
 # may be using it.
@@ -22,8 +22,12 @@ for name in indexer server oidc; do
   fi
 done
 
+if [ -n "${MDS_POSTGRES_CONTAINER:-}" ]; then
+  docker rm -f "$MDS_POSTGRES_CONTAINER" >/dev/null 2>&1 || true
+fi
+
 # Engine containers are removed by their runners, but remove leftovers from an interrupted run.
-for name in mds-spark-mds mds-spark-relative mds-trino-mds mds-trino-relative; do
+for name in mds-spark-catalog mds-spark-relative mds-trino-catalog mds-trino-relative; do
   docker_rm "$name"
 done
 

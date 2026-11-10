@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run every engine snippet of docs/metadata-search.md that this directory covers - Spark and Trino,
-# both the /mds/iceberg/api and the /iceberg/relative_to form - against a fresh local lakefs-sso and
-# indexer on SeaweedFS.
+# both /iceberg/api with system.metadata.<repo>.<ref>.objects and
+# /iceberg/relative_to/system.metadata/api with <repo>.<ref>.objects - against a fresh local
+# lakefs-sso and indexer on SeaweedFS.
 #
 # The environment is torn down on success and on failure.
 

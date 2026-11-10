@@ -1,7 +1,11 @@
 # Metadata Search: realign with the current official guide
 
-Status: plan. No task below is implemented. Done so far: `b2e7747ac` reverted (`a9949864d`), and the hr2 deployment
-manifests prepared for RA4b/RA5 (see RA4b "Deployment (hr2)").
+Status: **RA1, RA2, RA3, RA4, RA4b, RA5, RA6, RA7, RA9, RA10 and RA8 are done** (RA8, the documentation and
+acceptance-test card, is the commit that sets this line). X5 - the removal of the server's
+`iceberg.metadata_search.enabled` flag - is the one gap id this plan asks for that no card implemented; the
+design records it as a deviation. The hr2 deployment manifests prepared for RA4b/RA5 are still unapplied (see
+RA4b "Deployment (hr2)"), so the deployment work RA8 does not cover - Spark, Trino and the real Azure run -
+stays open for a separate card.
 
 ## 1. Why
 

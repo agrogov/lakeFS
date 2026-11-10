@@ -6,8 +6,15 @@ These are the runnable forms of the Spark and Trino snippets in
 `lakefs-sso mds run` indexer, and the SeaweedFS instance of
 [`../docker-compose-mds.yaml`](../docker-compose-mds.yaml). The lakeFS and indexer configuration is
 the one [`esti/mds_test.go`](../../mds_test.go) generates: the SSO/ACL auth service with the
-break-glass `installation.*` administrator, the bootstrap's `mds-indexer` principal and deny policy,
-static SeaweedFS `storage` keys, `period: 2s`, and the repository `my-repo` with branch `main`.
+break-glass `installation.*` administrator, the bootstrap's sync identity (`mds-service-user` with
+`MDSCatalogAccess`), the server's own `blockstore.*` credentials for the indexer's writes (there is
+no `metadata_search.storage` any more), `period: 2s`, and the repository `my-repo` with branch
+`main`.
+
+`lakefs-sso mds run` runs on the lakeFS server configuration (RA4b), so it opens the same
+`database.*` KV store as the server. A local Badger database cannot be opened by two processes, so
+`env-up.sh` starts a throw-away **PostgreSQL** container (`MDS_POSTGRES_*`, pinned digest) for the
+run and stops it in `env-down.sh`; SeaweedFS is still only the object store.
 
 The scripts do not edit or import the esti suite; they write the same layout into `.run/`.
 
@@ -91,27 +98,31 @@ the run.
 1. builds `lakefs-sso` and `tools/bucket`;
 2. serves a static OIDC discovery document (no login is performed; every client authenticates with
    a lakeFS key pair) and starts `lakefs-sso run`;
-3. creates the bucket, creates credentials for the bootstrap-created `mds-indexer`, and deletes
-   `my-repo` / `my-repo-metadata` left by an earlier run (the companion repository is deleted with
-   the indexer's credentials because the bootstrap deny policy keeps the administrator out);
+3. creates the bucket and deletes `my-repo` / `my-repo-metadata` left by an earlier run;
 4. creates `my-repo` in a unique namespace, uploads `orders/2024/one.parquet`,
    `orders/2024/two.parquet`, `orders/2025/three.parquet` and `customers/c1.json`, and commits;
-5. starts `lakefs-sso mds run` and waits until `/_health` reports
-   `main.last_indexed == head`.
+5. starts `lakefs-sso mds run` (with its own `LAKEFS_COMMITTED_LOCAL_CACHE_DIR`) and waits until
+   `/_health` reports `main.last_indexed == head`.
 
 `run-spark.sh` writes the guide's Spark properties into `.run/spark-*.properties` and runs
-`spark-sql` in `tabulario/spark-iceberg` once per endpoint. The first SQL statement is the guide's
+`spark-sql` in `tabulario/spark-iceberg` once per address. The first SQL statement is the guide's
 snippet unchanged; the second writes the snippet's own projection (the same four columns, table
 and filter, `to_json(user_metadata)` so the map is text) into `.run/spark-<variant>.rows`. The gate
 then concatenates **every** `part-*` file Spark wrote before comparing them with the three expected
 rows, because `INSERT OVERWRITE DIRECTORY` writes one file per non-empty output partition: reading
 only the first file would miss an extra row in any other one, and would report a correct engine as
-wrong whenever Spark spreads the three rows over several files. The identifier form quotes each
-namespace level: ``lakefs.`my-repo`.`main`.`system`.object_metadata``.
+wrong whenever Spark spreads the three rows over several files. The two addresses are:
+
+- `catalog`: `/iceberg/api`, reading `lakefs.system.metadata.`my-repo`.main.objects`;
+- `relative`: `/iceberg/relative_to/system.metadata/api`, reading
+  ``lakefs.`my-repo`.`main`.objects`` (the warehouse fixes `system.metadata`).
 
 `run-trino.sh` writes the guide's Trino catalog properties into
 `.run/trino-*/etc/catalog/lakefs.properties`, starts `trinodb/trino`, waits for `SERVER STARTED`,
-and runs the query through the image's Trino CLI once per endpoint.
+and runs the query through the image's Trino CLI once per address
+(`/iceberg/api` with `"system.metadata.<repo>.<ref>".objects` and
+`/iceberg/relative_to/system.metadata/api` with `"<repo>.<ref>".objects`; both need
+`nested-namespace-enabled=true`).
 
 Both runners bound each container run to **300 seconds** (`MDS_SPARK_TIMEOUT`,
 `MDS_TRINO_TIMEOUT`). On timeout they remove the container, print the last 80 log lines and exit
@@ -142,7 +153,10 @@ you want the default JVM settings.
 
 ## Observed result
 
-Both endpoints returned the same three `orders/` rows for both engines:
+The earlier build's runs below (`/mds/iceberg/api` and the data-repository `relative_to` form) are
+kept as the last recorded observation of those images; RA8 moved the scripts to the current
+addresses but did not re-run Spark or Trino, which needs a deployment. The rows the current build
+serves are the same three `orders/` rows.
 
 ```
 orders/2024/one.parquet    34  <source commit ID>  {}
@@ -204,6 +218,15 @@ they were not re-run here. SeaweedFS does not vend credentials, so all four engi
 S3 keys, which is the mode the guide's "pass S3 credentials explicitly" note describes.
 
 ## Azure (hr2)
+
+> **Historical record (AZ7, 2026-11-09).** These runs were made against the earlier build: the
+> `/mds/iceberg/api` catalog and the data-repository `relative_to` form, an indexer that was a REST
+> client configured through `LAKEFS_METADATA_SEARCH_AZURE_*`, and the `mds-indexer` principal. Since
+> METADATA_SEARCH_REALIGN.md RA4, RA4b and RA5, the indexer runs on the server configuration (its
+> Azure credentials are `blockstore.azure.*`), the tables are at `system.metadata.<repo>.<ref>.objects`
+> on `/iceberg/api` or through `relative_to/system.metadata/api`, and the sync identity is
+> `mds-service-user` with `MDSCatalogAccess`. These runs were not repeated after the realignment;
+> doing so needs the deployment and is a separate card.
 
 The same four engine runs (both engines, both catalog mounts) against a **real Azure storage
 account**, on the hr2 cluster, 2026-11-09. This is AZ7 of

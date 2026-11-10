@@ -1,31 +1,36 @@
 // Package esti holds the lakeFS system tests.
 //
 // mds_test.go is the Metadata Search end-to-end suite of METADATA_SEARCH_DESIGN.md §9 (task M6 of
-// METADATA_SEARCH_PLAN.md): the security tests of the design, plus the object-lifecycle cases the
-// index has to get right, run through both published query engines on both catalog mounts of
-// docs/metadata-search.md - PyIceberg and DuckDB, each through the upstream endpoint
-// /mds/iceberg/api (identifier form) and through /iceberg/relative_to/{repo}.{ref}/api (warehouse
-// form) - and the timing of a 100k-object backfill.
+// METADATA_SEARCH_PLAN.md, realigned by RA8): the security tests of the design, plus the
+// object-lifecycle cases the index has to get right, run through both published query engines on
+// the addressing forms of docs/metadata-search.md - PyIceberg and DuckDB, each through
+// /iceberg/api (identifier form system.metadata.<repo>.<ref>.objects) and through
+// /iceberg/relative_to/system.metadata/api (warehouse form <repo>.<ref>.objects) - one case on the
+// guide's deprecated catalog at /mds/iceberg/api with the old identifier
+// <repo>.<ref>.system.object_metadata, and the timing of a 100k-object backfill.
 //
 // # What runs
 //
 // The suite starts its own lakefs-sso (like the Iceberg suite, iceberg_utils.go), because the
-// indexer and the virtual table are served by cmd/lakefs-sso only:
+// indexer and the metadata tree are served by cmd/lakefs-sso only:
 //
 //   - the server runs with iceberg.enabled and iceberg.metadata_search.enabled, on the ambient
 //     S3-compatible blockstore (SeaweedFS locally - esti/ops/docker-compose-mds.yaml - and S3 in
-//     CI), with the ACL auth service selected by an sso: section and rbac: internal, so that the
-//     principals and policies of §8 can be created and enforced;
-//   - installation.* seeds the break-glass admin before the server mounts its extra routes, so the
-//     base groups (Admins, Supers, Writers, Readers, ...) exist when the Metadata Search bootstrap
-//     of §8 attaches mds-metadata-repo-protect to them - which is what makes the deny real in this
-//     run rather than a no-op;
-//   - the server creates the mds-indexer user, the MetadataSearchIndexers group and both policies
-//     (§8), and the suite - not the server - creates the credentials of mds-indexer, exactly as an
-//     administrator does with `lakectl auth users credentials create --id mds-indexer`;
-//   - `lakefs-sso mds run --config` then runs as a child process against that server, with the
-//     static `storage` keys of §4.6 (SeaweedFS does not vend credentials) and period 2s, so a case
-//     waits a couple of seconds for the index instead of a minute.
+//     CI), with the ACL auth service selected by an sso: section and rbac: internal;
+//   - the server provisions the guide's sync identity on every start (G12): the mds-service-user
+//     user and the MDSCatalogAccess policy, catalog-only grants, with no group and no deny policy;
+//   - installation.* seeds the break-glass admin, whose Admins group carries CatalogReadWriteAll,
+//     so it can read the metadata tree and act as the operator of the negative cases;
+//   - the suite starts a throw-away PostgreSQL container and gives both processes its connection
+//     string: `lakefs-sso mds run` runs on the lakeFS server configuration (RA4b, X13), so it opens
+//     the same database.* KV store and the same blockstore.* adapter as the server, and a local
+//     Badger database cannot be opened twice. The indexer reads the data repositories in process
+//     and writes the tables through the catalog as mds-service-user, signing its own login token
+//     with auth.encrypt.secret_key: the configuration carries no access_key_id/secret_key (G11,
+//     G12);
+//   - `lakefs-sso mds run --config` then runs as a child process against that server with period
+//     2s, so a case waits a couple of seconds for the index instead of a minute. The object-store
+//     credentials of its writes are the server's blockstore.* settings (X6).
 //
 // # The cases (§9 "Security tests", M6)
 //
@@ -46,26 +51,27 @@
 //	hard reset               the branch is rewritten to the indexed ancestor (§4.7)
 //	indexer restart          a deterministic kill after the Iceberg commit and before the lakeFS
 //	                         commit is recovered, with no replay and no leftover staging (§4.4)
-//	user without R access    403 on the virtual table
-//	user with R-metadata only  200 on R-metadata's own table, 403 through R.<ref>.system.object_metadata
-//	                            (the deprecated catalog's identifier; the lakeFS catalog's system
-//	                            namespace of R is the user's like any other, RA3)
-//	non-indexer write        admin cannot write R-metadata (the deny of §8 is in force)
-//	guard-group attach        a member of a base group cannot CreateRepository, bare or not, on
-//	                          either accepted spelling of R-metadata's storage namespace: each is
-//	                          403 from the deny (R3S-3), while an ordinary namespace is created
-//	                          and deleted by the same principal
+//	user without R access    403 on the metadata tree
+//	user with R-metadata only  200 on R-metadata's own table, 403 through
+//	                            system.metadata.<repo>.<ref>.objects (the tree authorizes on the data
+//	                            repository's catalog ARN, RA1, RA10)
+//	deprecated catalog       /mds/iceberg/api still serves <repo>.<ref>.system.object_metadata
+//	                          (G5) - the one case on that mount - and /iceberg/api answers the old
+//	                          identifier with 404 like any absent table (G5, RA3)
+//	sync identity            mds-service-user carries MDSCatalogAccess and nothing else, and the
+//	                          principals and policies of the earlier design are gone (G12, X1-X3)
+//	indexer keeps indexing   a commit of R after the security cases is still indexed
 //
 // TestMetadataSearchBackfill pushes a 100k-object commit into R and times the first indexing of the
 // branch - the full-listing rebuild of §4.5 step 2 - reporting the number. It is a measurement, not
 // a gate: the assertions are about the rows that come out, and the duration is logged (and quoted
 // in the commit that added this file).
 //
-// TestMetadataSearchCompactionAndTagRetention runs §4.9 on a real catalog with a low
-// max_delete_files and a short tag_retention: the compaction commit, the pre-compaction tag, the
-// unchanged rows and position, lakefs_mds_compactions_total, and the retirement of an old tag
-// while the live position's tag stays. TestMetadataSearchBranchDeletion runs §4.8's mirrored
-// deletion: the R-metadata branch is gone, its tags and history remain readable.
+// TestMetadataSearchBranchDeletion runs §4.8's mirrored deletion: the R-metadata branch is gone,
+// its tags and history remain readable. The compaction triggers and tag retention are no longer
+// configurable keys (METADATA_SEARCH_REALIGN.md X6: the guide's key list has neither), so the
+// end-to-end compaction and retention case the earlier build carried has no knob to turn here;
+// §4.9 stays covered by pkg/mds/indexer and pkg/mds/table's own tests.
 //
 // mds_azure_test.go runs the acceptance cases of METADATA_SEARCH_AZURE.md §5 AZ5 on the same
 // harness against an Azure blockstore (Azurite): it is the one place the harness takes another
@@ -75,14 +81,11 @@
 // # No workarounds
 //
 // The suite drives the product exactly as a user would: the indexer runs from its own section of
-// the same configuration file, under the principal and policy its bootstrap created, and the test
-// does nothing on its behalf beyond creating that principal's credentials (which §8 leaves to an
-// administrator). There is no compensating policy, no proxy in front of the server and no manual
-// repository initialisation: if the indexer cannot create R-metadata, cannot reach the catalog or
-// cannot record an indexed commit, the case that needs it fails and the failure names the product
-// defect. Earlier drafts of this suite carried workarounds for four such defects (design §8's
-// missing fs:AttachStorageNamespace, the catalog URL, the initialisation commit and an inclusive
-// log stop_at); they were fixed in the product and every workaround is gone.
+// the same configuration file, as the sync identity the server's bootstrap created and with no
+// credential of its own, and nothing else of the configuration is written on its behalf. There is
+// no compensating policy, no proxy in front of the server and no manual repository initialisation:
+// if the indexer cannot create R-metadata, cannot reach the catalog or cannot record an indexed
+// commit, the case that needs it fails and the failure names the product defect.
 //
 // # Skipping
 //
@@ -104,6 +107,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -123,7 +127,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/api/apigen"
 	"github.com/treeverse/lakefs/pkg/api/apiutil"
-	"github.com/treeverse/lakefs/pkg/datasets"
 	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/mds/bootstrap"
@@ -253,10 +256,26 @@ const (
 	// docs/metadata-search.md: the suite's objects live under data/ instead of orders/.
 	mdsFilteredPathPrefix = "data/"
 
-	// mdsGuardGroup is the base group the guard-group case adds its principal to. Admins is the
-	// RBAC template's most privileged group - FSFullAccess is fs:* on every resource - so a
-	// refusal of a CreateRepository by a member of it is the deny of §8 and not a missing grant.
+	// mdsGuardGroup is the base group the Azure acceptance case (esti/mds_azure_test.go, not owned by
+	// RA8) still adds its principal to. The current guide has no companion-repository deny policy
+	// (METADATA_SEARCH_REALIGN.md X2, RA5), so this suite no longer asserts that case; the constant
+	// stays because the Azure file names it.
 	mdsGuardGroup = "Admins"
+
+	// mdsPostgresImage is the database both processes share. `lakefs-sso mds run` opens the KV store
+	// of database.* in its own process (RA4b), and a local Badger database can be opened by one
+	// process only, so the two-process suite gives them a real server. The image is pinned by digest
+	// like the engine images, so a rerun reproduces the version.
+	mdsPostgresImage = "postgres@sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139"
+
+	// mdsPostgresUser, mdsPostgresPassword and mdsPostgresDatabase are the throw-away database's
+	// own settings. They are secrets of a container that lives for one test and are never reused.
+	mdsPostgresUser     = "lakefs"
+	mdsPostgresPassword = "lakefs"
+	mdsPostgresDatabase = "lakefs"
+
+	// mdsPostgresStartTimeout bounds the wait for the container to accept connections.
+	mdsPostgresStartTimeout = 60 * time.Second
 )
 
 // mdsEnv is one running lakefs-sso with Metadata Search enabled, one running `lakefs-sso mds run`,
@@ -311,7 +330,7 @@ type mdsEnv struct {
 	// metadataRepo is R + icebergcatalog.MetadataRepositorySuffix (§3.3).
 	metadataRepo string
 
-	// indexerEndpoint is the lakeFS base URL written to metadata_search.lakefs_mds_endpoint.
+	// indexerEndpoint is the lakeFS base URL written to metadata_search.lakefs_endpoint.
 	// It is the intercepting proxy below, so the restart case can hold one lakeFS request and
 	// kill the indexer inside the crash window of §4.4.
 	indexerEndpoint string
@@ -320,17 +339,16 @@ type mdsEnv struct {
 	// of R-metadata after the Iceberg commit has been staged.
 	indexerProxy *mdsProxy
 
-	// The maintenance settings of metadata_search (§4.9, §7). newMDSEnv writes the design's
-	// defaults; a maintenance case overrides them before startIndexer.
-	tagRetention             string
-	deleteBranches           bool
-	compactionMaxDeleteFiles int
-	compactionEveryCommits   int
-
-	// indexerKey and indexerSecret are the credentials of mds-indexer, created by this suite
-	// through the auth API after the server's bootstrap created the user (§8).
+	// indexerKey and indexerSecret are always empty: the guide's sync identity has no credential
+	// of its own (G11, G12). They stay as fields because the Azure acceptance case still passes
+	// them to writeConfig.
 	indexerKey    string
 	indexerSecret string
+
+	// databaseDSN is the connection string of the PostgreSQL both processes share, and database is
+	// the name of the container that serves it, so a failed run can be removed.
+	databaseDSN string
+	database    string
 
 	// indexerEnv is the environment of the indexer process only, appended to os.Environ(). It is
 	// how the Azure case proves G4 of METADATA_SEARCH_AZURE.md: the indexer is configured with
@@ -338,9 +356,10 @@ type mdsEnv struct {
 	// all. nil keeps the indexer's environment identical to the server's.
 	indexerEnv []string
 
-	// blockstoreSection and storageSection are the YAML fragments writeConfig writes for the
-	// blockstore section and for metadata_search.storage. newMDSEnv fills in the S3 profile; the
-	// Azure profile of mds_azure_test.go fills in its own, and writes no storage key at all.
+	// blockstoreSection is the YAML fragment writeConfig writes for the blockstore section. The S3
+	// profile of newMDSEnv and the Azure profile of mds_azure_test.go each fill it in. storageSection
+	// is always empty now: metadata_search has no storage key (X6), and the indexer writes with the
+	// blockstore.* settings of the same file. It stays as a field because the Azure file sets it.
 	blockstoreSection string
 	storageSection    string
 
@@ -356,8 +375,9 @@ type mdsEnv struct {
 }
 
 // TestMetadataSearchEndToEnd is the M6 case list of METADATA_SEARCH_DESIGN.md §9: every row
-// lifecycle change, every ref kind and every security case, read back through PyIceberg
-// (/mds/iceberg/api) and DuckDB (/iceberg/relative_to/{repo}.{ref}/api).
+// lifecycle change, every ref kind and every security case, read back through PyIceberg and DuckDB
+// on /iceberg/api (system.metadata.<repo>.<ref>.objects) and on
+// /iceberg/relative_to/system.metadata/api (<repo>.<ref>.objects).
 func TestMetadataSearchEndToEnd(t *testing.T) {
 	env := newMDSEnv(t)
 	env.startIndexer(t)
@@ -378,13 +398,12 @@ func TestMetadataSearchEndToEnd(t *testing.T) {
 		env.waitIndexed(t, mdsBranch, firstCommit)
 
 		// Every read of the suite goes through all four recipes of docs/metadata-search.md -
-		// PyIceberg and DuckDB, each through /mds/iceberg/api and /iceberg/relative_to - and
-		// readRows fails when they disagree. The two recipes no earlier run exercised are
-		// PyIceberg through /iceberg/relative_to (load_table("system.object_metadata")) and
-		// DuckDB's three-level identifier form ("{repo}.{ref}.system"."object_metadata").
+		// PyIceberg and DuckDB, each through /iceberg/api with the root-tree identifier and through
+		// /iceberg/relative_to/system.metadata/api with the <repo>.<ref>.objects warehouse form -
+		// and readRows fails when they disagree.
 		read := env.readRows(t, mdsBranch)
 		require.Equal(t, []string{"data/one.txt", "data/two.txt"}, mdsPaths(read.PyIceberg.Rows),
-			"PyIceberg through %s must see one row per object of %s", icebergcatalog.MetadataSearchBasePath, mdsBranch)
+			"PyIceberg through %s must see one row per object of %s", icebergcatalog.APIBasePath, mdsBranch)
 		require.Equal(t, mdsPaths(read.PyIceberg.Rows), mdsPaths(read.DuckDB.Rows),
 			"DuckDB through relative_to must see the same rows as PyIceberg")
 		require.Equal(t, firstCommit, read.PyIceberg.SourceCommit,
@@ -462,7 +481,7 @@ func TestMetadataSearchEndToEnd(t *testing.T) {
 		require.Equal(t, "data/one.txt", read.DuckDB.Rows[0].Path,
 			"DuckDB's ORDER BY size_bytes DESC must put the largest row first")
 		requireNonIncreasingSizes(t, read.DuckDB.Rows, "DuckDB through "+icebergcatalog.RelativeToBasePath)
-		requireNonIncreasingSizes(t, read.DuckDBIdentifier.Rows, "DuckDB through "+icebergcatalog.MetadataSearchBasePath)
+		requireNonIncreasingSizes(t, read.DuckDBIdentifier.Rows, "DuckDB through "+icebergcatalog.APIBasePath)
 	})
 
 	t.Run("new branch is seeded", func(t *testing.T) {
@@ -487,11 +506,13 @@ func TestMetadataSearchEndToEnd(t *testing.T) {
 		require.Equal(t, afterGateway, seeded.CommitID,
 			"the seeded rows carry the commit the branch was created at (§3.2 backfill rows)")
 
-		// The rows alone do not prove the seeding of §4.5 step 1: this run configures
-		// backfill: head, so a branch rebuilt from a full listing at its head writes exactly the
-		// same rows with exactly the same commit_id. R-metadata's own history is what tells the
-		// two apart - a seed descends from the mds-<A> tag of an indexed ancestor, a backfill of
-		// the new head starts again at the initialisation commit.
+		// The rows alone do not prove the seeding of §4.5 step 1: a branch rebuilt from a full
+		// listing at its head writes exactly the same rows with exactly the same commit_id. The
+		// guide has no backfill key any more (X11: the first sync captures history from the
+		// branch's creation), so a rebuild is a real alternative here rather than a configured
+		// one. R-metadata's own history is what tells the two apart - a seed descends from the
+		// mds-<A> tag of an indexed ancestor, a rebuild of the new head starts again at the
+		// initialisation commit.
 		mainLog := env.metadataLog(t, mdsBranch)
 		seededAt := env.metadataCommitTagged(t, afterGateway)
 		require.Equal(t, mainLog[0].Id, seededAt,
@@ -584,9 +605,10 @@ func TestMetadataSearchEndToEnd(t *testing.T) {
 	t.Run("indexer restart", func(t *testing.T) {
 		// §4.4 row 1: a kill after the Iceberg commit (step 3) and before the lakeFS commit
 		// (step 4) must be recovered by the next process. The test does not hope to catch the gap
-		// between two ticks: it holds the lakeFS commit request at the indexer's proxy, which is
-		// the observable moment after the staged pointer exists and before it is committed, and
-		// fails when that request does not arrive within a bounded wait.
+		// between two ticks: it lets the indexer's Iceberg commit reach the server (which stages
+		// the pointer) and holds the catalog's answer at the indexer's proxy, so the indexer is
+		// waiting with the table staged and its in-process lakeFS commit still due. A missed hold
+		// within a bounded wait fails the case.
 		env.uploadObject(t, mdsBranch, "data/before-restart.txt", "before")
 		beforeRestart := env.commitBranch(t, cl, mdsBranch, "mds test: commit before the restart")
 		env.waitIndexed(t, mdsBranch, beforeRestart)
@@ -600,14 +622,14 @@ func TestMetadataSearchEndToEnd(t *testing.T) {
 		gate.letGo()
 
 		// The kill landed after step 3 and before step 4: the staged pointer is on the branch,
-		// and the branch head still records the previous commit because the held commit was never
-		// forwarded.
+		// and the branch head still records the previous commit because the answer the indexer
+		// was waiting for never arrived.
 		require.NotEmptyf(t, env.metadataStaging(t, mdsBranch),
 			"the kill must land after the Iceberg commit staged %s on %s@%s",
 			windowCommit, env.metadataRepo, mdsBranch)
 		afterKill := env.metadataLog(t, mdsBranch)
 		require.Equalf(t, seededAt, afterKill[0].Id,
-			"the held lakeFS commit of %s must not exist after the kill; history: %v",
+			"no lakeFS commit of %s may exist after the kill; history: %v",
 			windowCommit, mdsCommitLog(afterKill))
 
 		env.uploadObject(t, mdsBranch, "data/after-restart.txt", "after")
@@ -657,175 +679,132 @@ func TestMetadataSearchEndToEnd(t *testing.T) {
 		outsider := env.createPrincipal(t, "esti-mds-outsider", nil)
 		status, body := env.loadTableAs(t, outsider.key, outsider.secret, mdsBranch)
 		require.Equalf(t, http.StatusForbidden, status,
-			"%s, who has no grant at all, must get 403 on the virtual table of %s (§9); body: %s",
+			"%s, who has no grant at all, must get 403 on the metadata tree of %s (§9); body: %s",
 			outsider.username, env.repo, body)
 	})
 
-	t.Run("R-metadata access does not open the virtual table", func(t *testing.T) {
-		// §9: a user with access to R-metadata only gets 403 through R.<ref>.system.object_metadata.
-		// The direct read below proves the user really does hold a grant on R-metadata, so the 403
-		// is the virtual table's rule and not a missing permission.
+	t.Run("R-metadata access does not open the metadata tree", func(t *testing.T) {
+		// §9: a user with access to R-metadata only gets 403 through
+		// system.metadata.<repo>.<ref>.objects, because the tree authorizes on the catalog ARNs of
+		// the data repository (RA1, RA10). The direct read below proves the user really does hold
+		// a grant on R-metadata, so the 403 is the tree's rule and not a missing permission.
 		metadataOnly := env.createPrincipal(t, "esti-mds-metadata-only", []apigen.Statement{
-			{Effect: "allow", Action: []string{"fs:*"}, Resource: mdsRepoPattern(env.metadataRepo)},
-			{Effect: "allow", Action: []string{"fs:*"}, Resource: mdsRepoPattern(env.metadataRepo) + "/*"},
-			{Effect: "allow", Action: []string{"catalog:*"}, Resource: "arn:lakefs:catalog:::*/*-metadata/*"},
+			{Effect: "allow", Action: []string{"catalog:*"},
+				Resource: "arn:lakefs:catalog:::table/" + env.metadataRepo + "/*"},
+			{Effect: "allow", Action: []string{"catalog:*"},
+				Resource: "arn:lakefs:catalog:::namespace/" + env.metadataRepo + "/*"},
 		})
 
 		status, body := env.loadTableAs(t, metadataOnly.key, metadataOnly.secret, mdsBranch)
 		require.Equalf(t, http.StatusForbidden, status,
-			"%s, who has access to %s only, must get 403 through the virtual table (§5.2, §9); body: %s",
+			"%s, who has access to %s only, must get 403 through the metadata tree (§5.2, §9); body: %s",
 			metadataOnly.username, env.metadataRepo, body)
 
 		status, body = env.loadMetadataTableAs(t, metadataOnly.key, metadataOnly.secret, mdsBranch)
 		require.Equalf(t, http.StatusOK, status,
-			"the same user must be able to read %s's table directly, so the 403 above is not a "+
+			"the same user must be able to read %s's own table directly, so the 403 above is not a "+
 				"missing grant; body: %s", env.metadataRepo, body)
 	})
 
-	t.Run("non-indexer cannot write R-metadata", func(t *testing.T) {
-		// §8: mds-metadata-repo-protect denies the fs: and catalog: writes on the companion
-		// repositories of every base group, and a deny wins over the administrator's fs:* allow.
-		//
-		// The suite opts into auth.authorization_failure_status: 403, so the core API reports the
-		// refusal with the 403 plan M6 names; the S3 gateway and the Iceberg catalog answer 403
-		// anyway. Both APIs are asserted, so neither convention can hide a missing deny.
-		res, err := cl.UploadObjectWithBodyWithResponse(t.Context(), env.metadataRepo, mdsBranch,
-			&apigen.UploadObjectParams{Path: "forged/row.txt"}, mdsObjectContentType, strings.NewReader("forged"))
-		require.NoError(t, err, "upload into %s", env.metadataRepo)
-		require.Equalf(t, http.StatusForbidden, res.StatusCode(),
-			"an administrator must not be able to write %s through the API while the deny of §8 is "+
-				"in force: %s", env.metadataRepo, res.Body)
-		require.Containsf(t, string(res.Body), "denied permission",
-			"the refusal must come from the deny policy, not from a missing grant: %s", res.Body)
+	t.Run("deprecated catalog serves the old identifier", func(t *testing.T) {
+		// The guide: "The separate Metadata Search catalog at <lakefs_endpoint>/mds/iceberg/api is
+		// deprecated and will be removed in a future release. Until then it keeps serving the
+		// <repo>.<ref>.system.object_metadata identifier." This is the suite's one case on that
+		// mount (G5, RA3).
+		ref := env.headCommit(t, cl, mdsBranch)
+		rootURL := env.rootTreeURL(ref)
+		rootStatus, root, rootBody := env.loadTableDocument(t, env.key, env.secret, rootURL)
+		require.Equalf(t, http.StatusOK, rootStatus, "load the metadata tree table at %s: %s", rootURL, rootBody)
 
-		_, err = env.s3ClientFor(t, env.key, env.secret).PutObject(t.Context(), env.metadataRepo, mdsBranch+"/forged/row.txt",
-			strings.NewReader("forged"), int64(len("forged")), minio.PutObjectOptions{})
-		require.Errorf(t, err, "an administrator must not be able to write %s through the S3 gateway either",
-			env.metadataRepo)
-		response := minio.ToErrorResponse(err)
-		require.Equalf(t, "AccessDenied", response.Code,
-			"the S3 gateway must refuse the write with 403 AccessDenied, the same deny on the other "+
-				"API: %v", err)
+		legacyURL := env.deprecatedTableURL(ref)
+		legacyStatus, legacy, legacyBody := env.loadTableDocument(t, env.key, env.secret, legacyURL)
+		require.Equalf(t, http.StatusOK, legacyStatus,
+			"the deprecated catalog must keep serving the old identifier (G5): %s: %s", legacyURL, legacyBody)
+		require.Equal(t, root.MetadataLocation, legacy.MetadataLocation,
+			"the old identifier must name the same companion table as system.metadata.<repo>.<ref>.objects (G5)")
+		require.Equal(t,
+			root.Metadata.Properties[mdsTableSourceCommit],
+			legacy.Metadata.Properties[mdsTableSourceCommit],
+			"both catalogs must serve the same indexing position")
+
+		// The lakeFS catalog itself has nothing named system below <repo>.<ref> any more (RA3):
+		// the old identifier there is an absent table like any other.
+		status, body := env.loadAs(t, env.key, env.secret,
+			env.tableURLFor(icebergcatalog.APIBasePath, []string{env.repo, ref, icebergcatalog.SystemNamespace, icebergcatalog.ObjectMetadataTable}))
+		require.Equalf(t, http.StatusNotFound, status,
+			"%s must answer the old identifier with the 404 of an absent table; body: %s",
+			icebergcatalog.APIBasePath, body)
+		require.Containsf(t, string(body), icebergcatalog.ErrTypeNoSuchTable,
+			"the 404 must be the catalog's NoSuchTableException, not a routing miss: %s", body)
+
+		// And the deprecated catalog serves the rows an engine reads there, agreeing with the
+		// root tree on path, commit_id, etag, size_bytes and user_metadata.
+		read := env.readLegacyRows(t, ref)
+		require.Equal(t, mdsRowSignature(env.readRows(t, ref).PyIceberg.Rows), mdsRowSignature(read.Rows),
+			"the deprecated catalog's <repo>.<ref>.system.object_metadata must read the same table")
 	})
 
-	t.Run("guard group cannot create a repository on the companion storage namespace", func(t *testing.T) {
-		// §8 (R3S-3, MDS_REVIEW_3.md): the deny carries fs:AttachStorageNamespace on the storage
-		// namespace of every companion repository, and CreateRepository authorizes that action on
-		// the raw string the client sent (pkg/api/controller.go) - not on a canonical form - while
-		// the block layer resolves one trailing "/" away (pkg/block.resolveRelative,
-		// formatPathWithNamespace). A deny that named only the stored spelling would therefore leave
-		// the same physical prefix to a guard-group member with fs:*, who could create a bare
-		// repository on it and let its uncommitted GC sweep the index files (§3.3).
-		//
-		// bootstrap.storageNamespaceDenyResources emits one ARN per accepted spelling for exactly
-		// that reason. This case drives the real CreateRepository with each spelling, bare and not
-		// bare - the bare flag is not read before the authorization node, but it decides what the
-		// request would write, so both are sent - and requires the 403.
-		//
-		// The companion repository itself is what carries the namespace, and the indexer creates it
-		// on its first tick of R (§3.3), so the case waits for it instead of assuming an earlier
-		// case indexed something: run alone, nothing has been indexed yet.
-		env.waitMetadataRepository(t)
-		meta, err := env.admin.GetRepositoryWithResponse(t.Context(), env.metadataRepo)
-		require.NoErrorf(t, err, "read %s", env.metadataRepo)
-		require.Equalf(t, http.StatusOK, meta.StatusCode(), "read %s: %s", env.metadataRepo, meta.Body)
-		require.NotNilf(t, meta.JSON200, "read %s: %s", env.metadataRepo, meta.Body)
-		stored := strings.TrimRight(meta.JSON200.StorageNamespace, "/")
-		require.NotEmptyf(t, stored, "%s must report its storage namespace: %s", env.metadataRepo, meta.Body)
+	t.Run("sync identity", func(t *testing.T) {
+		// G12: lakeFS provisions mds-service-user and attaches MDSCatalogAccess on every start, and
+		// detaches the read-only MDSFSReadAccess policy if it is there. X1-X3: the principals and
+		// policies of the earlier design are gone.
+		user, err := env.admin.GetUserWithResponse(t.Context(), bootstrap.UserName)
+		require.NoErrorf(t, err, "get user %s", bootstrap.UserName)
+		require.Equalf(t, http.StatusOK, user.StatusCode(),
+			"the server must provision %s on every start: %s", bootstrap.UserName, user.Body)
 
-		// For a namespace with a path - the indexer derives R-metadata's from R's, so it always has
-		// one - this is the whole enumeration of storageNamespaceDenyResources: the stored spelling
-		// and that spelling with one "/". A bucket-root companion has one more ("…//"), and is not
-		// what this installation creates.
-		spellings := []string{stored, stored + "/"}
-		resources := make(map[string]struct{}, len(spellings))
-		for _, spelling := range spellings {
-			resources[permissions.StorageNamespace(spelling)] = struct{}{}
+		policy, err := env.admin.GetPolicyWithResponse(t.Context(), bootstrap.PolicyName)
+		require.NoErrorf(t, err, "get policy %s", bootstrap.PolicyName)
+		require.Equalf(t, http.StatusOK, policy.StatusCode(),
+			"the server must provision %s on every start: %s", bootstrap.PolicyName, policy.Body)
+		require.NotNilf(t, policy.JSON200, "get policy %s: %s", bootstrap.PolicyName, policy.Body)
+		require.Lenf(t, policy.JSON200.Statement, 1, "%s is one catalog-only allow", bootstrap.PolicyName)
+		statement := policy.JSON200.Statement[0]
+		require.Equal(t, "allow", statement.Effect)
+		require.Equal(t, bootstrap.CatalogAccessResource, statement.Resource,
+			"%s grants the catalog actions on every catalog resource, and nothing else", bootstrap.PolicyName)
+		require.ElementsMatch(t, bootstrap.CatalogAccessActions, statement.Action)
+
+		amount := apigen.PaginationAmount(mdsPolicyListAmount)
+		attached, err := env.admin.ListUserPoliciesWithResponse(t.Context(), bootstrap.UserName,
+			&apigen.ListUserPoliciesParams{Amount: &amount})
+		require.NoErrorf(t, err, "list the policies of %s", bootstrap.UserName)
+		require.Equalf(t, http.StatusOK, attached.StatusCode(),
+			"list the policies of %s: %s", bootstrap.UserName, attached.Body)
+		require.NotNilf(t, attached.JSON200, "list the policies of %s: %s", bootstrap.UserName, attached.Body)
+		ids := make([]string, 0, len(attached.JSON200.Results))
+		for _, policy := range attached.JSON200.Results {
+			ids = append(ids, policy.Id)
 		}
+		require.Containsf(t, ids, bootstrap.PolicyName,
+			"%s must carry %s, or the sync cannot write the metadata tables: %v",
+			bootstrap.UserName, bootstrap.PolicyName, ids)
+		require.NotContainsf(t, ids, bootstrap.FSReadPolicyName,
+			"the guide detaches %s from %s on start: %v", bootstrap.FSReadPolicyName, bootstrap.UserName, ids)
 
-		// The deny is re-derived by the bootstrap's refresher, which runs every one minute, so a
-		// companion repository the indexer created after the server started is named only after the
-		// next refresh. Waiting for it is part of §8's contract, not a workaround: the window is at
-		// most one interval, and the wait fails the case (with the policy set it saw) if it is not
-		// closed within mdsPolicyRefreshTimeout.
-		groupID := env.groupID(t, mdsGuardGroup)
-		env.waitCompanionNamespaceDeny(t, groupID, resources)
-
-		// The principal is created after the deny is in force, so its first authorization answer is
-		// the current policy set: the auth service caches a user's effective policies, and a cache
-		// filled before the refresh would hide the deny for its TTL.
-		member := env.createPrincipal(t, "esti-mds-guard-member", nil)
-		added, err := env.admin.AddGroupMembershipWithResponse(t.Context(), groupID, member.username)
-		require.NoErrorf(t, err, "add %s to %s", member.username, mdsGuardGroup)
-		require.Equalf(t, http.StatusCreated, added.StatusCode(), "add %s to %s: %s",
-			member.username, mdsGuardGroup, added.Body)
-		memberClient := env.coreAPIAs(t, member.key, member.secret)
-
-		// The control: the same principal, in the same group, creates and deletes an ordinary
-		// repository. Its fs:* allow is what the deny overrides below, so a failure here means the
-		// grant is broken and the 403s are not evidence of anything.
-		controlNS := "s3://" + env.bucket + "/" + env.runPrefix + "/guard-control"
-		for _, bare := range []bool{true, false} {
-			name := env.repo + "-guard-control"
-			if bare {
-				name += "-bare"
-			}
-			created, err := memberClient.CreateRepositoryWithResponse(t.Context(),
-				&apigen.CreateRepositoryParams{Bare: apiutil.Ptr(bare)},
-				apigen.CreateRepositoryJSONRequestBody{
-					Name:             name,
-					StorageNamespace: controlNS,
-					DefaultBranch:    apiutil.Ptr(mdsBranch),
-				})
-			require.NoErrorf(t, err, "create the control repository %s", name)
-			require.Equalf(t, http.StatusCreated, created.StatusCode(),
-				"%s is a member of %s and holds fs:*, so creating %s (bare=%t) on the ordinary namespace %q "+
-					"must succeed, or the refusals below are not the deny of §8: %s",
-				member.username, mdsGuardGroup, name, bare, controlNS, created.Body)
-
-			deleted, err := memberClient.DeleteRepositoryWithResponse(t.Context(), name, &apigen.DeleteRepositoryParams{})
-			require.NoErrorf(t, err, "delete the control repository %s", name)
-			require.Equalf(t, http.StatusNoContent, deleted.StatusCode(),
-				"delete the control repository %s: %s", name, deleted.Body)
-		}
-
-		for i, spelling := range spellings {
-			// Bare first: it is the shape the pre-fix deny let through, because a bare
-			// CreateRepository skips the storage-namespace-in-use check that refuses a non-bare one
-			// on the same prefix (R3S-3).
-			for _, bare := range []bool{true, false} {
-				name := fmt.Sprintf("%s-guard-%d-%t", env.repo, i, bare)
-				res, err := memberClient.CreateRepositoryWithResponse(t.Context(),
-					&apigen.CreateRepositoryParams{Bare: apiutil.Ptr(bare)},
-					apigen.CreateRepositoryJSONRequestBody{
-						Name:             name,
-						StorageNamespace: spelling,
-						DefaultBranch:    apiutil.Ptr(mdsBranch),
-					})
-				require.NoErrorf(t, err, "create %s on the companion storage namespace spelled %q", name, spelling)
-				require.Equalf(t, http.StatusForbidden, res.StatusCode(),
-					"%s is a member of %s and holds fs:*, so only the deny of §8 can refuse this: a repository "+
-						"(bare=%t) on the storage namespace of %s spelled %q must be 403 (R3S-3); it would share "+
-						"the companion's physical prefix and let its uncommitted GC sweep the index files: %s",
-					member.username, mdsGuardGroup, bare, env.metadataRepo, spelling, res.Body)
-				require.Containsf(t, string(res.Body), "denied permission",
-					"the refusal of the spelling %q must come from the deny policy, not from a missing grant: %s",
-					spelling, res.Body)
-				require.Containsf(t, string(res.Body), permissions.AttachStorageNamespaceAction,
-					"the refusal of the spelling %q must name %s, the action the deny carries: %s",
-					spelling, permissions.AttachStorageNamespaceAction, res.Body)
-
-				// Nothing is created: the authorization node precedes every write.
-				found, err := memberClient.GetRepositoryWithResponse(t.Context(), name)
-				require.NoErrorf(t, err, "read %s after the refused create", name)
-				require.Equalf(t, http.StatusNotFound, found.StatusCode(),
-					"a refused CreateRepository must not create %s: %s", name, found.Body)
+		for _, legacy := range []struct{ name, kind string }{
+			{bootstrap.LegacyUserName, "user"},
+			{bootstrap.LegacyPolicyName, "policy"},
+			{bootstrap.LegacyMetadataRepoProtectPolicyName, "policy"},
+		} {
+			switch legacy.kind {
+			case "user":
+				res, err := env.admin.GetUserWithResponse(t.Context(), legacy.name)
+				require.NoErrorf(t, err, "get user %s", legacy.name)
+				require.Equalf(t, http.StatusNotFound, res.StatusCode(),
+					"the %s of the earlier design must be removed on start (X1-X3): %s", legacy.name, res.Body)
+			case "policy":
+				res, err := env.admin.GetPolicyWithResponse(t.Context(), legacy.name)
+				require.NoErrorf(t, err, "get policy %s", legacy.name)
+				require.Equalf(t, http.StatusNotFound, res.StatusCode(),
+					"the %s of the earlier design must be removed on start (X1-X3): %s", legacy.name, res.Body)
 			}
 		}
 	})
 
-	t.Run("indexer still owns R-metadata", func(t *testing.T) {
-		// The deny must not disarm the indexer: a new commit of R is still indexed after it.
+	t.Run("indexer keeps indexing", func(t *testing.T) {
+		// A commit of R after the security cases is still indexed, as the sync identity of the
+		// current guide and with no credential configured for it.
 		env.uploadObject(t, mdsBranch, "data/final.txt", "final")
 		final := env.commitBranch(t, cl, mdsBranch, "mds test: commit after the security cases")
 		env.waitIndexed(t, mdsBranch, final)
@@ -876,86 +855,6 @@ func TestMetadataSearchBackfill(t *testing.T) {
 		"DuckDB must read one row per imported object")
 	require.Equal(t, head, read.PyIceberg.SourceCommit,
 		"the backfilled table must record the imported commit as its position")
-}
-
-// TestMetadataSearchCompactionAndTagRetention runs §4.9 on a real catalog: a low max_delete_files
-// makes two deletes trigger the compaction, the compaction commit is visible in R-metadata's
-// history, the mds-* tag stays on the pre-compaction commit, the rows and the position do not
-// change, lakefs_mds_compactions_total reports the rewrite, and a short tag_retention retires the
-// old tag while keeping the tag of the live position.
-func TestMetadataSearchCompactionAndTagRetention(t *testing.T) {
-	env := newMDSEnv(t)
-	env.compactionMaxDeleteFiles = 1
-	env.compactionEveryCommits = 1000
-	env.tagRetention = "1s"
-	env.writeConfig(t, env.indexerKey, env.indexerSecret)
-	env.startIndexer(t)
-	cl := env.admin
-
-	for path, content := range map[string]string{
-		"data/keep-one.txt": "keep one",
-		"data/keep-two.txt": "keep two",
-		"data/gone-one.txt": "gone one",
-		"data/gone-two.txt": "gone two",
-	} {
-		env.uploadObject(t, mdsBranch, path, content)
-	}
-	first := env.commitBranch(t, cl, mdsBranch, "mds test: four rows before compaction")
-	env.waitIndexed(t, mdsBranch, first)
-	require.Len(t, env.readRows(t, mdsBranch).PyIceberg.Rows, 4, "the four objects must be indexed")
-
-	// Age the first source commit beyond tag_retention: retention measures the source commit's
-	// creation date, not the tag's.
-	time.Sleep(1500 * time.Millisecond)
-
-	// Two separate deletes are two merge-on-read transactions, so the table carries two delete
-	// files; max_delete_files=1 makes the second one cross the threshold.
-	env.deleteObject(t, mdsBranch, "data/gone-one.txt")
-	firstDelete := env.commitBranch(t, cl, mdsBranch, "mds test: first delete")
-	env.waitIndexed(t, mdsBranch, firstDelete)
-	env.deleteObject(t, mdsBranch, "data/gone-two.txt")
-	secondDelete := env.commitBranch(t, cl, mdsBranch, "mds test: second delete")
-	env.waitIndexed(t, mdsBranch, secondDelete)
-
-	log := env.metadataLog(t, mdsBranch)
-	require.NotEmpty(t, log)
-	require.Equalf(t, fmt.Sprintf(indexer.CompactCommitMessage, env.repo, secondDelete), log[0].Message,
-		"the tick that crossed max_delete_files must end with the %q commit of §4.9; history: %v",
-		indexer.CompactCommitMessage, mdsCommitLog(log))
-	require.Equal(t, secondDelete, mdsSourceCommitOf(log[0]),
-		"the compaction commit keeps the same source commit")
-
-	tagCommit := env.metadataCommitTagged(t, secondDelete)
-	require.NotEqualf(t, log[0].Id, tagCommit,
-		"the compaction must not move %s%s: the tag stays on the pre-compaction commit; history: %v",
-		indexer.TagPrefix, secondDelete, mdsCommitLog(log))
-	require.Equalf(t, log[1].Id, tagCommit,
-		"%s%s must stay on the indexing commit the compaction rewrote, not on an older one; history: %v",
-		indexer.TagPrefix, secondDelete, mdsCommitLog(log))
-	require.Equal(t, secondDelete, mdsSourceCommitOf(log[1]),
-		"the commit under the compaction commit must be the index commit it compacted; history: %v",
-		mdsCommitLog(log))
-
-	read := env.readRows(t, mdsBranch)
-	require.Equal(t, []string{"data/keep-one.txt", "data/keep-two.txt"}, mdsPaths(read.PyIceberg.Rows),
-		"compaction must keep the rows that were not deleted and must not duplicate the survivors")
-	require.Equal(t, secondDelete, read.PyIceberg.SourceCommit,
-		"compaction must not move the freshness property")
-
-	line := env.indexerMetric(t, "lakefs_mds_compactions_total")
-	require.NotEqualf(t, "unavailable", line, "the indexer must expose %s", "lakefs_mds_compactions_total")
-	fields := strings.Fields(line)
-	require.Lenf(t, fields, 2, "unexpected %s line: %q", "lakefs_mds_compactions_total", line)
-	require.Equalf(t, "1", fields[1], "one compaction must be counted: %q", line)
-
-	// Retention is measured on the source commit, so the old tag is retired once it is older than
-	// tag_retention. The tag that records the branch's current position stays: §4.4 would recreate
-	// it on the next tick, and retention must not fight tag repair.
-	env.waitTagGone(t, indexer.TagPrefix+first)
-	res, err := env.admin.GetTagWithResponse(t.Context(), env.metadataRepo, indexer.TagPrefix+secondDelete)
-	require.NoErrorf(t, err, "get tag %s%s", indexer.TagPrefix, secondDelete)
-	require.Equalf(t, http.StatusOK, res.StatusCode(),
-		"tag_retention must keep the tag of the live position: %s", res.Body)
 }
 
 // TestMetadataSearchBranchDeletion runs §4.8's mirrored deletion on a real catalog: deleting a data
@@ -1012,9 +911,9 @@ const mdsTableSourceCommit = "lakefs.mds.source-commit"
 // the throw-away installation
 // ---------------------------------------------------------------------------------------------
 
-// newMDSEnv starts lakefs-sso with Metadata Search enabled, creates the indexer's credentials and
-// returns the environment. The indexer itself is not started: a test starts it when the state it
-// wants to index exists (which is what makes the backfill measurement meaningful).
+// newMDSEnv starts lakefs-sso with Metadata Search enabled and returns the environment. The indexer
+// itself is not started: a test starts it when the state it wants to index exists (which is what
+// makes the backfill measurement meaningful).
 func newMDSEnv(t *testing.T) *mdsEnv {
 	t.Helper()
 	requireIcebergS3Blockstore(t)
@@ -1023,7 +922,6 @@ func newMDSEnv(t *testing.T) *mdsEnv {
 	env.s3 = icebergS3Settings(t)
 	env.bucket, env.runPrefix, env.storageNamespace = icebergStorageNamespace(t, env.repo)
 	env.blockstoreSection = mdsS3BlockstoreSection(env.s3)
-	env.storageSection = mdsS3StorageSection(env.s3)
 	env.setupStorage = env.ensureBucket
 	env.cleanupStorage = env.deleteRunPrefix
 	return env.start(t)
@@ -1071,26 +969,17 @@ func newMDSEnvSkeleton(t *testing.T, repo string) *mdsEnv {
 	return env
 }
 
-// start runs the server of a skeleton environment, waits for it, asserts the Metadata Search
-// bootstrap of §8, creates the data repository and writes the final configuration with the
-// credentials the suite created for mds-indexer. The indexer is started by the case itself.
+// start runs the server of a skeleton environment, waits for it, asserts the Metadata Search sync
+// identity of §8, and creates the data repository. The indexer is started by the case itself.
 func (e *mdsEnv) start(t *testing.T) *mdsEnv {
 	t.Helper()
 	e.setupStorage(t)
-
-	// §7 defaults, written explicitly so a maintenance case can override one without losing the
-	// others. tag_retention 0 keeps every tag; compaction fires above 200 delete files or every
-	// 500 indexed commits; a deleted data branch loses its metadata branch.
-	e.tagRetention = "0s"
-	e.deleteBranches = true
-	e.compactionMaxDeleteFiles = 200
-	e.compactionEveryCommits = 500
+	e.startDatabase(t)
 	e.startIndexerProxy(t)
 
-	// The server and the indexer read one file, as §7 documents. The metadata_search section is
-	// written without credentials first, because the mds-indexer user does not exist until the
-	// server has bootstrapped it; the file is rewritten with the created credentials before the
-	// indexer starts.
+	// One configuration for both processes, as §7 documents, and it needs no second pass: the sync
+	// identity is provisioned by the server at startup (G12) and the indexer signs its own token, so
+	// there is no credential to create before it can run.
 	e.writeConfig(t, "", "")
 	e.startServer(t)
 	t.Cleanup(func() { e.stop(t) })
@@ -1099,9 +988,57 @@ func (e *mdsEnv) start(t *testing.T) *mdsEnv {
 	e.admin = e.coreAPI(t)
 	e.requireMDSCore(t)
 	e.createRepository(t)
-	e.indexerKey, e.indexerSecret = e.createIndexerCredentials(t)
-	e.writeConfig(t, e.indexerKey, e.indexerSecret)
 	return e
+}
+
+// startDatabase starts the PostgreSQL both processes open. `lakefs-sso mds run` opens the KV store
+// of database.* in its own process (RA4b, X13), and a local Badger database refuses a second
+// process, so the suite gives the server and the indexer a real database server. The connection
+// string is a secret of one throw-away container.
+func (e *mdsEnv) startDatabase(t *testing.T) {
+	t.Helper()
+	port := icebergFreePort(t)
+	name := "mds-postgres-" + icebergUniqueSuffix()
+
+	cmd := exec.CommandContext(e.ctx, "docker", "run", "--rm", "-d",
+		"--name", name,
+		"-e", "POSTGRES_USER="+mdsPostgresUser,
+		"-e", "POSTGRES_PASSWORD="+mdsPostgresPassword,
+		"-e", "POSTGRES_DB="+mdsPostgresDatabase,
+		"-p", fmt.Sprintf("127.0.0.1:%d:5432", port),
+		mdsPostgresImage)
+	output, err := cmd.CombinedOutput()
+	require.NoErrorf(t, err, "start the PostgreSQL container %s: %s", name, output)
+	e.database = name
+	t.Cleanup(func() {
+		_ = exec.Command("docker", "rm", "-f", name).Run()
+	})
+
+	e.databaseDSN = fmt.Sprintf("postgres://%s:%s@127.0.0.1:%d/%s?sslmode=disable",
+		mdsPostgresUser, mdsPostgresPassword, port, mdsPostgresDatabase)
+	e.waitForDatabase(t)
+}
+
+// waitForDatabase waits until the database answers a query. A published port accepts TCP before the
+// entrypoint's initdb has finished (the image starts and stops a temporary server first), so the
+// probe is pg_isready inside the container, not a dial to the port.
+func (e *mdsEnv) waitForDatabase(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(mdsPostgresStartTimeout)
+	var output []byte
+	for {
+		output, _ = exec.Command("docker", "exec", e.database,
+			"pg_isready", "-U", mdsPostgresUser, "-d", mdsPostgresDatabase).CombinedOutput()
+		if strings.Contains(string(output), "accepting connections") {
+			return
+		}
+		if time.Now().After(deadline) {
+			logs, _ := exec.Command("docker", "logs", e.database).CombinedOutput()
+			t.Fatalf("the PostgreSQL container %s did not accept connections within %s: %s\nlogs:\n%s",
+				e.database, mdsPostgresStartTimeout, output, logs)
+		}
+		time.Sleep(icebergHealthInterval)
+	}
 }
 
 // writeConfig writes the one lakefs.yaml both processes read (design §7).
@@ -1109,21 +1046,33 @@ func (e *mdsEnv) start(t *testing.T) *mdsEnv {
 // The blockstore section is spelled out in full instead of being inherited from the ambient
 // LAKEFS_* variables: a partial section would shadow viper's nested defaults, and the server, the
 // indexer and the query-engine containers must all address the same bucket with the same
-// credentials and path style. The section itself is the storage profile's (e.blockstoreSection),
-// so the Azure case writes an Azure blockstore and no metadata_search.storage at all.
-func (e *mdsEnv) writeConfig(t *testing.T, indexerKey, indexerSecret string) {
+// credentials and path style. The section is the storage profile's (e.blockstoreSection).
+//
+// The metadata_search section is the guide's key list and nothing else (G10, G11, X6): the endpoint,
+// the optional credential pair (empty here: the sync runs as mds-service-user), the listen address,
+// the tick settings and the repositories. The object-store credentials of its writes are the
+// blockstore.* section above, because `mds run` runs on the server configuration (RA4b).
+func (e *mdsEnv) writeConfig(t *testing.T, _ string, _ string) {
 	t.Helper()
 	document := fmt.Sprintf(`listen_address: %q
 logging:
   format: text
   level: "warn"
+# Both processes open this database: the server as its own KV store, the indexer because mds run
+# runs on the lakeFS configuration (RA4b). A local Badger database cannot be opened twice.
 database:
-  type: local
-  local:
-    path: %q
+  type: postgres
+  postgres:
+    connection_string: %q
+# The cache the committed ranges are read through. The indexer gets its own directory through
+# LAKEFS_COMMITTED_LOCAL_CACHE_DIR (startIndexer), because two processes sharing one cache directory
+# is not a property the product promises.
+committed:
+  local_cache:
+    dir: %q
 # The break-glass administrator of the SSO auth service. installation.* makes run seed it, and the
 # ACL/RBAC base groups, before the extra routes builders - i.e. before the Metadata Search bootstrap
-# of §8 attaches the metadata-repo deny, which is what makes that deny real in this run.
+# of G12 provisions mds-service-user and MDSCatalogAccess.
 installation:
   user_name: %q
   access_key_id: %q
@@ -1133,11 +1082,8 @@ auth:
     secret_key: "esti-metadata-search-auth-secret"
   ui_config:
     rbac: "internal"
-  # The refusals of §9 are asserted as 403 (plan M6). lakeFS answers an authorization failure 401
-  # by default and only the opt-in changes that (auth.authorization_failure_status, CHANGELOG_SSO.md),
-  # so the suite sets it: a guard-group member's CreateRepository on a companion namespace and a
-  # non-indexer's write into R-metadata are then the 403 the plan names, on the core API too.
-  authorization_failure_status: 403
+  # The 403s of §9 are the catalog's own answer (PermissionDeniedError). The core API of this
+  # installation is only used by the administrator, so the opt-in 403 mode is not needed.
 sso:
   enabled: true
   client_id: "esti-mds"
@@ -1149,41 +1095,22 @@ sso:
   prefix: %q
   metadata_search:
     enabled: true
-# The indexer section (§7). The server ignores it; lakefs-sso mds run reads only it.
+# The indexer section (G10, G11). The server ignores it; lakefs-sso mds run reads it.
 metadata_search:
-  lakefs_mds_endpoint: %q
-  access_key_id: %q
-  secret_key: %q
+  lakefs_endpoint: %q
   listen_address: %q
   period: %s
   concurrency: 4
   max_commits: 1000
-  backfill: head
-  delete_branches: %t
-  tag_retention: %s
-  compaction:
-    max_delete_files: %d
-    every_commits: %d
-%s%s`, e.listenAddress, filepath.Join(e.dir, "metadata"),
+%s`, e.listenAddress, e.databaseDSN, filepath.Join(e.dir, "cache"),
 		mdsAdminUsername, e.key, e.secret,
 		e.issuer, "http://"+e.listenAddress,
 		e.blockstoreSection, icebergcatalog.CatalogPrefix,
-		e.indexerEndpoint, indexerKey, indexerSecret, e.indexerListenAddress, mdsIndexerPeriod,
-		e.deleteBranches, e.tagRetention, e.compactionMaxDeleteFiles, e.compactionEveryCommits,
-		e.storageSectionYAML(), e.repositoriesSection())
+		e.indexerEndpoint, e.indexerListenAddress, mdsIndexerPeriod,
+		e.repositoriesSection())
 
 	require.NoError(t, os.WriteFile(e.configPath, []byte(document), mdsConfigFileMode),
 		"write the lakefs.yaml both processes read")
-}
-
-// storageSectionYAML renders metadata_search.storage, or nothing at all when the storage profile
-// configures the Indexer's FileIO some other way: the Azure case leaves it to the
-// LAKEFS_METADATA_SEARCH_AZURE_* environment of the indexer process (METADATA_SEARCH_AZURE G4).
-func (e *mdsEnv) storageSectionYAML() string {
-	if e.storageSection == "" {
-		return ""
-	}
-	return "  storage:\n" + e.storageSection
 }
 
 // repositoriesSection renders the repositories of the indexer configuration: the suite's own data
@@ -1215,22 +1142,6 @@ func mdsS3BlockstoreSection(s3 icebergS3Config) string {
 	return blockstore.String()
 }
 
-// mdsS3StorageSection is metadata_search.storage of the S3 profile: the same endpoint and
-// credentials, in the iceberg-go property names of design §4.6.
-func mdsS3StorageSection(s3 icebergS3Config) string {
-	var storage strings.Builder
-	if s3.Endpoint != "" {
-		fmt.Fprintf(&storage, "    s3.endpoint: %q\n", s3.Endpoint)
-	}
-	fmt.Fprintf(&storage, "    s3.region: %q\n", s3.Region)
-	fmt.Fprintf(&storage, "    s3.access-key-id: %q\n", s3.AccessKey)
-	fmt.Fprintf(&storage, "    s3.secret-access-key: %q\n", s3.SecretKey)
-	if s3.PathStyle {
-		storage.WriteString("    s3.path-style-access: \"true\"\n")
-	}
-	return storage.String()
-}
-
 // ensureBucket makes sure the bucket the run allocates its prefix in exists. On AWS it does; on the
 // SeaweedFS instance of esti/ops/docker-compose-mds.yaml it may not, and creating it here keeps the
 // documented local run a single command.
@@ -1256,6 +1167,7 @@ func (e *mdsEnv) ensureBucket(t *testing.T) {
 type mdsProxy struct {
 	server       *httptest.Server
 	reverse      *httputil.ReverseProxy
+	target       *url.URL
 	metadataRepo string
 	branch       string
 
@@ -1287,6 +1199,7 @@ func (e *mdsEnv) startIndexerProxy(t *testing.T) {
 	require.NoErrorf(t, err, "parse the lakeFS URL %q for the indexer proxy", e.baseURL)
 	p := &mdsProxy{
 		reverse:      httputil.NewSingleHostReverseProxy(target),
+		target:       target,
 		metadataRepo: e.metadataRepo,
 		branch:       mdsBranch,
 	}
@@ -1296,9 +1209,9 @@ func (e *mdsEnv) startIndexerProxy(t *testing.T) {
 	t.Cleanup(func() { p.server.Close() })
 }
 
-// holdNextMetadataCommit arms the next lakeFS commit of R-metadata@main. The returned gate's
-// reached channel is closed when that request is in flight, which is the observed signal the
-// restart case waits for; the request itself is never forwarded.
+// holdNextMetadataCommit arms the answer to the next Iceberg commit of R-metadata@main. The returned
+// gate's reached channel is closed once the server has staged that commit, which is the observable
+// signal the restart case waits for; the indexer never receives the answer.
 func (p *mdsProxy) holdNextMetadataCommit(t *testing.T) *mdsCommitGate {
 	t.Helper()
 	gate := &mdsCommitGate{reached: make(chan struct{}), release: make(chan struct{})}
@@ -1321,34 +1234,49 @@ func (p *mdsProxy) takeGate() *mdsCommitGate {
 }
 
 func (p *mdsProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	if isMetadataCommitRequest(r, p.metadataRepo, p.branch) {
+	if isMetadataTableCommitRequest(r, p.metadataRepo, p.branch) {
 		if gate := p.takeGate(); gate != nil {
+			// Forward the commit so the server stages the pointer, then swallow the answer: the
+			// indexer is left waiting with the table staged and no lakeFS commit.
+			out := r.Clone(r.Context())
+			out.URL.Scheme, out.URL.Host, out.RequestURI = p.target.Scheme, p.target.Host, ""
+			if resp, err := http.DefaultTransport.RoundTrip(out); err == nil {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+			}
 			close(gate.reached)
 			select {
 			case <-gate.release:
 			case <-r.Context().Done():
 			case <-time.After(mdsHeldCommitTimeout):
 			}
-			// The request never reaches the server: the process being killed has already
-			// staged the Iceberg commit, and no lakeFS commit exists for it.
-			http.Error(w, "the Metadata Search restart case held this lakeFS commit", http.StatusServiceUnavailable)
+			http.Error(w, "the Metadata Search restart case held the answer to this table commit",
+				http.StatusServiceUnavailable)
 			return
 		}
 	}
 	p.reverse.ServeHTTP(w, r)
 }
 
-// isMetadataCommitRequest reports whether r is POST .../repositories/<metadataRepo>/branches/<branch>/commits.
-func isMetadataCommitRequest(r *http.Request, metadataRepo, branch string) bool {
+// isMetadataTableCommitRequest reports whether r is the Iceberg commit of the metadata table through
+// the relative_to mount the indexer writes with:
+// POST /iceberg/relative_to/<R-metadata>.<branch>/api/v1/<prefix>/namespaces/<ns>/tables/<table>.
+// The initialisation's create is the same route; a hold is armed only after the branch is indexed,
+// so the request it takes is an index commit.
+func isMetadataTableCommitRequest(r *http.Request, metadataRepo, branch string) bool {
 	if r.Method != http.MethodPost {
 		return false
 	}
-	want := "/api/v1/repositories/" + url.PathEscape(metadataRepo) + "/branches/" + url.PathEscape(branch) + "/commits"
-	return r.URL.Path == want
+	warehouse := url.PathEscape(metadataRepo + "." + branch)
+	prefix := icebergcatalog.RelativeToBasePath + "/" + warehouse + "/api/v1/" + icebergcatalog.CatalogPrefix + "/namespaces/"
+	if !strings.HasPrefix(r.URL.Path, prefix) {
+		return false
+	}
+	return strings.Contains(r.URL.Path, "/tables/")
 }
 
-// waitForMetadataCommitWindow waits, with a bounded timeout, until the indexer has sent the lakeFS
-// commit of R-metadata and the proxy holds it. A kill outside that window proves nothing about
+// waitForMetadataCommitWindow waits, with a bounded timeout, until the server has staged the indexer's
+// Iceberg commit and the proxy holds its answer. A kill outside that window proves nothing about
 // §4.4, so a missed window fails the case with the indexer's observed state.
 func (e *mdsEnv) waitForMetadataCommitWindow(t *testing.T, gate *mdsCommitGate, sourceCommit string) {
 	t.Helper()
@@ -1356,19 +1284,19 @@ func (e *mdsEnv) waitForMetadataCommitWindow(t *testing.T, gate *mdsCommitGate, 
 	defer timer.Stop()
 	select {
 	case <-gate.reached:
-		t.Logf("the indexer staged %s on %s@%s and its lakeFS commit is in flight; killing it now",
+		t.Logf("the indexer staged %s on %s@%s and its in-process lakeFS commit is still due; killing it now",
 			sourceCommit, e.metadataRepo, mdsBranch)
 		return
 	case <-e.indexer.done:
-		e.exitedWhileRunning(t, e.indexer, "waiting for the lakeFS commit of "+sourceCommit)
-		t.Fatalf("the indexer exited before it sent the lakeFS commit of %s", sourceCommit)
+		e.exitedWhileRunning(t, e.indexer, "waiting for the staging of "+sourceCommit)
+		t.Fatalf("the indexer exited before it staged %s", sourceCommit)
 	case <-timer.C:
 		report := "unavailable"
 		if health, ok := e.indexerHealth(t); ok {
 			encoded, _ := json.Marshal(health)
 			report = string(encoded)
 		}
-		t.Fatalf("the indexer did not send the lakeFS commit of %s within %s, so a kill would land between ticks and prove nothing about §4.4; last health report: %s\nlast %d lines of the indexer log:\n%s",
+		t.Fatalf("the indexer did not stage %s within %s, so a kill would land between ticks and prove nothing about §4.4; last health report: %s\nlast %d lines of the indexer log:\n%s",
 			sourceCommit, mdsCommitWindowTimeout, report, mdsLogTailLines, mdsLogTail(e.indexPath, mdsLogTailLines))
 	}
 }
@@ -1520,7 +1448,12 @@ func (e *mdsEnv) startServer(t *testing.T) {
 func (e *mdsEnv) startIndexer(t *testing.T) {
 	t.Helper()
 	require.Nil(t, e.indexer, "the indexer is already running; stop it first")
-	e.indexer = e.startProcess(t, "lakefs-sso mds run", e.indexPath, e.indexerEnv,
+	// The indexer gets its own committed-range cache directory: both processes build the catalog
+	// over the same KV store and block adapter, and a shared cache directory is not a property the
+	// product promises. The rest of its environment is the suite's (or the Azure case's).
+	extraEnv := append([]string{}, e.indexerEnv...)
+	extraEnv = append(extraEnv, "LAKEFS_COMMITTED_LOCAL_CACHE_DIR="+filepath.Join(e.dir, "mds-cache"))
+	e.indexer = e.startProcess(t, "lakefs-sso mds run", e.indexPath, extraEnv,
 		"mds", "run", "--config", e.configPath)
 	t.Logf("metadata search indexer started (pid %d, period %s)", e.indexer.cmd.Process.Pid, mdsIndexerPeriod)
 	e.waitForIndexerServer(t)
@@ -1598,100 +1531,58 @@ func (e *mdsEnv) stop(t *testing.T) {
 // principals of §8
 // ---------------------------------------------------------------------------------------------
 
-// requireMDSCore asserts that the server's Metadata Search bootstrap ran: the mds-indexer user
-// and allow policy exist, the metadata-repo deny is stored only as numeric chunks (R3S-2: the deny
-// has no repository-independent statement, so it has no base policy), and every chunk is attached
-// to the base groups, which is what makes the deny of §8 enforced in this installation.
+// requireMDSCore asserts that the server's Metadata Search bootstrap ran: the guide's sync identity
+// mds-service-user exists, carries MDSCatalogAccess (one catalog-only allow), does not carry the
+// read-only MDSFSReadAccess policy, and the principals and policies of the earlier design are gone
+// (G12, X1-X3, RA5).
 func (e *mdsEnv) requireMDSCore(t *testing.T) {
 	t.Helper()
 	user, err := e.admin.GetUserWithResponse(t.Context(), bootstrap.UserName)
 	require.NoErrorf(t, err, "get user %s", bootstrap.UserName)
 	require.Equalf(t, http.StatusOK, user.StatusCode(),
-		"the server must bootstrap the %s user of §8 at startup: %s", bootstrap.UserName, user.Body)
+		"the server must provision %s of G12 at startup: %s", bootstrap.UserName, user.Body)
 
-	// The allow policy has repository-independent statements, so its base policy always exists.
-	indexer, err := e.admin.GetPolicyWithResponse(t.Context(), bootstrap.IndexerPolicyName)
-	require.NoErrorf(t, err, "get policy %s", bootstrap.IndexerPolicyName)
-	require.Equalf(t, http.StatusOK, indexer.StatusCode(),
-		"the server must bootstrap the %s policy of §8 at startup: %s", bootstrap.IndexerPolicyName, indexer.Body)
+	policy, err := e.admin.GetPolicyWithResponse(t.Context(), bootstrap.PolicyName)
+	require.NoErrorf(t, err, "get policy %s", bootstrap.PolicyName)
+	require.Equalf(t, http.StatusOK, policy.StatusCode(),
+		"the server must provision %s of G12 at startup: %s", bootstrap.PolicyName, policy.Body)
+	require.NotNilf(t, policy.JSON200, "get policy %s: %s", bootstrap.PolicyName, policy.Body)
+	require.Lenf(t, policy.JSON200.Statement, 1, "%s is one catalog-only allow", bootstrap.PolicyName)
+	statement := policy.JSON200.Statement[0]
+	require.Equal(t, "allow", statement.Effect)
+	require.Equal(t, bootstrap.CatalogAccessResource, statement.Resource,
+		"%s grants catalog actions on catalog resources, and nothing else", bootstrap.PolicyName)
+	require.ElementsMatch(t, bootstrap.CatalogAccessActions, statement.Action)
 
-	// R3S-2: the deny has no repository-independent statement, and a policy with zero statements
-	// is not a policy (api/authorization.yml requires minItems: 1), so the base name must not
-	// exist at all - the deny lives only in its numeric chunks.
-	base, err := e.admin.GetPolicyWithResponse(t.Context(), bootstrap.MetadataRepoProtectPolicyName)
-	require.NoErrorf(t, err, "get policy %s", bootstrap.MetadataRepoProtectPolicyName)
-	require.Equalf(t, http.StatusNotFound, base.StatusCode(),
-		"the %s deny of §8 must not exist as a base policy, only as numeric chunks: %s: %s",
-		bootstrap.MetadataRepoProtectPolicyName, base.Status(), base.Body)
-
-	// List the chunks the server wrote. Chunk names are matched exactly (base + '-' + digits),
-	// never by a loose prefix, so a policy the bootstrap does not own cannot pass for a chunk.
-	prefix := apigen.PaginationPrefix(bootstrap.MetadataRepoProtectPolicyName)
-	amount := apigen.PaginationAmount(-1)
-	policies, err := e.admin.ListPoliciesWithResponse(t.Context(), &apigen.ListPoliciesParams{
-		Prefix: &prefix,
-		Amount: &amount,
-	})
-	require.NoErrorf(t, err, "list the %s chunk policies", bootstrap.MetadataRepoProtectPolicyName)
-	require.Equalf(t, http.StatusOK, policies.StatusCode(),
-		"list the %s chunk policies: %s", bootstrap.MetadataRepoProtectPolicyName, policies.Body)
-	require.NotNilf(t, policies.JSON200, "list the %s chunk policies: %s",
-		bootstrap.MetadataRepoProtectPolicyName, policies.Body)
-	chunks := make([]string, 0, len(policies.JSON200.Results))
-	for _, policy := range policies.JSON200.Results {
-		if bootstrap.IsMetadataRepoProtectChunk(policy.Id) {
-			chunks = append(chunks, policy.Id)
-		}
+	amount := apigen.PaginationAmount(mdsPolicyListAmount)
+	attached, err := e.admin.ListUserPoliciesWithResponse(t.Context(), bootstrap.UserName,
+		&apigen.ListUserPoliciesParams{Amount: &amount})
+	require.NoErrorf(t, err, "list the policies of %s", bootstrap.UserName)
+	require.Equalf(t, http.StatusOK, attached.StatusCode(),
+		"list the policies of %s: %s", bootstrap.UserName, attached.Body)
+	require.NotNilf(t, attached.JSON200, "list the policies of %s: %s", bootstrap.UserName, attached.Body)
+	ids := make([]string, 0, len(attached.JSON200.Results))
+	for _, policy := range attached.JSON200.Results {
+		ids = append(ids, policy.Id)
 	}
-	require.NotEmptyf(t, chunks,
-		"the server must bootstrap at least one %s-<n> deny chunk of §8 at startup; policies with that prefix: %+v",
-		bootstrap.MetadataRepoProtectPolicyName, policies.JSON200.Results)
-	sort.Strings(chunks)
+	require.Containsf(t, ids, bootstrap.PolicyName,
+		"%s must carry %s, or the sync cannot write the metadata tables: %v",
+		bootstrap.UserName, bootstrap.PolicyName, ids)
+	require.NotContainsf(t, ids, bootstrap.FSReadPolicyName,
+		"the guide detaches %s from %s on start: %v", bootstrap.FSReadPolicyName, bootstrap.UserName, ids)
 
-	// Every chunk is attached to the base groups of §8 - the same guard list the server passes to
-	// the deny, whatever group template the installation runs. A group of the other template does
-	// not exist here and the bootstrap skips it, so a 404 is expected for it; a base group that
-	// does exist must carry every chunk, or the deny is not in force for its members. Admins is
-	// the break-glass administrator's group, so this is also the attachment the "non-indexer
-	// cannot write" case needs.
-	for _, group := range datasets.PinsProtectGroups(nil) {
-		res, err := e.admin.ListGroupPoliciesWithResponse(t.Context(), group, &apigen.ListGroupPoliciesParams{
-			Prefix: &prefix,
-			Amount: &amount,
-		})
-		require.NoErrorf(t, err, "list the policies of the %s group", group)
-		if res.StatusCode() == http.StatusNotFound {
-			continue
-		}
-		require.Equalf(t, http.StatusOK, res.StatusCode(), "list the policies of %s: %s", group, res.Body)
-		require.NotNilf(t, res.JSON200, "list the policies of %s: %s", group, res.Body)
-		attached := make([]string, 0, len(res.JSON200.Results))
-		for _, policy := range res.JSON200.Results {
-			require.Truef(t, bootstrap.IsMetadataRepoProtectChunk(policy.Id),
-				"%s carries %q, which is not a numeric %s chunk of §8", group, policy.Id,
-				bootstrap.MetadataRepoProtectPolicyName)
-			attached = append(attached, policy.Id)
-		}
-		sort.Strings(attached)
-		require.ElementsMatchf(t, chunks, attached,
-			"every %s-<n> deny chunk of §8 must be attached to the base group %s, or the write "+
-				"protection is not in force in this run", bootstrap.MetadataRepoProtectPolicyName, group)
+	// The earlier design's principals and policies are removed on every start (X1-X3).
+	legacyUser, err := e.admin.GetUserWithResponse(t.Context(), bootstrap.LegacyUserName)
+	require.NoErrorf(t, err, "get user %s", bootstrap.LegacyUserName)
+	require.Equalf(t, http.StatusNotFound, legacyUser.StatusCode(),
+		"the %s user of the earlier design must be removed on start: %s",
+		bootstrap.LegacyUserName, legacyUser.Body)
+	for _, legacy := range []string{bootstrap.LegacyPolicyName, bootstrap.LegacyMetadataRepoProtectPolicyName} {
+		res, err := e.admin.GetPolicyWithResponse(t.Context(), legacy)
+		require.NoErrorf(t, err, "get policy %s", legacy)
+		require.Equalf(t, http.StatusNotFound, res.StatusCode(),
+			"the %s policy of the earlier design must be removed on start: %s", legacy, res.Body)
 	}
-}
-
-// createIndexerCredentials creates the access key pair of mds-indexer, which §8 leaves to the
-// administrator: the bootstrap creates the user, the operator creates its credentials and puts them
-// in the indexer configuration.
-func (e *mdsEnv) createIndexerCredentials(t *testing.T) (key, secret string) {
-	t.Helper()
-	res, err := e.admin.CreateCredentialsWithResponse(t.Context(), bootstrap.UserName)
-	require.NoErrorf(t, err, "create credentials for %s", bootstrap.UserName)
-	require.Equalf(t, http.StatusCreated, res.StatusCode(),
-		"create credentials for %s: %s", bootstrap.UserName, res.Body)
-	require.NotNilf(t, res.JSON201, "create credentials for %s: %s", bootstrap.UserName, res.Body)
-	require.NotEmpty(t, res.JSON201.AccessKeyId)
-	require.NotEmpty(t, res.JSON201.SecretAccessKey)
-	return res.JSON201.AccessKeyId, res.JSON201.SecretAccessKey
 }
 
 // mdsPrincipal is one principal the suite creates to assert the authorization rules of §9.
@@ -1792,14 +1683,10 @@ func (e *mdsEnv) waitMetadataRepository(t *testing.T) {
 	}
 }
 
-// waitCompanionNamespaceDeny waits until the deny policy set of §8 names the given storage-namespace
-// ARNs, and fails the case with the policy set it saw if that does not happen within
-// mdsPolicyRefreshTimeout.
-//
-// The set is re-derived by the bootstrap's refresher while the server runs
-// (bootstrap.startPolicyRefresher), so a companion repository created after the server started is
-// named at most one refresh interval later. Reading the policy back is the only way to know the deny
-// is in force without trying the write it refuses, and the write is what the case asserts.
+// waitCompanionNamespaceDeny is retained for esti/mds_azure_test.go, which is not part of this card
+// and still asserts the companion-repository deny of the earlier design. The current guide has no
+// such deny policy (METADATA_SEARCH_REALIGN.md X2, RA5), so nothing in this file calls it; the policy
+// name it reads is the removed one, which a current server never creates.
 func (e *mdsEnv) waitCompanionNamespaceDeny(t *testing.T, groupID string, resources map[string]struct{}) {
 	t.Helper()
 	amount := apigen.PaginationAmount(mdsPolicyListAmount)
@@ -1813,7 +1700,7 @@ func (e *mdsEnv) waitCompanionNamespaceDeny(t *testing.T, groupID string, resour
 
 		seen = seen[:0]
 		for _, policy := range res.JSON200.Results {
-			if !strings.HasPrefix(policy.Id, bootstrap.MetadataRepoProtectPolicyName+"-") {
+			if !strings.HasPrefix(policy.Id, bootstrap.LegacyMetadataRepoProtectPolicyName+"-") {
 				continue
 			}
 			for _, statement := range policy.Statement {
@@ -1830,7 +1717,7 @@ func (e *mdsEnv) waitCompanionNamespaceDeny(t *testing.T, groupID string, resour
 		if time.Now().After(deadline) {
 			t.Fatalf("the deny of §8 does not name the companion storage namespace within %s; the %s policies "+
 				"attached to group %s carried: %v; wanted one of %v",
-				mdsPolicyRefreshTimeout, bootstrap.MetadataRepoProtectPolicyName, groupID, seen, sortedKeysOfSet(resources))
+				mdsPolicyRefreshTimeout, bootstrap.LegacyMetadataRepoProtectPolicyName, groupID, seen, sortedKeysOfSet(resources))
 		}
 		time.Sleep(mdsPollInterval)
 	}
@@ -1923,56 +1810,59 @@ type mdsClientRead struct {
 	SourceCommit     string   `json:"source_commit"`
 }
 
-// mdsRead is the result of one read step: the same table through both published engines on both
-// catalog mounts of docs/metadata-search.md.
+// mdsRead is the result of one read step: the same table through both published engines on the
+// addressing forms of docs/metadata-search.md.
 type mdsRead struct {
-	// PyIceberg is PyIceberg through /mds/iceberg/api, loading the identifier
-	// [repository, ref, system, object_metadata].
+	// PyIceberg is PyIceberg through /iceberg/api, loading the identifier
+	// [system, metadata, repository, ref, objects].
 	PyIceberg mdsClientRead `json:"pyiceberg"`
-	// PyIcebergRelative is PyIceberg through /iceberg/relative_to/{repo}.{ref}/api, loading
-	// "system.object_metadata": the mount fixes the repository and the ref.
+	// PyIcebergRelative is PyIceberg through /iceberg/relative_to/system.metadata/api, loading
+	// [repository, ref, objects]: the warehouse fixes system and metadata.
 	PyIcebergRelative mdsClientRead `json:"pyiceberg_relative"`
-	// DuckDB is DuckDB through /iceberg/relative_to/{repo}.{ref}/api, from
-	// "system"."object_metadata".
+	// DuckDB is DuckDB through /iceberg/relative_to/system.metadata/api, from
+	// "<repository>.<ref>"."objects".
 	DuckDB mdsClientRead `json:"duckdb"`
-	// DuckDBIdentifier is DuckDB through /mds/iceberg/api, from
-	// "{repository}.{ref}.system"."object_metadata": the three levels are one schema.
+	// DuckDBIdentifier is DuckDB through /iceberg/api, from
+	// "system.metadata.<repository>.<ref>"."objects": the levels are one quoted schema.
 	DuckDBIdentifier mdsClientRead `json:"duckdb_identifier"`
+	// Legacy is the deprecated catalog's read of <repo>.<ref>.system.object_metadata, reported only
+	// by readLegacyRows: the suite has one case on that mount (G5).
+	Legacy mdsClientRead `json:"legacy"`
 }
 
 // requireAgrees asserts that every engine/mount combination of the guide reads the same table, so
-// that a case cannot pass on one form while the other serves something else. It compares the
-// columns every engine reports - path, commit_id, etag, size_bytes and user_metadata - and, when
-// the step materialises no rows, the count.
+// that a case cannot pass on one form while another serves something else. It compares the columns
+// every engine reports - path, commit_id, etag, size_bytes and user_metadata - and, when the step
+// materialises no rows, the count.
 func (r mdsRead) requireAgrees(t *testing.T, ref string) {
 	t.Helper()
 	engines := []struct {
 		name string
 		read mdsClientRead
 	}{
-		{"DuckDB through " + icebergcatalog.RelativeToBasePath, r.DuckDB},
-		{"PyIceberg through " + icebergcatalog.RelativeToBasePath, r.PyIcebergRelative},
-		{"DuckDB through " + icebergcatalog.MetadataSearchBasePath, r.DuckDBIdentifier},
+		{"DuckDB through " + icebergcatalog.RelativeToBasePath + "/system.metadata", r.DuckDB},
+		{"PyIceberg through " + icebergcatalog.RelativeToBasePath + "/system.metadata", r.PyIcebergRelative},
+		{"DuckDB through " + icebergcatalog.APIBasePath, r.DuckDBIdentifier},
 	}
 	if len(r.PyIceberg.Rows) == 0 {
 		// countRows: the rows are not materialised, so the count is the whole report.
 		for _, engine := range engines {
 			require.Equalf(t, r.PyIceberg.Count, engine.read.Count,
 				"%s must count the same rows of %s as PyIceberg through %s",
-				engine.name, ref, icebergcatalog.MetadataSearchBasePath)
+				engine.name, ref, icebergcatalog.APIBasePath)
 		}
 		return
 	}
 	want := mdsRowSignature(r.PyIceberg.Rows)
 	for _, engine := range engines {
 		require.Equalf(t, want, mdsRowSignature(engine.read.Rows),
-			"%s must read the same rows of %s as PyIceberg through %s: both mounts of the catalog "+
-				"serve the same table",
-			engine.name, ref, icebergcatalog.MetadataSearchBasePath)
+			"%s must read the same rows of %s as PyIceberg through %s: both addressing forms of the "+
+				"catalog serve the same table",
+			engine.name, ref, icebergcatalog.APIBasePath)
 	}
 	require.Equalf(t, r.PyIceberg.SourceCommit, r.PyIcebergRelative.SourceCommit,
 		"PyIceberg must read the same %s property through %s as through %s",
-		mdsTableSourceCommit, icebergcatalog.RelativeToBasePath, icebergcatalog.MetadataSearchBasePath)
+		mdsTableSourceCommit, icebergcatalog.RelativeToBasePath, icebergcatalog.APIBasePath)
 }
 
 // mdsRowSignature is the part of a row that every engine and every mount reports, in a comparable
@@ -2007,11 +1897,12 @@ func requireNonIncreasingSizes(t *testing.T, rows []mdsRow, description string) 
 	}
 }
 
-// readRows reads the virtual table of R at ref with both published engines on both published
-// mounts: PyIceberg and DuckDB through /mds/iceberg/api (the upstream endpoint of §5.5) and through
-// /iceberg/relative_to/{repo}.{ref}/api, the four recipes of docs/metadata-search.md. Every row of
-// §3.1 is reported by PyIceberg; DuckDB reports the columns the cases assert on, because that is
-// what its published recipe selects. The four reports must agree (requireAgrees).
+// readRows reads the metadata table of R at ref with both published engines on both published
+// addressing forms: PyIceberg and DuckDB through /iceberg/api (system.metadata.<repo>.<ref>.objects)
+// and through /iceberg/relative_to/system.metadata/api (<repo>.<ref>.objects), the four recipes of
+// docs/metadata-search.md. Every row of §3.1 is reported by PyIceberg; DuckDB reports the columns
+// the cases assert on, because that is what its published recipe selects. The four reports must
+// agree (requireAgrees).
 func (e *mdsEnv) readRows(t *testing.T, ref string) mdsRead {
 	t.Helper()
 	read := mdsDecode[mdsRead](t, e.runReadStep(t, ref, true, false))
@@ -2019,8 +1910,24 @@ func (e *mdsEnv) readRows(t *testing.T, ref string) mdsRead {
 	return read
 }
 
+// readLegacyRows reads the deprecated catalog's <repo>.<ref>.system.object_metadata at ref. It is
+// the one read of the suite through /mds/iceberg/api (G5): the caller compares it with readRows.
+func (e *mdsEnv) readLegacyRows(t *testing.T, ref string) mdsClientRead {
+	t.Helper()
+	env := e.readStepEnv(t, ref, true)
+	env["MDS_FILTERED"] = "0"
+	env["MDS_LEGACY_URI"] = e.dockerReachableURL(e.baseURL + icebergcatalog.MetadataSearchBasePath)
+	env["MDS_LEGACY_IDENTIFIER"] = e.legacyIdentifierJSON(t, ref)
+	result := e.runClient(t, "mds-read-legacy:"+ref, mdsReadScript, env)
+	legacy, ok := result["legacy"]
+	require.Truef(t, ok, "the read step must report the deprecated catalog's answer: %v", result)
+	legacyMap, ok := legacy.(map[string]any)
+	require.Truef(t, ok, "the read step must report the deprecated catalog's answer as an object: %v", legacy)
+	return mdsDecode[mdsClientRead](t, legacyMap)
+}
+
 // readFilteredRows runs the guide's filtered scans - PyIceberg's row_filter expression and DuckDB's
-// WHERE ... ORDER BY size_bytes DESC LIMIT - through the same four engine/mount recipes. It
+// WHERE ... ORDER BY size_bytes DESC LIMIT - through the same four engine/addressing recipes. It
 // returns the same result shape as readRows so the four answers are compared the same way.
 func (e *mdsEnv) readFilteredRows(t *testing.T, ref string) mdsRead {
 	t.Helper()
@@ -2057,42 +1964,59 @@ func (e *mdsEnv) runReadStep(t *testing.T, ref string, withRows, filtered bool) 
 	return e.runClient(t, "mds-read:"+ref, mdsReadScript, env)
 }
 
-// readStepEnv is the environment of one read step: the table, the ref and the four catalog mounts.
+// readStepEnv is the environment of one read step: the table, the ref and the four addresses.
 func (e *mdsEnv) readStepEnv(t *testing.T, ref string, withRows bool) map[string]string {
 	t.Helper()
-	identifier, err := json.Marshal([]string{e.repo, ref, icebergcatalog.SystemNamespace, icebergcatalog.ObjectMetadataTable})
+	identifier, err := json.Marshal([]string{
+		icebergcatalog.SystemNamespace, icebergcatalog.MetadataNamespace, e.repo, ref, icebergcatalog.ObjectsTable,
+	})
 	require.NoError(t, err, "marshal the PyIceberg identifier")
+	relativeIdentifier, err := json.Marshal([]string{e.repo, ref, icebergcatalog.ObjectsTable})
+	require.NoError(t, err, "marshal the PyIceberg relative_to identifier")
 	rows := "1"
 	if !withRows {
 		rows = "0"
 	}
+	relativeRootURI := e.dockerReachableURL(e.baseURL + icebergcatalog.RelativeToBasePath + "/" +
+		icebergcatalog.SystemNamespace + "." + icebergcatalog.MetadataNamespace)
 	return map[string]string{
-		"MDS_WAREHOUSE":          e.storageNamespace,
-		"MDS_IDENTIFIER":         string(identifier),
-		"MDS_CREDENTIAL":         e.key + ":" + e.secret,
-		"MDS_CATALOG_URI":        e.dockerReachableURL(e.baseURL + icebergcatalog.MetadataSearchBasePath),
-		"MDS_RELATIVE_URI":       e.dockerReachableURL(e.baseURL+icebergcatalog.RelativeToBasePath) + "/" + e.repo + "." + ref + "/api",
-		"MDS_OAUTH_URI":          e.dockerReachableURL(e.baseURL+icebergcatalog.MetadataSearchBasePath) + "/v1/oauth/tokens",
-		"MDS_RELATIVE_OAUTH_URI": e.dockerReachableURL(e.baseURL+icebergcatalog.APIBasePath) + "/v1/oauth/tokens",
-		"MDS_RELATIVE_TABLE":     icebergcatalog.SystemNamespace + "." + icebergcatalog.ObjectMetadataTable,
-		"MDS_MDS_SCHEMA":         e.repo + "." + ref + "." + icebergcatalog.SystemNamespace,
-		"MDS_ROWS":               rows,
+		"MDS_WAREHOUSE":           e.storageNamespace,
+		"MDS_IDENTIFIER":          string(identifier),
+		"MDS_RELATIVE_IDENTIFIER": string(relativeIdentifier),
+		"MDS_CREDENTIAL":          e.key + ":" + e.secret,
+		"MDS_CATALOG_URI":         e.dockerReachableURL(e.baseURL + icebergcatalog.APIBasePath),
+		"MDS_OAUTH_URI":           e.dockerReachableURL(e.baseURL+icebergcatalog.APIBasePath) + "/v1/oauth/tokens",
+		"MDS_RELATIVE_URI":        relativeRootURI + "/api",
+		"MDS_RELATIVE_OAUTH_URI":  e.dockerReachableURL(e.baseURL+icebergcatalog.APIBasePath) + "/v1/oauth/tokens",
+		"MDS_RELATIVE_SCHEMA":     e.repo + "." + ref,
+		"MDS_CATALOG_SCHEMA":      icebergcatalog.SystemNamespace + "." + icebergcatalog.MetadataNamespace + "." + e.repo + "." + ref,
+		"MDS_ROWS":                rows,
 	}
 }
 
-// loadTableAs loads the virtual table of R at ref as an arbitrary principal and returns the status
-// and body: the negative authorization cases are about the status, and the body says which
+// legacyIdentifierJSON is the deprecated catalog's identifier [repository, ref, system,
+// object_metadata] as the client step takes it.
+func (e *mdsEnv) legacyIdentifierJSON(t *testing.T, ref string) string {
+	t.Helper()
+	identifier, err := json.Marshal([]string{e.repo, ref, icebergcatalog.SystemNamespace, icebergcatalog.ObjectMetadataTable})
+	require.NoError(t, err, "marshal the deprecated catalog's identifier")
+	return string(identifier)
+}
+
+// loadTableAs loads the metadata tree's table of R at ref as an arbitrary principal and returns the
+// status and body: the negative authorization cases are about the status, and the body says which
 // exception the catalog chose.
 func (e *mdsEnv) loadTableAs(t *testing.T, key, secret, ref string) (int, []byte) {
 	t.Helper()
-	return e.loadAs(t, key, secret, e.virtualTableURL(ref))
+	return e.loadAs(t, key, secret, e.rootTreeURL(ref))
 }
 
 // loadMetadataTableAs loads R-metadata's own table at ref as an arbitrary principal. It is the
-// control for the "R-metadata only" case: the grant really is there, the virtual table is not.
+// control for the "R-metadata only" case: the grant really is there, the metadata tree is not.
 func (e *mdsEnv) loadMetadataTableAs(t *testing.T, key, secret, ref string) (int, []byte) {
 	t.Helper()
-	return e.loadAs(t, key, secret, e.tableURLFor(icebergcatalog.MetadataSearchBasePath, e.metadataRepo, ref))
+	return e.loadAs(t, key, secret, e.tableURLFor(icebergcatalog.APIBasePath,
+		[]string{e.metadataRepo, ref, icebergcatalog.SystemNamespace, icebergcatalog.ObjectMetadataTable}))
 }
 
 // loadAs issues one authenticated loadTable request.
@@ -2110,22 +2034,53 @@ func (e *mdsEnv) loadAs(t *testing.T, key, secret, rawURL string) (int, []byte) 
 	return resp.StatusCode, body.Bytes()
 }
 
-// virtualTableURL is the loadTable URL of R.<ref>.system.object_metadata through the upstream
-// endpoint of §5.5.
-func (e *mdsEnv) virtualTableURL(ref string) string {
-	return e.tableURLFor(icebergcatalog.MetadataSearchBasePath, e.repo, ref)
+// mdsLoadedTable is the part of a loadTable answer the suite reads: where the table's metadata is
+// and the properties that name the data repository and the indexing position.
+type mdsLoadedTable struct {
+	MetadataLocation string `json:"metadata-location"`
+	Metadata         struct {
+		Properties map[string]string `json:"properties"`
+	} `json:"metadata"`
 }
 
-// tableURLFor is the loadTable URL of repo.ref.system.object_metadata below a catalog mount.
-func (e *mdsEnv) tableURLFor(mountPath, repo, ref string) string {
-	levels := []string{repo, ref, icebergcatalog.SystemNamespace}
-	encoded := make([]string, 0, len(levels))
-	for _, level := range levels {
-		encoded = append(encoded, url.PathEscape(level))
+// loadTableDocument issues one authenticated loadTable request, decodes the answer and returns the
+// status, the decoded table and the raw body. It is how the deprecated-catalog case compares the
+// table the two catalogs hand out.
+func (e *mdsEnv) loadTableDocument(t *testing.T, key, secret, rawURL string) (int, mdsLoadedTable, []byte) {
+	t.Helper()
+	status, body := e.loadAs(t, key, secret, rawURL)
+	var loaded mdsLoadedTable
+	if status == http.StatusOK {
+		require.NoErrorf(t, json.Unmarshal(body, &loaded), "decode the loadTable answer of %s: %s", rawURL, body)
+	}
+	return status, loaded, body
+}
+
+// rootTreeURL is the loadTable URL of system.metadata.<repo>.<ref>.objects on the lakeFS catalog.
+func (e *mdsEnv) rootTreeURL(ref string) string {
+	return e.tableURLFor(icebergcatalog.APIBasePath, []string{
+		icebergcatalog.SystemNamespace, icebergcatalog.MetadataNamespace, e.repo, ref, icebergcatalog.ObjectsTable,
+	})
+}
+
+// deprecatedTableURL is the loadTable URL of <repo>.<ref>.system.object_metadata on the guide's
+// deprecated, separate catalog (G5).
+func (e *mdsEnv) deprecatedTableURL(ref string) string {
+	return e.tableURLFor(icebergcatalog.MetadataSearchBasePath, []string{
+		e.repo, ref, icebergcatalog.SystemNamespace, icebergcatalog.ObjectMetadataTable,
+	})
+}
+
+// tableURLFor is the loadTable URL of a table whose namespace is the first len(levels)-1 entries
+// of levels and whose name is the last, below a catalog mount.
+func (e *mdsEnv) tableURLFor(mountPath string, levels []string) string {
+	namespace := make([]string, 0, len(levels)-1)
+	for _, level := range levels[:len(levels)-1] {
+		namespace = append(namespace, url.PathEscape(level))
 	}
 	return e.baseURL + mountPath + "/v1/" + icebergcatalog.CatalogPrefix + "/namespaces/" +
-		strings.Join(encoded, icebergcatalog.EncodedNamespaceSeparator) +
-		"/tables/" + url.PathEscape(icebergcatalog.ObjectMetadataTable)
+		strings.Join(namespace, icebergcatalog.EncodedNamespaceSeparator) +
+		"/tables/" + url.PathEscape(levels[len(levels)-1])
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2897,7 +2852,7 @@ def pyiceberg_read(uri, identifier, row_filter=None):
 
 
 def duckdb_iceberg_connection(oauth_uri):
-    # A connection per mount: the catalog secret names the OAuth server of the mount the ATTACH
+    # A connection per address: the catalog secret names the OAuth server of the address the ATTACH
     # below uses, and a fresh duckdb.connect() keeps the two secrets and ATTACHes apart.
     con = duckdb.connect()
     con.execute("INSTALL iceberg")
@@ -2941,15 +2896,17 @@ def duckdb_rows(con, query, columns):
     return {"rows": rows, "count": len(rows) if with_rows else count}
 
 
-# --- PyIceberg, through /mds/iceberg/api (the upstream endpoint of design §5.5) ---------------
+# --- PyIceberg, through /iceberg/api (system.metadata.<repo>.<ref>.objects) -------------------
 pyiceberg = pyiceberg_read(required("MDS_CATALOG_URI"), tuple(json.loads(required("MDS_IDENTIFIER"))))
 
-# --- PyIceberg, through /iceberg/relative_to/{repo}.{ref}/api (the warehouse form) ------------
-pyiceberg_relative = pyiceberg_read(required("MDS_RELATIVE_URI"), required("MDS_RELATIVE_TABLE"))
+# --- PyIceberg, through /iceberg/relative_to/system.metadata/api (<repo>.<ref>.objects) -------
+pyiceberg_relative = pyiceberg_read(required("MDS_RELATIVE_URI"),
+                                    tuple(json.loads(required("MDS_RELATIVE_IDENTIFIER"))))
 
-# --- DuckDB, through /iceberg/relative_to/{repo}.{ref}/api ------------------------------------
-relation = required("MDS_RELATIVE_TABLE")
+# --- DuckDB, through /iceberg/relative_to/system.metadata/api ---------------------------------
+# The warehouse fixes system.metadata, so the client names "<repo>.<ref>" and "objects".
 duckdb_columns = ["path", "etag", "commit_id", "size_bytes", "user_metadata"]
+relative_schema = sql_identifier(required("MDS_RELATIVE_SCHEMA"))
 con = duckdb_iceberg_connection(required("MDS_RELATIVE_OAUTH_URI"))
 con.execute(
     "ATTACH %s AS lakefs (TYPE iceberg, ENDPOINT %s)" % (
@@ -2957,29 +2914,28 @@ con.execute(
         sql_literal(required("MDS_RELATIVE_URI")),
     )
 )
-duckdb_query = 'SELECT %s FROM lakefs."system"."object_metadata"' % ", ".join(duckdb_columns)
+duckdb_query = 'SELECT %s FROM lakefs.%s."objects"' % (", ".join(duckdb_columns), relative_schema)
 if not with_rows:
-    duckdb_query = 'SELECT count(*) FROM lakefs."system"."object_metadata"'
+    duckdb_query = 'SELECT count(*) FROM lakefs.%s."objects"' % relative_schema
 duckdb_relative = duckdb_rows(con, duckdb_query, duckdb_columns)
 
-# --- DuckDB, through /mds/iceberg/api (the identifier form: one schema, three levels) ---------
-# The guide's note for this form: the OAuth token URI is the /mds one, and the repository and the
-# ref stay in the identifier, so the schema is the single quoted name
-# "{repository}.{ref}.system" and the table stands on its own.
-mds_schema = sql_identifier(required("MDS_MDS_SCHEMA"))
-con_mds = duckdb_iceberg_connection(required("MDS_OAUTH_URI"))
-con_mds.execute(
-    "ATTACH %s AS lakefs_mds (TYPE iceberg, ENDPOINT %s)" % (
+# --- DuckDB, through /iceberg/api (the identifier form: one quoted schema, five levels) -------
+# Every level is one part of the Iceberg namespace, so the schema is the single quoted name
+# "system.metadata.<repo>.<ref>" and the table stands on its own.
+catalog_schema = sql_identifier(required("MDS_CATALOG_SCHEMA"))
+con_catalog = duckdb_iceberg_connection(required("MDS_OAUTH_URI"))
+con_catalog.execute(
+    "ATTACH %s AS lakefs_catalog (TYPE iceberg, ENDPOINT %s)" % (
         sql_literal(required("MDS_WAREHOUSE")),
         sql_literal(required("MDS_CATALOG_URI")),
     )
 )
-duckdb_mds_query = 'SELECT %s FROM lakefs_mds.%s."object_metadata"' % (
-    ", ".join(duckdb_columns), mds_schema,
+duckdb_catalog_query = 'SELECT %s FROM lakefs_catalog.%s."objects"' % (
+    ", ".join(duckdb_columns), catalog_schema,
 )
 if not with_rows:
-    duckdb_mds_query = 'SELECT count(*) FROM lakefs_mds.%s."object_metadata"' % mds_schema
-duckdb_identifier = duckdb_rows(con_mds, duckdb_mds_query, duckdb_columns)
+    duckdb_catalog_query = 'SELECT count(*) FROM lakefs_catalog.%s."objects"' % catalog_schema
+duckdb_identifier = duckdb_rows(con_catalog, duckdb_catalog_query, duckdb_columns)
 
 # --- the guide's filtered scans ---------------------------------------------------------------
 # PyIceberg takes the expression as a row_filter; DuckDB spells the same predicate in SQL and adds
@@ -2996,22 +2952,29 @@ if filtered:
     filtered_pyiceberg = pyiceberg_read(required("MDS_CATALOG_URI"),
                                          tuple(json.loads(required("MDS_IDENTIFIER"))), expression)
     filtered_pyiceberg_relative = pyiceberg_read(required("MDS_RELATIVE_URI"),
-                                                  required("MDS_RELATIVE_TABLE"), expression)
+                                                  tuple(json.loads(required("MDS_RELATIVE_IDENTIFIER"))), expression)
     like = sql_literal(prefix + "%")
     filtered_duckdb_query = (
-        'SELECT %s FROM lakefs."system"."object_metadata" '
+        'SELECT %s FROM lakefs.%s."objects" '
         'WHERE path LIKE %s AND size_bytes > 0 ORDER BY size_bytes DESC LIMIT 20'
-    ) % (", ".join(duckdb_columns), like)
-    filtered_duckdb_query_mds = (
-        'SELECT %s FROM lakefs_mds.%s."object_metadata" '
+    ) % (", ".join(duckdb_columns), relative_schema, like)
+    filtered_duckdb_query_catalog = (
+        'SELECT %s FROM lakefs_catalog.%s."objects" '
         'WHERE path LIKE %s AND size_bytes > 0 ORDER BY size_bytes DESC LIMIT 20'
-    ) % (", ".join(duckdb_columns), mds_schema, like)
+    ) % (", ".join(duckdb_columns), catalog_schema, like)
     result["filtered"] = {
         "pyiceberg": filtered_pyiceberg,
         "pyiceberg_relative": filtered_pyiceberg_relative,
         "duckdb": duckdb_rows(con, filtered_duckdb_query, duckdb_columns),
-        "duckdb_identifier": duckdb_rows(con_mds, filtered_duckdb_query_mds, duckdb_columns),
+        "duckdb_identifier": duckdb_rows(con_catalog, filtered_duckdb_query_catalog, duckdb_columns),
     }
+
+# --- the deprecated catalog, only when a case asks for it (G5) --------------------------------
+# The separate Metadata Search catalog still serves <repo>.<ref>.system.object_metadata. Exactly
+# one case of the suite reads it, through MDS_LEGACY_URI/MDS_LEGACY_IDENTIFIER.
+if os.environ.get("MDS_LEGACY_URI"):
+    result["legacy"] = pyiceberg_read(required("MDS_LEGACY_URI"),
+                                      tuple(json.loads(required("MDS_LEGACY_IDENTIFIER"))))
 
 print("RESULT:" + json.dumps(result))
 `

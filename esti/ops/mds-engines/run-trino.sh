@@ -49,6 +49,8 @@ run_trino_variant() {
     echo "iceberg.rest-catalog.oauth2.credential=${MDS_ADMIN_KEY}:${MDS_ADMIN_SECRET}"
     echo "iceberg.rest-catalog.oauth2.server-uri=${oauth_uri}"
     echo "iceberg.rest-catalog.vended-credentials-enabled=false"
+    # Both addresses name a multi-level namespace (<repo>.<ref> or system.metadata.<repo>.<ref>), so
+    # the nested-namespace switch is required on both.
     [ "$nested" = "true" ] && echo "iceberg.rest-catalog.nested-namespace-enabled=true"
     echo "fs.s3.enabled=true"
     echo "s3.endpoint=${MDS_SEAWEEDFS_CONTAINER_ENDPOINT}"
@@ -97,10 +99,10 @@ run_trino_variant() {
   remaining=$((deadline - $(date +%s)))
   [ "$remaining" -gt 0 ] || die "Trino ${variant} consumed its whole ${TRINO_TIMEOUT}s budget before the query"
 
-  if [ "$variant" = "mds" ]; then
-    sql="SELECT path, size_bytes, commit_id, user_metadata FROM lakefs.\"${MDS_REPO}.main.system\".object_metadata WHERE path LIKE 'orders/%';"
+  if [ "$variant" = "catalog" ]; then
+    sql="SELECT path, size_bytes, commit_id, user_metadata FROM lakefs.\"system.metadata.${MDS_REPO}.main\".objects WHERE path LIKE 'orders/%';"
   else
-    sql="SELECT path, size_bytes, commit_id, user_metadata FROM lakefs.system.object_metadata WHERE path LIKE 'orders/%';"
+    sql="SELECT path, size_bytes, commit_id, user_metadata FROM lakefs.\"${MDS_REPO}.main\".objects WHERE path LIKE 'orders/%';"
   fi
 
   log "querying Trino ${variant}"
@@ -116,13 +118,13 @@ run_trino_variant() {
   CURRENT_CONTAINER=
 }
 
-run_trino_variant mds \
-  "${MDS_DOCKER_SERVER_URL}/mds/iceberg/api" \
-  "${MDS_DOCKER_SERVER_URL}/mds/iceberg/api/v1/oauth/tokens" \
+run_trino_variant catalog \
+  "${MDS_DOCKER_SERVER_URL}/iceberg/api" \
+  "${MDS_DOCKER_SERVER_URL}/iceberg/api/v1/oauth/tokens" \
   true
 run_trino_variant relative \
-  "${MDS_DOCKER_SERVER_URL}/iceberg/relative_to/${MDS_REPO}.main/api" \
+  "${MDS_DOCKER_SERVER_URL}/iceberg/relative_to/system.metadata/api" \
   "${MDS_DOCKER_SERVER_URL}/iceberg/api/v1/oauth/tokens" \
-  false
-assert_same_rows "$RUN_DIR/trino-mds.rows.tsv" "$RUN_DIR/trino-relative.rows.tsv" "Trino"
+  true
+assert_same_rows "$RUN_DIR/trino-catalog.rows.tsv" "$RUN_DIR/trino-relative.rows.tsv" "Trino"
 log "Trino snippets passed"
