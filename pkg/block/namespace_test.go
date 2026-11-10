@@ -3,9 +3,11 @@ package block_test
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/go-test/deep"
+	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/block"
 )
 
@@ -187,6 +189,71 @@ func TestResolveNamespace(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestNamespaceDeletePrefix pins the shared delete-prefix guard of REPO_DELETE_STORAGE_DESIGN.md
+// section 2.2: exactly one trailing "/", the storage root for each blockstore, and
+// ErrNamespaceIsRoot whenever the prefix would be empty so a bucket/container/root is refused.
+func TestNamespaceDeletePrefix(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		Name           string
+		Namespace      string
+		ExpectedRoot   string
+		ExpectedPrefix string
+		ExpectedErr    error
+	}{
+		{Name: "s3_root", Namespace: "s3://bucket", ExpectedErr: block.ErrNamespaceIsRoot},
+		{Name: "s3_root_trailing_slash", Namespace: "s3://bucket/", ExpectedErr: block.ErrNamespaceIsRoot},
+		{Name: "s3_prefix", Namespace: "s3://bucket/data", ExpectedRoot: "s3://bucket", ExpectedPrefix: "data/"},
+		{Name: "s3_prefix_trailing_slash", Namespace: "s3://bucket/data/", ExpectedRoot: "s3://bucket", ExpectedPrefix: "data/"},
+		{Name: "s3_nested_prefix", Namespace: "s3://bucket/data/inner/", ExpectedRoot: "s3://bucket", ExpectedPrefix: "data/inner/"},
+		{Name: "gs_root", Namespace: "gs://bucket", ExpectedErr: block.ErrNamespaceIsRoot},
+		{Name: "gs_prefix", Namespace: "gs://bucket/a/b", ExpectedRoot: "gs://bucket", ExpectedPrefix: "a/b/"},
+		{Name: "azure_container_root", Namespace: "https://acct.blob.core.windows.net/c", ExpectedErr: block.ErrNamespaceIsRoot},
+		{Name: "azure_container_root_trailing_slash", Namespace: "https://acct.blob.core.windows.net/c/", ExpectedErr: block.ErrNamespaceIsRoot},
+		{
+			Name:           "azure_path",
+			Namespace:      "https://acct.blob.core.windows.net/c/p",
+			ExpectedRoot:   "https://acct.blob.core.windows.net/c",
+			ExpectedPrefix: "p/",
+		},
+		{
+			Name:           "azure_nested_path_trailing_slash",
+			Namespace:      "https://acct.blob.core.windows.net/c/p/q/",
+			ExpectedRoot:   "https://acct.blob.core.windows.net/c",
+			ExpectedPrefix: "p/q/",
+		},
+		{Name: "local_root", Namespace: "local://", ExpectedErr: block.ErrNamespaceIsRoot},
+		{Name: "local_root_slash", Namespace: "local:///", ExpectedErr: block.ErrNamespaceIsRoot},
+		{Name: "local_namespace", Namespace: "local://repo1", ExpectedRoot: "local://", ExpectedPrefix: "repo1/"},
+		{Name: "local_namespace_trailing_slash", Namespace: "local://repo1/", ExpectedRoot: "local://", ExpectedPrefix: "repo1/"},
+		{Name: "local_namespace_path", Namespace: "local://repo1/path/", ExpectedRoot: "local://", ExpectedPrefix: "repo1/path/"},
+		{Name: "local_absolute_namespace", Namespace: "local:///var/lib/lakefs", ExpectedRoot: "local://", ExpectedPrefix: "var/lib/lakefs/"},
+		{Name: "mem_root", Namespace: "mem://", ExpectedErr: block.ErrNamespaceIsRoot},
+		{Name: "mem_namespace", Namespace: "mem://analytics", ExpectedRoot: "mem://", ExpectedPrefix: "analytics/"},
+		{Name: "mem_namespace_path", Namespace: "mem://analytics/prefix", ExpectedRoot: "mem://", ExpectedPrefix: "analytics/prefix/"},
+		{Name: "memory_namespace", Namespace: "memory://analytics", ExpectedRoot: "mem://", ExpectedPrefix: "analytics/"},
+		{Name: "empty", Namespace: "", ExpectedErr: block.ErrInvalidAddress},
+		{Name: "no_scheme", Namespace: "bucket/data", ExpectedErr: block.ErrInvalidAddress},
+		{Name: "unknown_scheme", Namespace: "ftp://bucket/data", ExpectedErr: block.ErrInvalidAddress},
+		{Name: "azure_without_container", Namespace: "https://acct.blob.core.windows.net", ExpectedErr: block.ErrInvalidNamespace},
+	}
+	for _, cas := range cases {
+		t.Run(cas.Name, func(t *testing.T) {
+			t.Parallel()
+			root, prefix, err := block.NamespaceDeletePrefix(cas.Namespace)
+			if cas.ExpectedErr != nil {
+				require.ErrorIs(t, err, cas.ExpectedErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, cas.ExpectedRoot, root)
+			require.Equal(t, cas.ExpectedPrefix, prefix)
+			require.True(t, strings.HasSuffix(prefix, "/"), "prefix must end in a slash")
+			require.False(t, strings.HasSuffix(prefix, "//"), "prefix must end in exactly one slash")
+		})
 	}
 }
 

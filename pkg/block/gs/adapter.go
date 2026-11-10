@@ -720,6 +720,7 @@ func (a *Adapter) GetStorageNamespaceInfo(string) *block.StorageNamespaceInfo {
 	if !(a.disablePreSignedUI || a.disablePreSigned) {
 		info.PreSignSupportUI = true
 	}
+	info.DeleteNamespaceSupport = true
 	return &info
 }
 

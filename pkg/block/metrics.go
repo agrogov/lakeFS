@@ -179,6 +179,15 @@ func (m *MetricsAdapter) CompleteMultiPartUpload(ctx context.Context, obj Object
 	return m.adapter.CompleteMultiPartUpload(ctx, obj, uploadID, multipartList)
 }
 
+func (m *MetricsAdapter) DeleteNamespacePage(ctx context.Context, storageID, storageNamespace string, opts DeleteNamespaceOpts) (*DeleteNamespaceResult, error) {
+	blockstoreType := m.adapter.BlockstoreType()
+	const operation = "delete_namespace_page"
+	concurrentOperations.WithLabelValues(operation, blockstoreType).Inc()
+	defer concurrentOperations.WithLabelValues(operation, blockstoreType).Dec()
+	ctx = httputil.SetClientTrace(ctx, blockstoreType)
+	return m.adapter.DeleteNamespacePage(ctx, storageID, storageNamespace, opts)
+}
+
 func (m *MetricsAdapter) BlockstoreType() string {
 	return m.adapter.BlockstoreType()
 }

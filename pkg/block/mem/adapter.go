@@ -443,6 +443,7 @@ func (a *Adapter) GetStorageNamespaceInfo(string) *block.StorageNamespaceInfo {
 	info := block.DefaultStorageNamespaceInfo(block.BlockstoreTypeMem)
 	info.PreSignSupport = false
 	info.ImportSupport = false
+	info.DeleteNamespaceSupport = true
 	return &info
 }
 

@@ -26,6 +26,7 @@ func AdapterTest(t *testing.T, adapter block.Adapter, storageNamespace, external
 	t.Run("Adapter_Walker", func(t *testing.T) { testAdapterWalker(t, adapter, storageNamespace) })
 	t.Run("Adapter_GetPreSignedURL", func(t *testing.T) { testGetPreSignedURL(t, adapter, storageNamespace) })
 	t.Run("Adapter_GetProperties", func(t *testing.T) { testGetProperties(t, adapter, storageNamespace) })
+	t.Run("Adapter_DeleteNamespace", func(t *testing.T) { testAdapterDeleteNamespace(t, adapter, storageNamespace) })
 }
 
 func AdapterPresignedEndpointOverrideTest(t *testing.T, adapter block.Adapter, storageNamespace, externalPath string, oe *url.URL) {

@@ -156,6 +156,20 @@ type ListMultipartUploadsOpts struct {
 	KeyMarker      *string
 }
 
+// DeleteNamespaceOpts are the arguments of one Adapter.DeleteNamespacePage call.
+type DeleteNamespaceOpts struct {
+	After string   // relative key; "" starts from the beginning
+	Limit int      // objects to delete in this call; the adapter may delete fewer
+	Keep  []string // relative keys to leave in place (the worker passes "_lakefs/dummy")
+}
+
+// DeleteNamespaceResult reports one page of a namespace deletion.
+type DeleteNamespaceResult struct {
+	Deleted int
+	LastKey string // relative key of the last listed object; the worker stores it as the next After
+	Done    bool
+}
+
 // Properties of an object stored on the underlying block store.
 // Refer to the actual underlying Adapter for which properties are
 // actually reported.
@@ -212,6 +226,11 @@ type Adapter interface {
 	ListMultipartUploads(ctx context.Context, obj ObjectPointer, opts ListMultipartUploadsOpts) (*ListMultipartUploadsResponse, error)
 	AbortMultiPartUpload(ctx context.Context, obj ObjectPointer, uploadID string) error
 	CompleteMultiPartUpload(ctx context.Context, obj ObjectPointer, uploadID string, multipartList *MultipartUploadCompletion) (*CompleteMultiPartUploadResponse, error)
+
+	// DeleteNamespacePage deletes up to opts.Limit objects under storageNamespace whose keys sort after
+	// opts.After, skipping opts.Keep (keys relative to the namespace). It never touches a key outside
+	// "<namespace>/". Deleting a missing object is success. Done reports that the listing reached the end.
+	DeleteNamespacePage(ctx context.Context, storageID, storageNamespace string, opts DeleteNamespaceOpts) (*DeleteNamespaceResult, error)
 
 	BlockstoreType() string
 	BlockstoreMetadata(ctx context.Context) (*BlockstoreMetadata, error)

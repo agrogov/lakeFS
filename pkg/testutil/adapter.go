@@ -5,10 +5,18 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/treeverse/lakefs/pkg/block"
 )
+
+// DeleteNamespaceCall is one recorded MockAdapter.DeleteNamespacePage call.
+type DeleteNamespaceCall struct {
+	StorageID        string
+	StorageNamespace string
+	Opts             block.DeleteNamespaceOpts
+}
 
 type MockAdapter struct {
 	TotalSize            int64
@@ -18,6 +26,9 @@ type MockAdapter struct {
 
 	blockstoreMetadata block.BlockstoreMetadata
 	namespaceRegion    *string
+
+	deleteNamespaceMu    sync.Mutex
+	deleteNamespaceCalls []DeleteNamespaceCall
 }
 
 var (
@@ -139,7 +150,26 @@ func (a *MockAdapter) GetStorageNamespaceInfo(string) *block.StorageNamespaceInf
 	info := block.DefaultStorageNamespaceInfo("s3")
 	info.PreSignSupport = false
 	info.ImportSupport = false
+	info.DeleteNamespaceSupport = true
 	return &info
+}
+
+func (a *MockAdapter) DeleteNamespacePage(_ context.Context, storageID, storageNamespace string, opts block.DeleteNamespaceOpts) (*block.DeleteNamespaceResult, error) {
+	a.deleteNamespaceMu.Lock()
+	a.deleteNamespaceCalls = append(a.deleteNamespaceCalls, DeleteNamespaceCall{
+		StorageID:        storageID,
+		StorageNamespace: storageNamespace,
+		Opts:             opts,
+	})
+	a.deleteNamespaceMu.Unlock()
+	return &block.DeleteNamespaceResult{Done: true}, nil
+}
+
+// DeleteNamespaceCalls returns a copy of the recorded DeleteNamespacePage calls.
+func (a *MockAdapter) DeleteNamespaceCalls() []DeleteNamespaceCall {
+	a.deleteNamespaceMu.Lock()
+	defer a.deleteNamespaceMu.Unlock()
+	return append([]DeleteNamespaceCall(nil), a.deleteNamespaceCalls...)
 }
 
 func (a *MockAdapter) ResolveNamespace(_, storageNamespace, key string, identifierType block.IdentifierType) (block.QualifiedKey, error) {

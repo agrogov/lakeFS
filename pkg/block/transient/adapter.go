@@ -153,7 +153,12 @@ func (a *Adapter) GetStorageNamespaceInfo(string) *block.StorageNamespaceInfo {
 	info.PreSignSupport = false
 	info.PreSignSupportUI = false
 	info.ImportSupport = false
+	info.DeleteNamespaceSupport = false
 	return &info
+}
+
+func (a *Adapter) DeleteNamespacePage(_ context.Context, _, _ string, _ block.DeleteNamespaceOpts) (*block.DeleteNamespaceResult, error) {
+	return nil, block.ErrOperationNotSupported
 }
 
 func (a *Adapter) ResolveNamespace(_, storageNamespace, key string, identifierType block.IdentifierType) (block.QualifiedKey, error) {

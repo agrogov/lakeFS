@@ -1,6 +1,7 @@
 package block
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -53,6 +54,9 @@ type StorageNamespaceInfo struct {
 	PreSignSupportMultipart bool
 	ImportSupport           bool
 	ImportValidityRegex     string
+	// DeleteNamespaceSupport reports whether the adapter can delete every object under a storage
+	// namespace (Adapter.DeleteNamespacePage).
+	DeleteNamespaceSupport bool
 }
 
 type QualifiedKey interface {
@@ -148,6 +152,57 @@ func NamespaceRoot(namespace string) (root, path string, err error) {
 		return "", "", fmt.Errorf("azure storage namespace %q names no container: %w", namespace, ErrInvalidNamespace)
 	}
 	return fmt.Sprintf("%s://%s/%s", parsed.Scheme, parsed.Host, segments[0]), strings.Join(segments[1:], "/"), nil
+}
+
+var (
+	// ErrNamespaceIsRoot is returned when a storage namespace names the root of its storage
+	// location - an S3 or GCS bucket, an Azure container, or local://, mem:// - so there is no
+	// namespace-only prefix to delete under.
+	ErrNamespaceIsRoot = errors.New("storage namespace is a storage root")
+
+	// ErrNamespaceDeleteOutsidePrefix is returned by an adapter that a listing handed a key which
+	// is not under the namespace's delete prefix. It guards against a listing bug deleting outside
+	// the namespace and is never expected in normal operation.
+	ErrNamespaceDeleteOutsidePrefix = errors.New("key outside the namespace delete prefix")
+)
+
+// NamespaceDeletePrefix returns the listing root of storageNamespace and the key prefix that
+// bounds everything a namespace deletion may touch. The prefix always ends in exactly one "/",
+// which is what keeps a sibling namespace such as "<namespace>-metadata/" out of a deletion of
+// "<namespace>".
+//
+// The root is the storage location the namespace lives in: for S3 and GCS the bucket, for Azure
+// the container (its first path segment), and for local and mem the scheme alone - "local://repo1"
+// is a namespace and "local://" is the root. A namespace that would produce an empty prefix is a
+// root and returns ErrNamespaceIsRoot (REPO_DELETE_STORAGE_DESIGN.md section 2.2).
+func NamespaceDeletePrefix(storageNamespace string) (root, prefix string, err error) {
+	parsed, err := url.Parse(storageNamespace)
+	if err != nil {
+		return "", "", fmt.Errorf("parse storage namespace %q: %w", storageNamespace, ErrInvalidNamespace)
+	}
+	storageType, err := GetStorageType(parsed)
+	if err != nil {
+		return "", "", fmt.Errorf("storage namespace %q: %w", storageNamespace, err)
+	}
+
+	var path string
+	switch storageType {
+	case StorageTypeLocal, StorageTypeMem:
+		// For local and mem the host part is not a bucket: it is the first path segment of the
+		// namespace (local://repo1), so the root is the scheme alone.
+		root = storageType.Scheme() + "://"
+		path = strings.Trim(parsed.Host+parsed.Path, "/")
+	default:
+		root, path, err = NamespaceRoot(storageNamespace)
+		if err != nil {
+			return "", "", err
+		}
+	}
+
+	if path == "" {
+		return "", "", fmt.Errorf("%q: %w", storageNamespace, ErrNamespaceIsRoot)
+	}
+	return root, path + "/", nil
 }
 
 func formatPathWithNamespace(namespacePath, keyPath string) string {

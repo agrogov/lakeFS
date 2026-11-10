@@ -551,6 +551,7 @@ func (l *Adapter) GetStorageNamespaceInfo(string) *block.StorageNamespaceInfo {
 	info.PreSignSupport = false
 	info.DefaultNamespacePrefix = DefaultNamespacePrefix
 	info.ImportSupport = l.importEnabled
+	info.DeleteNamespaceSupport = true
 	return &info
 }
 

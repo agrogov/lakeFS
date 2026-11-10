@@ -920,6 +920,7 @@ func (a *Adapter) GetStorageNamespaceInfo(string) *block.StorageNamespaceInfo {
 	if !a.disablePreSignedMultipart && info.PreSignSupport {
 		info.PreSignSupportMultipart = true
 	}
+	info.DeleteNamespaceSupport = true
 	return &info
 }
 
