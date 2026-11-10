@@ -1,0 +1,10 @@
+Repository: lakefs://${REPO}
+Warning: Deleting repository '${REPO}' also deletes every object under '${STORAGE}'. Objects referenced from other repositories will break.
+
+[?25l[2K[1m[34m?[0m [1mAre you sure you want to delete repository ${REPO} and every object under ${STORAGE}[0m? [2m[y/N][0m █
+[1A[2K[2K[1m[34m?[0m [1mAre you sure you want to delete repository ${REPO} and every object under ${STORAGE}[0m? [2m[y/N][0m n█
+[1A[2K[2K[1m[34m?[0m [1mAre you sure you want to delete repository ${REPO} and every object under ${STORAGE}[0m? [2m[y/N][0m n█
+[1A[2K[2K[1m[31m✗[0m [1mAre you sure you want to delete repository ${REPO} and every object under ${STORAGE}[0m[1m:[0m 
+[?25hDelete Repository '${REPO}' aborted
+
+Error executing command.

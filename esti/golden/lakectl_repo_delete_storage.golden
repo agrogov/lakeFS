@@ -1,0 +1,4 @@
+Repository: lakefs://${REPO}
+Warning: Deleting repository '${REPO}' also deletes every object under '${STORAGE}'. Objects referenced from other repositories will break.
+
+Repository '${REPO}' storage deletion requested

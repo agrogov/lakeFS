@@ -1,0 +1,8 @@
+repository: deletion-stub-repo
+storage namespace: s3://deletion-stub/bucket
+state: done
+objects deleted: 7
+requested by: esti
+requested at: <DATE> <TIME> <TZ>
+updated at: <DATE> <TIME> <TZ>
+attempts: 1

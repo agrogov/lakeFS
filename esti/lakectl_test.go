@@ -1,7 +1,10 @@
 package esti
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -1259,4 +1262,114 @@ func TestLakectlTagList(t *testing.T) {
 		RunCmdAndVerifySuccess(t, Lakectl()+" tag delete lakefs://"+repoName+"/tag1 -y", false, "", vars)
 		RunCmdAndVerifySuccessWithFile(t, Lakectl()+" tag list lakefs://"+repoName, false, "lakectl_tag_list_single", vars_test)
 	})
+}
+
+// TestLakectlRepoDeleteStorage covers the repository storage deletion surface of the CLI (R23):
+// the confirmation prompt, the 202 answer, `--wait` and `repo deletion-status`.
+func TestLakectlRepoDeleteStorage(t *testing.T) {
+	repoName := GenerateUniqueRepositoryName()
+	storage := GenerateUniqueStorageNamespace(repoName)
+	vars := map[string]string{
+		"REPO":    repoName,
+		"STORAGE": storage,
+		"BRANCH":  mainBranch,
+	}
+	RunCmdAndVerifySuccessWithFile(t, Lakectl()+" repo create lakefs://"+repoName+" "+storage+" --sample-data", false, "lakectl_repo_create_sample", vars)
+
+	// The prompt names the storage namespace and warns.  Answering "n" aborts the deletion.
+	RunCmdAndVerifyFailureWithFile(t, "echo n | "+Lakectl()+" repo delete lakefs://"+repoName+" --delete-storage", false, "lakectl_repo_delete_storage_prompt", vars)
+
+	// The request answers 202 and the object deletion runs in the background.
+	RunCmdAndVerifySuccessWithFile(t, Lakectl()+" repo delete lakefs://"+repoName+" --delete-storage --yes", false, "lakectl_repo_delete_storage", vars)
+
+	// A live server cannot be made to reach `done` or `failed` on demand with a known object
+	// count, so the two `--wait` cases and the status command run against a stub API that
+	// serves one fixed deletion record.
+	t.Run("wait", func(t *testing.T) {
+		endpoint := newRepositoryDeletionStub(t, repoDeletionStubRecord{state: "done", objectsDeleted: 7, attempts: 1})
+		RunCmdAndVerifySuccessWithFile(t, LakectlWithParams("stub-key-id", "stub-secret-key", endpoint)+" repo delete lakefs://"+repoDeletionStubName+" --delete-storage --wait --yes", false, "lakectl_repo_delete_storage_wait", emptyVars)
+	})
+
+	t.Run("wait failed", func(t *testing.T) {
+		endpoint := newRepositoryDeletionStub(t, repoDeletionStubRecord{
+			state:     "failed",
+			attempts:  10,
+			lastError: "AccessDenied: access denied while deleting objects",
+		})
+		RunCmdAndVerifyFailureWithFile(t, LakectlWithParams("stub-key-id", "stub-secret-key", endpoint)+" repo delete lakefs://"+repoDeletionStubName+" --delete-storage --wait --yes", false, "lakectl_repo_delete_storage_wait_failed", emptyVars)
+	})
+
+	t.Run("deletion-status", func(t *testing.T) {
+		endpoint := newRepositoryDeletionStub(t, repoDeletionStubRecord{state: "done", objectsDeleted: 7, attempts: 1})
+		RunCmdAndVerifySuccessWithFile(t, LakectlWithParams("stub-key-id", "stub-secret-key", endpoint)+" repo deletion-status lakefs://"+repoDeletionStubName, false, "lakectl_repo_delete_storage_status", emptyVars)
+	})
+}
+
+const (
+	repoDeletionStubName      = "deletion-stub-repo"
+	repoDeletionStubNamespace = "s3://deletion-stub/bucket"
+	repoDeletionStubTime      = 1700000000
+	repoDeletionStubUpdated   = 1700000100
+)
+
+type repoDeletionStubRecord struct {
+	state          string
+	objectsDeleted int64
+	attempts       int
+	lastError      string
+}
+
+// newRepositoryDeletionStub serves the API calls of one storage deletion with a fixed record and
+// returns the endpoint URL.  It lets the CLI output of a terminal state be compared to a golden
+// with an exact state, object count and error.
+func newRepositoryDeletionStub(t *testing.T, record repoDeletionStubRecord) string {
+	t.Helper()
+	toAPI := func(state string, objectsDeleted int64, attempts int, lastError string) apigen.RepositoryDeletion {
+		deletion := apigen.RepositoryDeletion{
+			Repository:       repoDeletionStubName,
+			StorageNamespace: repoDeletionStubNamespace,
+			State:            state,
+			ObjectsDeleted:   objectsDeleted,
+			RequestedBy:      "esti",
+			RequestedAt:      repoDeletionStubTime,
+			UpdatedAt:        repoDeletionStubUpdated,
+			Attempts:         attempts,
+		}
+		if lastError != "" {
+			deletion.LastError = &lastError
+		}
+		return deletion
+	}
+	repository := apigen.Repository{
+		Id:               repoDeletionStubName,
+		StorageNamespace: repoDeletionStubNamespace,
+		DefaultBranch:    mainBranch,
+		CreationDate:     repoDeletionStubTime,
+	}
+	pending := toAPI("pending", 0, 0, "")
+	current := toAPI(record.state, record.objectsDeleted, record.attempts, record.lastError)
+
+	writeJSON := func(w http.ResponseWriter, statusCode int, body any) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(statusCode)
+		_ = json.NewEncoder(w).Encode(body)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repositories/"+repoDeletionStubName:
+			writeJSON(w, http.StatusOK, repository)
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/repositories/"+repoDeletionStubName:
+			if r.URL.Query().Get("delete_storage") != "true" {
+				writeJSON(w, http.StatusBadRequest, apigen.Error{Message: "delete_storage must be true"})
+				return
+			}
+			writeJSON(w, http.StatusAccepted, pending)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repository_deletions/"+repoDeletionStubName:
+			writeJSON(w, http.StatusOK, current)
+		default:
+			writeJSON(w, http.StatusNotFound, apigen.Error{Message: "not found"})
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server.URL + "/"
 }

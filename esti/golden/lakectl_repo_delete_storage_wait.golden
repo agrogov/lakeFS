@@ -1,0 +1,12 @@
+Repository: lakefs://deletion-stub-repo
+Warning: Deleting repository 'deletion-stub-repo' also deletes every object under 's3://deletion-stub/bucket'. Objects referenced from other repositories will break.
+
+Repository 'deletion-stub-repo' storage deletion requested
+repository: deletion-stub-repo
+storage namespace: s3://deletion-stub/bucket
+state: done
+objects deleted: 7
+requested by: esti
+requested at: <DATE> <TIME> <TZ>
+updated at: <DATE> <TIME> <TZ>
+attempts: 1
