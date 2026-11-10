@@ -1,4 +1,4 @@
-// check.go is the startup check of the current guide's Metadata Search section
+// Package startupcheck is the startup check of the current guide's Metadata Search section
 // (METADATA_SEARCH_REALIGN.md RA5, G12), verbatim: the service "checks that lakefs_endpoint answers
 // as the lakeFS Iceberg REST catalog, and stops if it does not or stays unreachable for two
 // minutes. If the catalog rejects the service's token or denies it access, the service logs the
@@ -14,7 +14,11 @@
 // catalog but would not accept the identity, so the check logs the likely causes and returns nil.
 // The sync then starts and every tick retries the same authentication, which is where the failure
 // surfaces as /_health and metrics rather than as a process that never starts.
-package bootstrap
+//
+// It is its own package and not part of pkg/mds/bootstrap: the bootstrap imports
+// cmd/lakefs/cmd for ServerDeps, and "mds run" - which calls this check - is registered in that
+// same package, so importing the bootstrap from there would be an import cycle.
+package startupcheck
 
 import (
 	"context"
@@ -243,18 +247,24 @@ func (c CatalogCheckConfig) usingStaticKeys() bool {
 	return c.AccessKeyID != "" || c.SecretKey != ""
 }
 
+// syncPolicyName is the guide's MDSCatalogAccess policy, the one policy the sync identity carries
+// (pkg/mds/bootstrap.PolicyName). The literal is restated here rather than imported: bootstrapping
+// the identity needs cmd/lakefs/cmd, so pkg/mds/bootstrap cannot be imported from this package -
+// the command that runs this check lives next to that package. The guide pins the spelling.
+const syncPolicyName = "MDSCatalogAccess"
+
 // logRejectedIdentity logs the likely causes of a 401/403 the guide asks the service to report
 // before it starts anyway.
 func logRejectedIdentity(ctx context.Context, log logging.Logger, endpoint string, status int, staticKeys bool, cause error) {
 	causes := []string{
 		"the service user " + table.ServiceUserName + " does not exist (the lakeFS server provisions it on start)",
-		"the " + PolicyName + " policy is not attached to the sync identity",
+		"the " + syncPolicyName + " policy is not attached to the sync identity",
 		"auth.encrypt.secret_key does not match the lakeFS server's key, so the signed login token is rejected",
 	}
 	if staticKeys {
 		causes = []string{
 			"the configured access_key_id/secret_key are wrong or the user no longer exists",
-			"the configured user does not have the " + PolicyName + " policy attached",
+			"the configured user does not have the " + syncPolicyName + " policy attached",
 			"the user is not a member of every tenant it syncs (installations with tenants)",
 		}
 	}

@@ -1,4 +1,18 @@
-package main
+// Package mdscmd registers the Metadata Search indexer command, `mds run`, on the root command of
+// the lakeFS binaries.
+//
+// It is its own package, and not a file in cmd/lakefs/cmd, because of an import cycle: the command
+// builds the indexer service (pkg/mds -> pkg/mds/indexer), and pkg/mds/indexer imports
+// pkg/icebergcatalog, which imports cmd/lakefs/cmd for the server dependency struct. The command
+// therefore has to be a package that imports cmd/lakefs/cmd and is never imported back. Registering
+// on the root command from this package's init is what keeps the two binaries from drifting:
+// cmd/lakefs and cmd/lakefs-sso expose the command by importing this package, and neither defines
+// a copy of it.
+//
+// The indexer of METADATA_SEARCH_REALIGN.md RA4b (X13) runs on the server's own configuration: it
+// opens the same KV store from database.*, builds pkg/catalog over the blockstore.* block adapter,
+// and reads the same metadata_search section. Run one replica.
+package mdscmd
 
 import (
 	"context"
@@ -11,6 +25,7 @@ import (
 	"github.com/apache/iceberg-go"
 	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/spf13/cobra"
+	cmdcore "github.com/treeverse/lakefs/cmd/lakefs/cmd"
 	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/config"
@@ -18,17 +33,9 @@ import (
 	"github.com/treeverse/lakefs/pkg/kv/kvparams"
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/mds"
-	"github.com/treeverse/lakefs/pkg/mds/bootstrap"
 	"github.com/treeverse/lakefs/pkg/mds/reader"
+	"github.com/treeverse/lakefs/pkg/mds/startupcheck"
 	"github.com/treeverse/lakefs/pkg/upload"
-
-	lakefsCmd "github.com/treeverse/lakefs/cmd/lakefs/cmd"
-
-	// The KV drivers `lakefs run` can open. They register themselves with pkg/kv on import; the
-	// server command imports the same ones, and `mds run` opens the same database.* configuration.
-	_ "github.com/treeverse/lakefs/pkg/kv/cosmosdb"
-	_ "github.com/treeverse/lakefs/pkg/kv/dynamodb"
-	_ "github.com/treeverse/lakefs/pkg/kv/postgres"
 )
 
 // The static errors of the command. They are wrapped with the details an operator needs, so a
@@ -46,11 +53,15 @@ var (
 // /app/config.yaml`, and that has to be the same file `lakefs run` reads.
 const configFlagName = "config"
 
-// newMDSCommand returns the "mds" command group: the Metadata Search indexer of
+//nolint:gochecknoinits
+func init() {
+	cmdcore.GetRoot().AddCommand(NewMDSCommand())
+}
+
+// NewMDSCommand returns the "mds" command group: the Metadata Search indexer of
 // METADATA_SEARCH_REALIGN.md RA4b (X13). It is a subcommand of the server binary and runs on the
-// server's own configuration: it opens the same KV store from database.*, builds pkg/catalog over
-// the blockstore.* block adapter, and reads the same metadata_search section. Run one replica.
-func newMDSCommand() *cobra.Command {
+// server's own configuration.
+func NewMDSCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "mds",
 		Short: "Metadata Search indexer",
@@ -95,7 +106,7 @@ process; the metadata tables are written through the lakeFS Iceberg REST catalog
 			// The full server configuration first, so that viper holds the file and the LAKEFS_*
 			// environment when the metadata_search section is read below. LoadConfig is the same
 			// loader `lakefs run` uses, including its startup failures.
-			fullCfg := lakefsCmd.LoadConfig()
+			fullCfg := cmdcore.LoadConfig()
 			cfg, err := mds.LoadConfig()
 			if err != nil {
 				return err
@@ -125,7 +136,7 @@ func runMDS(ctx context.Context, fullCfg config.Config, cfg *mds.Config) error {
 	// as the lakeFS Iceberg REST catalog, or the process stops (after two minutes of retries). A
 	// catalog that rejects the identity is only logged: the service starts anyway and every sync
 	// cycle retries the same authentication.
-	if err := bootstrap.CheckCatalog(ctx, bootstrap.CatalogCheckConfig{
+	if err := startupcheck.CheckCatalog(ctx, startupcheck.CatalogCheckConfig{
 		Endpoint:         cfg.LakeFSEndpoint,
 		AccessKeyID:      cfg.AccessKeyID,
 		SecretKey:        cfg.SecretKey,
@@ -164,6 +175,10 @@ func runMDS(ctx context.Context, fullCfg config.Config, cfg *mds.Config) error {
 // openMDSCatalog opens the KV store from database.* and builds pkg/catalog over the blockstore.*
 // adapter, which is what `run` does with the same configuration. The catalog is returned with the
 // store because its close releases resources the store owns; the caller closes both.
+//
+// The KV drivers it may open (cosmosdb, dynamodb, postgres) are registered by the blank imports of
+// cmd/lakefs/cmd's run.go, which both binaries link: the indexer opens the same database the server
+// does, so the same drivers have to be in the process.
 func openMDSCatalog(ctx context.Context, fullCfg config.Config) (kv.Store, *catalog.Catalog, error) {
 	baseCfg := fullCfg.GetBaseConfig()
 	kvParams, err := kvparams.NewConfig(&baseCfg.Database)

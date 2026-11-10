@@ -1,9 +1,10 @@
 # lakeFS configuration: Iceberg and Metadata Search
 
 Configuration is a YAML file and/or environment variables. The server reads its file with
-`lakefs-sso run --config <file>`; the Metadata Search indexer reads the top-level
-`metadata_search` section of the same file with `lakefs-sso mds run --config <file>`. Both can
-share one file: the server ignores `metadata_search`, and the indexer ignores everything else.
+`lakefs run --config <file>`; the Metadata Search indexer runs on the same server binary and reads
+the top-level `metadata_search` section of the same file with `lakefs mds run --config <file>`.
+Both can share one file: the server ignores `metadata_search`, and the indexer ignores everything
+else.
 
 Every scalar key can also be set through the lakeFS environment convention: prefix `LAKEFS_`,
 replace each `.` with `_`, and upper-case the result. For example `LAKEFS_ICEBERG_ENABLED` sets
@@ -39,7 +40,7 @@ The catalog is off by default. `iceberg.enabled: true` mounts `/iceberg/api` and
 
 ## Metadata Search indexer (`metadata_search`)
 
-Read by `lakefs-sso mds run --config <file>` (design §7). The endpoint and the indexer credentials
+Read by `lakefs mds run --config <file>` (design §7). The endpoint and the indexer credentials
 are required; every other key has a default.
 
 ### Reference
@@ -154,7 +155,7 @@ metadata_search:
 
 ### Validation
 
-`lakefs-sso mds run` validates the section before the first tick and fails startup with one error
+`lakefs mds run` validates the section before the first tick and fails startup with one error
 per problem. Invalid: an empty endpoint, access key or secret; `period`, `concurrency`,
 `max_commits`, `seed_lookback` or `rebuild_threshold` not positive; an unknown `backfill`; an empty
 `repositories` map or empty `branches` list; a data repository name that ends in `-metadata` or is

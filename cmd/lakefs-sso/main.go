@@ -17,8 +17,14 @@
 //     identity (METADATA_SEARCH_REALIGN.md RA5: mds-service-user and MDSCatalogAccess) with a
 //     fourth builder that mounts no route either and runs on every start.
 //
-// Merge-friendliness: the upstream cmd/lakefs directory is untouched except for
-// cmd/lakefs/cmd/hooks.go (new file) and 2 lines in cmd/lakefs/cmd/run.go.
+// The "mds" subcommand (the Metadata Search indexer, METADATA_SEARCH_REALIGN.md RA4b) is not
+// registered here: it is registered on the root command by the init of cmd/lakefs/mdscmd, which
+// this binary imports, so `lakefs-sso mds run` and `lakefs mds run` are one implementation on one
+// configuration.
+//
+// Merge-friendliness: the upstream cmd/lakefs directory is untouched except for new files
+// cmd/lakefs/cmd/hooks.go, cmd/lakefs/mdscmd/mds.go and the import in cmd/lakefs/main.go, and 2
+// lines in cmd/lakefs/cmd/run.go.
 package main
 
 import (
@@ -29,6 +35,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/spf13/cobra"
 	lakefsCmd "github.com/treeverse/lakefs/cmd/lakefs/cmd"
+	_ "github.com/treeverse/lakefs/cmd/lakefs/mdscmd" // registers the "mds" command on the root command
 	"github.com/treeverse/lakefs/contrib/auth/acl"
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/crypt"
@@ -49,10 +56,10 @@ func main() {
 	lakefsCmd.SetAuthServiceBuilder(buildAuthService)
 	lakefsCmd.SetAuthenticationServiceBuilder(sso.BuildAuthenticationService)
 
-	// Register the sso-migrate, rbac-migrate and mds (Metadata Search indexer) subcommands.
+	// Register the sso-migrate and rbac-migrate subcommands. The mds subcommand comes from the
+	// cmd/lakefs/mdscmd import above, so both binaries run the same one.
 	lakefsCmd.GetRoot().AddCommand(newSSOmigrateCmd())
 	lakefsCmd.GetRoot().AddCommand(newRBACMigrateCmd())
-	lakefsCmd.GetRoot().AddCommand(newMDSCommand())
 
 	// Mount the datasets control plane on /api/v1/datasets (DATASETS_DESIGN.md §4.4). The
 	// builder mounts a 501 handler when datasets.enabled is false.

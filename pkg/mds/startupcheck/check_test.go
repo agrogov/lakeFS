@@ -1,4 +1,4 @@
-package bootstrap
+package startupcheck
 
 // Tests for the guide's startup check (METADATA_SEARCH_REALIGN.md RA5, G12): the endpoint must
 // answer as the lakeFS Iceberg REST catalog or the service stops after two minutes; a catalog that
@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/treeverse/lakefs/pkg/mds/internal/mdstest"
 	"github.com/treeverse/lakefs/pkg/mds/table"
 )
 
@@ -157,7 +158,7 @@ func TestCheckCatalogStartsAnywayWhenTheIdentityIsRejected(t *testing.T) {
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			_, server := newCatalogStub(t, status, `{"error":{"message":"no"}}`)
-			readLog := capturePackageLog(t)
+			readLog := mdstest.CapturePackageLog(t)
 
 			err := CheckCatalog(t.Context(), CatalogCheckConfig{
 				Endpoint:         server.URL,
@@ -170,7 +171,7 @@ func TestCheckCatalogStartsAnywayWhenTheIdentityIsRejected(t *testing.T) {
 			output := readLog()
 			require.Contains(t, output, "level=warning")
 			require.Contains(t, output, "rejected the sync identity")
-			require.Contains(t, output, PolicyName, "the likely causes name the policy to attach")
+			require.Contains(t, output, syncPolicyName, "the likely causes name the policy to attach")
 			require.Contains(t, output, "auth.encrypt.secret_key", "the likely causes name the key mismatch")
 		})
 	}
@@ -178,7 +179,7 @@ func TestCheckCatalogStartsAnywayWhenTheIdentityIsRejected(t *testing.T) {
 
 func TestCheckCatalogStartsAnywayWithConfiguredKeys(t *testing.T) {
 	_, server := newCatalogStub(t, http.StatusUnauthorized, `{}`)
-	readLog := capturePackageLog(t)
+	readLog := mdstest.CapturePackageLog(t)
 
 	err := CheckCatalog(t.Context(), CatalogCheckConfig{
 		Endpoint:    server.URL,

@@ -15,8 +15,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -29,6 +27,7 @@ import (
 	authparams "github.com/treeverse/lakefs/pkg/auth/params"
 	"github.com/treeverse/lakefs/pkg/kv/kvtest"
 	"github.com/treeverse/lakefs/pkg/logging"
+	"github.com/treeverse/lakefs/pkg/mds/internal/mdstest"
 	"github.com/treeverse/lakefs/pkg/mds/table"
 	"github.com/treeverse/lakefs/pkg/permissions"
 )
@@ -113,7 +112,7 @@ func TestEnsureSyncIdentityRepairsDriftedPolicy(t *testing.T) {
 		}},
 	}, false /* create */), "a predictable policy name can be pre-created")
 
-	readLog := capturePackageLog(t)
+	readLog := mdstest.CapturePackageLog(t)
 	inForce, err := EnsureSyncIdentity(t.Context(), svc, bootstrapTS)
 	require.NoError(t, err)
 	require.True(t, inForce)
@@ -296,7 +295,7 @@ func TestEnsureSyncIdentityDegradesWithoutPolicyBackend(t *testing.T) {
 	_, err := basic.CreateUser(t.Context(), &model.User{Username: "admin", CreatedAt: bootstrapTS})
 	require.NoError(t, err)
 
-	readLog := capturePackageLog(t)
+	readLog := mdstest.CapturePackageLog(t)
 	inForce, err := EnsureSyncIdentity(t.Context(), basic, bootstrapTS)
 	require.NoError(t, err, "a service that cannot store policies must not refuse to start Metadata Search")
 	require.False(t, inForce, "nothing is in force on a backend without policies")
@@ -485,20 +484,3 @@ func newACLService(t *testing.T) *acl.AuthService {
 		authparams.ServiceCache{Enabled: false})
 }
 
-// capturePackageLog redirects the package logger (the one logging.FromContext returns, where the
-// bootstrap writes its warnings) to a file and returns a reader for it.
-func capturePackageLog(t *testing.T) func() string {
-	t.Helper()
-	logFile := filepath.Join(t.TempDir(), "mds-bootstrap.log")
-	require.NoError(t, logging.SetOutputs([]string{logFile}, 0, 0), "redirect the package logger")
-	t.Cleanup(func() {
-		_ = logging.CloseWriters()
-		require.NoError(t, logging.SetOutputs([]string{"-"}, 0, 0), "restore the package logger")
-	})
-	return func() string {
-		require.NoError(t, logging.CloseWriters(), "flush the captured log")
-		data, err := os.ReadFile(logFile)
-		require.NoError(t, err, "read the captured log")
-		return string(data)
-	}
-}

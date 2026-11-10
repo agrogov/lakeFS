@@ -50,7 +50,7 @@ exact upstream `commit_id` semantics for objects that existed before the first i
 | Root `system.metadata` tree, authz on `R`, read-only tree, `relative_to` root-tree warehouses | `pkg/icebergcatalog/resolver.go`, `namespaces.go`, `tables.go`, `relative.go`, `http.go` | **Done** (RA1, RA2; sections 5.1–5.3). |
 | Deprecated, separate Metadata Search catalog at `/mds/iceberg/api` | `pkg/icebergcatalog/http.go`, `resolver.go` | **Done** (RA3; section 5.5). |
 | `RefMapper` for tags and commits | `pkg/mds/refmap`, installed from `cmd/lakefs-sso/main.go` | Done (section 6). |
-| Indexer (`lakefs mds run` on the server binary and configuration) | `pkg/mds/...`, `cmd/lakefs-sso/mds.go` | Done (RA4, RA4b; sections 4, 7). |
+| Indexer (`lakefs mds run` on the server binary and configuration) | `pkg/mds/...`, `cmd/lakefs/mdscmd/mds.go` | Done (RA4, RA4b; sections 4, 7). |
 | Sync identity `mds-service-user` and `MDSCatalogAccess` | `pkg/mds/bootstrap/bootstrap.go`, extra routes builder in `cmd/lakefs-sso/main.go` | Done (RA5; section 8). |
 
 The indexer runs on the **server binary and configuration** (RA4b): `lakefs mds run --config <file>`
@@ -384,7 +384,7 @@ The catalog stages client-written files; the indexer must write Parquet and Avro
 - If the catalog vends write credentials (S3 blockstore with `credentials_vending.role_arn`), the indexer requests
   `X-Iceberg-Access-Delegation: vended-credentials` (the iceberg-go REST default) and needs nothing else.
 - Otherwise the indexer writes with the **standard `blockstore.*` configuration of the process** (X6, RA4b):
-  `cmd/lakefs-sso/mds.go` translates `blockstore.s3.*` (region, endpoint, static credentials, path style) or
+  `cmd/lakefs/mdscmd/mds.go` translates `blockstore.s3.*` (region, endpoint, static credentials, path style) or
   `blockstore.azure.*` (storage account and key) into the iceberg-go IO properties (`s3.*`, `adls.*`) and passes
   them with `rest.WithAdditionalProps`. This is the mode esti runs in (SeaweedFS, static keys). There is no
   `metadata_search.storage` or `metadata_search.azure` section any more: the guide has no such keys, and the
@@ -832,7 +832,7 @@ whether or not a request ever arrives.
 - **Startup check** (guide, verbatim): the service "checks that `lakefs_endpoint` answers as the lakeFS Iceberg
   REST catalog, and stops if it does not or stays unreachable for two minutes. If the catalog rejects the
   service's token or denies it access, the service logs the likely causes, starts anyway, and retries on every
-  sync cycle." `pkg/mds/bootstrap.CheckCatalog` probes `GET <endpoint>/iceberg/api/v1/config`.
+  sync cycle." `pkg/mds/startupcheck.CheckCatalog` probes `GET <endpoint>/iceberg/api/v1/config`.
 - **No init-commit proof.** The earlier design's MDS-SEC-3 committer check is gone (X4): the guide's "as another
   user instead" contradicts a check pinned to one committer, and the ownership proof reads the marker and the
   position only (5.1).
