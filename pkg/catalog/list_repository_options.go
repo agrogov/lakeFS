@@ -13,6 +13,12 @@ type ListRepositoriesOptions struct {
 	// FilterFunc is an optional predicate that filters repositories.
 	// Returns true if the repository should be included in the results.
 	FilterFunc func(repoID string) bool
+
+	// HideMetadataCompanions leaves Metadata Search companion repositories (R-metadata) out of the
+	// listing. A repository is left out only when it proves it was created by the sync - the
+	// indexer's initialisation commit - so a repository of the user's own that merely ends in
+	// "-metadata" is still listed (metadata_companion.go).
+	HideMetadataCompanions bool
 }
 
 // ListRepositoriesOptionsFunc is a function that modifies ListRepositoriesOptions
@@ -25,6 +31,17 @@ func NewListRepositoriesOptions(opts []ListRepositoriesOptionsFunc) *ListReposit
 		opt(options)
 	}
 	return options
+}
+
+// WithHiddenMetadataCompanions hides Metadata Search companion repositories from the listing, as
+// the guide requires ("Metadata repositories are hidden from repository listings, but remain
+// reachable by name", METADATA_SEARCH_REALIGN.md G9). The proof is the indexer's initialisation
+// commit, cached per repository, so a repository named "-metadata" that the sync did not create is
+// still listed (metadata_companion.go).
+func WithHiddenMetadataCompanions() ListRepositoriesOptionsFunc {
+	return func(opts *ListRepositoriesOptions) {
+		opts.HideMetadataCompanions = true
+	}
 }
 
 // WithListReposPermissionFilter creates a filter predicate based on user policies.

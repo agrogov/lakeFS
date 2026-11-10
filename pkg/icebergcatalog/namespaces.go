@@ -1208,8 +1208,39 @@ func withSystemRoot(namespaces []Namespace) []Namespace {
 // allRepositories walks the repository listing to the end. The catalog lists repositories in
 // pages; the namespace tree needs the whole filtered set before it can paginate by namespace, so
 // the pages are concatenated here.
+//
+// Metadata Search companion repositories are left out of the root level: the guide says they are
+// hidden from repository listings and remain reachable by name (METADATA_SEARCH_REALIGN.md G9,
+// catalog.WithHiddenMetadataCompanions). The filter is the catalog's, not this file's: a repository
+// is hidden only when it proves the sync created it, so a repository of the user's own that ends in
+// "-metadata" stays in the listing. It is deliberately not the walk of the root `system.metadata`
+// tree (resolver.go, Store.listAllRepositories): that tree finds companions through the repository
+// listing and has to keep seeing them.
 func (n *namespaceService) allRepositories(ctx context.Context) ([]*catalog.Repository, error) {
-	return walkRepositories(ctx, n.lister)
+	return walkRepositoriesWithOptions(ctx, n.lister,
+		catalog.WithHiddenMetadataCompanions())
+}
+
+// walkRepositoriesWithOptions is walkRepositories with the listing options a caller needs. It is the
+// same page walk as resolver.go's walkRepositories: the catalog lists repositories in name order,
+// and the last name of a page is the `after` of the next one, so filtering on the catalog side
+// keeps the pages full of visible repositories rather than of hidden ones.
+func walkRepositoriesWithOptions(ctx context.Context, lister metadataTreeLister, opts ...catalog.ListRepositoriesOptionsFunc) ([]*catalog.Repository, error) {
+	var (
+		repositories []*catalog.Repository
+		after        string
+	)
+	for {
+		page, hasMore, err := lister.ListRepositories(ctx, catalog.ListRepositoriesLimitMax, "", "", after, opts...)
+		if err != nil {
+			return nil, err
+		}
+		repositories = append(repositories, page...)
+		if !hasMore || len(page) == 0 {
+			return repositories, nil
+		}
+		after = page[len(page)-1].Name
+	}
 }
 
 // allBranches walks the branch listing of repo to the end.

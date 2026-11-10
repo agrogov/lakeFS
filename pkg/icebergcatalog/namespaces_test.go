@@ -393,6 +393,53 @@ func TestNamespacesRead(t *testing.T) {
 	})
 }
 
+// TestNamespacesReadRootHidesMetadataCompanions pins the guide's rule at the catalog's root level
+// ("Metadata repositories are hidden from repository listings, but remain reachable by name",
+// METADATA_SEARCH_REALIGN.md G9, RA6). The root level of the namespace tree lists repositories, so
+// it hides a repository the sync created - proven by the indexer's initialisation commit, not by its
+// name - and keeps listing a repository of the user's own that merely ends in "-metadata". Reachable
+// by name is the branch listing of the hidden repository, which the same caller may read.
+func TestNamespacesReadRootHidesMetadataCompanions(t *testing.T) {
+	f := newNamespacesFixture(t)
+
+	// The companion repository, with the indexer's initialisation commit on its default branch
+	// (METADATA_SEARCH_DESIGN.md §4.8), and a user's own repository whose name ends in "-metadata"
+	// and whose history carries no such commit.
+	companion := nsTestRepo + MetadataRepositorySuffix
+	const userRepo = "plain-metadata"
+	_, err := f.catalog.CreateRepository(f.ctx, companion, "",
+		"mem://iceberg-namespaces-companion", nsTestRef, false)
+	require.NoError(t, err, "create the companion repository")
+	_, err = f.catalog.Commit(f.ctx, companion, nsTestRef, MetadataSearchInitCommitMessage,
+		"mds-service-user", catalog.Metadata{MetadataSearchInitProperty: MetadataSearchInitValue},
+		nil, nil, true)
+	require.NoError(t, err, "commit the initialisation of the companion repository")
+	_, err = f.catalog.CreateRepository(f.ctx, userRepo, "",
+		"mem://iceberg-namespaces-user", nsTestRef, false)
+	require.NoError(t, err, "create the user's own -metadata repository")
+	_, err = f.catalog.Commit(f.ctx, userRepo, nsTestRef, "my own data", "alice", nil, nil, nil, true)
+	require.NoError(t, err, "commit the user's own data")
+
+	// alice may read the companion as well: hiding it is a listing rule, not an authorization rule,
+	// so the listing is what has to hide it.
+	f.authz.attachStatements(t, "companion-reader", "alice", resolverCatalogReadStatements(companion))
+	f.authz.attachStatements(t, "user-metadata-reader", "alice", resolverCatalogReadStatements(userRepo))
+
+	root := decodeListNamespaces(t, f.request(t, http.MethodGet, listTarget(nil, nil), "alice"))
+	require.Equal(t, []Namespace{{nsTestRepo}, {userRepo}}, root.Namespaces,
+		"the companion repository is hidden; the user's own -metadata repository is listed")
+
+	// Reachable by name: the hidden repository's branches are still listed for the same caller.
+	branches := decodeListNamespaces(t, f.request(t, http.MethodGet, listTarget([]string{companion}, nil), "alice"))
+	require.Equal(t, []Namespace{{companion, nsTestRef}}, branches.Namespaces,
+		"a hidden companion is still reachable by name")
+
+	// A listing of the companion's own branches is unaffected by the root filter, and the user's
+	// repository is listed on its own address as well.
+	userBranches := decodeListNamespaces(t, f.request(t, http.MethodGet, listTarget([]string{userRepo}, nil), "alice"))
+	require.Equal(t, []Namespace{{userRepo, nsTestRef}}, userBranches.Namespaces)
+}
+
 // Tests for the namespace write endpoints of I2-2 (ICEBERG_CATALOG_PLAN.md §6.1 "Layout on the
 // branch", §7.2 "Authorization" and §11 I-2 "namespaces create/update-properties/drop"). Every
 // test name starts with TestNamespacesWrite so that the task's validation command,

@@ -173,6 +173,89 @@ func TestController_ListRepositoriesHandler(t *testing.T) {
 	})
 }
 
+// TestController_ListRepositoriesHidesMetadataCompanions pins the guide's rule for the REST listing
+// ("Metadata repositories are hidden from repository listings, but remain reachable by name",
+// METADATA_SEARCH_REALIGN.md G9, RA6): a repository the Metadata Search sync created is left out of
+// /repositories - the listing lakectl and the Web UI read - and is still read by name; a repository
+// of the user's own whose name merely ends in "-metadata" is listed, because "companion" is the
+// indexer's initialisation commit (pkg/catalog/metadata_companion.go) and not a name.
+func TestController_ListRepositoriesHidesMetadataCompanions(t *testing.T) {
+	clt, deps := setupClientWithAdmin(t)
+	ctx := t.Context()
+
+	// The data repository, its companion, and a user's own repository that ends in "-metadata" and
+	// carries no initialisation commit.
+	const (
+		dataRepo   = "orders"
+		companion  = "orders-metadata"
+		userRepo   = "reports-metadata"
+		initMarker = "lakefs.mds.init"
+	)
+	for _, repo := range []string{dataRepo, companion, userRepo} {
+		_, err := deps.catalog.CreateRepository(ctx, repo, config.SingleBlockstoreID,
+			onBlock(deps, repo), "main", false)
+		testutil.Must(t, err)
+	}
+	// The indexer's initialisation commit (pkg/mds/indexer/repo.go): the marker and the message, on
+	// the companion's default branch.
+	_, err := deps.catalog.Commit(ctx, companion, "main", "mds: init", "mds-service-user",
+		catalog.Metadata{initMarker: "true"}, nil, nil, true)
+	testutil.Must(t, err)
+	// The user's own repository has ordinary commits, and no marker anywhere in its history.
+	_, err = deps.catalog.Commit(ctx, userRepo, "main", "my own data", "some_user", nil, nil, nil, true)
+	testutil.Must(t, err)
+
+	listIDs := func(t *testing.T) []string {
+		t.Helper()
+		resp, err := clt.ListRepositoriesWithResponse(ctx, &apigen.ListRepositoriesParams{})
+		testutil.Must(t, err)
+		verifyResponseOK(t, resp, err)
+		ids := make([]string, 0, len(resp.JSON200.Results))
+		for _, repo := range resp.JSON200.Results {
+			ids = append(ids, repo.Id)
+		}
+		return ids
+	}
+
+	t.Run("the companion is hidden and the user's own -metadata repository is listed", func(t *testing.T) {
+		require.Equal(t, []string{dataRepo, userRepo}, listIDs(t),
+			"the companion repository is hidden; the user's own -metadata repository is not")
+	})
+
+	t.Run("the companion is still reachable by name", func(t *testing.T) {
+		resp, err := clt.GetRepositoryWithResponse(ctx, companion)
+		testutil.Must(t, err)
+		verifyResponseOK(t, resp, err)
+		require.Equal(t, companion, resp.JSON200.Id)
+
+		branch := "main"
+		branchResp, err := clt.GetBranchWithResponse(ctx, companion, branch)
+		testutil.Must(t, err)
+		verifyResponseOK(t, branchResp, err)
+	})
+
+	t.Run("pages stay full of visible repositories", func(t *testing.T) {
+		// One result per page, name order: the hidden companion must not consume a page slot, and
+		// has_more must count visible results only.
+		first, err := clt.ListRepositoriesWithResponse(ctx, &apigen.ListRepositoriesParams{
+			Amount: apiutil.Ptr(apigen.PaginationAmount(1)),
+		})
+		testutil.Must(t, err)
+		verifyResponseOK(t, first, err)
+		require.Equal(t, dataRepo, first.JSON200.Results[0].Id)
+		require.True(t, first.JSON200.Pagination.HasMore)
+
+		second, err := clt.ListRepositoriesWithResponse(ctx, &apigen.ListRepositoriesParams{
+			Amount: apiutil.Ptr(apigen.PaginationAmount(1)),
+			After:  apiutil.Ptr(apigen.PaginationAfter(first.JSON200.Pagination.NextOffset)),
+		})
+		testutil.Must(t, err)
+		verifyResponseOK(t, second, err)
+		require.Equal(t, userRepo, second.JSON200.Results[0].Id)
+		require.False(t, second.JSON200.Pagination.HasMore)
+	})
+}
+
 func TestController_GetRepoHandler(t *testing.T) {
 	clt, deps := setupClientWithAdmin(t)
 	ctx := t.Context()

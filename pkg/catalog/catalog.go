@@ -254,6 +254,10 @@ type Catalog struct {
 	errorToStatusCodeAndMsg ErrorToStatusCodeAndMsg
 	instanceID              string          // unique ID for this server process
 	activeTasks             stdatomic.Int64 // number of tasks currently queued or running
+
+	// metadataCompanions caches which repositories are Metadata Search companion repositories, for
+	// the repository listings that hide them (METADATA_SEARCH_REALIGN.md G9, metadata_companion.go).
+	metadataCompanions metadataCompanionCache
 }
 
 const (
@@ -714,6 +718,17 @@ func (c *Catalog) ListRepositories(ctx context.Context, limit int, prefix, searc
 		// Apply permission filter if provided
 		if options.FilterFunc != nil && !options.FilterFunc(string(record.RepositoryID)) {
 			continue
+		}
+		// Metadata Search companion repositories are hidden from repository listings, and keep
+		// working by name (METADATA_SEARCH_REALIGN.md G9, metadata_companion.go).
+		if options.HideMetadataCompanions {
+			companion, err := c.isHiddenMetadataCompanion(ctx, string(record.RepositoryID), record.DefaultBranchID.String())
+			// A history that cannot be read proves nothing, and the repository is listed: hiding is
+			// a listing nicety, never worth failing the listing or making a repository of the user's
+			// own disappear (metadata_companion.go).
+			if err == nil && companion {
+				continue
+			}
 		}
 		repos = append(repos, &Repository{
 			Name:             record.RepositoryID.String(),

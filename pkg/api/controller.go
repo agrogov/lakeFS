@@ -2225,6 +2225,12 @@ func (c *Controller) ListRepositories(w http.ResponseWriter, r *http.Request, pa
 	// Instead, we check if the user has ListRepositories on at least one resource,
 	// then apply RBAC-based filtering to return only accessible repositories.
 	var opts []catalog.ListRepositoriesOptionsFunc
+	// Metadata Search companion repositories are hidden from every repository listing (the guide:
+	// "hidden from repository listings, but remain reachable by name",
+	// METADATA_SEARCH_REALIGN.md G9). Only a repository the sync created - proven by the indexer's
+	// initialisation commit - is hidden, so a repository of the user's own that ends in "-metadata"
+	// is listed. Reading one by name is GetRepository, which this does not touch.
+	opts = append(opts, catalog.WithHiddenMetadataCompanions())
 	policies, _, err := c.Auth.ListEffectivePolicies(ctx, user.Username, &model.PaginationParams{Amount: -1})
 	// Check auth.ErrNotImplemented for BasicAuthService
 	if err != nil && !errors.Is(err, auth.ErrNotImplemented) {
