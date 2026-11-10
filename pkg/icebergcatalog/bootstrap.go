@@ -11,6 +11,14 @@ package icebergcatalog
 //     catalog.SetMergeConflictResolver so that a merge auto-resolves a pointer conflict caused only
 //     by compactions while iceberg.ignore_compaction_commits is true.
 //
+// and, with Metadata Search enabled, one seam that is not a GC control but a consequence of the
+// companions the catalog serves:
+//
+//  4. the repository-deletion cascade of REPO_DELETE_STORAGE_DESIGN.md §6 (R17), installed with
+//     catalog.SetDeletionCascade so that deleting a data repository's storage also deletes
+//     R-metadata - but only when R-metadata passes the init-commit proof, i.e. only when it really
+//     is the indexer's companion.
+//
 // It lives in its own file because it is not part of the HTTP surface http.go mounts: the deny has
 // to exist before the first request can be served, whether or not a request ever arrives, the
 // grace has to be in place before the first GC prepare run, and the merge hook has to be installed
@@ -52,6 +60,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/model"
 	"github.com/treeverse/lakefs/pkg/catalog"
+	"github.com/treeverse/lakefs/pkg/graveler"
 	"github.com/treeverse/lakefs/pkg/logging"
 )
 
@@ -90,6 +99,9 @@ func Bootstrap(ctx context.Context, deps cmdpkg.ServerDeps, extraGroups []string
 		// A process-wide hook, so a disabled catalog has to clear it rather than leave a previous
 		// installation's resolver installed.
 		installMergeConflictResolver(cfg, deps)
+		// The deletion cascade is a process-wide hook for the same reason: Metadata Search requires
+		// the catalog, so a disabled catalog has no companion any deletion could cascade into.
+		installDeletionCascade(cfg, deps)
 		return nil
 	}
 	if deps.AuthService == nil || deps.Logger == nil || deps.Catalog == nil || deps.BlockAdapter == nil {
@@ -113,6 +125,10 @@ func Bootstrap(ctx context.Context, deps cmdpkg.ServerDeps, extraGroups []string
 	// §6.4: let a merge auto-resolve a table-pointer conflict that only compaction snapshots
 	// caused, while iceberg.ignore_compaction_commits is on (the default).
 	installMergeConflictResolver(cfg, deps)
+
+	// R17: deleting a data repository's storage also deletes its Metadata Search companion, when
+	// Metadata Search is enabled and the companion passes the init-commit proof.
+	installDeletionCascade(cfg, deps)
 
 	fields := logging.Fields{
 		"uncommitted_gc_grace_s":    int64(cfg.UncommittedGCGrace / time.Second),
@@ -147,6 +163,57 @@ func installMergeConflictResolver(cfg *Config, deps cmdpkg.ServerDeps) {
 	}
 	store := NewStore(deps.Catalog, deps.BlockAdapter, cfg.StoreOptions()...)
 	catalog.SetMergeConflictResolver(store.MergeConflictResolver(cfg))
+}
+
+// installDeletionCascade installs the Metadata Search deletion cascade of
+// REPO_DELETE_STORAGE_DESIGN.md §6, or clears it, according to cfg: the cascade exists only for an
+// enabled catalog with iceberg.metadata_search.enabled, because that is the only configuration in
+// which the indexer creates companion repositories. Like the merge hook it is a process-wide
+// pointer, so it is cleared rather than left installed but inert when the setting is off.
+//
+// It is a function of its own, rather than three lines inside Bootstrap, because the decision is
+// testable without a server configuration: TestInstallDeletionCascade requests a repository deletion
+// with the cascade installed and cleared.
+func installDeletionCascade(cfg *Config, deps cmdpkg.ServerDeps) {
+	if !cfg.MetadataSearchEnabled() || deps.Catalog == nil {
+		catalog.SetDeletionCascade(nil)
+		return
+	}
+	deps.Catalog.SetDeletionCascade(MetadataSearchDeletionCascade(deps.Catalog))
+}
+
+// MetadataSearchDeletionCascade returns the R17 cascade for a catalog whose Metadata Search
+// companions the indexer writes: for a data repository R, the companion is
+// MetadataRepository(R.Name) when that repository exists and Catalog.IsMetadataCompanion proves it.
+//
+// The proof is the listing's proof (pkg/catalog/metadata_companion.go), not a suffix test: a user
+// may create foo-metadata themselves, and that repository is the user's own - it is neither hidden
+// from a listing nor deleted by a cascade into foo. A repository whose history cannot be read at all
+// proves nothing and is left alone for the same reason, exactly as a listing lists it: the cascade's
+// one job is to delete derived data, and it must never guess where that data is.
+//
+// The companion's default branch is the branch the proof walks, and it is read from the companion's
+// own record: the indexer creates it with the data repository's default branch, but a record is the
+// only place that fact is stored.
+func MetadataSearchDeletionCascade(cat *catalog.Catalog) catalog.DeletionCascade {
+	return func(ctx context.Context, repository *catalog.Repository) (string, bool, error) {
+		companion := MetadataRepository(repository.Name)
+		companionRepo, err := cat.GetRepository(ctx, companion)
+		switch {
+		case errors.Is(err, graveler.ErrNotFound):
+			return "", false, nil
+		case err != nil:
+			// The companion cannot be read, so the request cannot decide whether it has one. Refuse
+			// before anything is deleted rather than delete R and leave a proven companion behind.
+			return "", false, fmt.Errorf("read repository %q: %w", companion, err)
+		}
+		proven, err := cat.IsMetadataCompanion(ctx, companion, companionRepo.DefaultBranch)
+		if err != nil || !proven {
+			// Not the indexer's companion: nothing to cascade into, and nothing to refuse.
+			return "", false, nil
+		}
+		return companion, true, nil
+	}
 }
 
 // EnsureReservedPrefixProtectPolicy makes the iceberg-reserved-prefix-protect deny policy exist

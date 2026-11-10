@@ -213,6 +213,28 @@ func (f *fake) addRepository(name, namespace, defaultBranch string) {
 	f.addRepositoryLocked(name, namespace, defaultBranch)
 }
 
+// deleteRepository removes a repository and everything a reader could still reach through it - its
+// branches, commits, objects and tags - the way lakeFS deletes the metadata of a repository. It is
+// how a test models a repository that was deleted and later re-created under the same name in the
+// same process, which is what the deletion cascade's re-created companion is.
+func (f *fake) deleteRepository(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.repositories, name)
+	delete(f.branches, name)
+	delete(f.commits, name)
+	delete(f.objects, name)
+	delete(f.tags, name)
+	if f.metadataRepo == name {
+		f.metadataRepo = ""
+	}
+	// The fake tracks the table and its staging per process, but the real catalog keeps the table
+	// pointer in the repository's own metadata: a deleted repository takes its table with it, so a
+	// re-created companion starts without one.
+	f.tableExists = false
+	clear(f.staged)
+}
+
 func (f *fake) addRepositoryLocked(name, namespace, defaultBranch string) {
 	f.repositories[name] = reader.Repository{
 		Name:             name,

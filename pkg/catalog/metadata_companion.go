@@ -113,14 +113,29 @@ type metadataCompanionCommitLister interface {
 	ListCommits(ctx context.Context, repositoryID string, ref string, params LogParams) ([]*CommitLog, bool, error)
 }
 
-// isHiddenMetadataCompanion reports whether one listed repository is a Metadata Search companion
-// repository, which a repository listing leaves out (G9). repository and defaultBranch are the ones
-// the repository listing already holds, so the filter costs no repository read.
+// IsMetadataCompanion reports whether repository is a Metadata Search companion repository: one the
+// indexer created as R-metadata, not any repository whose name ends in "-metadata" (see the file
+// comment). repository and defaultBranch are the ones the caller already holds, so the answer costs
+// no repository read.
+//
+// It is exported because two callers outside this file need the same proof: the repository listing
+// hides the companions it proves (isHiddenMetadataCompanion, below), and the repository deletion
+// cascade deletes the companion it proves (REPO_DELETE_STORAGE_DESIGN.md section 6, R17). Sharing
+// one function is what keeps those two from disagreeing - a repository that a listing hides must be
+// exactly one that a deletion cascades into, never the user's own "foo-metadata".
 //
 // The error is the reason the history could not be read; the caller treats it as "not proved" (see
 // the file comment).
-func (c *Catalog) isHiddenMetadataCompanion(ctx context.Context, repository, defaultBranch string) (bool, error) {
+func (c *Catalog) IsMetadataCompanion(ctx context.Context, repository, defaultBranch string) (bool, error) {
 	return c.metadataCompanions.hidden(ctx, c, repository, defaultBranch)
+}
+
+// isHiddenMetadataCompanion reports whether one listed repository is a Metadata Search companion
+// repository, which a repository listing leaves out (G9). It is the listing's name for
+// IsMetadataCompanion, and deliberately only that name: two proofs that could disagree would hide
+// one repository from a listing while a deletion cascaded into another.
+func (c *Catalog) isHiddenMetadataCompanion(ctx context.Context, repository, defaultBranch string) (bool, error) {
+	return c.IsMetadataCompanion(ctx, repository, defaultBranch)
 }
 
 // isMetadataCompanionName reports whether repository's name can name a companion at all. It is the

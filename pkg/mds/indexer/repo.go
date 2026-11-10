@@ -152,6 +152,13 @@ func (x *Indexer) ensureMetadataRepository(ctx context.Context, repository Repos
 	meta, err := x.lakeFS.GetRepository(ctx, metadata)
 	switch {
 	case errors.Is(err, reader.ErrNotFound):
+		// A companion is being created, so whatever this process remembered about an earlier
+		// companion of the same name is stale: R and R-metadata may have been deleted (with their
+		// storage, REPO_DELETE_STORAGE_DESIGN.md section 6) and re-created under the same names,
+		// and the per-process initialised flag would then skip the mds: init commit the new
+		// repository needs to be recognised as the indexer's (§4.8). Resetting it here - before the
+		// create - covers every path that re-creates a companion, not only the cascade's.
+		x.setMetaInfo(repository.Name, metadataState{})
 		meta, err = x.createMetadataRepository(ctx, repository, data)
 		if err != nil {
 			return "", err

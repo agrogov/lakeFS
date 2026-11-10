@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	cmdpkg "github.com/treeverse/lakefs/cmd/lakefs/cmd"
@@ -140,4 +141,106 @@ func capturePackageLog(t *testing.T) func() string {
 		require.NoError(t, err, "read the captured log")
 		return string(data)
 	}
+}
+
+// TestMetadataSearchDeletionCascade pins the decision of REPO_DELETE_STORAGE_DESIGN.md §6 (R17) on
+// the function installDeletionCascade installs: the cascade names only a repository that exists and
+// passes the init-commit proof, so a user's own "-metadata" repository - which is neither hidden from
+// a listing nor derived data of R - is never named.
+func TestMetadataSearchDeletionCascade(t *testing.T) {
+	f := newStoreFixture(t)
+	ctx := t.Context()
+	companion := MetadataRepository(storeTestRepo)
+
+	_, err := f.catalog.CreateRepository(ctx, companion, "", "mem://companion-ns", "main", false)
+	require.NoError(t, err, "create the companion repository")
+	require.NoError(t, f.catalog.CreateEntry(ctx, companion, "main", catalog.DBEntry{
+		Path:            "system/init",
+		PhysicalAddress: "system/init",
+		AddressType:     catalog.AddressTypeRelative,
+		CreationDate:    time.Now().UTC(),
+	}))
+	_, err = f.catalog.Commit(ctx, companion, "main",
+		MetadataSearchInitCommitMessage, "mds-service-user",
+		catalog.Metadata{MetadataSearchInitProperty: MetadataSearchInitValue}, nil, nil, false)
+	require.NoError(t, err, "write the indexer's initialisation commit")
+
+	// A user's own repository whose name has the companion suffix, without the initialisation.
+	_, err = f.catalog.CreateRepository(ctx, "own-metadata", "", "mem://own-ns", "main", false)
+	require.NoError(t, err, "create a user's own -metadata repository")
+
+	cascade := MetadataSearchDeletionCascade(f.catalog)
+	tests := []struct {
+		name       string
+		repository string
+		want       string
+	}{
+		{name: "a proven companion is cascaded", repository: storeTestRepo, want: companion},
+		{name: "a user's own -metadata repository is not", repository: "own"},
+		{name: "a repository without a companion is not", repository: "absent"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok, err := cascade(ctx, &catalog.Repository{Name: test.repository, DefaultBranch: "main"})
+			require.NoError(t, err)
+			require.Equal(t, test.want != "", ok)
+			require.Equal(t, test.want, got)
+		})
+	}
+}
+
+// TestInstallDeletionCascade pins the wiring: the cascade is installed only while Metadata Search is
+// enabled, and a request with it installed deletes the data repository and its companion - while the
+// same request without it deletes only the repository it named.
+func TestInstallDeletionCascade(t *testing.T) {
+	t.Run("metadata search enabled cascades into the companion", func(t *testing.T) {
+		f := newStoreFixture(t)
+		ctx := t.Context()
+		companion := MetadataRepository(storeTestRepo)
+		_, err := f.catalog.CreateRepository(ctx, companion, "", "mem://enabled-companion-ns", "main", false)
+		require.NoError(t, err, "create the companion repository")
+		require.NoError(t, f.catalog.CreateEntry(ctx, companion, "main", catalog.DBEntry{
+			Path:            "system/init",
+			PhysicalAddress: "system/init",
+			AddressType:     catalog.AddressTypeRelative,
+			CreationDate:    time.Now().UTC(),
+		}))
+		_, err = f.catalog.Commit(ctx, companion, "main",
+			MetadataSearchInitCommitMessage, "mds-service-user",
+			catalog.Metadata{MetadataSearchInitProperty: MetadataSearchInitValue}, nil, nil, false)
+		require.NoError(t, err, "write the indexer's initialisation commit")
+
+		installDeletionCascade(&Config{Enabled: true, MetadataSearch: MetadataSearchConfig{Enabled: true}},
+			cmdpkg.ServerDeps{Catalog: f.catalog})
+		t.Cleanup(func() { catalog.SetDeletionCascade(nil) })
+
+		records, err := f.catalog.DeleteRepositoryWithStorage(ctx, storeTestRepo, catalog.DeleteStorageOptions{})
+		require.NoError(t, err)
+		require.Len(t, records, 2)
+		require.Equal(t, storeTestRepo, records[0].Repository)
+		require.Equal(t, companion, records[1].Repository)
+		require.Equal(t, storeTestRepo, records[1].CascadeOf)
+	})
+
+	t.Run("metadata search disabled installs no cascade", func(t *testing.T) {
+		f := newStoreFixture(t)
+		ctx := t.Context()
+		companion := MetadataRepository(storeTestRepo)
+		_, err := f.catalog.CreateRepository(ctx, companion, "", "mem://disabled-companion-ns", "main", false)
+		require.NoError(t, err, "create the companion repository")
+
+		// A previous installation's cascade must not survive: the hook is process-wide.
+		installDeletionCascade(&Config{Enabled: true, MetadataSearch: MetadataSearchConfig{Enabled: true}},
+			cmdpkg.ServerDeps{Catalog: f.catalog})
+		installDeletionCascade(&Config{Enabled: true}, cmdpkg.ServerDeps{Catalog: f.catalog})
+		t.Cleanup(func() { catalog.SetDeletionCascade(nil) })
+
+		records, err := f.catalog.DeleteRepositoryWithStorage(ctx, storeTestRepo, catalog.DeleteStorageOptions{})
+		require.NoError(t, err)
+		require.Len(t, records, 1, "without Metadata Search there is no companion to cascade into")
+		require.Equal(t, storeTestRepo, records[0].Repository)
+
+		_, err = f.catalog.GetRepository(ctx, companion)
+		require.NoError(t, err, "an unproven companion is left alone")
+	})
 }

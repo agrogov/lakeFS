@@ -11,11 +11,19 @@ import (
 	"testing"
 
 	"github.com/apache/iceberg-go/catalog/rest"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
+	"github.com/treeverse/lakefs/pkg/block"
+	lakefscatalog "github.com/treeverse/lakefs/pkg/catalog"
+	"github.com/treeverse/lakefs/pkg/config"
+	"github.com/treeverse/lakefs/pkg/graveler"
+	"github.com/treeverse/lakefs/pkg/kv"
+	"github.com/treeverse/lakefs/pkg/kv/kvparams"
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/mds/indexer"
 	"github.com/treeverse/lakefs/pkg/mds/reader"
 	"github.com/treeverse/lakefs/pkg/mds/table"
+	"github.com/treeverse/lakefs/pkg/upload"
 )
 
 // TestMetadataNamespace pins the namespace rules of §3.3 through the effect they have on the
@@ -1074,4 +1082,114 @@ func TestReadOnlyMetadataRepositoryFailsTheRepository(t *testing.T) {
 	require.NoError(t, e.health.branch("repo", "main").err)
 	require.Equal(t, []string{"a", "b"}, e.paths("main"))
 	require.Equal(t, "s2", e.health.branch("repo", "main").lastIndexed)
+}
+
+// TestRecreatedCompanionGetsItsInitialisationCommitAgain pins the stale initialisation cache of
+// design §6: deleting R and R-metadata with delete_storage and re-creating both under the same names
+// inside one process used to leave the per-process `initialised` flag set, so the second companion
+// was never initialised and failed the catalog's init-commit proof. The fix resets the flag whenever
+// a missing companion is about to be created.
+func TestRecreatedCompanionGetsItsInitialisationCommitAgain(t *testing.T) {
+	e := newEnv(t)
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
+	e.tick()
+
+	require.NoError(t, e.health.repositoryError("repo"))
+	first := e.fake.initCommitID()
+	require.NotEmpty(t, first, "the first companion is initialised")
+	require.Len(t, e.fake.createdRepositories, 1)
+
+	// The cascade deleted both repositories, and both are re-created under the same names before
+	// this process restarts: the second companion is a fresh, empty repository.
+	e.fake.deleteRepository("repo-metadata")
+	e.fake.deleteRepository("repo")
+	e.fake.addRepository("repo", "s3://bucket/data", "main")
+	e.fake.addCommit("repo", "main", "s2", nil, []reader.ObjectStat{object("b", 20)})
+
+	e.tick()
+
+	require.NoError(t, e.health.repositoryError("repo"))
+	require.Len(t, e.fake.createdRepositories, 2, "the companion is created again")
+	second := e.fake.initCommitID()
+	require.NotEmpty(t, second, "the re-created companion is initialised again, whatever the process remembers")
+	require.NotEqual(t, first, second)
+	init := e.fake.commits["repo-metadata"][second]
+	require.Equal(t, indexer.MetadataKeyInitValue, init.Metadata[indexer.MetadataKeyInit])
+	require.Equal(t, "repo", init.Metadata[indexer.MetadataKeySourceRepository])
+	root := e.fake.commits["repo-metadata"][init.Parents[0]]
+	require.Empty(t, root.Parents, "the initialisation sits directly above the automatic creation root")
+}
+
+// TestCompanionCreateIsRefusedWhileItsDeletionIsPending pins design §6's indexer interaction and R16
+// through the indexer's own client (the in-process reader): a tick that read R just before R and its
+// companion were deleted with storage tries to create R-metadata again while that name's deletion
+// record is pending, and the catalog refuses the create.
+func TestCompanionCreateIsRefusedWhileItsDeletionIsPending(t *testing.T) {
+	ctx := t.Context()
+	cat := newIndexerCatalog(t)
+
+	const (
+		dataRepository      = "repo"
+		companionRepository = "repo-metadata"
+		dataNamespace       = "mem://pending/data"
+		companionNamespace  = "mem://pending/data-metadata"
+	)
+	_, err := cat.CreateRepository(ctx, dataRepository, "", dataNamespace, "main", false)
+	require.NoError(t, err, "create the data repository")
+	_, err = cat.CreateRepository(ctx, companionRepository, "", companionNamespace, "main", false)
+	require.NoError(t, err, "create the companion repository before its deletion")
+
+	// The cascade deleted R-metadata's metadata and left its deletion record pending: the exact
+	// window in which a tick that already read R still tries to create the companion.
+	require.NoError(t, cat.CreateRepositoryDeletion(ctx, &lakefscatalog.RepositoryDeletion{
+		Repository:       companionRepository,
+		StorageNamespace: companionNamespace,
+		State:            lakefscatalog.RepositoryDeletionState_DELETING,
+		Step:             lakefscatalog.RepositoryDeletionStep_OBJECTS,
+	}))
+	require.NoError(t, cat.DeleteRepository(ctx, companionRepository, graveler.WithForce(true)))
+
+	health := newFakeHealth()
+	idx, err := indexer.New(indexer.Options{
+		LakeFS:       reader.New(cat, 10),
+		Tables:       newFake(),
+		Repositories: []indexer.Repository{{Name: dataRepository, Branches: []string{"main"}}},
+		Health:       health,
+		Log:          logging.ContextUnavailable(),
+	})
+	require.NoError(t, err, "build the indexer over the in-process reader")
+
+	require.NoError(t, idx.Tick(ctx))
+	err = health.repositoryError(dataRepository)
+	require.ErrorIs(t, err, lakefscatalog.ErrDeletionInProgress,
+		"the companion create is refused while R's deletion is pending (R16)")
+	require.Contains(t, err.Error(), companionRepository, "the refusal names the repository whose deletion is pending")
+}
+
+// newIndexerCatalog builds the lakeFS catalog the in-process reader of a test runs on: a mem KV store
+// and the mem block adapter, with no repository cache so a deleted repository is gone immediately.
+func newIndexerCatalog(t *testing.T) *lakefscatalog.Catalog {
+	t.Helper()
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	viper.Set(config.BlockstoreTypeKey, block.BlockstoreTypeMem)
+	viper.Set("graveler.repository_cache.size", 0)
+
+	cfg := &config.ConfigImpl{}
+	_, err := config.NewConfig("", cfg)
+	require.NoError(t, err, "build the lakeFS configuration")
+	cfg.Committed.LocalCache.Dir = t.TempDir()
+
+	kvStore, err := kv.Open(t.Context(), kvparams.Config{Type: "mem"})
+	require.NoError(t, err, "open the mem KV store")
+	t.Cleanup(kvStore.Close)
+
+	cat, err := lakefscatalog.New(context.WithoutCancel(t.Context()), lakefscatalog.Config{
+		Config:       cfg,
+		KVStore:      kvStore,
+		PathProvider: upload.DefaultPathProvider,
+	})
+	require.NoError(t, err, "build the lakeFS catalog")
+	t.Cleanup(func() { _ = cat.Close() })
+	return cat
 }

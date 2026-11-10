@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	stdatomic "sync/atomic"
 	"time"
 
 	"github.com/treeverse/lakefs/pkg/block"
@@ -11,6 +12,48 @@ import (
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/validator"
 )
+
+// DeletionCascade names the Metadata Search companion repository whose storage deletion a request
+// for repository should also request (REPO_DELETE_STORAGE_SPEC.md R17). repository is the data
+// repository's public record, as Catalog.GetRepository returns it.
+//
+// companion is the repository to cascade into, and it is only ever a name a proof named: the
+// installer returns "<repository.Name>-metadata" when that repository exists and passes the
+// init-commit proof (Catalog.IsMetadataCompanion, metadata_companion.go), so a user's own
+// "foo-metadata" without the init commit is never cascaded. An empty companion, or ok false, means
+// "no companion": the request deletes exactly the repository it named. err aborts the request
+// before anything is written.
+//
+// The hook must be safe for concurrent use: one process serves many deletion requests at once.
+type DeletionCascade func(ctx context.Context, repository *Repository) (companion string, ok bool, err error)
+
+// deletionCascade holds the cascade installed by SetDeletionCascade. It is read on every request
+// that asks to delete a repository's storage and written once at startup, so it is an atomic pointer
+// rather than a plain variable - the same shape as the merge-conflict resolver
+// (merge_conflict.go) and the uncommitted-GC protector (gc_write_uncommitted.go).
+var deletionCascade stdatomic.Pointer[DeletionCascade]
+
+// SetDeletionCascade installs f, or clears the cascade when f is nil. It is called once at startup
+// by the binary that owns a catalog whose data repositories have Metadata Search companions
+// (pkg/icebergcatalog.Bootstrap, installed from cmd/lakefs-sso/main.go), and it is cleared again -
+// not left installed but inert - when Metadata Search is not enabled.
+//
+// A nil cascade is the upstream behaviour: a request deletes only the repository it named.
+func SetDeletionCascade(f DeletionCascade) {
+	if f == nil {
+		deletionCascade.Store(nil)
+		return
+	}
+	deletionCascade.Store(&f)
+}
+
+// SetDeletionCascade is the catalog-shaped spelling of the package function of the same name
+// (REPO_DELETE_STORAGE_DESIGN.md section 6). The hook is process-wide - it is installed once, before
+// the first request, and read by every catalog of the process - so the receiver is only the handle a
+// caller such as pkg/icebergcatalog.Bootstrap already holds.
+func (c *Catalog) SetDeletionCascade(f DeletionCascade) {
+	SetDeletionCascade(f)
+}
 
 // DeleteStorageOptions are the request-path options of DeleteRepositoryWithStorage
 // (REPO_DELETE_STORAGE_DESIGN.md section 4.2).
@@ -61,8 +104,9 @@ func (c *Catalog) DeleteRepositoryWithStorage(ctx context.Context, repository st
 		return nil, err
 	}
 
-	// No cascade yet: the Metadata Search companion seam is added by D7.  The shape below already
-	// takes a list of targets, so the seam only appends to it.
+	// The targets are R plus, when a cascade is installed and proves one, R's Metadata Search
+	// companion (R17).  Both are resolved here and checked together below, so a refusal of either
+	// target changes nothing at all (R19).
 	targets := []repositoryDeletionTarget{{
 		RepositoryDeletionTarget: RepositoryDeletionTarget{
 			Repository:       repository,
@@ -71,6 +115,13 @@ func (c *Catalog) DeleteRepositoryWithStorage(ctx context.Context, repository st
 		},
 		ReadOnly: repo.ReadOnly,
 	}}
+	companion, err := c.deletionCascadeTarget(ctx, repository, repo)
+	if err != nil {
+		return nil, err
+	}
+	if companion != nil {
+		targets = append(targets, *companion)
+	}
 
 	// Every refusal check runs for every target before the first write (R19): a refusal changes
 	// nothing at all.
@@ -90,6 +141,7 @@ func (c *Catalog) DeleteRepositoryWithStorage(ctx context.Context, repository st
 			Step:             RepositoryDeletionStep_METADATA,
 			RequestedBy:      opts.RequestedBy,
 			Force:            opts.Force,
+			CascadeOf:        target.CascadeOf,
 		}
 		stored, err := c.createOrReplaceRepositoryDeletion(ctx, record)
 		if err != nil {
@@ -115,6 +167,53 @@ func (c *Catalog) DeleteRepositoryWithStorage(ctx context.Context, repository st
 type repositoryDeletionTarget struct {
 	RepositoryDeletionTarget
 	ReadOnly bool
+	// CascadeOf is the data repository whose deletion requested this target's deletion, or empty
+	// for the repository the request named.  It is recorded on the companion's deletion record
+	// (R17, design section 3.1).
+	CascadeOf string
+}
+
+// deletionCascadeTarget resolves the Metadata Search companion the installed cascade names for
+// repository (R17).  It returns nil when no cascade is installed, or when the data repository has no
+// proven companion - the ordinary case, and the only one for a plain lakeFS installation.
+//
+// The companion's storage namespace is read from the companion's own repository record and never
+// derived from R's: the indexer lets an operator override it
+// (metadata_search.repositories.<R>.storage_namespace, pkg/mds/indexer/repo.go metadataNamespace), so
+// "R's namespace with -metadata appended" would name the wrong prefix - and delete the wrong
+// prefix - for such a companion.
+func (c *Catalog) deletionCascadeTarget(ctx context.Context, repository string, repo *graveler.RepositoryRecord) (*repositoryDeletionTarget, error) {
+	cascade := deletionCascade.Load()
+	if cascade == nil {
+		return nil, nil
+	}
+	companion, ok, err := (*cascade)(ctx, &Repository{
+		Name:             repository,
+		StorageID:        repo.StorageID.String(),
+		StorageNamespace: repo.StorageNamespace.String(),
+		DefaultBranch:    repo.DefaultBranchID.String(),
+		CreationDate:     repo.CreationDate,
+		ReadOnly:         repo.ReadOnly,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("resolve the metadata companion of repository %s: %w", repository, err)
+	}
+	if !ok || companion == "" || companion == repository {
+		return nil, nil
+	}
+	companionRepo, err := c.getRepository(ctx, companion)
+	if err != nil {
+		return nil, fmt.Errorf("read metadata companion repository %s of %s: %w", companion, repository, err)
+	}
+	return &repositoryDeletionTarget{
+		RepositoryDeletionTarget: RepositoryDeletionTarget{
+			Repository:       companion,
+			StorageID:        companionRepo.StorageID.String(),
+			StorageNamespace: companionRepo.StorageNamespace.String(),
+		},
+		ReadOnly:  companionRepo.ReadOnly,
+		CascadeOf: repository,
+	}, nil
 }
 
 // resumeRepositoryDeletion serves a request for a repository that is already gone (R15): the record
