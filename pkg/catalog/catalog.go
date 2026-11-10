@@ -258,6 +258,10 @@ type Catalog struct {
 	// metadataCompanions caches which repositories are Metadata Search companion repositories, for
 	// the repository listings that hide them (METADATA_SEARCH_REALIGN.md G9, metadata_companion.go).
 	metadataCompanions metadataCompanionCache
+
+	// RepositoryDeletionStorage is the repository_deletion.storage configuration: whether storage
+	// deletion is enabled, the worker interval, the page size and the retry budget.
+	RepositoryDeletionStorage config.RepositoryDeletionStorage
 }
 
 const (
@@ -436,21 +440,22 @@ func New(ctx context.Context, cfg Config) (*Catalog, error) {
 	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
 	closers = append(closers, &ctxCloser{heartbeatCancel})
 	cat := &Catalog{
-		BlockAdapter:            tierFSParams.Adapter,
-		Store:                   gStore,
-		UGCPrepareMaxFileSize:   baseCfg.UGC.PrepareMaxFileSize,
-		UGCPrepareInterval:      baseCfg.UGC.PrepareInterval,
-		PathProvider:            cfg.PathProvider,
-		BackgroundLimiter:       limiter,
-		workPool:                workPool,
-		KVStore:                 cfg.KVStore,
-		managers:                closers,
-		KVStoreLimited:          storeLimiter,
-		addressProvider:         addressProvider,
-		deleteSensor:            deleteSensor,
-		signingKey:              cfg.Config.StorageConfig().SigningKey(),
-		errorToStatusCodeAndMsg: errToStatusFunc,
-		instanceID:              xid.New().String(),
+		BlockAdapter:              tierFSParams.Adapter,
+		Store:                     gStore,
+		UGCPrepareMaxFileSize:     baseCfg.UGC.PrepareMaxFileSize,
+		UGCPrepareInterval:        baseCfg.UGC.PrepareInterval,
+		PathProvider:              cfg.PathProvider,
+		BackgroundLimiter:         limiter,
+		workPool:                  workPool,
+		KVStore:                   cfg.KVStore,
+		managers:                  closers,
+		KVStoreLimited:            storeLimiter,
+		addressProvider:           addressProvider,
+		deleteSensor:              deleteSensor,
+		signingKey:                cfg.Config.StorageConfig().SigningKey(),
+		errorToStatusCodeAndMsg:   errToStatusFunc,
+		instanceID:                xid.New().String(),
+		RepositoryDeletionStorage: baseCfg.RepositoryDeletion.Storage,
 	}
 	go cat.runInstanceHeartbeat(heartbeatCtx)
 	return cat, nil
@@ -545,6 +550,9 @@ func (c *Catalog) CreateRepository(ctx context.Context, repository string, stora
 	}); err != nil {
 		return nil, err
 	}
+	if err := c.CheckRepositoryDeletionConflict(ctx, repositoryID.String(), storageIdentifier.String(), storageNS.String()); err != nil {
+		return nil, err
+	}
 
 	repo, err := c.Store.CreateRepository(ctx, repositoryID, storageIdentifier, storageNS, branchID, readOnly)
 	if err != nil {
@@ -572,6 +580,9 @@ func (c *Catalog) CreateBareRepository(ctx context.Context, repository string, s
 		{Name: "name", Value: repositoryID, Fn: graveler.ValidateRepositoryID},
 		{Name: "storageNamespace", Value: storageNS, Fn: graveler.ValidateStorageNamespace},
 	}); err != nil {
+		return nil, err
+	}
+	if err := c.CheckRepositoryDeletionConflict(ctx, repositoryID.String(), storageIdentifier.String(), storageNS.String()); err != nil {
 		return nil, err
 	}
 

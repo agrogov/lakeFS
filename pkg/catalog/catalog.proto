@@ -95,3 +95,47 @@ message MergeAsyncStatusData {
 message TaskMsg {
   Task task = 1;
 }
+
+// RepositoryDeletionState is the lifecycle state of a repository storage deletion.
+enum RepositoryDeletionState {
+  PENDING = 0;
+  DELETING = 1;
+  DONE = 2;
+  FAILED = 3;
+}
+
+// RepositoryDeletionStep is the resumable position of a repository storage deletion.
+enum RepositoryDeletionStep {
+  METADATA = 0;
+  SETTLE = 1;
+  OBJECTS = 2;
+  VERIFY = 3;
+  MARKER = 4;
+  FINISHED = 5;
+}
+
+// RepositoryDeletionData is the persistent record of a repository storage deletion.  It lives in
+// the global "repository-deletions" KV partition under "deletions/<repository id>": the repository
+// partition is wiped by the metadata delete, so the record must outlive it.  One record per
+// repository name enforces a single pending deletion per name.
+message RepositoryDeletionData {
+  string repository = 1;
+  string storage_id = 2;
+  string storage_namespace = 3;
+  RepositoryDeletionState state = 4;
+  RepositoryDeletionStep step = 5;
+  // marker is DeleteNamespaceOpts.After for the next page: the last object key already handled.
+  string marker = 6;
+  int64 objects_deleted = 7;
+  string requested_by = 8;
+  google.protobuf.Timestamp requested_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+  google.protobuf.Timestamp metadata_deleted_at = 11;
+  google.protobuf.Timestamp next_attempt_at = 12;
+  int32 attempts = 13;
+  string last_error = 14;
+  // force is passed to the metadata step on retry, after R8 already refused read-only repositories.
+  bool force = 15;
+  // cascade_of is set on a Metadata Search companion's record: the data repository that caused it.
+  string cascade_of = 16;
+}

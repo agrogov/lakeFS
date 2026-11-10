@@ -23,6 +23,118 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// RepositoryDeletionState is the lifecycle state of a repository storage deletion.
+type RepositoryDeletionState int32
+
+const (
+	RepositoryDeletionState_PENDING  RepositoryDeletionState = 0
+	RepositoryDeletionState_DELETING RepositoryDeletionState = 1
+	RepositoryDeletionState_DONE     RepositoryDeletionState = 2
+	RepositoryDeletionState_FAILED   RepositoryDeletionState = 3
+)
+
+// Enum value maps for RepositoryDeletionState.
+var (
+	RepositoryDeletionState_name = map[int32]string{
+		0: "PENDING",
+		1: "DELETING",
+		2: "DONE",
+		3: "FAILED",
+	}
+	RepositoryDeletionState_value = map[string]int32{
+		"PENDING":  0,
+		"DELETING": 1,
+		"DONE":     2,
+		"FAILED":   3,
+	}
+)
+
+func (x RepositoryDeletionState) Enum() *RepositoryDeletionState {
+	p := new(RepositoryDeletionState)
+	*p = x
+	return p
+}
+
+func (x RepositoryDeletionState) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (RepositoryDeletionState) Descriptor() protoreflect.EnumDescriptor {
+	return file_catalog_catalog_proto_enumTypes[0].Descriptor()
+}
+
+func (RepositoryDeletionState) Type() protoreflect.EnumType {
+	return &file_catalog_catalog_proto_enumTypes[0]
+}
+
+func (x RepositoryDeletionState) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use RepositoryDeletionState.Descriptor instead.
+func (RepositoryDeletionState) EnumDescriptor() ([]byte, []int) {
+	return file_catalog_catalog_proto_rawDescGZIP(), []int{0}
+}
+
+// RepositoryDeletionStep is the resumable position of a repository storage deletion.
+type RepositoryDeletionStep int32
+
+const (
+	RepositoryDeletionStep_METADATA RepositoryDeletionStep = 0
+	RepositoryDeletionStep_SETTLE   RepositoryDeletionStep = 1
+	RepositoryDeletionStep_OBJECTS  RepositoryDeletionStep = 2
+	RepositoryDeletionStep_VERIFY   RepositoryDeletionStep = 3
+	RepositoryDeletionStep_MARKER   RepositoryDeletionStep = 4
+	RepositoryDeletionStep_FINISHED RepositoryDeletionStep = 5
+)
+
+// Enum value maps for RepositoryDeletionStep.
+var (
+	RepositoryDeletionStep_name = map[int32]string{
+		0: "METADATA",
+		1: "SETTLE",
+		2: "OBJECTS",
+		3: "VERIFY",
+		4: "MARKER",
+		5: "FINISHED",
+	}
+	RepositoryDeletionStep_value = map[string]int32{
+		"METADATA": 0,
+		"SETTLE":   1,
+		"OBJECTS":  2,
+		"VERIFY":   3,
+		"MARKER":   4,
+		"FINISHED": 5,
+	}
+)
+
+func (x RepositoryDeletionStep) Enum() *RepositoryDeletionStep {
+	p := new(RepositoryDeletionStep)
+	*p = x
+	return p
+}
+
+func (x RepositoryDeletionStep) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (RepositoryDeletionStep) Descriptor() protoreflect.EnumDescriptor {
+	return file_catalog_catalog_proto_enumTypes[1].Descriptor()
+}
+
+func (RepositoryDeletionStep) Type() protoreflect.EnumType {
+	return &file_catalog_catalog_proto_enumTypes[1]
+}
+
+func (x RepositoryDeletionStep) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use RepositoryDeletionStep.Descriptor instead.
+func (RepositoryDeletionStep) EnumDescriptor() ([]byte, []int) {
+	return file_catalog_catalog_proto_rawDescGZIP(), []int{1}
+}
+
 type Entry_AddressType int32
 
 const (
@@ -59,11 +171,11 @@ func (x Entry_AddressType) String() string {
 }
 
 func (Entry_AddressType) Descriptor() protoreflect.EnumDescriptor {
-	return file_catalog_catalog_proto_enumTypes[0].Descriptor()
+	return file_catalog_catalog_proto_enumTypes[2].Descriptor()
 }
 
 func (Entry_AddressType) Type() protoreflect.EnumType {
-	return &file_catalog_catalog_proto_enumTypes[0]
+	return &file_catalog_catalog_proto_enumTypes[2]
 }
 
 func (x Entry_AddressType) Number() protoreflect.EnumNumber {
@@ -783,6 +895,177 @@ func (x *TaskMsg) GetTask() *Task {
 	return nil
 }
 
+// RepositoryDeletionData is the persistent record of a repository storage deletion.  It lives in
+// the global "repository-deletions" KV partition under "deletions/<repository id>": the repository
+// partition is wiped by the metadata delete, so the record must outlive it.  One record per
+// repository name enforces a single pending deletion per name.
+type RepositoryDeletionData struct {
+	state            protoimpl.MessageState  `protogen:"open.v1"`
+	Repository       string                  `protobuf:"bytes,1,opt,name=repository,proto3" json:"repository,omitempty"`
+	StorageId        string                  `protobuf:"bytes,2,opt,name=storage_id,json=storageId,proto3" json:"storage_id,omitempty"`
+	StorageNamespace string                  `protobuf:"bytes,3,opt,name=storage_namespace,json=storageNamespace,proto3" json:"storage_namespace,omitempty"`
+	State            RepositoryDeletionState `protobuf:"varint,4,opt,name=state,proto3,enum=catalog.RepositoryDeletionState" json:"state,omitempty"`
+	Step             RepositoryDeletionStep  `protobuf:"varint,5,opt,name=step,proto3,enum=catalog.RepositoryDeletionStep" json:"step,omitempty"`
+	// marker is DeleteNamespaceOpts.After for the next page: the last object key already handled.
+	Marker            string                 `protobuf:"bytes,6,opt,name=marker,proto3" json:"marker,omitempty"`
+	ObjectsDeleted    int64                  `protobuf:"varint,7,opt,name=objects_deleted,json=objectsDeleted,proto3" json:"objects_deleted,omitempty"`
+	RequestedBy       string                 `protobuf:"bytes,8,opt,name=requested_by,json=requestedBy,proto3" json:"requested_by,omitempty"`
+	RequestedAt       *timestamppb.Timestamp `protobuf:"bytes,9,opt,name=requested_at,json=requestedAt,proto3" json:"requested_at,omitempty"`
+	UpdatedAt         *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	MetadataDeletedAt *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=metadata_deleted_at,json=metadataDeletedAt,proto3" json:"metadata_deleted_at,omitempty"`
+	NextAttemptAt     *timestamppb.Timestamp `protobuf:"bytes,12,opt,name=next_attempt_at,json=nextAttemptAt,proto3" json:"next_attempt_at,omitempty"`
+	Attempts          int32                  `protobuf:"varint,13,opt,name=attempts,proto3" json:"attempts,omitempty"`
+	LastError         string                 `protobuf:"bytes,14,opt,name=last_error,json=lastError,proto3" json:"last_error,omitempty"`
+	// force is passed to the metadata step on retry, after R8 already refused read-only repositories.
+	Force bool `protobuf:"varint,15,opt,name=force,proto3" json:"force,omitempty"`
+	// cascade_of is set on a Metadata Search companion's record: the data repository that caused it.
+	CascadeOf     string `protobuf:"bytes,16,opt,name=cascade_of,json=cascadeOf,proto3" json:"cascade_of,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RepositoryDeletionData) Reset() {
+	*x = RepositoryDeletionData{}
+	mi := &file_catalog_catalog_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RepositoryDeletionData) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RepositoryDeletionData) ProtoMessage() {}
+
+func (x *RepositoryDeletionData) ProtoReflect() protoreflect.Message {
+	mi := &file_catalog_catalog_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RepositoryDeletionData.ProtoReflect.Descriptor instead.
+func (*RepositoryDeletionData) Descriptor() ([]byte, []int) {
+	return file_catalog_catalog_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *RepositoryDeletionData) GetRepository() string {
+	if x != nil {
+		return x.Repository
+	}
+	return ""
+}
+
+func (x *RepositoryDeletionData) GetStorageId() string {
+	if x != nil {
+		return x.StorageId
+	}
+	return ""
+}
+
+func (x *RepositoryDeletionData) GetStorageNamespace() string {
+	if x != nil {
+		return x.StorageNamespace
+	}
+	return ""
+}
+
+func (x *RepositoryDeletionData) GetState() RepositoryDeletionState {
+	if x != nil {
+		return x.State
+	}
+	return RepositoryDeletionState_PENDING
+}
+
+func (x *RepositoryDeletionData) GetStep() RepositoryDeletionStep {
+	if x != nil {
+		return x.Step
+	}
+	return RepositoryDeletionStep_METADATA
+}
+
+func (x *RepositoryDeletionData) GetMarker() string {
+	if x != nil {
+		return x.Marker
+	}
+	return ""
+}
+
+func (x *RepositoryDeletionData) GetObjectsDeleted() int64 {
+	if x != nil {
+		return x.ObjectsDeleted
+	}
+	return 0
+}
+
+func (x *RepositoryDeletionData) GetRequestedBy() string {
+	if x != nil {
+		return x.RequestedBy
+	}
+	return ""
+}
+
+func (x *RepositoryDeletionData) GetRequestedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.RequestedAt
+	}
+	return nil
+}
+
+func (x *RepositoryDeletionData) GetUpdatedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.UpdatedAt
+	}
+	return nil
+}
+
+func (x *RepositoryDeletionData) GetMetadataDeletedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.MetadataDeletedAt
+	}
+	return nil
+}
+
+func (x *RepositoryDeletionData) GetNextAttemptAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.NextAttemptAt
+	}
+	return nil
+}
+
+func (x *RepositoryDeletionData) GetAttempts() int32 {
+	if x != nil {
+		return x.Attempts
+	}
+	return 0
+}
+
+func (x *RepositoryDeletionData) GetLastError() string {
+	if x != nil {
+		return x.LastError
+	}
+	return ""
+}
+
+func (x *RepositoryDeletionData) GetForce() bool {
+	if x != nil {
+		return x.Force
+	}
+	return false
+}
+
+func (x *RepositoryDeletionData) GetCascadeOf() string {
+	if x != nil {
+		return x.CascadeOf
+	}
+	return ""
+}
+
 var File_catalog_catalog_proto protoreflect.FileDescriptor
 
 const file_catalog_catalog_proto_rawDesc = "" +
@@ -842,7 +1125,47 @@ const file_catalog_catalog_proto_rawDesc = "" +
 	"\x04task\x18\x01 \x01(\v2\r.catalog.TaskR\x04task\x12&\n" +
 	"\x04info\x18\x02 \x01(\v2\x12.catalog.MergeDataR\x04info\",\n" +
 	"\aTaskMsg\x12!\n" +
-	"\x04task\x18\x01 \x01(\v2\r.catalog.TaskR\x04taskB$Z\"github.com/treevese/lakefs/catalogb\x06proto3"
+	"\x04task\x18\x01 \x01(\v2\r.catalog.TaskR\x04task\"\xcf\x05\n" +
+	"\x16RepositoryDeletionData\x12\x1e\n" +
+	"\n" +
+	"repository\x18\x01 \x01(\tR\n" +
+	"repository\x12\x1d\n" +
+	"\n" +
+	"storage_id\x18\x02 \x01(\tR\tstorageId\x12+\n" +
+	"\x11storage_namespace\x18\x03 \x01(\tR\x10storageNamespace\x126\n" +
+	"\x05state\x18\x04 \x01(\x0e2 .catalog.RepositoryDeletionStateR\x05state\x123\n" +
+	"\x04step\x18\x05 \x01(\x0e2\x1f.catalog.RepositoryDeletionStepR\x04step\x12\x16\n" +
+	"\x06marker\x18\x06 \x01(\tR\x06marker\x12'\n" +
+	"\x0fobjects_deleted\x18\a \x01(\x03R\x0eobjectsDeleted\x12!\n" +
+	"\frequested_by\x18\b \x01(\tR\vrequestedBy\x12=\n" +
+	"\frequested_at\x18\t \x01(\v2\x1a.google.protobuf.TimestampR\vrequestedAt\x129\n" +
+	"\n" +
+	"updated_at\x18\n" +
+	" \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x12J\n" +
+	"\x13metadata_deleted_at\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\x11metadataDeletedAt\x12B\n" +
+	"\x0fnext_attempt_at\x18\f \x01(\v2\x1a.google.protobuf.TimestampR\rnextAttemptAt\x12\x1a\n" +
+	"\battempts\x18\r \x01(\x05R\battempts\x12\x1d\n" +
+	"\n" +
+	"last_error\x18\x0e \x01(\tR\tlastError\x12\x14\n" +
+	"\x05force\x18\x0f \x01(\bR\x05force\x12\x1d\n" +
+	"\n" +
+	"cascade_of\x18\x10 \x01(\tR\tcascadeOf*J\n" +
+	"\x17RepositoryDeletionState\x12\v\n" +
+	"\aPENDING\x10\x00\x12\f\n" +
+	"\bDELETING\x10\x01\x12\b\n" +
+	"\x04DONE\x10\x02\x12\n" +
+	"\n" +
+	"\x06FAILED\x10\x03*e\n" +
+	"\x16RepositoryDeletionStep\x12\f\n" +
+	"\bMETADATA\x10\x00\x12\n" +
+	"\n" +
+	"\x06SETTLE\x10\x01\x12\v\n" +
+	"\aOBJECTS\x10\x02\x12\n" +
+	"\n" +
+	"\x06VERIFY\x10\x03\x12\n" +
+	"\n" +
+	"\x06MARKER\x10\x04\x12\f\n" +
+	"\bFINISHED\x10\x05B$Z\"github.com/treevese/lakefs/catalogb\x06proto3"
 
 var (
 	file_catalog_catalog_proto_rawDescOnce sync.Once
@@ -856,47 +1179,56 @@ func file_catalog_catalog_proto_rawDescGZIP() []byte {
 	return file_catalog_catalog_proto_rawDescData
 }
 
-var file_catalog_catalog_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_catalog_catalog_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_catalog_catalog_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_catalog_catalog_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
 var file_catalog_catalog_proto_goTypes = []any{
-	(Entry_AddressType)(0),                      // 0: catalog.Entry.AddressType
-	(*Entry)(nil),                               // 1: catalog.Entry
-	(*Task)(nil),                                // 2: catalog.Task
-	(*InstanceHeartbeat)(nil),                   // 3: catalog.InstanceHeartbeat
-	(*RepositoryDumpInfo)(nil),                  // 4: catalog.RepositoryDumpInfo
-	(*RepositoryDumpStatus)(nil),                // 5: catalog.RepositoryDumpStatus
-	(*RepositoryRestoreStatus)(nil),             // 6: catalog.RepositoryRestoreStatus
-	(*GarbageCollectionPrepareCommitsInfo)(nil), // 7: catalog.GarbageCollectionPrepareCommitsInfo
-	(*GarbageCollectionPrepareStatus)(nil),      // 8: catalog.GarbageCollectionPrepareStatus
-	(*CommitAsyncStatusData)(nil),               // 9: catalog.CommitAsyncStatusData
-	(*MergeData)(nil),                           // 10: catalog.MergeData
-	(*MergeAsyncStatusData)(nil),                // 11: catalog.MergeAsyncStatusData
-	(*TaskMsg)(nil),                             // 12: catalog.TaskMsg
-	nil,                                         // 13: catalog.Entry.MetadataEntry
-	(*timestamppb.Timestamp)(nil),               // 14: google.protobuf.Timestamp
-	(*graveler.CommitData)(nil),                 // 15: io.treeverse.lakefs.graveler.CommitData
+	(RepositoryDeletionState)(0),                // 0: catalog.RepositoryDeletionState
+	(RepositoryDeletionStep)(0),                 // 1: catalog.RepositoryDeletionStep
+	(Entry_AddressType)(0),                      // 2: catalog.Entry.AddressType
+	(*Entry)(nil),                               // 3: catalog.Entry
+	(*Task)(nil),                                // 4: catalog.Task
+	(*InstanceHeartbeat)(nil),                   // 5: catalog.InstanceHeartbeat
+	(*RepositoryDumpInfo)(nil),                  // 6: catalog.RepositoryDumpInfo
+	(*RepositoryDumpStatus)(nil),                // 7: catalog.RepositoryDumpStatus
+	(*RepositoryRestoreStatus)(nil),             // 8: catalog.RepositoryRestoreStatus
+	(*GarbageCollectionPrepareCommitsInfo)(nil), // 9: catalog.GarbageCollectionPrepareCommitsInfo
+	(*GarbageCollectionPrepareStatus)(nil),      // 10: catalog.GarbageCollectionPrepareStatus
+	(*CommitAsyncStatusData)(nil),               // 11: catalog.CommitAsyncStatusData
+	(*MergeData)(nil),                           // 12: catalog.MergeData
+	(*MergeAsyncStatusData)(nil),                // 13: catalog.MergeAsyncStatusData
+	(*TaskMsg)(nil),                             // 14: catalog.TaskMsg
+	(*RepositoryDeletionData)(nil),              // 15: catalog.RepositoryDeletionData
+	nil,                                         // 16: catalog.Entry.MetadataEntry
+	(*timestamppb.Timestamp)(nil),               // 17: google.protobuf.Timestamp
+	(*graveler.CommitData)(nil),                 // 18: io.treeverse.lakefs.graveler.CommitData
 }
 var file_catalog_catalog_proto_depIdxs = []int32{
-	14, // 0: catalog.Entry.last_modified:type_name -> google.protobuf.Timestamp
-	13, // 1: catalog.Entry.metadata:type_name -> catalog.Entry.MetadataEntry
-	0,  // 2: catalog.Entry.address_type:type_name -> catalog.Entry.AddressType
-	14, // 3: catalog.Task.updated_at:type_name -> google.protobuf.Timestamp
-	14, // 4: catalog.InstanceHeartbeat.updated_at:type_name -> google.protobuf.Timestamp
-	2,  // 5: catalog.RepositoryDumpStatus.task:type_name -> catalog.Task
-	4,  // 6: catalog.RepositoryDumpStatus.info:type_name -> catalog.RepositoryDumpInfo
-	2,  // 7: catalog.RepositoryRestoreStatus.task:type_name -> catalog.Task
-	2,  // 8: catalog.GarbageCollectionPrepareStatus.task:type_name -> catalog.Task
-	7,  // 9: catalog.GarbageCollectionPrepareStatus.info:type_name -> catalog.GarbageCollectionPrepareCommitsInfo
-	2,  // 10: catalog.CommitAsyncStatusData.task:type_name -> catalog.Task
-	15, // 11: catalog.CommitAsyncStatusData.info:type_name -> io.treeverse.lakefs.graveler.CommitData
-	2,  // 12: catalog.MergeAsyncStatusData.task:type_name -> catalog.Task
-	10, // 13: catalog.MergeAsyncStatusData.info:type_name -> catalog.MergeData
-	2,  // 14: catalog.TaskMsg.task:type_name -> catalog.Task
-	15, // [15:15] is the sub-list for method output_type
-	15, // [15:15] is the sub-list for method input_type
-	15, // [15:15] is the sub-list for extension type_name
-	15, // [15:15] is the sub-list for extension extendee
-	0,  // [0:15] is the sub-list for field type_name
+	17, // 0: catalog.Entry.last_modified:type_name -> google.protobuf.Timestamp
+	16, // 1: catalog.Entry.metadata:type_name -> catalog.Entry.MetadataEntry
+	2,  // 2: catalog.Entry.address_type:type_name -> catalog.Entry.AddressType
+	17, // 3: catalog.Task.updated_at:type_name -> google.protobuf.Timestamp
+	17, // 4: catalog.InstanceHeartbeat.updated_at:type_name -> google.protobuf.Timestamp
+	4,  // 5: catalog.RepositoryDumpStatus.task:type_name -> catalog.Task
+	6,  // 6: catalog.RepositoryDumpStatus.info:type_name -> catalog.RepositoryDumpInfo
+	4,  // 7: catalog.RepositoryRestoreStatus.task:type_name -> catalog.Task
+	4,  // 8: catalog.GarbageCollectionPrepareStatus.task:type_name -> catalog.Task
+	9,  // 9: catalog.GarbageCollectionPrepareStatus.info:type_name -> catalog.GarbageCollectionPrepareCommitsInfo
+	4,  // 10: catalog.CommitAsyncStatusData.task:type_name -> catalog.Task
+	18, // 11: catalog.CommitAsyncStatusData.info:type_name -> io.treeverse.lakefs.graveler.CommitData
+	4,  // 12: catalog.MergeAsyncStatusData.task:type_name -> catalog.Task
+	12, // 13: catalog.MergeAsyncStatusData.info:type_name -> catalog.MergeData
+	4,  // 14: catalog.TaskMsg.task:type_name -> catalog.Task
+	0,  // 15: catalog.RepositoryDeletionData.state:type_name -> catalog.RepositoryDeletionState
+	1,  // 16: catalog.RepositoryDeletionData.step:type_name -> catalog.RepositoryDeletionStep
+	17, // 17: catalog.RepositoryDeletionData.requested_at:type_name -> google.protobuf.Timestamp
+	17, // 18: catalog.RepositoryDeletionData.updated_at:type_name -> google.protobuf.Timestamp
+	17, // 19: catalog.RepositoryDeletionData.metadata_deleted_at:type_name -> google.protobuf.Timestamp
+	17, // 20: catalog.RepositoryDeletionData.next_attempt_at:type_name -> google.protobuf.Timestamp
+	21, // [21:21] is the sub-list for method output_type
+	21, // [21:21] is the sub-list for method input_type
+	21, // [21:21] is the sub-list for extension type_name
+	21, // [21:21] is the sub-list for extension extendee
+	0,  // [0:21] is the sub-list for field type_name
 }
 
 func init() { file_catalog_catalog_proto_init() }
@@ -909,8 +1241,8 @@ func file_catalog_catalog_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_catalog_catalog_proto_rawDesc), len(file_catalog_catalog_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   13,
+			NumEnums:      3,
+			NumMessages:   14,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

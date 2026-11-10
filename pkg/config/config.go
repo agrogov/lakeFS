@@ -181,6 +181,26 @@ type Database struct {
 }
 
 // ApproximatelyCorrectOwnership configures an approximate ("mostly correct") ownership.
+// RepositoryDeletionStorage configures the background deletion of a repository's storage
+// namespace (REPO_DELETE_STORAGE_SPEC.md R20).
+type RepositoryDeletionStorage struct {
+	// Enabled gates the request path: with false, a delete request that asks to delete storage is
+	// refused (R7), and the worker does not run.
+	Enabled bool `mapstructure:"enabled"`
+	// Interval is the delay between worker scans.
+	Interval time.Duration `mapstructure:"interval"`
+	// BatchSize is the maximum number of objects one DeleteNamespacePage call deletes.  Adapters
+	// cap it to their own provider limit.
+	BatchSize int `mapstructure:"batch_size"`
+	// MaxAttempts is the number of failed attempts after which a record becomes FAILED.
+	MaxAttempts int `mapstructure:"max_attempts"`
+}
+
+// RepositoryDeletion configures repository deletion.
+type RepositoryDeletion struct {
+	Storage RepositoryDeletionStorage `mapstructure:"storage"`
+}
+
 type ApproximatelyCorrectOwnership struct {
 	Enabled bool          `mapstructure:"enabled"`
 	Refresh time.Duration `mapstructure:"refresh"`
@@ -539,6 +559,8 @@ type BaseConfig struct {
 		// shorter name.
 		BranchOwnership ApproximatelyCorrectOwnership `mapstructure:"branch_ownership"`
 	} `mapstructure:"graveler"`
+	RepositoryDeletion RepositoryDeletion `mapstructure:"repository_deletion"`
+
 	Gateways struct {
 		S3 struct {
 			DomainNames       Strings `mapstructure:"domain_name"`

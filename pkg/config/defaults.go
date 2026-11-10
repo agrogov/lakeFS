@@ -35,6 +35,12 @@ const (
 	DefaultBlockstoreAzureTryTimeout                  = 10 * time.Minute
 	DefaultBlockstoreAzurePreSignedExpiry             = 15 * time.Minute
 	DefaultBlockstoreAzureDisablePreSignedUI          = true
+
+	// Repository deletion defaults (REPO_DELETE_STORAGE_SPEC.md R20).
+	DefaultRepositoryDeletionStorageEnabled     = true
+	DefaultRepositoryDeletionStorageInterval    = 30 * time.Second
+	DefaultRepositoryDeletionStorageBatchSize   = 1000
+	DefaultRepositoryDeletionStorageMaxAttempts = 10
 )
 
 //nolint:mnd
@@ -190,6 +196,11 @@ func setBaseDefaults(cfgType string) {
 
 	viper.SetDefault("ugc.prepare_interval", time.Minute)
 	viper.SetDefault("ugc.prepare_max_file_size", 20*1024*1024)
+
+	viper.SetDefault("repository_deletion.storage.enabled", DefaultRepositoryDeletionStorageEnabled)
+	viper.SetDefault("repository_deletion.storage.interval", DefaultRepositoryDeletionStorageInterval)
+	viper.SetDefault("repository_deletion.storage.batch_size", DefaultRepositoryDeletionStorageBatchSize)
+	viper.SetDefault("repository_deletion.storage.max_attempts", DefaultRepositoryDeletionStorageMaxAttempts)
 
 	viper.SetDefault("usage_report.flush_interval", 5*time.Minute)
 }
