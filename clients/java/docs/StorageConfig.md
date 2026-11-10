@@ -18,6 +18,7 @@
 |**preSignMultipartUpload** | **Boolean** |  |  [optional] |
 |**blockstoreId** | **String** |  |  [optional] |
 |**blockstoreDescription** | **String** |  |  [optional] |
+|**deleteNamespaceSupport** | **Boolean** | Whether the blockstore can delete a whole storage namespace, so that a repository can be deleted together with its objects. Not required, so older servers parse. |  [optional] |
 
 
 

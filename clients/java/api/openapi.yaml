@@ -2300,7 +2300,24 @@ paths:
           default: false
           type: boolean
         style: form
+      - description: |
+          Delete every object under the repository's storage namespace as well. The request answers 202 with the
+          deletion status, and the object deletion runs in the background.
+        explode: true
+        in: query
+        name: delete_storage
+        required: false
+        schema:
+          default: false
+          type: boolean
+        style: form
       responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepositoryDeletion'
+          description: repository deletion with storage accepted
         "204":
           description: repository deleted successfully
         "400":
@@ -2321,6 +2338,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
           description: Resource Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Resource Conflicts With Target
         "429":
           description: too many requests
         default:
@@ -2377,6 +2400,118 @@ paths:
                 $ref: '#/components/schemas/Error'
           description: Internal Server Error
       summary: get repository
+      tags:
+      - repositories
+      x-accepts: application/json
+  /repository_deletions:
+    get:
+      operationId: listRepositoryDeletions
+      parameters:
+      - allowEmptyValue: true
+        description: return items prefixed with this value
+        explode: true
+        in: query
+        name: prefix
+        required: false
+        schema:
+          type: string
+        style: form
+      - allowEmptyValue: true
+        description: return items after this value
+        explode: true
+        in: query
+        name: after
+        required: false
+        schema:
+          type: string
+        style: form
+      - description: how many items to return
+        explode: true
+        in: query
+        name: amount
+        required: false
+        schema:
+          default: 100
+          maximum: 1000
+          minimum: -1
+          type: integer
+        style: form
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepositoryDeletionList'
+          description: repository storage deletion list
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Unauthorized
+        "429":
+          description: too many requests
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Internal Server Error
+      summary: list repository storage deletions
+      tags:
+      - repositories
+      x-accepts: application/json
+  /repository_deletions/{repository}:
+    get:
+      operationId: getRepositoryDeletion
+      parameters:
+      - explode: false
+        in: path
+        name: repository
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepositoryDeletion'
+          description: repository storage deletion status
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Unauthorized
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Resource Not Found
+        "429":
+          description: too many requests
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          description: Internal Server Error
+      summary: get repository storage deletion status
       tags:
       - repositories
       x-accepts: application/json
@@ -8512,6 +8647,93 @@ components:
       - pagination
       - results
       type: object
+    RepositoryDeletion:
+      example:
+        requested_by: requested_by
+        updated_at: 1
+        state: pending
+        last_error: last_error
+        repository: repository
+        storage_namespace: storage_namespace
+        objects_deleted: 0
+        requested_at: 6
+        attempts: 5
+      properties:
+        repository:
+          type: string
+        storage_namespace:
+          type: string
+        state:
+          enum:
+          - pending
+          - deleting
+          - done
+          - failed
+          type: string
+        objects_deleted:
+          format: int64
+          type: integer
+        requested_by:
+          type: string
+        requested_at:
+          description: Unix Epoch in seconds
+          format: int64
+          type: integer
+        updated_at:
+          description: Unix Epoch in seconds
+          format: int64
+          type: integer
+        attempts:
+          type: integer
+        last_error:
+          type: string
+      required:
+      - attempts
+      - objects_deleted
+      - repository
+      - requested_at
+      - requested_by
+      - state
+      - storage_namespace
+      - updated_at
+      type: object
+    RepositoryDeletionList:
+      example:
+        pagination:
+          max_per_page: 0
+          has_more: true
+          next_offset: next_offset
+          results: 0
+        results:
+        - requested_by: requested_by
+          updated_at: 1
+          state: pending
+          last_error: last_error
+          repository: repository
+          storage_namespace: storage_namespace
+          objects_deleted: 0
+          requested_at: 6
+          attempts: 5
+        - requested_by: requested_by
+          updated_at: 1
+          state: pending
+          last_error: last_error
+          repository: repository
+          storage_namespace: storage_namespace
+          objects_deleted: 0
+          requested_at: 6
+          attempts: 5
+      properties:
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+        results:
+          items:
+            $ref: '#/components/schemas/RepositoryDeletion'
+          type: array
+      required:
+      - pagination
+      - results
+      type: object
     FindMergeBaseResult:
       example:
         destination_commit_id: destination_commit_id
@@ -10089,6 +10311,7 @@ components:
     StorageConfig:
       example:
         blockstore_description: blockstore_description
+        delete_namespace_support: true
         pre_sign_multipart_upload: true
         blockstore_namespace_example: blockstore_namespace_example
         blockstore_namespace_ValidityRegex: blockstore_namespace_ValidityRegex
@@ -10122,6 +10345,11 @@ components:
           type: string
         blockstore_description:
           type: string
+        delete_namespace_support:
+          description: "Whether the blockstore can delete a whole storage namespace,\
+            \ so that a repository can be deleted together with its objects. Not required,\
+            \ so older servers parse."
+          type: boolean
       required:
       - blockstore_namespace_ValidityRegex
       - blockstore_namespace_example
@@ -10139,6 +10367,7 @@ components:
       example:
         storage_config_list:
         - blockstore_description: blockstore_description
+          delete_namespace_support: true
           pre_sign_multipart_upload: true
           blockstore_namespace_example: blockstore_namespace_example
           blockstore_namespace_ValidityRegex: blockstore_namespace_ValidityRegex
@@ -10150,6 +10379,7 @@ components:
           default_namespace_prefix: default_namespace_prefix
           pre_sign_support: true
         - blockstore_description: blockstore_description
+          delete_namespace_support: true
           pre_sign_multipart_upload: true
           blockstore_namespace_example: blockstore_namespace_example
           blockstore_namespace_ValidityRegex: blockstore_namespace_ValidityRegex
@@ -10162,6 +10392,7 @@ components:
           pre_sign_support: true
         storage_config:
           blockstore_description: blockstore_description
+          delete_namespace_support: true
           pre_sign_multipart_upload: true
           blockstore_namespace_example: blockstore_namespace_example
           blockstore_namespace_ValidityRegex: blockstore_namespace_ValidityRegex

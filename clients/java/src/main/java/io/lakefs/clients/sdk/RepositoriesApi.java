@@ -33,6 +33,8 @@ import io.lakefs.clients.sdk.model.GarbageCollectionRules;
 import io.lakefs.clients.sdk.model.RefsRestore;
 import io.lakefs.clients.sdk.model.Repository;
 import io.lakefs.clients.sdk.model.RepositoryCreation;
+import io.lakefs.clients.sdk.model.RepositoryDeletion;
+import io.lakefs.clients.sdk.model.RepositoryDeletionList;
 import io.lakefs.clients.sdk.model.RepositoryDumpStatus;
 import io.lakefs.clients.sdk.model.RepositoryList;
 import io.lakefs.clients.sdk.model.RepositoryRestoreStatus;
@@ -451,7 +453,7 @@ public class RepositoriesApi {
     public APIdeleteGCRulesRequest deleteGCRules(String repository) {
         return new APIdeleteGCRulesRequest(repository);
     }
-    private okhttp3.Call deleteRepositoryCall(String repository, Boolean force, final ApiCallback _callback) throws ApiException {
+    private okhttp3.Call deleteRepositoryCall(String repository, Boolean force, Boolean deleteStorage, final ApiCallback _callback) throws ApiException {
         String basePath = null;
         // Operation Servers
         String[] localBasePaths = new String[] {  };
@@ -481,6 +483,10 @@ public class RepositoriesApi {
             localVarQueryParams.addAll(localVarApiClient.parameterToPair("force", force));
         }
 
+        if (deleteStorage != null) {
+            localVarQueryParams.addAll(localVarApiClient.parameterToPair("delete_storage", deleteStorage));
+        }
+
         final String[] localVarAccepts = {
             "application/json"
         };
@@ -501,32 +507,35 @@ public class RepositoriesApi {
     }
 
     @SuppressWarnings("rawtypes")
-    private okhttp3.Call deleteRepositoryValidateBeforeCall(String repository, Boolean force, final ApiCallback _callback) throws ApiException {
+    private okhttp3.Call deleteRepositoryValidateBeforeCall(String repository, Boolean force, Boolean deleteStorage, final ApiCallback _callback) throws ApiException {
         // verify the required parameter 'repository' is set
         if (repository == null) {
             throw new ApiException("Missing the required parameter 'repository' when calling deleteRepository(Async)");
         }
 
-        return deleteRepositoryCall(repository, force, _callback);
+        return deleteRepositoryCall(repository, force, deleteStorage, _callback);
 
     }
 
 
-    private ApiResponse<Void> deleteRepositoryWithHttpInfo(String repository, Boolean force) throws ApiException {
-        okhttp3.Call localVarCall = deleteRepositoryValidateBeforeCall(repository, force, null);
-        return localVarApiClient.execute(localVarCall);
+    private ApiResponse<RepositoryDeletion> deleteRepositoryWithHttpInfo(String repository, Boolean force, Boolean deleteStorage) throws ApiException {
+        okhttp3.Call localVarCall = deleteRepositoryValidateBeforeCall(repository, force, deleteStorage, null);
+        Type localVarReturnType = new TypeToken<RepositoryDeletion>(){}.getType();
+        return localVarApiClient.execute(localVarCall, localVarReturnType);
     }
 
-    private okhttp3.Call deleteRepositoryAsync(String repository, Boolean force, final ApiCallback<Void> _callback) throws ApiException {
+    private okhttp3.Call deleteRepositoryAsync(String repository, Boolean force, Boolean deleteStorage, final ApiCallback<RepositoryDeletion> _callback) throws ApiException {
 
-        okhttp3.Call localVarCall = deleteRepositoryValidateBeforeCall(repository, force, _callback);
-        localVarApiClient.executeAsync(localVarCall, _callback);
+        okhttp3.Call localVarCall = deleteRepositoryValidateBeforeCall(repository, force, deleteStorage, _callback);
+        Type localVarReturnType = new TypeToken<RepositoryDeletion>(){}.getType();
+        localVarApiClient.executeAsync(localVarCall, localVarReturnType, _callback);
         return localVarCall;
     }
 
     public class APIdeleteRepositoryRequest {
         private final String repository;
         private Boolean force;
+        private Boolean deleteStorage;
 
         private APIdeleteRepositoryRequest(String repository) {
             this.repository = repository;
@@ -543,6 +552,16 @@ public class RepositoriesApi {
         }
 
         /**
+         * Set deleteStorage
+         * @param deleteStorage Delete every object under the repository&#39;s storage namespace as well. The request answers 202 with the deletion status, and the object deletion runs in the background.  (optional, default to false)
+         * @return APIdeleteRepositoryRequest
+         */
+        public APIdeleteRepositoryRequest deleteStorage(Boolean deleteStorage) {
+            this.deleteStorage = deleteStorage;
+            return this;
+        }
+
+        /**
          * Build call for deleteRepository
          * @param _callback ApiCallback API callback
          * @return Call to execute
@@ -550,53 +569,61 @@ public class RepositoriesApi {
          * @http.response.details
          <table summary="Response Details" border="1">
             <tr><td> Status Code </td><td> Description </td><td> Response Headers </td></tr>
+            <tr><td> 202 </td><td> repository deletion with storage accepted </td><td>  -  </td></tr>
             <tr><td> 204 </td><td> repository deleted successfully </td><td>  -  </td></tr>
             <tr><td> 400 </td><td> Bad Request </td><td>  -  </td></tr>
             <tr><td> 401 </td><td> Unauthorized </td><td>  -  </td></tr>
             <tr><td> 404 </td><td> Resource Not Found </td><td>  -  </td></tr>
+            <tr><td> 409 </td><td> Resource Conflicts With Target </td><td>  -  </td></tr>
             <tr><td> 429 </td><td> too many requests </td><td>  -  </td></tr>
             <tr><td> 0 </td><td> Internal Server Error </td><td>  -  </td></tr>
          </table>
          */
         public okhttp3.Call buildCall(final ApiCallback _callback) throws ApiException {
-            return deleteRepositoryCall(repository, force, _callback);
+            return deleteRepositoryCall(repository, force, deleteStorage, _callback);
         }
 
         /**
          * Execute deleteRepository request
+         * @return RepositoryDeletion
          * @throws ApiException If fail to call the API, e.g. server error or cannot deserialize the response body
          * @http.response.details
          <table summary="Response Details" border="1">
             <tr><td> Status Code </td><td> Description </td><td> Response Headers </td></tr>
+            <tr><td> 202 </td><td> repository deletion with storage accepted </td><td>  -  </td></tr>
             <tr><td> 204 </td><td> repository deleted successfully </td><td>  -  </td></tr>
             <tr><td> 400 </td><td> Bad Request </td><td>  -  </td></tr>
             <tr><td> 401 </td><td> Unauthorized </td><td>  -  </td></tr>
             <tr><td> 404 </td><td> Resource Not Found </td><td>  -  </td></tr>
+            <tr><td> 409 </td><td> Resource Conflicts With Target </td><td>  -  </td></tr>
             <tr><td> 429 </td><td> too many requests </td><td>  -  </td></tr>
             <tr><td> 0 </td><td> Internal Server Error </td><td>  -  </td></tr>
          </table>
          */
-        public void execute() throws ApiException {
-            deleteRepositoryWithHttpInfo(repository, force);
+        public RepositoryDeletion execute() throws ApiException {
+            ApiResponse<RepositoryDeletion> localVarResp = deleteRepositoryWithHttpInfo(repository, force, deleteStorage);
+            return localVarResp.getData();
         }
 
         /**
          * Execute deleteRepository request with HTTP info returned
-         * @return ApiResponse&lt;Void&gt;
+         * @return ApiResponse&lt;RepositoryDeletion&gt;
          * @throws ApiException If fail to call the API, e.g. server error or cannot deserialize the response body
          * @http.response.details
          <table summary="Response Details" border="1">
             <tr><td> Status Code </td><td> Description </td><td> Response Headers </td></tr>
+            <tr><td> 202 </td><td> repository deletion with storage accepted </td><td>  -  </td></tr>
             <tr><td> 204 </td><td> repository deleted successfully </td><td>  -  </td></tr>
             <tr><td> 400 </td><td> Bad Request </td><td>  -  </td></tr>
             <tr><td> 401 </td><td> Unauthorized </td><td>  -  </td></tr>
             <tr><td> 404 </td><td> Resource Not Found </td><td>  -  </td></tr>
+            <tr><td> 409 </td><td> Resource Conflicts With Target </td><td>  -  </td></tr>
             <tr><td> 429 </td><td> too many requests </td><td>  -  </td></tr>
             <tr><td> 0 </td><td> Internal Server Error </td><td>  -  </td></tr>
          </table>
          */
-        public ApiResponse<Void> executeWithHttpInfo() throws ApiException {
-            return deleteRepositoryWithHttpInfo(repository, force);
+        public ApiResponse<RepositoryDeletion> executeWithHttpInfo() throws ApiException {
+            return deleteRepositoryWithHttpInfo(repository, force, deleteStorage);
         }
 
         /**
@@ -607,16 +634,18 @@ public class RepositoriesApi {
          * @http.response.details
          <table summary="Response Details" border="1">
             <tr><td> Status Code </td><td> Description </td><td> Response Headers </td></tr>
+            <tr><td> 202 </td><td> repository deletion with storage accepted </td><td>  -  </td></tr>
             <tr><td> 204 </td><td> repository deleted successfully </td><td>  -  </td></tr>
             <tr><td> 400 </td><td> Bad Request </td><td>  -  </td></tr>
             <tr><td> 401 </td><td> Unauthorized </td><td>  -  </td></tr>
             <tr><td> 404 </td><td> Resource Not Found </td><td>  -  </td></tr>
+            <tr><td> 409 </td><td> Resource Conflicts With Target </td><td>  -  </td></tr>
             <tr><td> 429 </td><td> too many requests </td><td>  -  </td></tr>
             <tr><td> 0 </td><td> Internal Server Error </td><td>  -  </td></tr>
          </table>
          */
-        public okhttp3.Call executeAsync(final ApiCallback<Void> _callback) throws ApiException {
-            return deleteRepositoryAsync(repository, force, _callback);
+        public okhttp3.Call executeAsync(final ApiCallback<RepositoryDeletion> _callback) throws ApiException {
+            return deleteRepositoryAsync(repository, force, deleteStorage, _callback);
         }
     }
 
@@ -628,10 +657,12 @@ public class RepositoriesApi {
      * @http.response.details
      <table summary="Response Details" border="1">
         <tr><td> Status Code </td><td> Description </td><td> Response Headers </td></tr>
+        <tr><td> 202 </td><td> repository deletion with storage accepted </td><td>  -  </td></tr>
         <tr><td> 204 </td><td> repository deleted successfully </td><td>  -  </td></tr>
         <tr><td> 400 </td><td> Bad Request </td><td>  -  </td></tr>
         <tr><td> 401 </td><td> Unauthorized </td><td>  -  </td></tr>
         <tr><td> 404 </td><td> Resource Not Found </td><td>  -  </td></tr>
+        <tr><td> 409 </td><td> Resource Conflicts With Target </td><td>  -  </td></tr>
         <tr><td> 429 </td><td> too many requests </td><td>  -  </td></tr>
         <tr><td> 0 </td><td> Internal Server Error </td><td>  -  </td></tr>
      </table>
@@ -1531,6 +1562,183 @@ public class RepositoriesApi {
     public APIgetRepositoryRequest getRepository(String repository) {
         return new APIgetRepositoryRequest(repository);
     }
+    private okhttp3.Call getRepositoryDeletionCall(String repository, final ApiCallback _callback) throws ApiException {
+        String basePath = null;
+        // Operation Servers
+        String[] localBasePaths = new String[] {  };
+
+        // Determine Base Path to Use
+        if (localCustomBaseUrl != null){
+            basePath = localCustomBaseUrl;
+        } else if ( localBasePaths.length > 0 ) {
+            basePath = localBasePaths[localHostIndex];
+        } else {
+            basePath = null;
+        }
+
+        Object localVarPostBody = null;
+
+        // create path and map variables
+        String localVarPath = "/repository_deletions/{repository}"
+            .replace("{" + "repository" + "}", localVarApiClient.escapeString(repository.toString()));
+
+        List<Pair> localVarQueryParams = new ArrayList<Pair>();
+        List<Pair> localVarCollectionQueryParams = new ArrayList<Pair>();
+        Map<String, String> localVarHeaderParams = new HashMap<String, String>();
+        Map<String, String> localVarCookieParams = new HashMap<String, String>();
+        Map<String, Object> localVarFormParams = new HashMap<String, Object>();
+
+        final String[] localVarAccepts = {
+            "application/json"
+        };
+        final String localVarAccept = localVarApiClient.selectHeaderAccept(localVarAccepts);
+        if (localVarAccept != null) {
+            localVarHeaderParams.put("Accept", localVarAccept);
+        }
+
+        final String[] localVarContentTypes = {
+        };
+        final String localVarContentType = localVarApiClient.selectHeaderContentType(localVarContentTypes);
+        if (localVarContentType != null) {
+            localVarHeaderParams.put("Content-Type", localVarContentType);
+        }
+
+        String[] localVarAuthNames = new String[] { "basic_auth", "cookie_auth", "oidc_auth", "saml_auth", "jwt_token" };
+        return localVarApiClient.buildCall(basePath, localVarPath, "GET", localVarQueryParams, localVarCollectionQueryParams, localVarPostBody, localVarHeaderParams, localVarCookieParams, localVarFormParams, localVarAuthNames, _callback);
+    }
+
+    @SuppressWarnings("rawtypes")
+    private okhttp3.Call getRepositoryDeletionValidateBeforeCall(String repository, final ApiCallback _callback) throws ApiException {
+        // verify the required parameter 'repository' is set
+        if (repository == null) {
+            throw new ApiException("Missing the required parameter 'repository' when calling getRepositoryDeletion(Async)");
+        }
+
+        return getRepositoryDeletionCall(repository, _callback);
+
+    }
+
+
+    private ApiResponse<RepositoryDeletion> getRepositoryDeletionWithHttpInfo(String repository) throws ApiException {
+        okhttp3.Call localVarCall = getRepositoryDeletionValidateBeforeCall(repository, null);
+        Type localVarReturnType = new TypeToken<RepositoryDeletion>(){}.getType();
+        return localVarApiClient.execute(localVarCall, localVarReturnType);
+    }
+
+    private okhttp3.Call getRepositoryDeletionAsync(String repository, final ApiCallback<RepositoryDeletion> _callback) throws ApiException {
+
+        okhttp3.Call localVarCall = getRepositoryDeletionValidateBeforeCall(repository, _callback);
+        Type localVarReturnType = new TypeToken<RepositoryDeletion>(){}.getType();
+        localVarApiClient.executeAsync(localVarCall, localVarReturnType, _callback);
+        return localVarCall;
+    }
+
+    public class APIgetRepositoryDeletionRequest {
+        private final String repository;
+
+        private APIgetRepositoryDeletionRequest(String repository) {
+            this.repository = repository;
+        }
+
+        /**
+         * Build call for getRepositoryDeletion
+         * @param _callback ApiCallback API callback
+         * @return Call to execute
+         * @throws ApiException If fail to serialize the request body object
+         * @http.response.details
+         <table summary="Response Details" border="1">
+            <tr><td> Status Code </td><td> Description </td><td> Response Headers </td></tr>
+            <tr><td> 200 </td><td> repository storage deletion status </td><td>  -  </td></tr>
+            <tr><td> 400 </td><td> Bad Request </td><td>  -  </td></tr>
+            <tr><td> 401 </td><td> Unauthorized </td><td>  -  </td></tr>
+            <tr><td> 404 </td><td> Resource Not Found </td><td>  -  </td></tr>
+            <tr><td> 429 </td><td> too many requests </td><td>  -  </td></tr>
+            <tr><td> 0 </td><td> Internal Server Error </td><td>  -  </td></tr>
+         </table>
+         */
+        public okhttp3.Call buildCall(final ApiCallback _callback) throws ApiException {
+            return getRepositoryDeletionCall(repository, _callback);
+        }
+
+        /**
+         * Execute getRepositoryDeletion request
+         * @return RepositoryDeletion
+         * @throws ApiException If fail to call the API, e.g. server error or cannot deserialize the response body
+         * @http.response.details
+         <table summary="Response Details" border="1">
+            <tr><td> Status Code </td><td> Description </td><td> Response Headers </td></tr>
+            <tr><td> 200 </td><td> repository storage deletion status </td><td>  -  </td></tr>
+            <tr><td> 400 </td><td> Bad Request </td><td>  -  </td></tr>
+            <tr><td> 401 </td><td> Unauthorized </td><td>  -  </td></tr>
+            <tr><td> 404 </td><td> Resource Not Found </td><td>  -  </td></tr>
+            <tr><td> 429 </td><td> too many requests </td><td>  -  </td></tr>
+            <tr><td> 0 </td><td> Internal Server Error </td><td>  -  </td></tr>
+         </table>
+         */
+        public RepositoryDeletion execute() throws ApiException {
+            ApiResponse<RepositoryDeletion> localVarResp = getRepositoryDeletionWithHttpInfo(repository);
+            return localVarResp.getData();
+        }
+
+        /**
+         * Execute getRepositoryDeletion request with HTTP info returned
+         * @return ApiResponse&lt;RepositoryDeletion&gt;
+         * @throws ApiException If fail to call the API, e.g. server error or cannot deserialize the response body
+         * @http.response.details
+         <table summary="Response Details" border="1">
+            <tr><td> Status Code </td><td> Description </td><td> Response Headers </td></tr>
+            <tr><td> 200 </td><td> repository storage deletion status </td><td>  -  </td></tr>
+            <tr><td> 400 </td><td> Bad Request </td><td>  -  </td></tr>
+            <tr><td> 401 </td><td> Unauthorized </td><td>  -  </td></tr>
+            <tr><td> 404 </td><td> Resource Not Found </td><td>  -  </td></tr>
+            <tr><td> 429 </td><td> too many requests </td><td>  -  </td></tr>
+            <tr><td> 0 </td><td> Internal Server Error </td><td>  -  </td></tr>
+         </table>
+         */
+        public ApiResponse<RepositoryDeletion> executeWithHttpInfo() throws ApiException {
+            return getRepositoryDeletionWithHttpInfo(repository);
+        }
+
+        /**
+         * Execute getRepositoryDeletion request (asynchronously)
+         * @param _callback The callback to be executed when the API call finishes
+         * @return The request call
+         * @throws ApiException If fail to process the API call, e.g. serializing the request body object
+         * @http.response.details
+         <table summary="Response Details" border="1">
+            <tr><td> Status Code </td><td> Description </td><td> Response Headers </td></tr>
+            <tr><td> 200 </td><td> repository storage deletion status </td><td>  -  </td></tr>
+            <tr><td> 400 </td><td> Bad Request </td><td>  -  </td></tr>
+            <tr><td> 401 </td><td> Unauthorized </td><td>  -  </td></tr>
+            <tr><td> 404 </td><td> Resource Not Found </td><td>  -  </td></tr>
+            <tr><td> 429 </td><td> too many requests </td><td>  -  </td></tr>
+            <tr><td> 0 </td><td> Internal Server Error </td><td>  -  </td></tr>
+         </table>
+         */
+        public okhttp3.Call executeAsync(final ApiCallback<RepositoryDeletion> _callback) throws ApiException {
+            return getRepositoryDeletionAsync(repository, _callback);
+        }
+    }
+
+    /**
+     * get repository storage deletion status
+     * 
+     * @param repository  (required)
+     * @return APIgetRepositoryDeletionRequest
+     * @http.response.details
+     <table summary="Response Details" border="1">
+        <tr><td> Status Code </td><td> Description </td><td> Response Headers </td></tr>
+        <tr><td> 200 </td><td> repository storage deletion status </td><td>  -  </td></tr>
+        <tr><td> 400 </td><td> Bad Request </td><td>  -  </td></tr>
+        <tr><td> 401 </td><td> Unauthorized </td><td>  -  </td></tr>
+        <tr><td> 404 </td><td> Resource Not Found </td><td>  -  </td></tr>
+        <tr><td> 429 </td><td> too many requests </td><td>  -  </td></tr>
+        <tr><td> 0 </td><td> Internal Server Error </td><td>  -  </td></tr>
+     </table>
+     */
+    public APIgetRepositoryDeletionRequest getRepositoryDeletion(String repository) {
+        return new APIgetRepositoryDeletionRequest(repository);
+    }
     private okhttp3.Call getRepositoryMetadataCall(String repository, final ApiCallback _callback) throws ApiException {
         String basePath = null;
         // Operation Servers
@@ -1930,6 +2138,214 @@ public class RepositoriesApi {
      */
     public APIlistRepositoriesRequest listRepositories() {
         return new APIlistRepositoriesRequest();
+    }
+    private okhttp3.Call listRepositoryDeletionsCall(String prefix, String after, Integer amount, final ApiCallback _callback) throws ApiException {
+        String basePath = null;
+        // Operation Servers
+        String[] localBasePaths = new String[] {  };
+
+        // Determine Base Path to Use
+        if (localCustomBaseUrl != null){
+            basePath = localCustomBaseUrl;
+        } else if ( localBasePaths.length > 0 ) {
+            basePath = localBasePaths[localHostIndex];
+        } else {
+            basePath = null;
+        }
+
+        Object localVarPostBody = null;
+
+        // create path and map variables
+        String localVarPath = "/repository_deletions";
+
+        List<Pair> localVarQueryParams = new ArrayList<Pair>();
+        List<Pair> localVarCollectionQueryParams = new ArrayList<Pair>();
+        Map<String, String> localVarHeaderParams = new HashMap<String, String>();
+        Map<String, String> localVarCookieParams = new HashMap<String, String>();
+        Map<String, Object> localVarFormParams = new HashMap<String, Object>();
+
+        if (prefix != null) {
+            localVarQueryParams.addAll(localVarApiClient.parameterToPair("prefix", prefix));
+        }
+
+        if (after != null) {
+            localVarQueryParams.addAll(localVarApiClient.parameterToPair("after", after));
+        }
+
+        if (amount != null) {
+            localVarQueryParams.addAll(localVarApiClient.parameterToPair("amount", amount));
+        }
+
+        final String[] localVarAccepts = {
+            "application/json"
+        };
+        final String localVarAccept = localVarApiClient.selectHeaderAccept(localVarAccepts);
+        if (localVarAccept != null) {
+            localVarHeaderParams.put("Accept", localVarAccept);
+        }
+
+        final String[] localVarContentTypes = {
+        };
+        final String localVarContentType = localVarApiClient.selectHeaderContentType(localVarContentTypes);
+        if (localVarContentType != null) {
+            localVarHeaderParams.put("Content-Type", localVarContentType);
+        }
+
+        String[] localVarAuthNames = new String[] { "basic_auth", "cookie_auth", "oidc_auth", "saml_auth", "jwt_token" };
+        return localVarApiClient.buildCall(basePath, localVarPath, "GET", localVarQueryParams, localVarCollectionQueryParams, localVarPostBody, localVarHeaderParams, localVarCookieParams, localVarFormParams, localVarAuthNames, _callback);
+    }
+
+    @SuppressWarnings("rawtypes")
+    private okhttp3.Call listRepositoryDeletionsValidateBeforeCall(String prefix, String after, Integer amount, final ApiCallback _callback) throws ApiException {
+        return listRepositoryDeletionsCall(prefix, after, amount, _callback);
+
+    }
+
+
+    private ApiResponse<RepositoryDeletionList> listRepositoryDeletionsWithHttpInfo(String prefix, String after, Integer amount) throws ApiException {
+        okhttp3.Call localVarCall = listRepositoryDeletionsValidateBeforeCall(prefix, after, amount, null);
+        Type localVarReturnType = new TypeToken<RepositoryDeletionList>(){}.getType();
+        return localVarApiClient.execute(localVarCall, localVarReturnType);
+    }
+
+    private okhttp3.Call listRepositoryDeletionsAsync(String prefix, String after, Integer amount, final ApiCallback<RepositoryDeletionList> _callback) throws ApiException {
+
+        okhttp3.Call localVarCall = listRepositoryDeletionsValidateBeforeCall(prefix, after, amount, _callback);
+        Type localVarReturnType = new TypeToken<RepositoryDeletionList>(){}.getType();
+        localVarApiClient.executeAsync(localVarCall, localVarReturnType, _callback);
+        return localVarCall;
+    }
+
+    public class APIlistRepositoryDeletionsRequest {
+        private String prefix;
+        private String after;
+        private Integer amount;
+
+        private APIlistRepositoryDeletionsRequest() {
+        }
+
+        /**
+         * Set prefix
+         * @param prefix return items prefixed with this value (optional)
+         * @return APIlistRepositoryDeletionsRequest
+         */
+        public APIlistRepositoryDeletionsRequest prefix(String prefix) {
+            this.prefix = prefix;
+            return this;
+        }
+
+        /**
+         * Set after
+         * @param after return items after this value (optional)
+         * @return APIlistRepositoryDeletionsRequest
+         */
+        public APIlistRepositoryDeletionsRequest after(String after) {
+            this.after = after;
+            return this;
+        }
+
+        /**
+         * Set amount
+         * @param amount how many items to return (optional, default to 100)
+         * @return APIlistRepositoryDeletionsRequest
+         */
+        public APIlistRepositoryDeletionsRequest amount(Integer amount) {
+            this.amount = amount;
+            return this;
+        }
+
+        /**
+         * Build call for listRepositoryDeletions
+         * @param _callback ApiCallback API callback
+         * @return Call to execute
+         * @throws ApiException If fail to serialize the request body object
+         * @http.response.details
+         <table summary="Response Details" border="1">
+            <tr><td> Status Code </td><td> Description </td><td> Response Headers </td></tr>
+            <tr><td> 200 </td><td> repository storage deletion list </td><td>  -  </td></tr>
+            <tr><td> 400 </td><td> Bad Request </td><td>  -  </td></tr>
+            <tr><td> 401 </td><td> Unauthorized </td><td>  -  </td></tr>
+            <tr><td> 429 </td><td> too many requests </td><td>  -  </td></tr>
+            <tr><td> 0 </td><td> Internal Server Error </td><td>  -  </td></tr>
+         </table>
+         */
+        public okhttp3.Call buildCall(final ApiCallback _callback) throws ApiException {
+            return listRepositoryDeletionsCall(prefix, after, amount, _callback);
+        }
+
+        /**
+         * Execute listRepositoryDeletions request
+         * @return RepositoryDeletionList
+         * @throws ApiException If fail to call the API, e.g. server error or cannot deserialize the response body
+         * @http.response.details
+         <table summary="Response Details" border="1">
+            <tr><td> Status Code </td><td> Description </td><td> Response Headers </td></tr>
+            <tr><td> 200 </td><td> repository storage deletion list </td><td>  -  </td></tr>
+            <tr><td> 400 </td><td> Bad Request </td><td>  -  </td></tr>
+            <tr><td> 401 </td><td> Unauthorized </td><td>  -  </td></tr>
+            <tr><td> 429 </td><td> too many requests </td><td>  -  </td></tr>
+            <tr><td> 0 </td><td> Internal Server Error </td><td>  -  </td></tr>
+         </table>
+         */
+        public RepositoryDeletionList execute() throws ApiException {
+            ApiResponse<RepositoryDeletionList> localVarResp = listRepositoryDeletionsWithHttpInfo(prefix, after, amount);
+            return localVarResp.getData();
+        }
+
+        /**
+         * Execute listRepositoryDeletions request with HTTP info returned
+         * @return ApiResponse&lt;RepositoryDeletionList&gt;
+         * @throws ApiException If fail to call the API, e.g. server error or cannot deserialize the response body
+         * @http.response.details
+         <table summary="Response Details" border="1">
+            <tr><td> Status Code </td><td> Description </td><td> Response Headers </td></tr>
+            <tr><td> 200 </td><td> repository storage deletion list </td><td>  -  </td></tr>
+            <tr><td> 400 </td><td> Bad Request </td><td>  -  </td></tr>
+            <tr><td> 401 </td><td> Unauthorized </td><td>  -  </td></tr>
+            <tr><td> 429 </td><td> too many requests </td><td>  -  </td></tr>
+            <tr><td> 0 </td><td> Internal Server Error </td><td>  -  </td></tr>
+         </table>
+         */
+        public ApiResponse<RepositoryDeletionList> executeWithHttpInfo() throws ApiException {
+            return listRepositoryDeletionsWithHttpInfo(prefix, after, amount);
+        }
+
+        /**
+         * Execute listRepositoryDeletions request (asynchronously)
+         * @param _callback The callback to be executed when the API call finishes
+         * @return The request call
+         * @throws ApiException If fail to process the API call, e.g. serializing the request body object
+         * @http.response.details
+         <table summary="Response Details" border="1">
+            <tr><td> Status Code </td><td> Description </td><td> Response Headers </td></tr>
+            <tr><td> 200 </td><td> repository storage deletion list </td><td>  -  </td></tr>
+            <tr><td> 400 </td><td> Bad Request </td><td>  -  </td></tr>
+            <tr><td> 401 </td><td> Unauthorized </td><td>  -  </td></tr>
+            <tr><td> 429 </td><td> too many requests </td><td>  -  </td></tr>
+            <tr><td> 0 </td><td> Internal Server Error </td><td>  -  </td></tr>
+         </table>
+         */
+        public okhttp3.Call executeAsync(final ApiCallback<RepositoryDeletionList> _callback) throws ApiException {
+            return listRepositoryDeletionsAsync(prefix, after, amount, _callback);
+        }
+    }
+
+    /**
+     * list repository storage deletions
+     * 
+     * @return APIlistRepositoryDeletionsRequest
+     * @http.response.details
+     <table summary="Response Details" border="1">
+        <tr><td> Status Code </td><td> Description </td><td> Response Headers </td></tr>
+        <tr><td> 200 </td><td> repository storage deletion list </td><td>  -  </td></tr>
+        <tr><td> 400 </td><td> Bad Request </td><td>  -  </td></tr>
+        <tr><td> 401 </td><td> Unauthorized </td><td>  -  </td></tr>
+        <tr><td> 429 </td><td> too many requests </td><td>  -  </td></tr>
+        <tr><td> 0 </td><td> Internal Server Error </td><td>  -  </td></tr>
+     </table>
+     */
+    public APIlistRepositoryDeletionsRequest listRepositoryDeletions() {
+        return new APIlistRepositoryDeletionsRequest();
     }
     private okhttp3.Call restoreStatusCall(String repository, String taskId, final ApiCallback _callback) throws ApiException {
         String basePath = null;

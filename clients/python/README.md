@@ -257,8 +257,10 @@ Class | Method | HTTP request | Description
 *RepositoriesApi* | [**get_branch_protection_rules**](docs/RepositoriesApi.md#get_branch_protection_rules) | **GET** /repositories/{repository}/settings/branch_protection | get branch protection rules
 *RepositoriesApi* | [**get_gc_rules**](docs/RepositoriesApi.md#get_gc_rules) | **GET** /repositories/{repository}/settings/gc_rules | get repository GC rules
 *RepositoriesApi* | [**get_repository**](docs/RepositoriesApi.md#get_repository) | **GET** /repositories/{repository} | get repository
+*RepositoriesApi* | [**get_repository_deletion**](docs/RepositoriesApi.md#get_repository_deletion) | **GET** /repository_deletions/{repository} | get repository storage deletion status
 *RepositoriesApi* | [**get_repository_metadata**](docs/RepositoriesApi.md#get_repository_metadata) | **GET** /repositories/{repository}/metadata | get repository metadata
 *RepositoriesApi* | [**list_repositories**](docs/RepositoriesApi.md#list_repositories) | **GET** /repositories | list repositories
+*RepositoriesApi* | [**list_repository_deletions**](docs/RepositoriesApi.md#list_repository_deletions) | **GET** /repository_deletions | list repository storage deletions
 *RepositoriesApi* | [**restore_status**](docs/RepositoriesApi.md#restore_status) | **GET** /repositories/{repository}/restore | Status of a restore request
 *RepositoriesApi* | [**restore_submit**](docs/RepositoriesApi.md#restore_submit) | **POST** /repositories/{repository}/restore | Restore repository from a dump in the object store
 *RepositoriesApi* | [**set_branch_protection_rules**](docs/RepositoriesApi.md#set_branch_protection_rules) | **PUT** /repositories/{repository}/settings/branch_protection | 
@@ -354,6 +356,8 @@ Class | Method | HTTP request | Description
  - [RefsRestore](docs/RefsRestore.md)
  - [Repository](docs/Repository.md)
  - [RepositoryCreation](docs/RepositoryCreation.md)
+ - [RepositoryDeletion](docs/RepositoryDeletion.md)
+ - [RepositoryDeletionList](docs/RepositoryDeletionList.md)
  - [RepositoryDumpStatus](docs/RepositoryDumpStatus.md)
  - [RepositoryList](docs/RepositoryList.md)
  - [RepositoryMetadataKeys](docs/RepositoryMetadataKeys.md)

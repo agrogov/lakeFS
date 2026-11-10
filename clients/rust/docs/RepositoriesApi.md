@@ -12,8 +12,10 @@ Method | HTTP request | Description
 [**get_branch_protection_rules**](RepositoriesApi.md#get_branch_protection_rules) | **GET** /repositories/{repository}/settings/branch_protection | get branch protection rules
 [**get_gc_rules**](RepositoriesApi.md#get_gc_rules) | **GET** /repositories/{repository}/settings/gc_rules | get repository GC rules
 [**get_repository**](RepositoriesApi.md#get_repository) | **GET** /repositories/{repository} | get repository
+[**get_repository_deletion**](RepositoriesApi.md#get_repository_deletion) | **GET** /repository_deletions/{repository} | get repository storage deletion status
 [**get_repository_metadata**](RepositoriesApi.md#get_repository_metadata) | **GET** /repositories/{repository}/metadata | get repository metadata
 [**list_repositories**](RepositoriesApi.md#list_repositories) | **GET** /repositories | list repositories
+[**list_repository_deletions**](RepositoriesApi.md#list_repository_deletions) | **GET** /repository_deletions | list repository storage deletions
 [**restore_status**](RepositoriesApi.md#restore_status) | **GET** /repositories/{repository}/restore | Status of a restore request
 [**restore_submit**](RepositoriesApi.md#restore_submit) | **POST** /repositories/{repository}/restore | Restore repository from a dump in the object store
 [**set_branch_protection_rules**](RepositoriesApi.md#set_branch_protection_rules) | **PUT** /repositories/{repository}/settings/branch_protection | 
@@ -80,7 +82,7 @@ Name | Type | Description  | Required | Notes
 
 ## delete_repository
 
-> delete_repository(repository, force)
+> models::RepositoryDeletion delete_repository(repository, force, delete_storage)
 delete repository
 
 ### Parameters
@@ -90,10 +92,11 @@ Name | Type | Description  | Required | Notes
 ------------- | ------------- | ------------- | ------------- | -------------
 **repository** | **String** |  | [required] |
 **force** | Option<**bool**> | Bypass read-only protection and delete the repository |  |[default to false]
+**delete_storage** | Option<**bool**> | Delete every object under the repository's storage namespace as well. The request answers 202 with the deletion status, and the object deletion runs in the background.  |  |[default to false]
 
 ### Return type
 
- (empty response body)
+[**models::RepositoryDeletion**](RepositoryDeletion.md)
 
 ### Authorization
 
@@ -248,6 +251,34 @@ Name | Type | Description  | Required | Notes
 [[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
 
 
+## get_repository_deletion
+
+> models::RepositoryDeletion get_repository_deletion(repository)
+get repository storage deletion status
+
+### Parameters
+
+
+Name | Type | Description  | Required | Notes
+------------- | ------------- | ------------- | ------------- | -------------
+**repository** | **String** |  | [required] |
+
+### Return type
+
+[**models::RepositoryDeletion**](RepositoryDeletion.md)
+
+### Authorization
+
+[basic_auth](../README.md#basic_auth), [cookie_auth](../README.md#cookie_auth), [oidc_auth](../README.md#oidc_auth), [saml_auth](../README.md#saml_auth), [jwt_token](../README.md#jwt_token)
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
 ## get_repository_metadata
 
 > std::collections::HashMap<String, String> get_repository_metadata(repository)
@@ -294,6 +325,36 @@ Name | Type | Description  | Required | Notes
 ### Return type
 
 [**models::RepositoryList**](RepositoryList.md)
+
+### Authorization
+
+[basic_auth](../README.md#basic_auth), [cookie_auth](../README.md#cookie_auth), [oidc_auth](../README.md#oidc_auth), [saml_auth](../README.md#saml_auth), [jwt_token](../README.md#jwt_token)
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
+## list_repository_deletions
+
+> models::RepositoryDeletionList list_repository_deletions(prefix, after, amount)
+list repository storage deletions
+
+### Parameters
+
+
+Name | Type | Description  | Required | Notes
+------------- | ------------- | ------------- | ------------- | -------------
+**prefix** | Option<**String**> | return items prefixed with this value |  |
+**after** | Option<**String**> | return items after this value |  |
+**amount** | Option<**i32**> | how many items to return |  |[default to 100]
+
+### Return type
+
+[**models::RepositoryDeletionList**](RepositoryDeletionList.md)
 
 ### Authorization
 

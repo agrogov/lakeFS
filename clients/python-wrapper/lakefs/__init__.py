@@ -4,7 +4,8 @@ Allow importing of models from package root
 from lakefs.client import Client as Client
 from lakefs.repository import (
     Repository as Repository,
-    repositories as repositories
+    repositories as repositories,
+    repository_deletions as repository_deletions
 )
 from lakefs.reference import Reference as Reference
 from lakefs.models import (
@@ -14,7 +15,8 @@ from lakefs.models import (
     ServerStorageConfiguration as ServerStorageConfiguration,
     ObjectInfo as ObjectInfo,
     CommonPrefix as CommonPrefix,
-    RepositoryProperties as RepositoryProperties
+    RepositoryProperties as RepositoryProperties,
+    RepositoryDeletion as RepositoryDeletion
 )
 from lakefs.tag import Tag as Tag
 from lakefs.branch import Branch as Branch

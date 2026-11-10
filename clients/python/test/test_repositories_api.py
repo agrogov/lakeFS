@@ -82,6 +82,13 @@ class TestRepositoriesApi(unittest.TestCase):
         """
         pass
 
+    def test_get_repository_deletion(self) -> None:
+        """Test case for get_repository_deletion
+
+        get repository storage deletion status  # noqa: E501
+        """
+        pass
+
     def test_get_repository_metadata(self) -> None:
         """Test case for get_repository_metadata
 
@@ -93,6 +100,13 @@ class TestRepositoriesApi(unittest.TestCase):
         """Test case for list_repositories
 
         list repositories  # noqa: E501
+        """
+        pass
+
+    def test_list_repository_deletions(self) -> None:
+        """Test case for list_repository_deletions
+
+        list repository storage deletions  # noqa: E501
         """
         pass
 

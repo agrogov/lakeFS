@@ -12,8 +12,10 @@ Method | HTTP request | Description
 [**get_branch_protection_rules**](RepositoriesApi.md#get_branch_protection_rules) | **GET** /repositories/{repository}/settings/branch_protection | get branch protection rules
 [**get_gc_rules**](RepositoriesApi.md#get_gc_rules) | **GET** /repositories/{repository}/settings/gc_rules | get repository GC rules
 [**get_repository**](RepositoriesApi.md#get_repository) | **GET** /repositories/{repository} | get repository
+[**get_repository_deletion**](RepositoriesApi.md#get_repository_deletion) | **GET** /repository_deletions/{repository} | get repository storage deletion status
 [**get_repository_metadata**](RepositoriesApi.md#get_repository_metadata) | **GET** /repositories/{repository}/metadata | get repository metadata
 [**list_repositories**](RepositoriesApi.md#list_repositories) | **GET** /repositories | list repositories
+[**list_repository_deletions**](RepositoriesApi.md#list_repository_deletions) | **GET** /repository_deletions | list repository storage deletions
 [**restore_status**](RepositoriesApi.md#restore_status) | **GET** /repositories/{repository}/restore | Status of a restore request
 [**restore_submit**](RepositoriesApi.md#restore_submit) | **POST** /repositories/{repository}/restore | Restore repository from a dump in the object store
 [**set_branch_protection_rules**](RepositoriesApi.md#set_branch_protection_rules) | **PUT** /repositories/{repository}/settings/branch_protection | 
@@ -243,7 +245,7 @@ void (empty response body)
 [[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
 
 # **delete_repository**
-> delete_repository(repository, force=force)
+> RepositoryDeletion delete_repository(repository, force=force, delete_storage=delete_storage)
 
 delete repository
 
@@ -259,6 +261,7 @@ delete repository
 import time
 import os
 import lakefs_sdk
+from lakefs_sdk.models.repository_deletion import RepositoryDeletion
 from lakefs_sdk.rest import ApiException
 from pprint import pprint
 
@@ -308,10 +311,13 @@ with lakefs_sdk.ApiClient(configuration) as api_client:
     api_instance = lakefs_sdk.RepositoriesApi(api_client)
     repository = 'repository_example' # str | 
     force = False # bool | Bypass read-only protection and delete the repository (optional) (default to False)
+    delete_storage = False # bool | Delete every object under the repository's storage namespace as well. The request answers 202 with the deletion status, and the object deletion runs in the background.  (optional) (default to False)
 
     try:
         # delete repository
-        api_instance.delete_repository(repository, force=force)
+        api_response = api_instance.delete_repository(repository, force=force, delete_storage=delete_storage)
+        print("The response of RepositoriesApi->delete_repository:\n")
+        pprint(api_response)
     except Exception as e:
         print("Exception when calling RepositoriesApi->delete_repository: %s\n" % e)
 ```
@@ -325,10 +331,11 @@ Name | Type | Description  | Notes
 ------------- | ------------- | ------------- | -------------
  **repository** | **str**|  | 
  **force** | **bool**| Bypass read-only protection and delete the repository | [optional] [default to False]
+ **delete_storage** | **bool**| Delete every object under the repository&#39;s storage namespace as well. The request answers 202 with the deletion status, and the object deletion runs in the background.  | [optional] [default to False]
 
 ### Return type
 
-void (empty response body)
+[**RepositoryDeletion**](RepositoryDeletion.md)
 
 ### Authorization
 
@@ -343,10 +350,12 @@ void (empty response body)
 
 | Status code | Description | Response headers |
 |-------------|-------------|------------------|
+**202** | repository deletion with storage accepted |  -  |
 **204** | repository deleted successfully |  -  |
 **400** | Bad Request |  -  |
 **401** | Unauthorized |  -  |
 **404** | Resource Not Found |  -  |
+**409** | Resource Conflicts With Target |  -  |
 **429** | too many requests |  -  |
 **0** | Internal Server Error |  -  |
 
@@ -908,6 +917,117 @@ Name | Type | Description  | Notes
 
 [[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
 
+# **get_repository_deletion**
+> RepositoryDeletion get_repository_deletion(repository)
+
+get repository storage deletion status
+
+### Example
+
+* Basic Authentication (basic_auth):
+* Api Key Authentication (cookie_auth):
+* Api Key Authentication (oidc_auth):
+* Api Key Authentication (saml_auth):
+* Bearer (JWT) Authentication (jwt_token):
+
+```python
+import time
+import os
+import lakefs_sdk
+from lakefs_sdk.models.repository_deletion import RepositoryDeletion
+from lakefs_sdk.rest import ApiException
+from pprint import pprint
+
+# Defining the host is optional and defaults to /api/v1
+# See configuration.py for a list of all supported configuration parameters.
+configuration = lakefs_sdk.Configuration(
+    host = "/api/v1"
+)
+
+# The client must configure the authentication and authorization parameters
+# in accordance with the API server security policy.
+# Examples for each auth method are provided below, use the example that
+# satisfies your auth use case.
+
+# Configure HTTP basic authorization: basic_auth
+configuration = lakefs_sdk.Configuration(
+    username = os.environ["USERNAME"],
+    password = os.environ["PASSWORD"]
+)
+
+# Configure API key authorization: cookie_auth
+configuration.api_key['cookie_auth'] = os.environ["API_KEY"]
+
+# Uncomment below to setup prefix (e.g. Bearer) for API key, if needed
+# configuration.api_key_prefix['cookie_auth'] = 'Bearer'
+
+# Configure API key authorization: oidc_auth
+configuration.api_key['oidc_auth'] = os.environ["API_KEY"]
+
+# Uncomment below to setup prefix (e.g. Bearer) for API key, if needed
+# configuration.api_key_prefix['oidc_auth'] = 'Bearer'
+
+# Configure API key authorization: saml_auth
+configuration.api_key['saml_auth'] = os.environ["API_KEY"]
+
+# Uncomment below to setup prefix (e.g. Bearer) for API key, if needed
+# configuration.api_key_prefix['saml_auth'] = 'Bearer'
+
+# Configure Bearer authorization (JWT): jwt_token
+configuration = lakefs_sdk.Configuration(
+    access_token = os.environ["BEARER_TOKEN"]
+)
+
+# Enter a context with an instance of the API client
+with lakefs_sdk.ApiClient(configuration) as api_client:
+    # Create an instance of the API class
+    api_instance = lakefs_sdk.RepositoriesApi(api_client)
+    repository = 'repository_example' # str | 
+
+    try:
+        # get repository storage deletion status
+        api_response = api_instance.get_repository_deletion(repository)
+        print("The response of RepositoriesApi->get_repository_deletion:\n")
+        pprint(api_response)
+    except Exception as e:
+        print("Exception when calling RepositoriesApi->get_repository_deletion: %s\n" % e)
+```
+
+
+
+### Parameters
+
+
+Name | Type | Description  | Notes
+------------- | ------------- | ------------- | -------------
+ **repository** | **str**|  | 
+
+### Return type
+
+[**RepositoryDeletion**](RepositoryDeletion.md)
+
+### Authorization
+
+[basic_auth](../README.md#basic_auth), [cookie_auth](../README.md#cookie_auth), [oidc_auth](../README.md#oidc_auth), [saml_auth](../README.md#saml_auth), [jwt_token](../README.md#jwt_token)
+
+### HTTP request headers
+
+ - **Content-Type**: Not defined
+ - **Accept**: application/json
+
+### HTTP response details
+
+| Status code | Description | Response headers |
+|-------------|-------------|------------------|
+**200** | repository storage deletion status |  -  |
+**400** | Bad Request |  -  |
+**401** | Unauthorized |  -  |
+**404** | Resource Not Found |  -  |
+**429** | too many requests |  -  |
+**0** | Internal Server Error |  -  |
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
 # **get_repository_metadata**
 > Dict[str, str] get_repository_metadata(repository)
 
@@ -1127,6 +1247,120 @@ Name | Type | Description  | Notes
 | Status code | Description | Response headers |
 |-------------|-------------|------------------|
 **200** | repository list |  -  |
+**400** | Bad Request |  -  |
+**401** | Unauthorized |  -  |
+**429** | too many requests |  -  |
+**0** | Internal Server Error |  -  |
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+# **list_repository_deletions**
+> RepositoryDeletionList list_repository_deletions(prefix=prefix, after=after, amount=amount)
+
+list repository storage deletions
+
+### Example
+
+* Basic Authentication (basic_auth):
+* Api Key Authentication (cookie_auth):
+* Api Key Authentication (oidc_auth):
+* Api Key Authentication (saml_auth):
+* Bearer (JWT) Authentication (jwt_token):
+
+```python
+import time
+import os
+import lakefs_sdk
+from lakefs_sdk.models.repository_deletion_list import RepositoryDeletionList
+from lakefs_sdk.rest import ApiException
+from pprint import pprint
+
+# Defining the host is optional and defaults to /api/v1
+# See configuration.py for a list of all supported configuration parameters.
+configuration = lakefs_sdk.Configuration(
+    host = "/api/v1"
+)
+
+# The client must configure the authentication and authorization parameters
+# in accordance with the API server security policy.
+# Examples for each auth method are provided below, use the example that
+# satisfies your auth use case.
+
+# Configure HTTP basic authorization: basic_auth
+configuration = lakefs_sdk.Configuration(
+    username = os.environ["USERNAME"],
+    password = os.environ["PASSWORD"]
+)
+
+# Configure API key authorization: cookie_auth
+configuration.api_key['cookie_auth'] = os.environ["API_KEY"]
+
+# Uncomment below to setup prefix (e.g. Bearer) for API key, if needed
+# configuration.api_key_prefix['cookie_auth'] = 'Bearer'
+
+# Configure API key authorization: oidc_auth
+configuration.api_key['oidc_auth'] = os.environ["API_KEY"]
+
+# Uncomment below to setup prefix (e.g. Bearer) for API key, if needed
+# configuration.api_key_prefix['oidc_auth'] = 'Bearer'
+
+# Configure API key authorization: saml_auth
+configuration.api_key['saml_auth'] = os.environ["API_KEY"]
+
+# Uncomment below to setup prefix (e.g. Bearer) for API key, if needed
+# configuration.api_key_prefix['saml_auth'] = 'Bearer'
+
+# Configure Bearer authorization (JWT): jwt_token
+configuration = lakefs_sdk.Configuration(
+    access_token = os.environ["BEARER_TOKEN"]
+)
+
+# Enter a context with an instance of the API client
+with lakefs_sdk.ApiClient(configuration) as api_client:
+    # Create an instance of the API class
+    api_instance = lakefs_sdk.RepositoriesApi(api_client)
+    prefix = 'prefix_example' # str | return items prefixed with this value (optional)
+    after = 'after_example' # str | return items after this value (optional)
+    amount = 100 # int | how many items to return (optional) (default to 100)
+
+    try:
+        # list repository storage deletions
+        api_response = api_instance.list_repository_deletions(prefix=prefix, after=after, amount=amount)
+        print("The response of RepositoriesApi->list_repository_deletions:\n")
+        pprint(api_response)
+    except Exception as e:
+        print("Exception when calling RepositoriesApi->list_repository_deletions: %s\n" % e)
+```
+
+
+
+### Parameters
+
+
+Name | Type | Description  | Notes
+------------- | ------------- | ------------- | -------------
+ **prefix** | **str**| return items prefixed with this value | [optional] 
+ **after** | **str**| return items after this value | [optional] 
+ **amount** | **int**| how many items to return | [optional] [default to 100]
+
+### Return type
+
+[**RepositoryDeletionList**](RepositoryDeletionList.md)
+
+### Authorization
+
+[basic_auth](../README.md#basic_auth), [cookie_auth](../README.md#cookie_auth), [oidc_auth](../README.md#oidc_auth), [saml_auth](../README.md#saml_auth), [jwt_token](../README.md#jwt_token)
+
+### HTTP request headers
+
+ - **Content-Type**: Not defined
+ - **Accept**: application/json
+
+### HTTP response details
+
+| Status code | Description | Response headers |
+|-------------|-------------|------------------|
+**200** | repository storage deletion list |  -  |
 **400** | Bad Request |  -  |
 **401** | Unauthorized |  -  |
 **429** | too many requests |  -  |

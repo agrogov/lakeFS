@@ -125,4 +125,12 @@ public class StorageConfigTest {
         // TODO: test blockstoreDescription
     }
 
+    /**
+     * Test the property 'deleteNamespaceSupport'
+     */
+    @Test
+    public void deleteNamespaceSupportTest() {
+        // TODO: test deleteNamespaceSupport
+    }
+
 }

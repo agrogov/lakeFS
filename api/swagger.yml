@@ -261,6 +261,56 @@ components:
           items:
             $ref: "#/components/schemas/Repository"
 
+    RepositoryDeletion:
+      type: object
+      required:
+        - repository
+        - storage_namespace
+        - state
+        - objects_deleted
+        - requested_by
+        - requested_at
+        - updated_at
+        - attempts
+      properties:
+        repository:
+          type: string
+        storage_namespace:
+          type: string
+        state:
+          type: string
+          enum: [pending, deleting, done, failed]
+        objects_deleted:
+          type: integer
+          format: int64
+        requested_by:
+          type: string
+        requested_at:
+          type: integer
+          format: int64
+          description: Unix Epoch in seconds
+        updated_at:
+          type: integer
+          format: int64
+          description: Unix Epoch in seconds
+        attempts:
+          type: integer
+        last_error:
+          type: string
+
+    RepositoryDeletionList:
+      type: object
+      required:
+        - pagination
+        - results
+      properties:
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/RepositoryDeletion"
+
     FindMergeBaseResult:
       type: object
       required:
@@ -1384,6 +1434,9 @@ components:
           type: string
         blockstore_description:
           type: string
+        delete_namespace_support:
+          type: boolean
+          description: Whether the blockstore can delete a whole storage namespace, so that a repository can be deleted together with its objects. Not required, so older servers parse.
 
     StorageConfigList:
       type: array
@@ -3347,9 +3400,81 @@ paths:
             type: boolean
             default: false
           description: Bypass read-only protection and delete the repository
+        - in: query
+          name: delete_storage
+          schema:
+            type: boolean
+            default: false
+          description: |
+            Delete every object under the repository's storage namespace as well. The request answers 202 with the
+            deletion status, and the object deletion runs in the background.
       responses:
+        202:
+          description: repository deletion with storage accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepositoryDeletion"
         204:
           description: repository deleted successfully
+        400:
+          $ref: "#/components/responses/BadRequest"
+        401:
+          $ref: "#/components/responses/Unauthorized"
+        404:
+          $ref: "#/components/responses/NotFound"
+        409:
+          $ref: "#/components/responses/Conflict"
+        429:
+          description: too many requests
+        default:
+          $ref: "#/components/responses/ServerError"
+
+  /repository_deletions:
+    get:
+      tags:
+        - repositories
+      operationId: listRepositoryDeletions
+      summary: list repository storage deletions
+      parameters:
+        - $ref: "#/components/parameters/PaginationPrefix"
+        - $ref: "#/components/parameters/PaginationAfter"
+        - $ref: "#/components/parameters/PaginationAmount"
+      responses:
+        200:
+          description: repository storage deletion list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepositoryDeletionList"
+        400:
+          $ref: "#/components/responses/BadRequest"
+        401:
+          $ref: "#/components/responses/Unauthorized"
+        429:
+          description: too many requests
+        default:
+          $ref: "#/components/responses/ServerError"
+
+  /repository_deletions/{repository}:
+    parameters:
+      - in: path
+        name: repository
+        required: true
+        schema:
+          type: string
+    get:
+      tags:
+        - repositories
+      operationId: getRepositoryDeletion
+      summary: get repository storage deletion status
+      responses:
+        200:
+          description: repository storage deletion status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepositoryDeletion"
         400:
           $ref: "#/components/responses/BadRequest"
         401:

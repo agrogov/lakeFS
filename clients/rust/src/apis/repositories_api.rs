@@ -47,6 +47,7 @@ pub enum DeleteRepositoryError {
     Status400(models::Error),
     Status401(models::Error),
     Status404(models::Error),
+    Status409(models::Error),
     Status429(),
     DefaultResponse(models::Error),
     UnknownValue(serde_json::Value),
@@ -111,6 +112,18 @@ pub enum GetRepositoryError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`get_repository_deletion`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GetRepositoryDeletionError {
+    Status400(models::Error),
+    Status401(models::Error),
+    Status404(models::Error),
+    Status429(),
+    DefaultResponse(models::Error),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`get_repository_metadata`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -127,6 +140,17 @@ pub enum GetRepositoryMetadataError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ListRepositoriesError {
+    Status400(models::Error),
+    Status401(models::Error),
+    Status429(),
+    DefaultResponse(models::Error),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`list_repository_deletions`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ListRepositoryDeletionsError {
     Status400(models::Error),
     Status401(models::Error),
     Status429(),
@@ -256,7 +280,7 @@ pub async fn delete_gc_rules(configuration: &configuration::Configuration, repos
     }
 }
 
-pub async fn delete_repository(configuration: &configuration::Configuration, repository: &str, force: Option<bool>) -> Result<(), Error<DeleteRepositoryError>> {
+pub async fn delete_repository(configuration: &configuration::Configuration, repository: &str, force: Option<bool>, delete_storage: Option<bool>) -> Result<models::RepositoryDeletion, Error<DeleteRepositoryError>> {
     let local_var_configuration = configuration;
 
     let local_var_client = &local_var_configuration.client;
@@ -266,6 +290,9 @@ pub async fn delete_repository(configuration: &configuration::Configuration, rep
 
     if let Some(ref local_var_str) = force {
         local_var_req_builder = local_var_req_builder.query(&[("force", &local_var_str.to_string())]);
+    }
+    if let Some(ref local_var_str) = delete_storage {
+        local_var_req_builder = local_var_req_builder.query(&[("delete_storage", &local_var_str.to_string())]);
     }
     if let Some(ref local_var_user_agent) = local_var_configuration.user_agent {
         local_var_req_builder = local_var_req_builder.header(reqwest::header::USER_AGENT, local_var_user_agent.clone());
@@ -284,7 +311,7 @@ pub async fn delete_repository(configuration: &configuration::Configuration, rep
     let local_var_content = local_var_resp.text().await?;
 
     if !local_var_status.is_client_error() && !local_var_status.is_server_error() {
-        Ok(())
+        serde_json::from_str(&local_var_content).map_err(Error::from)
     } else {
         let local_var_entity: Option<DeleteRepositoryError> = serde_json::from_str(&local_var_content).ok();
         let local_var_error = ResponseContent { status: local_var_status, content: local_var_content, entity: local_var_entity };
@@ -458,6 +485,39 @@ pub async fn get_repository(configuration: &configuration::Configuration, reposi
     }
 }
 
+pub async fn get_repository_deletion(configuration: &configuration::Configuration, repository: &str) -> Result<models::RepositoryDeletion, Error<GetRepositoryDeletionError>> {
+    let local_var_configuration = configuration;
+
+    let local_var_client = &local_var_configuration.client;
+
+    let local_var_uri_str = format!("{}/repository_deletions/{repository}", local_var_configuration.base_path, repository=crate::apis::urlencode(repository));
+    let mut local_var_req_builder = local_var_client.request(reqwest::Method::GET, local_var_uri_str.as_str());
+
+    if let Some(ref local_var_user_agent) = local_var_configuration.user_agent {
+        local_var_req_builder = local_var_req_builder.header(reqwest::header::USER_AGENT, local_var_user_agent.clone());
+    }
+    if let Some(ref local_var_auth_conf) = local_var_configuration.basic_auth {
+        local_var_req_builder = local_var_req_builder.basic_auth(local_var_auth_conf.0.to_owned(), local_var_auth_conf.1.to_owned());
+    };
+    if let Some(ref local_var_token) = local_var_configuration.bearer_access_token {
+        local_var_req_builder = local_var_req_builder.bearer_auth(local_var_token.to_owned());
+    };
+
+    let local_var_req = local_var_req_builder.build()?;
+    let local_var_resp = local_var_client.execute(local_var_req).await?;
+
+    let local_var_status = local_var_resp.status();
+    let local_var_content = local_var_resp.text().await?;
+
+    if !local_var_status.is_client_error() && !local_var_status.is_server_error() {
+        serde_json::from_str(&local_var_content).map_err(Error::from)
+    } else {
+        let local_var_entity: Option<GetRepositoryDeletionError> = serde_json::from_str(&local_var_content).ok();
+        let local_var_error = ResponseContent { status: local_var_status, content: local_var_content, entity: local_var_entity };
+        Err(Error::ResponseError(local_var_error))
+    }
+}
+
 pub async fn get_repository_metadata(configuration: &configuration::Configuration, repository: &str) -> Result<std::collections::HashMap<String, String>, Error<GetRepositoryMetadataError>> {
     let local_var_configuration = configuration;
 
@@ -531,6 +591,48 @@ pub async fn list_repositories(configuration: &configuration::Configuration, pre
         serde_json::from_str(&local_var_content).map_err(Error::from)
     } else {
         let local_var_entity: Option<ListRepositoriesError> = serde_json::from_str(&local_var_content).ok();
+        let local_var_error = ResponseContent { status: local_var_status, content: local_var_content, entity: local_var_entity };
+        Err(Error::ResponseError(local_var_error))
+    }
+}
+
+pub async fn list_repository_deletions(configuration: &configuration::Configuration, prefix: Option<&str>, after: Option<&str>, amount: Option<i32>) -> Result<models::RepositoryDeletionList, Error<ListRepositoryDeletionsError>> {
+    let local_var_configuration = configuration;
+
+    let local_var_client = &local_var_configuration.client;
+
+    let local_var_uri_str = format!("{}/repository_deletions", local_var_configuration.base_path);
+    let mut local_var_req_builder = local_var_client.request(reqwest::Method::GET, local_var_uri_str.as_str());
+
+    if let Some(ref local_var_str) = prefix {
+        local_var_req_builder = local_var_req_builder.query(&[("prefix", &local_var_str.to_string())]);
+    }
+    if let Some(ref local_var_str) = after {
+        local_var_req_builder = local_var_req_builder.query(&[("after", &local_var_str.to_string())]);
+    }
+    if let Some(ref local_var_str) = amount {
+        local_var_req_builder = local_var_req_builder.query(&[("amount", &local_var_str.to_string())]);
+    }
+    if let Some(ref local_var_user_agent) = local_var_configuration.user_agent {
+        local_var_req_builder = local_var_req_builder.header(reqwest::header::USER_AGENT, local_var_user_agent.clone());
+    }
+    if let Some(ref local_var_auth_conf) = local_var_configuration.basic_auth {
+        local_var_req_builder = local_var_req_builder.basic_auth(local_var_auth_conf.0.to_owned(), local_var_auth_conf.1.to_owned());
+    };
+    if let Some(ref local_var_token) = local_var_configuration.bearer_access_token {
+        local_var_req_builder = local_var_req_builder.bearer_auth(local_var_token.to_owned());
+    };
+
+    let local_var_req = local_var_req_builder.build()?;
+    let local_var_resp = local_var_client.execute(local_var_req).await?;
+
+    let local_var_status = local_var_resp.status();
+    let local_var_content = local_var_resp.text().await?;
+
+    if !local_var_status.is_client_error() && !local_var_status.is_server_error() {
+        serde_json::from_str(&local_var_content).map_err(Error::from)
+    } else {
+        let local_var_entity: Option<ListRepositoryDeletionsError> = serde_json::from_str(&local_var_content).ok();
         let local_var_error = ResponseContent { status: local_var_status, content: local_var_content, entity: local_var_entity };
         Err(Error::ResponseError(local_var_error))
     }

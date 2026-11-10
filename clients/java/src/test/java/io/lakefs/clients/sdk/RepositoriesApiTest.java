@@ -20,6 +20,8 @@ import io.lakefs.clients.sdk.model.GarbageCollectionRules;
 import io.lakefs.clients.sdk.model.RefsRestore;
 import io.lakefs.clients.sdk.model.Repository;
 import io.lakefs.clients.sdk.model.RepositoryCreation;
+import io.lakefs.clients.sdk.model.RepositoryDeletion;
+import io.lakefs.clients.sdk.model.RepositoryDeletionList;
 import io.lakefs.clients.sdk.model.RepositoryDumpStatus;
 import io.lakefs.clients.sdk.model.RepositoryList;
 import io.lakefs.clients.sdk.model.RepositoryRestoreStatus;
@@ -75,8 +77,10 @@ public class RepositoriesApiTest {
     public void deleteRepositoryTest() throws ApiException {
         String repository = null;
         Boolean force = null;
-        api.deleteRepository(repository)
+        Boolean deleteStorage = null;
+        RepositoryDeletion response = api.deleteRepository(repository)
                 .force(force)
+                .deleteStorage(deleteStorage)
                 .execute();
         // TODO: test validations
     }
@@ -148,6 +152,19 @@ public class RepositoriesApiTest {
     }
 
     /**
+     * get repository storage deletion status
+     *
+     * @throws ApiException if the Api call fails
+     */
+    @Test
+    public void getRepositoryDeletionTest() throws ApiException {
+        String repository = null;
+        RepositoryDeletion response = api.getRepositoryDeletion(repository)
+                .execute();
+        // TODO: test validations
+    }
+
+    /**
      * get repository metadata
      *
      * @throws ApiException if the Api call fails
@@ -176,6 +193,24 @@ public class RepositoriesApiTest {
                 .after(after)
                 .amount(amount)
                 .search(search)
+                .execute();
+        // TODO: test validations
+    }
+
+    /**
+     * list repository storage deletions
+     *
+     * @throws ApiException if the Api call fails
+     */
+    @Test
+    public void listRepositoryDeletionsTest() throws ApiException {
+        String prefix = null;
+        String after = null;
+        Integer amount = null;
+        RepositoryDeletionList response = api.listRepositoryDeletions()
+                .prefix(prefix)
+                .after(after)
+                .amount(amount)
                 .execute();
         // TODO: test validations
     }

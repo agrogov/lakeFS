@@ -100,6 +100,8 @@ docs/RefsRestore.md
 docs/RepositoriesApi.md
 docs/Repository.md
 docs/RepositoryCreation.md
+docs/RepositoryDeletion.md
+docs/RepositoryDeletionList.md
 docs/RepositoryDumpStatus.md
 docs/RepositoryList.md
 docs/RepositoryMetadataKeys.md
@@ -241,6 +243,8 @@ lakefs_sdk/models/refs_dump.py
 lakefs_sdk/models/refs_restore.py
 lakefs_sdk/models/repository.py
 lakefs_sdk/models/repository_creation.py
+lakefs_sdk/models/repository_deletion.py
+lakefs_sdk/models/repository_deletion_list.py
 lakefs_sdk/models/repository_dump_status.py
 lakefs_sdk/models/repository_list.py
 lakefs_sdk/models/repository_metadata_keys.py
@@ -378,6 +382,8 @@ test/test_refs_restore.py
 test/test_repositories_api.py
 test/test_repository.py
 test/test_repository_creation.py
+test/test_repository_deletion.py
+test/test_repository_deletion_list.py
 test/test_repository_dump_status.py
 test/test_repository_list.py
 test/test_repository_metadata_keys.py

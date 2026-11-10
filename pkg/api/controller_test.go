@@ -1395,6 +1395,404 @@ func TestController_DeleteRepositoryHandler(t *testing.T) {
 	})
 }
 
+// noNamespaceDeleteAdapter hides the blockstore's namespace-deletion support, the way the transient
+// blockstore reports it, so the R6 refusal can be exercised with the mem blockstore of the tests.
+type noNamespaceDeleteAdapter struct {
+	block.Adapter
+}
+
+func (a *noNamespaceDeleteAdapter) GetStorageNamespaceInfo(storageID string) *block.StorageNamespaceInfo {
+	info := a.Adapter.GetStorageNamespaceInfo(storageID)
+	if info == nil {
+		return nil
+	}
+	copied := *info
+	copied.DeleteNamespaceSupport = false
+	return &copied
+}
+
+// requireDeleteStorageError asserts the status and the message prefix of a delete_storage refusal
+// (REPO_DELETE_STORAGE_DESIGN.md section 4.1: the Error schema carries only a message, so the code is
+// its prefix).
+func requireDeleteStorageError(t *testing.T, resp *apigen.DeleteRepositoryResponse, status int, prefix string) {
+	t.Helper()
+	require.NotNil(t, resp)
+	require.Equal(t, status, resp.StatusCode(), "status of the refusal")
+	var apiErr *apigen.Error
+	switch status {
+	case http.StatusBadRequest:
+		apiErr = resp.JSON400
+	case http.StatusConflict:
+		apiErr = resp.JSON409
+	case http.StatusUnauthorized:
+		apiErr = resp.JSON401
+	default:
+		t.Fatalf("unexpected refusal status %d", status)
+	}
+	require.NotNil(t, apiErr, "the refusal carries a message")
+	require.True(t, strings.HasPrefix(apiErr.Message, prefix), "message %q should start with %q", apiErr.Message, prefix)
+}
+
+// createDeleteStorageTestRepository creates a repository on its own namespace and returns it with the
+// namespace.  Every case gets its own namespace so the R10 overlap scan sees only what the case set up.
+func createDeleteStorageTestRepository(t *testing.T, ctx context.Context, deps *dependencies, repo string, readOnly bool) string {
+	t.Helper()
+	namespace := onBlock(deps, repo) + "/ns"
+	_, err := deps.catalog.CreateRepository(ctx, repo, config.SingleBlockstoreID, namespace, "main", readOnly)
+	require.NoError(t, err)
+	return namespace
+}
+
+// TestController_DeleteRepositoryStorage pins A1 on the mem blockstore: delete_storage=true answers
+// 202 with the deletion record (R3), the repository answers 404 from then on, the status endpoint
+// serves the record while the worker runs (R14), and once the worker finishes the namespace lists
+// empty and a create on the same namespace succeeds (G5).
+func TestController_DeleteRepositoryStorage(t *testing.T) {
+	clt, deps := setupClientWithAdmin(t)
+	ctx := t.Context()
+
+	repo := testUniqueRepoName()
+	namespace := createDeleteStorageTestRepository(t, ctx, deps, repo, false)
+	siblingKey := namespace + "-metadata/keep"
+
+	put := func(identifierType block.IdentifierType, storageNamespace, key string) {
+		t.Helper()
+		_, err := deps.blocks.Put(ctx, block.ObjectPointer{
+			StorageNamespace: storageNamespace,
+			Identifier:       key,
+			IdentifierType:   identifierType,
+		}, int64(len(key)), strings.NewReader(key), block.PutOpts{})
+		require.NoError(t, err)
+	}
+	// Committed data, staged data, a range and the namespace marker: the deletion does not care
+	// which is which (R12).  The sibling namespace's object must survive (A2).
+	objects := []string{"data/branch-main/committed", "staged/uncommitted", "_lakefs/ranges/range"}
+	for _, key := range objects {
+		put(block.IdentifierTypeRelative, namespace, key)
+	}
+	put(block.IdentifierTypeRelative, namespace, "_lakefs/dummy")
+	put(block.IdentifierTypeFull, "", siblingKey)
+
+	resp, err := clt.DeleteRepositoryWithResponse(ctx, repo, &apigen.DeleteRepositoryParams{DeleteStorage: swag.Bool(true)})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusAccepted, resp.StatusCode(), "delete_storage answers 202 (R3)")
+	require.NotNil(t, resp.JSON202, "the 202 carries the deletion status")
+	require.Equal(t, repo, resp.JSON202.Repository)
+	require.Equal(t, namespace, resp.JSON202.StorageNamespace)
+	require.Contains(t, []string{"pending", "deleting"}, resp.JSON202.State)
+	require.Zero(t, resp.JSON202.ObjectsDeleted, "the objects are deleted by the worker, not by the request")
+
+	// R3: the metadata is deleted before the response.  The repository cache of this process may
+	// serve the record until it expires, and the worker's SETTLE step exists for that same window
+	// (design section 5), so the test waits it out instead of pinning a cache setting.
+	require.Eventually(t, func() bool {
+		get, err := clt.GetRepositoryWithResponse(ctx, repo)
+		return err == nil && get.StatusCode() == http.StatusNotFound
+	}, 20*time.Second, 50*time.Millisecond, "the deleted repository answers 404 (R3)")
+
+	status, err := clt.GetRepositoryDeletionWithResponse(ctx, repo)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, status.StatusCode(), "the deletion status is readable while it runs (R14)")
+	require.NotNil(t, status.JSON200)
+	require.Equal(t, repo, status.JSON200.Repository)
+
+	// Drive the background worker in the test; a server starts it in run.go (design section 5).
+	deps.catalog.RepositoryDeletionStorage = config.RepositoryDeletionStorage{
+		Enabled:     true,
+		Interval:    5 * time.Millisecond,
+		BatchSize:   100,
+		MaxAttempts: 3,
+	}
+	workerCtx, cancelWorker := context.WithCancel(context.WithoutCancel(ctx))
+	t.Cleanup(cancelWorker)
+	deps.catalog.StartRepositoryDeletionWorker(workerCtx,
+		catalog.WithRepositoryDeletionSettle(time.Millisecond),
+		catalog.WithRepositoryDeletionOwnershipIntervals(5*time.Millisecond, 50*time.Millisecond))
+
+	var done *apigen.RepositoryDeletion
+	require.Eventually(t, func() bool {
+		status, err := clt.GetRepositoryDeletionWithResponse(ctx, repo)
+		if err != nil || status.JSON200 == nil {
+			return false
+		}
+		done = status.JSON200
+		return done.State == "done"
+	}, 30*time.Second, 20*time.Millisecond, "the deletion ends done")
+	require.GreaterOrEqual(t, done.ObjectsDeleted, int64(len(objects)+1), "the objects and the marker are deleted")
+	require.Empty(t, swag.StringValue(done.LastError))
+
+	// The namespace lists empty: the marker, the last object the worker deletes, is gone (R12).
+	_, err = deps.blocks.Get(ctx, block.ObjectPointer{
+		StorageNamespace: namespace,
+		Identifier:       "_lakefs/dummy",
+		IdentifierType:   block.IdentifierTypeRelative,
+	})
+	require.ErrorIs(t, err, block.ErrDataNotFound, "the namespace is empty")
+
+	// A2: the sibling prefix was not touched.
+	sibling, err := deps.blocks.Get(ctx, block.ObjectPointer{
+		Identifier:     siblingKey,
+		IdentifierType: block.IdentifierTypeFull,
+	})
+	require.NoError(t, err, "the sibling prefix survives (A2)")
+	require.NoError(t, sibling.Close())
+
+	// G5: once DONE, the same name and namespace can be used again (R16).
+	created, err := clt.CreateRepositoryWithResponse(ctx, &apigen.CreateRepositoryParams{}, apigen.CreateRepositoryJSONRequestBody{
+		Name:             repo,
+		StorageNamespace: namespace,
+	})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusCreated, created.StatusCode(), "a create on the same namespace succeeds after done (G5)")
+}
+
+// TestController_DeleteRepositoryStorage_RBAC pins R5: the request is authorized on the AND of
+// fs:DeleteRepository on the repository ARN and fs:DeleteStorageNamespace on the namespace ARN.
+func TestController_DeleteRepositoryStorage_RBAC(t *testing.T) {
+	_, deps := setupHandler(t)
+	ctx := t.Context()
+	authService := newACLAuthService(t)
+	controller := internalACLController(t, deps, authService)
+
+	newRepository := func(t *testing.T, repo string) string {
+		t.Helper()
+		return createDeleteStorageTestRepository(t, ctx, deps, repo, false)
+	}
+	deleteStorage := func(t *testing.T, username, repo string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodDelete, "/repositories/"+repo, nil)
+		req = req.WithContext(auth.WithUser(req.Context(), &model.User{Username: username}))
+		recorder := httptest.NewRecorder()
+		controller.DeleteRepository(recorder, req, repo, apigen.DeleteRepositoryParams{DeleteStorage: swag.Bool(true)})
+		return recorder
+	}
+
+	t.Run("delete-storage action missing is refused", func(t *testing.T) {
+		repo := testUniqueRepoName()
+		newRepository(t, repo)
+		createUserWithPolicy(t, authService, "delete-repo-only", "DeleteRepoOnly", model.Statements{{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{permissions.DeleteRepositoryAction},
+			Resource: permissions.RepoArn(repo),
+		}})
+
+		recorder := deleteStorage(t, "delete-repo-only", repo)
+		require.Equal(t, http.StatusUnauthorized, recorder.Code, "fs:DeleteRepository alone must not delete storage (R5)")
+		_, err := deps.catalog.GetRepository(ctx, repo)
+		require.NoError(t, err, "a refused request changes nothing")
+	})
+
+	t.Run("both actions are accepted", func(t *testing.T) {
+		repo := testUniqueRepoName()
+		namespace := newRepository(t, repo)
+		createUserWithPolicy(t, authService, "delete-repo-and-storage", "DeleteRepoAndStorage", model.Statements{
+			{
+				Effect:   model.StatementEffectAllow,
+				Action:   []string{permissions.DeleteRepositoryAction},
+				Resource: permissions.RepoArn(repo),
+			},
+			{
+				Effect:   model.StatementEffectAllow,
+				Action:   []string{permissions.DeleteStorageNamespaceAction},
+				Resource: permissions.StorageNamespace(namespace),
+			},
+		})
+
+		recorder := deleteStorage(t, "delete-repo-and-storage", repo)
+		require.Equal(t, http.StatusAccepted, recorder.Code)
+		var body apigen.RepositoryDeletion
+		require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body))
+		require.Equal(t, repo, body.Repository)
+	})
+
+	t.Run("FSFullAccess is accepted", func(t *testing.T) {
+		repo := testUniqueRepoName()
+		newRepository(t, repo)
+		createUserWithPolicy(t, authService, "delete-repo-full-access", "FSFullAccessDelete",
+			auth.MakeStatementForPolicyTypeOrDie("FSFullAccess", []string{permissions.All}))
+
+		require.Equal(t, http.StatusAccepted, deleteStorage(t, "delete-repo-full-access", repo).Code,
+			"fs:* covers the new action")
+	})
+
+	t.Run("FSReadWrite is refused", func(t *testing.T) {
+		repo := testUniqueRepoName()
+		newRepository(t, repo)
+		createUserWithPolicy(t, authService, "delete-repo-read-write", "FSReadWriteDelete",
+			auth.MakeStatementForPolicyTypeOrDie("FSReadWrite", []string{permissions.All}))
+
+		require.Equal(t, http.StatusUnauthorized, deleteStorage(t, "delete-repo-read-write", repo).Code,
+			"FSReadWrite lists its actions explicitly and does not include fs:DeleteStorageNamespace")
+		_, err := deps.catalog.GetRepository(ctx, repo)
+		require.NoError(t, err, "a refused request changes nothing")
+	})
+}
+
+// TestController_RepositoryDeletionStatusHandlers pins R14's authorization: reading one status needs
+// fs:ReadRepository on the repository ARN, and listing statuses needs fs:ListRepositories.
+func TestController_RepositoryDeletionStatusHandlers(t *testing.T) {
+	_, deps := setupHandler(t)
+	ctx := t.Context()
+	authService := newACLAuthService(t)
+
+	repo := testUniqueRepoName()
+	createDeleteStorageTestRepository(t, ctx, deps, repo, false)
+	_, err := deps.catalog.DeleteRepositoryWithStorage(ctx, repo, catalog.DeleteStorageOptions{RequestedBy: "admin"})
+	require.NoError(t, err)
+
+	const (
+		reader = "deletion-reader"
+		lister = "deletion-lister"
+	)
+	createUserWithPolicy(t, authService, reader, "DeletionReader", model.Statements{{
+		Effect:   model.StatementEffectAllow,
+		Action:   []string{permissions.ReadRepositoryAction},
+		Resource: permissions.RepoArn(repo),
+	}})
+	createUserWithPolicy(t, authService, lister, "DeletionLister", model.Statements{{
+		Effect:   model.StatementEffectAllow,
+		Action:   []string{permissions.ListRepositoriesAction},
+		Resource: permissions.All,
+	}})
+	controller := internalACLController(t, deps, authService)
+
+	withUser := func(r *http.Request, username string) *http.Request {
+		return r.WithContext(auth.WithUser(r.Context(), &model.User{Username: username}))
+	}
+	getStatus := func(username string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		controller.GetRepositoryDeletion(recorder, withUser(httptest.NewRequest(http.MethodGet, "/repository_deletions/"+repo, nil), username), repo)
+		return recorder
+	}
+	listStatuses := func(username string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		controller.ListRepositoryDeletions(recorder, withUser(httptest.NewRequest(http.MethodGet, "/repository_deletions", nil), username),
+			apigen.ListRepositoryDeletionsParams{})
+		return recorder
+	}
+
+	t.Run("get needs fs:ReadRepository", func(t *testing.T) {
+		recorder := getStatus(reader)
+		require.Equal(t, http.StatusOK, recorder.Code)
+		var body apigen.RepositoryDeletion
+		require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body))
+		require.Equal(t, repo, body.Repository)
+		require.Equal(t, "deleting", body.State)
+
+		require.Equal(t, http.StatusUnauthorized, getStatus(lister).Code, "fs:ListRepositories does not read one status")
+	})
+
+	t.Run("list needs fs:ListRepositories", func(t *testing.T) {
+		recorder := listStatuses(lister)
+		require.Equal(t, http.StatusOK, recorder.Code)
+		var body apigen.RepositoryDeletionList
+		require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body))
+		require.Len(t, body.Results, 1)
+		require.Equal(t, repo, body.Results[0].Repository)
+
+		require.Equal(t, http.StatusUnauthorized, listStatuses(reader).Code, "fs:ReadRepository does not list statuses")
+	})
+}
+
+// TestController_DeleteRepositoryStorage_Refusals pins the five error mappings of design section 4.1
+// (R6-R11): each refusal answers its status and message prefix, and nothing is deleted.
+func TestController_DeleteRepositoryStorage_Refusals(t *testing.T) {
+	t.Run("R6 blockstore cannot delete namespaces", func(t *testing.T) {
+		clt, deps := setupClientWithAdmin(t)
+		ctx := t.Context()
+		repo := testUniqueRepoName()
+		createDeleteStorageTestRepository(t, ctx, deps, repo, false)
+
+		deps.catalog.BlockAdapter = &noNamespaceDeleteAdapter{Adapter: deps.catalog.BlockAdapter}
+
+		resp, err := clt.DeleteRepositoryWithResponse(ctx, repo, &apigen.DeleteRepositoryParams{DeleteStorage: swag.Bool(true)})
+		require.NoError(t, err)
+		requireDeleteStorageError(t, resp, http.StatusBadRequest, "not_supported:")
+		_, err = deps.catalog.GetRepository(ctx, repo)
+		require.NoError(t, err, "a refused request changes nothing")
+	})
+
+	t.Run("R7 storage deletion is disabled", func(t *testing.T) {
+		clt, deps := setupClientWithAdmin(t)
+		ctx := t.Context()
+		repo := testUniqueRepoName()
+		createDeleteStorageTestRepository(t, ctx, deps, repo, false)
+
+		deps.catalog.RepositoryDeletionStorage.Enabled = false
+
+		resp, err := clt.DeleteRepositoryWithResponse(ctx, repo, &apigen.DeleteRepositoryParams{DeleteStorage: swag.Bool(true)})
+		require.NoError(t, err)
+		requireDeleteStorageError(t, resp, http.StatusBadRequest, "not_supported:")
+		_, err = deps.catalog.GetRepository(ctx, repo)
+		require.NoError(t, err, "a refused request changes nothing")
+	})
+
+	t.Run("R8 read-only repository", func(t *testing.T) {
+		clt, deps := setupClientWithAdmin(t)
+		ctx := t.Context()
+		repo := testUniqueRepoName()
+		createDeleteStorageTestRepository(t, ctx, deps, repo, true)
+
+		for _, force := range []bool{false, true} {
+			resp, err := clt.DeleteRepositoryWithResponse(ctx, repo, &apigen.DeleteRepositoryParams{
+				DeleteStorage: swag.Bool(true),
+				Force:         swag.Bool(force),
+			})
+			require.NoError(t, err)
+			requireDeleteStorageError(t, resp, http.StatusBadRequest, "read_only_storage:")
+		}
+		_, err := deps.catalog.GetRepository(ctx, repo)
+		require.NoError(t, err, "a refused request changes nothing")
+	})
+
+	t.Run("R9 namespace is a root", func(t *testing.T) {
+		clt, deps := setupClientWithAdmin(t)
+		ctx := t.Context()
+		repo := testUniqueRepoName()
+		rootNamespace := deps.blocks.BlockstoreType() + "://"
+		_, err := deps.catalog.CreateRepository(ctx, repo, config.SingleBlockstoreID, rootNamespace, "main", false)
+		require.NoError(t, err)
+
+		resp, err := clt.DeleteRepositoryWithResponse(ctx, repo, &apigen.DeleteRepositoryParams{DeleteStorage: swag.Bool(true)})
+		require.NoError(t, err)
+		requireDeleteStorageError(t, resp, http.StatusBadRequest, "namespace_is_root:")
+	})
+
+	t.Run("R10 namespace overlaps another repository", func(t *testing.T) {
+		clt, deps := setupClientWithAdmin(t)
+		ctx := t.Context()
+		other := testUniqueRepoName()
+		parentNamespace := onBlock(deps, testUniqueRepoName())
+		_, err := deps.catalog.CreateRepository(ctx, other, config.SingleBlockstoreID, parentNamespace+"/content", "main", false)
+		require.NoError(t, err)
+		repo := testUniqueRepoName()
+		_, err = deps.catalog.CreateRepository(ctx, repo, config.SingleBlockstoreID, parentNamespace, "main", false)
+		require.NoError(t, err)
+
+		resp, err := clt.DeleteRepositoryWithResponse(ctx, repo, &apigen.DeleteRepositoryParams{DeleteStorage: swag.Bool(true)})
+		require.NoError(t, err)
+		requireDeleteStorageError(t, resp, http.StatusConflict, "namespace_shared:")
+		require.Contains(t, resp.JSON409.Message, other, "the refusal names the other repository (R10)")
+		_, err = deps.catalog.GetRepository(ctx, repo)
+		require.NoError(t, err, "a refused request changes nothing")
+	})
+
+	t.Run("R11 deletion already pending", func(t *testing.T) {
+		clt, deps := setupClientWithAdmin(t)
+		ctx := t.Context()
+		repo := testUniqueRepoName()
+		createDeleteStorageTestRepository(t, ctx, deps, repo, false)
+
+		first, err := clt.DeleteRepositoryWithResponse(ctx, repo, &apigen.DeleteRepositoryParams{DeleteStorage: swag.Bool(true)})
+		require.NoError(t, err)
+		require.Equal(t, http.StatusAccepted, first.StatusCode())
+
+		second, err := clt.DeleteRepositoryWithResponse(ctx, repo, &apigen.DeleteRepositoryParams{DeleteStorage: swag.Bool(true)})
+		require.NoError(t, err)
+		requireDeleteStorageError(t, second, http.StatusConflict, "deletion_in_progress:")
+	})
+}
+
 func TestController_SetRepositoryMetadataHandler(t *testing.T) {
 	clt, deps := setupClientWithAdmin(t)
 	ctx := t.Context()

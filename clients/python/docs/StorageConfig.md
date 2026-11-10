@@ -16,6 +16,7 @@ Name | Type | Description | Notes
 **pre_sign_multipart_upload** | **bool** |  | [optional] 
 **blockstore_id** | **str** |  | [optional] 
 **blockstore_description** | **str** |  | [optional] 
+**delete_namespace_support** | **bool** | Whether the blockstore can delete a whole storage namespace, so that a repository can be deleted together with its objects. Not required, so older servers parse. | [optional] 
 
 ## Example
 

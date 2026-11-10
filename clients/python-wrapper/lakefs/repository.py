@@ -8,7 +8,7 @@ from typing import Optional, Generator
 
 import lakefs_sdk
 
-from lakefs.models import RepositoryProperties
+from lakefs.models import RepositoryProperties, RepositoryDeletion
 from lakefs.tag import Tag
 from lakefs.branch import Branch
 from lakefs.client import Client, _BaseLakeFSObject
@@ -68,17 +68,40 @@ class Repository(_BaseLakeFSObject):
             self._properties = RepositoryProperties(**repo.dict())
         return self
 
-    def delete(self, **kwargs) -> None:
+    def delete(self, delete_storage: bool = False, **kwargs) -> Optional[RepositoryDeletion]:
         """
         Delete repository from lakeFS server
 
+        :param delete_storage: Delete every object under the repository's storage namespace as well.
+            The object deletion runs in the background on the server, and this call returns its status;
+            poll :meth:`deletion_status` until it is "done" or "failed"
         :param kwargs: Additional Keyword Arguments to send to the server
+        :return: The repository storage deletion status when delete_storage is True, None otherwise
         :raise NotFoundException: if repository by this id does not exist
         :raise NotAuthorizedException: if user is not authorized to perform this operation
         :raise ServerException: for any other errors
         """
         with api_exception_handler():
+            if delete_storage:
+                deletion = self._client.sdk_client.repositories_api.delete_repository(
+                    self._id, delete_storage=True, **kwargs)
+                return RepositoryDeletion(**deletion.dict())
             self._client.sdk_client.repositories_api.delete_repository(self._id, **kwargs)
+            return None
+
+    def deletion_status(self) -> RepositoryDeletion:
+        """
+        Returns the status of this repository's storage deletion
+
+        The status is readable while the deletion runs and for 24 hours after it ends.
+
+        :raise NotFoundException: if no storage deletion was requested for this repository
+        :raise NotAuthorizedException: if user is not authorized to perform this operation
+        :raise ServerException: for any other errors
+        """
+        with api_exception_handler():
+            deletion = self._client.sdk_client.repositories_api.get_repository_deletion(self._id)
+            return RepositoryDeletion(**deletion.dict())
 
     def branch(self, branch_id: str) -> Branch:
         """
@@ -198,3 +221,25 @@ def repositories(client: Optional[Client] = None,
                                 after=after,
                                 **kwargs):
         yield Repository(res.id, client)
+
+
+def repository_deletions(client: Optional[Client] = None,
+                         prefix: Optional[str] = None,
+                         after: Optional[str] = None,
+                         **kwargs) -> Generator[RepositoryDeletion]:
+    """
+    Creates a generator listing lakeFS repository storage deletions
+
+    :param client: The lakeFS client to use, if None, tries to use the default client
+    :param prefix: Return items prefixed with this value
+    :param after: Return items after this value
+    :return: A generator listing lakeFS repository storage deletion statuses
+    """
+    if client is None:  # Try to get default client
+        client = Client()
+
+    for res in generate_listing(client.sdk_client.repositories_api.list_repository_deletions,
+                                prefix=prefix,
+                                after=after,
+                                **kwargs):
+        yield RepositoryDeletion(**res.dict())

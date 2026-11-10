@@ -2188,6 +2188,7 @@ func (c *Controller) getStorageConfig(storageID string) (*apigen.StorageConfig, 
 		ImportSupport:                    info.ImportSupport,
 		ImportValidityRegex:              info.ImportValidityRegex,
 		PreSignMultipartUpload:           swag.Bool(info.PreSignSupportMultipart),
+		DeleteNamespaceSupport:           swag.Bool(info.DeleteNamespaceSupport),
 	}, nil
 }
 
@@ -2514,6 +2515,15 @@ func (c *Controller) ensureStorageNamespace(ctx context.Context, storageID, stor
 }
 
 func (c *Controller) DeleteRepository(w http.ResponseWriter, r *http.Request, repository string, params apigen.DeleteRepositoryParams) {
+	if !swag.BoolValue(params.DeleteStorage) {
+		c.deleteRepositoryMetadataOnly(w, r, repository, params)
+		return
+	}
+	c.deleteRepositoryWithStorage(w, r, repository, params)
+}
+
+// deleteRepositoryMetadataOnly is today's repository delete, unchanged (R2, A6): metadata only, 204.
+func (c *Controller) deleteRepositoryMetadataOnly(w http.ResponseWriter, r *http.Request, repository string, params apigen.DeleteRepositoryParams) {
 	if !c.authorize(w, r, permissions.Node{
 		Permission: permissions.Permission{
 			Action:   permissions.DeleteRepositoryAction,
@@ -2529,6 +2539,205 @@ func (c *Controller) DeleteRepository(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 	writeResponse(w, r, http.StatusNoContent, nil)
+}
+
+// deleteRepositoryWithStorage is DELETE ?delete_storage=true (REPO_DELETE_STORAGE_DESIGN.md section
+// 4.1): authorize the repository delete and the namespace delete together, write the deletion record
+// and delete the metadata, then answer 202 with the record.  The objects are deleted by the
+// background worker, so the request returns whatever the size of the namespace (G2).
+func (c *Controller) deleteRepositoryWithStorage(w http.ResponseWriter, r *http.Request, repository string, params apigen.DeleteRepositoryParams) {
+	ctx := r.Context()
+
+	// The namespace is the resource of the second permission, so it is read before authorizing.  It
+	// is also the resume path of a repeated request (R15): the repository record is gone, and the
+	// deletion record is the only place the namespace is left (design section 3.3).
+	storageNamespace, err := c.repositoryDeleteStorageNamespace(ctx, repository)
+	if err != nil {
+		c.handleAPIError(ctx, w, r, err)
+		return
+	}
+
+	if !c.authorize(w, r, permissions.Node{
+		Type: permissions.NodeTypeAnd,
+		Nodes: []permissions.Node{
+			{
+				Permission: permissions.Permission{
+					Action:   permissions.DeleteRepositoryAction,
+					Resource: permissions.RepoArn(repository),
+				},
+			},
+			{
+				Permission: permissions.Permission{
+					Action:   permissions.DeleteStorageNamespaceAction,
+					Resource: permissions.StorageNamespace(storageNamespace),
+				},
+			},
+		},
+	}) {
+		return
+	}
+
+	c.LogAction(ctx, "delete_repo", r, repository, "", "", logging.Fields{"delete_storage": true})
+
+	requestedBy := ""
+	if user, err := auth.GetUser(ctx); err == nil && user != nil {
+		requestedBy = user.Username
+	}
+	records, err := c.Catalog.DeleteRepositoryWithStorage(ctx, repository, catalog.DeleteStorageOptions{
+		Force:       swag.BoolValue(params.Force),
+		RequestedBy: requestedBy,
+	})
+	if err != nil {
+		// A read-only repository is a 400 read_only_storage here, not the 403 that the same
+		// graveler error maps to on a plain delete (R8): mark the error for handleAPIError, which
+		// owns the mapping.
+		if errors.Is(err, graveler.ErrReadOnlyRepository) {
+			err = &storageDeletionReadOnlyError{err: err}
+		}
+		c.handleAPIError(ctx, w, r, err)
+		return
+	}
+
+	// The record of the requested repository is the answer; a cascade may have written more (R17).
+	for _, record := range records {
+		if record.Repository == repository {
+			writeResponse(w, r, http.StatusAccepted, repositoryDeletionToAPI(record))
+			return
+		}
+	}
+	if len(records) > 0 {
+		writeResponse(w, r, http.StatusAccepted, repositoryDeletionToAPI(records[0]))
+		return
+	}
+	// No record and no error: nothing is left to delete.
+	writeResponse(w, r, http.StatusNoContent, nil)
+}
+
+// storageDeletionReadOnlyError marks a read-only refusal of a delete_storage request.  R8 makes it a
+// 400 read_only_storage, with or without force, while graveler.ErrReadOnlyRepository stays a 403 on
+// every other path (A6) - so the mapping needs this marker, not errors.Is alone.
+type storageDeletionReadOnlyError struct {
+	err error
+}
+
+func (e *storageDeletionReadOnlyError) Error() string { return e.err.Error() }
+
+func (e *storageDeletionReadOnlyError) Unwrap() error { return e.err }
+
+// repositoryDeleteStorageNamespace returns the storage namespace a delete_storage request
+// authorizes on.  The repository record is the first source; when it is already gone the deletion
+// record of a repeated request is read (R15), and when it is mid-deletion the repository record is
+// read in any state.
+func (c *Controller) repositoryDeleteStorageNamespace(ctx context.Context, repository string) (string, error) {
+	repo, err := c.Catalog.GetRepository(ctx, repository)
+	if err == nil {
+		return repo.StorageNamespace, nil
+	}
+	if errors.Is(err, graveler.ErrNotFound) {
+		// Resume by name (R15): the metadata is already deleted, and the record outlives it.
+		deletion, deletionErr := c.Catalog.GetRepositoryDeletion(ctx, repository)
+		if deletionErr != nil {
+			if errors.Is(deletionErr, catalog.ErrRepositoryDeletionNotFound) {
+				return "", err
+			}
+			return "", deletionErr
+		}
+		return deletion.StorageNamespace, nil
+	}
+	if errors.Is(err, graveler.ErrRepositoryInDeletion) {
+		// GetRepository refuses a repository in deletion, and the catalog has no any-state getter
+		// yet; ListRepositories iterates repository records in every state, so the record is
+		// readable there.
+		repos, _, listErr := c.Catalog.ListRepositories(ctx, 1, repository, "", "")
+		if listErr != nil {
+			return "", listErr
+		}
+		for _, listed := range repos {
+			if listed.Name == repository {
+				return listed.StorageNamespace, nil
+			}
+		}
+	}
+	return "", err
+}
+
+// repositoryDeletionToAPI maps a catalog deletion record to its API form (R14).
+func repositoryDeletionToAPI(deletion *catalog.RepositoryDeletion) apigen.RepositoryDeletion {
+	response := apigen.RepositoryDeletion{
+		Repository:       deletion.Repository,
+		StorageNamespace: deletion.StorageNamespace,
+		State:            strings.ToLower(deletion.State.String()),
+		ObjectsDeleted:   deletion.ObjectsDeleted,
+		RequestedBy:      deletion.RequestedBy,
+		RequestedAt:      deletion.RequestedAt.Unix(),
+		UpdatedAt:        deletion.UpdatedAt.Unix(),
+		Attempts:         int(deletion.Attempts),
+	}
+	if deletion.LastError != "" {
+		response.LastError = swag.String(deletion.LastError)
+	}
+	return response
+}
+
+func (c *Controller) GetRepositoryDeletion(w http.ResponseWriter, r *http.Request, repository string) {
+	if !c.authorize(w, r, permissions.Node{
+		Permission: permissions.Permission{
+			Action:   permissions.ReadRepositoryAction,
+			Resource: permissions.RepoArn(repository),
+		},
+	}) {
+		return
+	}
+	ctx := r.Context()
+	c.LogAction(ctx, "get_repo_deletion", r, repository, "", "")
+	deletion, err := c.Catalog.GetRepositoryDeletion(ctx, repository)
+	if c.handleAPIError(ctx, w, r, err) {
+		return
+	}
+	writeResponse(w, r, http.StatusOK, repositoryDeletionToAPI(deletion))
+}
+
+func (c *Controller) ListRepositoryDeletions(w http.ResponseWriter, r *http.Request, params apigen.ListRepositoryDeletionsParams) {
+	if !c.authorize(w, r, permissions.Node{
+		Permission: permissions.Permission{
+			Action:   permissions.ListRepositoriesAction,
+			Resource: permissions.All,
+		},
+	}) {
+		return
+	}
+	ctx := r.Context()
+	c.LogAction(ctx, "list_repo_deletions", r, "", "", "")
+	records, err := c.Catalog.ListRepositoryDeletions(ctx)
+	if c.handleAPIError(ctx, w, r, err) {
+		return
+	}
+	results, hasMore := pageRepositoryDeletions(records, paginationPrefix(params.Prefix), paginationAfter(params.After), paginationAmount(params.Amount))
+	writeResponse(w, r, http.StatusOK, apigen.RepositoryDeletionList{
+		Pagination: paginationFor(hasMore, results, "Repository"),
+		Results:    results,
+	})
+}
+
+// pageRepositoryDeletions slices the records of ListRepositoryDeletions by prefix and after, in
+// repository name order, the way every other lakeFS listing pages.
+func pageRepositoryDeletions(records []*catalog.RepositoryDeletion, prefix, after string, amount int) ([]apigen.RepositoryDeletion, bool) {
+	results := make([]apigen.RepositoryDeletion, 0, len(records))
+	hasMore := false
+	for _, record := range records {
+		if !strings.HasPrefix(record.Repository, prefix) {
+			continue
+		}
+		if after != "" && record.Repository <= after {
+			continue
+		}
+		if len(results) == amount {
+			hasMore = true
+			break
+		}
+		results = append(results, repositoryDeletionToAPI(record))
+	}
+	return results, hasMore
 }
 
 func (c *Controller) GetRepository(w http.ResponseWriter, r *http.Request, repository string) {
@@ -3181,7 +3390,31 @@ func handleApiErrorCallback(log logging.Logger, w http.ResponseWriter, r *http.R
 	}
 
 	// order of case is important, more specific errors should be first
+	// A read-only refusal of a delete_storage request is a 400 read_only_storage, with or without
+	// force (R8).  The same graveler error on a plain delete stays a 403 below (R2, A6), which is
+	// why the marker type decides, not errors.Is on the graveler error alone.
+	var storageReadOnly *storageDeletionReadOnlyError
 	switch {
+	case errors.As(err, &storageReadOnly):
+		log.Debug("Read-only repository, storage deletion refused")
+		cb(w, r, http.StatusBadRequest, fmt.Errorf("read_only_storage: %w", storageReadOnly.err))
+
+	case errors.Is(err, catalog.ErrStorageDeletionNotSupported):
+		log.Debug("Storage deletion is not supported")
+		cb(w, r, http.StatusBadRequest, fmt.Errorf("not_supported: %w", err))
+
+	case errors.Is(err, block.ErrNamespaceIsRoot):
+		log.Debug("Storage namespace is a root, storage deletion refused")
+		cb(w, r, http.StatusBadRequest, fmt.Errorf("namespace_is_root: %w", err))
+
+	case errors.Is(err, catalog.ErrNamespaceShared):
+		log.Debug("Storage namespace is shared with another repository")
+		cb(w, r, http.StatusConflict, fmt.Errorf("namespace_shared: %w", err))
+
+	case errors.Is(err, catalog.ErrDeletionInProgress):
+		log.Debug("Repository storage deletion is in progress")
+		cb(w, r, http.StatusConflict, fmt.Errorf("deletion_in_progress: %w", err))
+
 	case errors.Is(err, graveler.ErrLinkAddressInvalid),
 		errors.Is(err, graveler.ErrLinkAddressExpired):
 		log.Debug("Expired or invalid address token")
@@ -6350,7 +6583,10 @@ func resolvePathList(objects, prefixes *[]string) []catalog.PathRecord {
 	return pathRecords
 }
 
-func (c *Controller) LogAction(ctx context.Context, action string, r *http.Request, repository, ref, sourceRef string) {
+// LogAction records an API action in the audit/debug log and the usage collector.  extra fields,
+// when given, are merged into the log line only: they carry details a client is not charged for
+// (for example delete_storage on a repository deletion, R22).
+func (c *Controller) LogAction(ctx context.Context, action string, r *http.Request, repository, ref, sourceRef string, extra ...logging.Fields) {
 	client := httputil.GetRequestLakeFSClient(r)
 	ev := stats.Event{
 		Class:      "api_server",
@@ -6365,7 +6601,7 @@ func (c *Controller) LogAction(ctx context.Context, action string, r *http.Reque
 		ev.UserID = user.Username
 	}
 
-	c.Logger.WithContext(ctx).WithFields(logging.Fields{
+	fields := logging.Fields{
 		"class":      ev.Class,
 		"name":       ev.Name,
 		"repository": ev.Repository,
@@ -6374,7 +6610,13 @@ func (c *Controller) LogAction(ctx context.Context, action string, r *http.Reque
 		"user_id":    ev.UserID,
 		"client":     ev.Client,
 		"source_ip":  r.RemoteAddr,
-	}).Debug("performing API action")
+	}
+	for _, m := range extra {
+		for k, v := range m {
+			fields[k] = v
+		}
+	}
+	c.Logger.WithContext(ctx).WithFields(fields).Debug("performing API action")
 	c.Collector.CollectEvent(ev)
 	usageCounter.Add(1)
 }

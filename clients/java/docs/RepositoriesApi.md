@@ -12,8 +12,10 @@ All URIs are relative to */api/v1*
 | [**getBranchProtectionRules**](RepositoriesApi.md#getBranchProtectionRules) | **GET** /repositories/{repository}/settings/branch_protection | get branch protection rules |
 | [**getGCRules**](RepositoriesApi.md#getGCRules) | **GET** /repositories/{repository}/settings/gc_rules | get repository GC rules |
 | [**getRepository**](RepositoriesApi.md#getRepository) | **GET** /repositories/{repository} | get repository |
+| [**getRepositoryDeletion**](RepositoriesApi.md#getRepositoryDeletion) | **GET** /repository_deletions/{repository} | get repository storage deletion status |
 | [**getRepositoryMetadata**](RepositoriesApi.md#getRepositoryMetadata) | **GET** /repositories/{repository}/metadata | get repository metadata |
 | [**listRepositories**](RepositoriesApi.md#listRepositories) | **GET** /repositories | list repositories |
+| [**listRepositoryDeletions**](RepositoriesApi.md#listRepositoryDeletions) | **GET** /repository_deletions | list repository storage deletions |
 | [**restoreStatus**](RepositoriesApi.md#restoreStatus) | **GET** /repositories/{repository}/restore | Status of a restore request |
 | [**restoreSubmit**](RepositoriesApi.md#restoreSubmit) | **POST** /repositories/{repository}/restore | Restore repository from a dump in the object store |
 | [**setBranchProtectionRules**](RepositoriesApi.md#setBranchProtectionRules) | **PUT** /repositories/{repository}/settings/branch_protection |  |
@@ -213,7 +215,7 @@ null (empty response body)
 
 <a id="deleteRepository"></a>
 # **deleteRepository**
-> deleteRepository(repository).force(force).execute();
+> RepositoryDeletion deleteRepository(repository).force(force).deleteStorage(deleteStorage).execute();
 
 delete repository
 
@@ -262,10 +264,13 @@ public class Example {
     RepositoriesApi apiInstance = new RepositoriesApi(defaultClient);
     String repository = "repository_example"; // String | 
     Boolean force = false; // Boolean | Bypass read-only protection and delete the repository
+    Boolean deleteStorage = false; // Boolean | Delete every object under the repository's storage namespace as well. The request answers 202 with the deletion status, and the object deletion runs in the background. 
     try {
-      apiInstance.deleteRepository(repository)
+      RepositoryDeletion result = apiInstance.deleteRepository(repository)
             .force(force)
+            .deleteStorage(deleteStorage)
             .execute();
+      System.out.println(result);
     } catch (ApiException e) {
       System.err.println("Exception when calling RepositoriesApi#deleteRepository");
       System.err.println("Status code: " + e.getCode());
@@ -283,10 +288,11 @@ public class Example {
 |------------- | ------------- | ------------- | -------------|
 | **repository** | **String**|  | |
 | **force** | **Boolean**| Bypass read-only protection and delete the repository | [optional] [default to false] |
+| **deleteStorage** | **Boolean**| Delete every object under the repository&#39;s storage namespace as well. The request answers 202 with the deletion status, and the object deletion runs in the background.  | [optional] [default to false] |
 
 ### Return type
 
-null (empty response body)
+[**RepositoryDeletion**](RepositoryDeletion.md)
 
 ### Authorization
 
@@ -300,10 +306,12 @@ null (empty response body)
 ### HTTP response details
 | Status code | Description | Response headers |
 |-------------|-------------|------------------|
+| **202** | repository deletion with storage accepted |  -  |
 | **204** | repository deleted successfully |  -  |
 | **400** | Bad Request |  -  |
 | **401** | Unauthorized |  -  |
 | **404** | Resource Not Found |  -  |
+| **409** | Resource Conflicts With Target |  -  |
 | **429** | too many requests |  -  |
 | **0** | Internal Server Error |  -  |
 
@@ -778,6 +786,100 @@ public class Example {
 | **429** | too many requests |  -  |
 | **0** | Internal Server Error |  -  |
 
+<a id="getRepositoryDeletion"></a>
+# **getRepositoryDeletion**
+> RepositoryDeletion getRepositoryDeletion(repository).execute();
+
+get repository storage deletion status
+
+### Example
+```java
+// Import classes:
+import io.lakefs.clients.sdk.ApiClient;
+import io.lakefs.clients.sdk.ApiException;
+import io.lakefs.clients.sdk.Configuration;
+import io.lakefs.clients.sdk.auth.*;
+import io.lakefs.clients.sdk.models.*;
+import io.lakefs.clients.sdk.RepositoriesApi;
+
+public class Example {
+  public static void main(String[] args) {
+    ApiClient defaultClient = Configuration.getDefaultApiClient();
+    defaultClient.setBasePath("/api/v1");
+    
+    // Configure HTTP basic authorization: basic_auth
+    HttpBasicAuth basic_auth = (HttpBasicAuth) defaultClient.getAuthentication("basic_auth");
+    basic_auth.setUsername("YOUR USERNAME");
+    basic_auth.setPassword("YOUR PASSWORD");
+
+    // Configure API key authorization: cookie_auth
+    ApiKeyAuth cookie_auth = (ApiKeyAuth) defaultClient.getAuthentication("cookie_auth");
+    cookie_auth.setApiKey("YOUR API KEY");
+    // Uncomment the following line to set a prefix for the API key, e.g. "Token" (defaults to null)
+    //cookie_auth.setApiKeyPrefix("Token");
+
+    // Configure API key authorization: oidc_auth
+    ApiKeyAuth oidc_auth = (ApiKeyAuth) defaultClient.getAuthentication("oidc_auth");
+    oidc_auth.setApiKey("YOUR API KEY");
+    // Uncomment the following line to set a prefix for the API key, e.g. "Token" (defaults to null)
+    //oidc_auth.setApiKeyPrefix("Token");
+
+    // Configure API key authorization: saml_auth
+    ApiKeyAuth saml_auth = (ApiKeyAuth) defaultClient.getAuthentication("saml_auth");
+    saml_auth.setApiKey("YOUR API KEY");
+    // Uncomment the following line to set a prefix for the API key, e.g. "Token" (defaults to null)
+    //saml_auth.setApiKeyPrefix("Token");
+
+    // Configure HTTP bearer authorization: jwt_token
+    HttpBearerAuth jwt_token = (HttpBearerAuth) defaultClient.getAuthentication("jwt_token");
+    jwt_token.setBearerToken("BEARER TOKEN");
+
+    RepositoriesApi apiInstance = new RepositoriesApi(defaultClient);
+    String repository = "repository_example"; // String | 
+    try {
+      RepositoryDeletion result = apiInstance.getRepositoryDeletion(repository)
+            .execute();
+      System.out.println(result);
+    } catch (ApiException e) {
+      System.err.println("Exception when calling RepositoriesApi#getRepositoryDeletion");
+      System.err.println("Status code: " + e.getCode());
+      System.err.println("Reason: " + e.getResponseBody());
+      System.err.println("Response headers: " + e.getResponseHeaders());
+      e.printStackTrace();
+    }
+  }
+}
+```
+
+### Parameters
+
+| Name | Type | Description  | Notes |
+|------------- | ------------- | ------------- | -------------|
+| **repository** | **String**|  | |
+
+### Return type
+
+[**RepositoryDeletion**](RepositoryDeletion.md)
+
+### Authorization
+
+[basic_auth](../README.md#basic_auth), [cookie_auth](../README.md#cookie_auth), [oidc_auth](../README.md#oidc_auth), [saml_auth](../README.md#saml_auth), [jwt_token](../README.md#jwt_token)
+
+### HTTP request headers
+
+ - **Content-Type**: Not defined
+ - **Accept**: application/json
+
+### HTTP response details
+| Status code | Description | Response headers |
+|-------------|-------------|------------------|
+| **200** | repository storage deletion status |  -  |
+| **400** | Bad Request |  -  |
+| **401** | Unauthorized |  -  |
+| **404** | Resource Not Found |  -  |
+| **429** | too many requests |  -  |
+| **0** | Internal Server Error |  -  |
+
 <a id="getRepositoryMetadata"></a>
 # **getRepositoryMetadata**
 > Map&lt;String, String&gt; getRepositoryMetadata(repository).execute();
@@ -970,6 +1072,106 @@ public class Example {
 | Status code | Description | Response headers |
 |-------------|-------------|------------------|
 | **200** | repository list |  -  |
+| **400** | Bad Request |  -  |
+| **401** | Unauthorized |  -  |
+| **429** | too many requests |  -  |
+| **0** | Internal Server Error |  -  |
+
+<a id="listRepositoryDeletions"></a>
+# **listRepositoryDeletions**
+> RepositoryDeletionList listRepositoryDeletions().prefix(prefix).after(after).amount(amount).execute();
+
+list repository storage deletions
+
+### Example
+```java
+// Import classes:
+import io.lakefs.clients.sdk.ApiClient;
+import io.lakefs.clients.sdk.ApiException;
+import io.lakefs.clients.sdk.Configuration;
+import io.lakefs.clients.sdk.auth.*;
+import io.lakefs.clients.sdk.models.*;
+import io.lakefs.clients.sdk.RepositoriesApi;
+
+public class Example {
+  public static void main(String[] args) {
+    ApiClient defaultClient = Configuration.getDefaultApiClient();
+    defaultClient.setBasePath("/api/v1");
+    
+    // Configure HTTP basic authorization: basic_auth
+    HttpBasicAuth basic_auth = (HttpBasicAuth) defaultClient.getAuthentication("basic_auth");
+    basic_auth.setUsername("YOUR USERNAME");
+    basic_auth.setPassword("YOUR PASSWORD");
+
+    // Configure API key authorization: cookie_auth
+    ApiKeyAuth cookie_auth = (ApiKeyAuth) defaultClient.getAuthentication("cookie_auth");
+    cookie_auth.setApiKey("YOUR API KEY");
+    // Uncomment the following line to set a prefix for the API key, e.g. "Token" (defaults to null)
+    //cookie_auth.setApiKeyPrefix("Token");
+
+    // Configure API key authorization: oidc_auth
+    ApiKeyAuth oidc_auth = (ApiKeyAuth) defaultClient.getAuthentication("oidc_auth");
+    oidc_auth.setApiKey("YOUR API KEY");
+    // Uncomment the following line to set a prefix for the API key, e.g. "Token" (defaults to null)
+    //oidc_auth.setApiKeyPrefix("Token");
+
+    // Configure API key authorization: saml_auth
+    ApiKeyAuth saml_auth = (ApiKeyAuth) defaultClient.getAuthentication("saml_auth");
+    saml_auth.setApiKey("YOUR API KEY");
+    // Uncomment the following line to set a prefix for the API key, e.g. "Token" (defaults to null)
+    //saml_auth.setApiKeyPrefix("Token");
+
+    // Configure HTTP bearer authorization: jwt_token
+    HttpBearerAuth jwt_token = (HttpBearerAuth) defaultClient.getAuthentication("jwt_token");
+    jwt_token.setBearerToken("BEARER TOKEN");
+
+    RepositoriesApi apiInstance = new RepositoriesApi(defaultClient);
+    String prefix = "prefix_example"; // String | return items prefixed with this value
+    String after = "after_example"; // String | return items after this value
+    Integer amount = 100; // Integer | how many items to return
+    try {
+      RepositoryDeletionList result = apiInstance.listRepositoryDeletions()
+            .prefix(prefix)
+            .after(after)
+            .amount(amount)
+            .execute();
+      System.out.println(result);
+    } catch (ApiException e) {
+      System.err.println("Exception when calling RepositoriesApi#listRepositoryDeletions");
+      System.err.println("Status code: " + e.getCode());
+      System.err.println("Reason: " + e.getResponseBody());
+      System.err.println("Response headers: " + e.getResponseHeaders());
+      e.printStackTrace();
+    }
+  }
+}
+```
+
+### Parameters
+
+| Name | Type | Description  | Notes |
+|------------- | ------------- | ------------- | -------------|
+| **prefix** | **String**| return items prefixed with this value | [optional] |
+| **after** | **String**| return items after this value | [optional] |
+| **amount** | **Integer**| how many items to return | [optional] [default to 100] |
+
+### Return type
+
+[**RepositoryDeletionList**](RepositoryDeletionList.md)
+
+### Authorization
+
+[basic_auth](../README.md#basic_auth), [cookie_auth](../README.md#cookie_auth), [oidc_auth](../README.md#oidc_auth), [saml_auth](../README.md#saml_auth), [jwt_token](../README.md#jwt_token)
+
+### HTTP request headers
+
+ - **Content-Type**: Not defined
+ - **Accept**: application/json
+
+### HTTP response details
+| Status code | Description | Response headers |
+|-------------|-------------|------------------|
+| **200** | repository storage deletion list |  -  |
 | **400** | Bad Request |  -  |
 | **401** | Unauthorized |  -  |
 | **429** | too many requests |  -  |

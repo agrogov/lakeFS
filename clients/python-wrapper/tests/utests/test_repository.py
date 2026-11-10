@@ -112,6 +112,48 @@ def test_delete_repository(monkeypatch):
             repo.delete()
 
 
+def test_delete_repository_with_storage(monkeypatch):
+    repo = get_test_repo()
+    deletion = {
+        "repository": TEST_REPO_ARGS.name,
+        "storage_namespace": TEST_REPO_ARGS.storage_namespace,
+        "state": "deleting",
+        "objects_deleted": 0,
+        "requested_by": "tester",
+        "requested_at": int(time.time()),
+        "updated_at": int(time.time()),
+        "attempts": 0,
+    }
+
+    # The generated SDK of an older server has no RepositoryDeletion model, so the stand-in only
+    # needs the dict() the wrapper reads (this is what the SDK model returns too).
+    class _Deletion:
+        def dict(self):
+            return deletion
+
+    with monkeypatch.context():
+        requested = {}
+
+        def monkey_delete_repository(*_, **kwargs):
+            requested.update(kwargs)
+            return _Deletion()
+
+        monkeypatch.setattr(lakefs_sdk.RepositoriesApi, "delete_repository", monkey_delete_repository)
+        status = repo.delete(delete_storage=True)
+        assert requested["delete_storage"] is True
+        assert status.repository == TEST_REPO_ARGS.name
+        assert status.storage_namespace == TEST_REPO_ARGS.storage_namespace
+        assert status.state == "deleting"
+
+        # A plain delete keeps today's request and return value.
+        requested.clear()
+        assert repo.delete() is None
+        assert "delete_storage" not in requested
+
+        monkeypatch.setattr(lakefs_sdk.RepositoriesApi, "get_repository_deletion", lambda *_, **__: _Deletion())
+        assert repo.deletion_status().state == "deleting"
+
+
 def test_create_repository_no_authentication(monkeypatch):
     with lakectl_no_config_context(monkeypatch):
         from lakefs.repository import Repository

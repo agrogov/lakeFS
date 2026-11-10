@@ -117,3 +117,24 @@ class RepositoryProperties(LenientNamedTuple):
     default_branch: str
     storage_namespace: str
     storage_id: str
+
+
+class RepositoryDeletion(LenientNamedTuple):
+    """
+    Represent the status of a lakeFS repository storage deletion
+
+    state is one of "pending", "deleting", "done" or "failed".
+    """
+    repository: str
+    storage_namespace: str
+    state: Literal["pending", "deleting", "done", "failed"]
+    objects_deleted: int
+    requested_by: str
+    requested_at: int
+    updated_at: int
+    attempts: int
+    last_error: Optional[str] = None
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("last_error", None)
+        super().__init__(**kwargs)

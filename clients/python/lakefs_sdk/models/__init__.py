@@ -96,6 +96,8 @@ from lakefs_sdk.models.refs_dump import RefsDump
 from lakefs_sdk.models.refs_restore import RefsRestore
 from lakefs_sdk.models.repository import Repository
 from lakefs_sdk.models.repository_creation import RepositoryCreation
+from lakefs_sdk.models.repository_deletion import RepositoryDeletion
+from lakefs_sdk.models.repository_deletion_list import RepositoryDeletionList
 from lakefs_sdk.models.repository_dump_status import RepositoryDumpStatus
 from lakefs_sdk.models.repository_list import RepositoryList
 from lakefs_sdk.models.repository_metadata_keys import RepositoryMetadataKeys

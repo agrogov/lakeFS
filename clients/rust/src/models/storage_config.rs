@@ -34,6 +34,9 @@ pub struct StorageConfig {
     pub blockstore_id: Option<String>,
     #[serde(rename = "blockstore_description", skip_serializing_if = "Option::is_none")]
     pub blockstore_description: Option<String>,
+    /// Whether the blockstore can delete a whole storage namespace, so that a repository can be deleted together with its objects. Not required, so older servers parse.
+    #[serde(rename = "delete_namespace_support", skip_serializing_if = "Option::is_none")]
+    pub delete_namespace_support: Option<bool>,
 }
 
 impl StorageConfig {
@@ -50,6 +53,7 @@ impl StorageConfig {
             pre_sign_multipart_upload: None,
             blockstore_id: None,
             blockstore_description: None,
+            delete_namespace_support: None,
         }
     }
 }

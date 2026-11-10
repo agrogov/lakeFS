@@ -99,6 +99,8 @@ docs/RefsRestore.md
 docs/RepositoriesApi.md
 docs/Repository.md
 docs/RepositoryCreation.md
+docs/RepositoryDeletion.md
+docs/RepositoryDeletionList.md
 docs/RepositoryDumpStatus.md
 docs/RepositoryList.md
 docs/RepositoryMetadataKeys.md
@@ -237,6 +239,8 @@ src/models/refs_dump.rs
 src/models/refs_restore.rs
 src/models/repository.rs
 src/models/repository_creation.rs
+src/models/repository_deletion.rs
+src/models/repository_deletion_list.rs
 src/models/repository_dump_status.rs
 src/models/repository_list.rs
 src/models/repository_metadata_keys.rs

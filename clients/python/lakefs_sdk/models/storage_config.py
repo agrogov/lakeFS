@@ -40,7 +40,8 @@ class StorageConfig(BaseModel):
     pre_sign_multipart_upload: Optional[StrictBool] = None
     blockstore_id: Optional[StrictStr] = None
     blockstore_description: Optional[StrictStr] = None
-    __properties = ["blockstore_type", "blockstore_namespace_example", "blockstore_namespace_ValidityRegex", "default_namespace_prefix", "pre_sign_support", "pre_sign_support_ui", "import_support", "import_validity_regex", "pre_sign_multipart_upload", "blockstore_id", "blockstore_description"]
+    delete_namespace_support: Optional[StrictBool] = Field(None, description="Whether the blockstore can delete a whole storage namespace, so that a repository can be deleted together with its objects. Not required, so older servers parse.")
+    __properties = ["blockstore_type", "blockstore_namespace_example", "blockstore_namespace_ValidityRegex", "default_namespace_prefix", "pre_sign_support", "pre_sign_support_ui", "import_support", "import_validity_regex", "pre_sign_multipart_upload", "blockstore_id", "blockstore_description", "delete_namespace_support"]
 
     class Config:
         """Pydantic configuration"""
@@ -88,7 +89,8 @@ class StorageConfig(BaseModel):
             "import_validity_regex": obj.get("import_validity_regex"),
             "pre_sign_multipart_upload": obj.get("pre_sign_multipart_upload"),
             "blockstore_id": obj.get("blockstore_id"),
-            "blockstore_description": obj.get("blockstore_description")
+            "blockstore_description": obj.get("blockstore_description"),
+            "delete_namespace_support": obj.get("delete_namespace_support")
         })
         return _obj
 

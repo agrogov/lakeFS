@@ -15,6 +15,7 @@ Name | Type | Description | Notes
 **pre_sign_multipart_upload** | Option<**bool**> |  | [optional]
 **blockstore_id** | Option<**String**> |  | [optional]
 **blockstore_description** | Option<**String**> |  | [optional]
+**delete_namespace_support** | Option<**bool**> | Whether the blockstore can delete a whole storage namespace, so that a repository can be deleted together with its objects. Not required, so older servers parse. | [optional]
 
 [[Back to Model list]](../README.md#documentation-for-models) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to README]](../README.md)
 

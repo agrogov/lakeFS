@@ -35,6 +35,8 @@ from lakefs_sdk.models.garbage_collection_rules import GarbageCollectionRules
 from lakefs_sdk.models.refs_restore import RefsRestore
 from lakefs_sdk.models.repository import Repository
 from lakefs_sdk.models.repository_creation import RepositoryCreation
+from lakefs_sdk.models.repository_deletion import RepositoryDeletion
+from lakefs_sdk.models.repository_deletion_list import RepositoryDeletionList
 from lakefs_sdk.models.repository_dump_status import RepositoryDumpStatus
 from lakefs_sdk.models.repository_list import RepositoryList
 from lakefs_sdk.models.repository_restore_status import RepositoryRestoreStatus
@@ -354,19 +356,21 @@ class RepositoriesApi:
             _request_auth=_params.get('_request_auth'))
 
     @validate_arguments
-    def delete_repository(self, repository : StrictStr, force : Annotated[Optional[StrictBool], Field(description="Bypass read-only protection and delete the repository")] = None, **kwargs) -> None:  # noqa: E501
+    def delete_repository(self, repository : StrictStr, force : Annotated[Optional[StrictBool], Field(description="Bypass read-only protection and delete the repository")] = None, delete_storage : Annotated[Optional[StrictBool], Field(description="Delete every object under the repository's storage namespace as well. The request answers 202 with the deletion status, and the object deletion runs in the background. ")] = None, **kwargs) -> RepositoryDeletion:  # noqa: E501
         """delete repository  # noqa: E501
 
         This method makes a synchronous HTTP request by default. To make an
         asynchronous HTTP request, please pass async_req=True
 
-        >>> thread = api.delete_repository(repository, force, async_req=True)
+        >>> thread = api.delete_repository(repository, force, delete_storage, async_req=True)
         >>> result = thread.get()
 
         :param repository: (required)
         :type repository: str
         :param force: Bypass read-only protection and delete the repository
         :type force: bool
+        :param delete_storage: Delete every object under the repository's storage namespace as well. The request answers 202 with the deletion status, and the object deletion runs in the background. 
+        :type delete_storage: bool
         :param async_req: Whether to execute the request asynchronously.
         :type async_req: bool, optional
         :param _request_timeout: timeout setting for this request.
@@ -376,28 +380,30 @@ class RepositoriesApi:
         :return: Returns the result object.
                  If the method is called asynchronously,
                  returns the request thread.
-        :rtype: None
+        :rtype: RepositoryDeletion
         """
         kwargs['_return_http_data_only'] = True
         if '_preload_content' in kwargs:
             message = "Error! Please call the delete_repository_with_http_info method with `_preload_content` instead and obtain raw data from ApiResponse.raw_data"  # noqa: E501
             raise ValueError(message)
-        return self.delete_repository_with_http_info(repository, force, **kwargs)  # noqa: E501
+        return self.delete_repository_with_http_info(repository, force, delete_storage, **kwargs)  # noqa: E501
 
     @validate_arguments
-    def delete_repository_with_http_info(self, repository : StrictStr, force : Annotated[Optional[StrictBool], Field(description="Bypass read-only protection and delete the repository")] = None, **kwargs) -> ApiResponse:  # noqa: E501
+    def delete_repository_with_http_info(self, repository : StrictStr, force : Annotated[Optional[StrictBool], Field(description="Bypass read-only protection and delete the repository")] = None, delete_storage : Annotated[Optional[StrictBool], Field(description="Delete every object under the repository's storage namespace as well. The request answers 202 with the deletion status, and the object deletion runs in the background. ")] = None, **kwargs) -> ApiResponse:  # noqa: E501
         """delete repository  # noqa: E501
 
         This method makes a synchronous HTTP request by default. To make an
         asynchronous HTTP request, please pass async_req=True
 
-        >>> thread = api.delete_repository_with_http_info(repository, force, async_req=True)
+        >>> thread = api.delete_repository_with_http_info(repository, force, delete_storage, async_req=True)
         >>> result = thread.get()
 
         :param repository: (required)
         :type repository: str
         :param force: Bypass read-only protection and delete the repository
         :type force: bool
+        :param delete_storage: Delete every object under the repository's storage namespace as well. The request answers 202 with the deletion status, and the object deletion runs in the background. 
+        :type delete_storage: bool
         :param async_req: Whether to execute the request asynchronously.
         :type async_req: bool, optional
         :param _preload_content: if False, the ApiResponse.data will
@@ -420,14 +426,15 @@ class RepositoriesApi:
         :return: Returns the result object.
                  If the method is called asynchronously,
                  returns the request thread.
-        :rtype: None
+        :rtype: tuple(RepositoryDeletion, status_code(int), headers(HTTPHeaderDict))
         """
 
         _params = locals()
 
         _all_params = [
             'repository',
-            'force'
+            'force',
+            'delete_storage'
         ]
         _all_params.extend(
             [
@@ -464,6 +471,9 @@ class RepositoriesApi:
         if _params.get('force') is not None:  # noqa: E501
             _query_params.append(('force', _params['force']))
 
+        if _params.get('delete_storage') is not None:  # noqa: E501
+            _query_params.append(('delete_storage', _params['delete_storage']))
+
         # process the header parameters
         _header_params = dict(_params.get('_headers', {}))
         # process the form parameters
@@ -478,7 +488,15 @@ class RepositoriesApi:
         # authentication setting
         _auth_settings = ['basic_auth', 'cookie_auth', 'oidc_auth', 'saml_auth', 'jwt_token']  # noqa: E501
 
-        _response_types_map = {}
+        _response_types_map = {
+            '202': "RepositoryDeletion",
+            '204': None,
+            '400': "Error",
+            '401': "Error",
+            '404': "Error",
+            '409': "Error",
+            '429': None,
+        }
 
         return self.api_client.call_api(
             '/repositories/{repository}', 'DELETE',
@@ -1215,6 +1233,148 @@ class RepositoriesApi:
             _request_auth=_params.get('_request_auth'))
 
     @validate_arguments
+    def get_repository_deletion(self, repository : StrictStr, **kwargs) -> RepositoryDeletion:  # noqa: E501
+        """get repository storage deletion status  # noqa: E501
+
+        This method makes a synchronous HTTP request by default. To make an
+        asynchronous HTTP request, please pass async_req=True
+
+        >>> thread = api.get_repository_deletion(repository, async_req=True)
+        >>> result = thread.get()
+
+        :param repository: (required)
+        :type repository: str
+        :param async_req: Whether to execute the request asynchronously.
+        :type async_req: bool, optional
+        :param _request_timeout: timeout setting for this request.
+               If one number provided, it will be total request
+               timeout. It can also be a pair (tuple) of
+               (connection, read) timeouts.
+        :return: Returns the result object.
+                 If the method is called asynchronously,
+                 returns the request thread.
+        :rtype: RepositoryDeletion
+        """
+        kwargs['_return_http_data_only'] = True
+        if '_preload_content' in kwargs:
+            message = "Error! Please call the get_repository_deletion_with_http_info method with `_preload_content` instead and obtain raw data from ApiResponse.raw_data"  # noqa: E501
+            raise ValueError(message)
+        return self.get_repository_deletion_with_http_info(repository, **kwargs)  # noqa: E501
+
+    @validate_arguments
+    def get_repository_deletion_with_http_info(self, repository : StrictStr, **kwargs) -> ApiResponse:  # noqa: E501
+        """get repository storage deletion status  # noqa: E501
+
+        This method makes a synchronous HTTP request by default. To make an
+        asynchronous HTTP request, please pass async_req=True
+
+        >>> thread = api.get_repository_deletion_with_http_info(repository, async_req=True)
+        >>> result = thread.get()
+
+        :param repository: (required)
+        :type repository: str
+        :param async_req: Whether to execute the request asynchronously.
+        :type async_req: bool, optional
+        :param _preload_content: if False, the ApiResponse.data will
+                                 be set to none and raw_data will store the
+                                 HTTP response body without reading/decoding.
+                                 Default is True.
+        :type _preload_content: bool, optional
+        :param _return_http_data_only: response data instead of ApiResponse
+                                       object with status code, headers, etc
+        :type _return_http_data_only: bool, optional
+        :param _request_timeout: timeout setting for this request. If one
+                                 number provided, it will be total request
+                                 timeout. It can also be a pair (tuple) of
+                                 (connection, read) timeouts.
+        :param _request_auth: set to override the auth_settings for an a single
+                              request; this effectively ignores the authentication
+                              in the spec for a single request.
+        :type _request_auth: dict, optional
+        :type _content_type: string, optional: force content-type for the request
+        :return: Returns the result object.
+                 If the method is called asynchronously,
+                 returns the request thread.
+        :rtype: tuple(RepositoryDeletion, status_code(int), headers(HTTPHeaderDict))
+        """
+
+        _params = locals()
+
+        _all_params = [
+            'repository'
+        ]
+        _all_params.extend(
+            [
+                'async_req',
+                '_return_http_data_only',
+                '_preload_content',
+                '_request_timeout',
+                '_request_auth',
+                '_content_type',
+                '_headers'
+            ]
+        )
+
+        # validate the arguments
+        for _key, _val in _params['kwargs'].items():
+            if _key not in _all_params:
+                raise ApiTypeError(
+                    "Got an unexpected keyword argument '%s'"
+                    " to method get_repository_deletion" % _key
+                )
+            _params[_key] = _val
+        del _params['kwargs']
+
+        _collection_formats = {}
+
+        # process the path parameters
+        _path_params = {}
+        if _params['repository']:
+            _path_params['repository'] = _params['repository']
+
+
+        # process the query parameters
+        _query_params = []
+        # process the header parameters
+        _header_params = dict(_params.get('_headers', {}))
+        # process the form parameters
+        _form_params = []
+        _files = {}
+        # process the body parameter
+        _body_params = None
+        # set the HTTP header `Accept`
+        _header_params['Accept'] = self.api_client.select_header_accept(
+            ['application/json'])  # noqa: E501
+
+        # authentication setting
+        _auth_settings = ['basic_auth', 'cookie_auth', 'oidc_auth', 'saml_auth', 'jwt_token']  # noqa: E501
+
+        _response_types_map = {
+            '200': "RepositoryDeletion",
+            '400': "Error",
+            '401': "Error",
+            '404': "Error",
+            '429': None,
+        }
+
+        return self.api_client.call_api(
+            '/repository_deletions/{repository}', 'GET',
+            _path_params,
+            _query_params,
+            _header_params,
+            body=_body_params,
+            post_params=_form_params,
+            files=_files,
+            response_types_map=_response_types_map,
+            auth_settings=_auth_settings,
+            async_req=_params.get('async_req'),
+            _return_http_data_only=_params.get('_return_http_data_only'),  # noqa: E501
+            _preload_content=_params.get('_preload_content', True),
+            _request_timeout=_params.get('_request_timeout'),
+            collection_formats=_collection_formats,
+            _request_auth=_params.get('_request_auth'))
+
+    @validate_arguments
     def get_repository_metadata(self, repository : StrictStr, **kwargs) -> Dict[str, str]:  # noqa: E501
         """get repository metadata  # noqa: E501
 
@@ -1506,6 +1666,163 @@ class RepositoriesApi:
 
         return self.api_client.call_api(
             '/repositories', 'GET',
+            _path_params,
+            _query_params,
+            _header_params,
+            body=_body_params,
+            post_params=_form_params,
+            files=_files,
+            response_types_map=_response_types_map,
+            auth_settings=_auth_settings,
+            async_req=_params.get('async_req'),
+            _return_http_data_only=_params.get('_return_http_data_only'),  # noqa: E501
+            _preload_content=_params.get('_preload_content', True),
+            _request_timeout=_params.get('_request_timeout'),
+            collection_formats=_collection_formats,
+            _request_auth=_params.get('_request_auth'))
+
+    @validate_arguments
+    def list_repository_deletions(self, prefix : Annotated[Optional[StrictStr], Field(description="return items prefixed with this value")] = None, after : Annotated[Optional[StrictStr], Field(description="return items after this value")] = None, amount : Annotated[Optional[conint(strict=True, le=1000, ge=-1)], Field(description="how many items to return")] = None, **kwargs) -> RepositoryDeletionList:  # noqa: E501
+        """list repository storage deletions  # noqa: E501
+
+        This method makes a synchronous HTTP request by default. To make an
+        asynchronous HTTP request, please pass async_req=True
+
+        >>> thread = api.list_repository_deletions(prefix, after, amount, async_req=True)
+        >>> result = thread.get()
+
+        :param prefix: return items prefixed with this value
+        :type prefix: str
+        :param after: return items after this value
+        :type after: str
+        :param amount: how many items to return
+        :type amount: int
+        :param async_req: Whether to execute the request asynchronously.
+        :type async_req: bool, optional
+        :param _request_timeout: timeout setting for this request.
+               If one number provided, it will be total request
+               timeout. It can also be a pair (tuple) of
+               (connection, read) timeouts.
+        :return: Returns the result object.
+                 If the method is called asynchronously,
+                 returns the request thread.
+        :rtype: RepositoryDeletionList
+        """
+        kwargs['_return_http_data_only'] = True
+        if '_preload_content' in kwargs:
+            message = "Error! Please call the list_repository_deletions_with_http_info method with `_preload_content` instead and obtain raw data from ApiResponse.raw_data"  # noqa: E501
+            raise ValueError(message)
+        return self.list_repository_deletions_with_http_info(prefix, after, amount, **kwargs)  # noqa: E501
+
+    @validate_arguments
+    def list_repository_deletions_with_http_info(self, prefix : Annotated[Optional[StrictStr], Field(description="return items prefixed with this value")] = None, after : Annotated[Optional[StrictStr], Field(description="return items after this value")] = None, amount : Annotated[Optional[conint(strict=True, le=1000, ge=-1)], Field(description="how many items to return")] = None, **kwargs) -> ApiResponse:  # noqa: E501
+        """list repository storage deletions  # noqa: E501
+
+        This method makes a synchronous HTTP request by default. To make an
+        asynchronous HTTP request, please pass async_req=True
+
+        >>> thread = api.list_repository_deletions_with_http_info(prefix, after, amount, async_req=True)
+        >>> result = thread.get()
+
+        :param prefix: return items prefixed with this value
+        :type prefix: str
+        :param after: return items after this value
+        :type after: str
+        :param amount: how many items to return
+        :type amount: int
+        :param async_req: Whether to execute the request asynchronously.
+        :type async_req: bool, optional
+        :param _preload_content: if False, the ApiResponse.data will
+                                 be set to none and raw_data will store the
+                                 HTTP response body without reading/decoding.
+                                 Default is True.
+        :type _preload_content: bool, optional
+        :param _return_http_data_only: response data instead of ApiResponse
+                                       object with status code, headers, etc
+        :type _return_http_data_only: bool, optional
+        :param _request_timeout: timeout setting for this request. If one
+                                 number provided, it will be total request
+                                 timeout. It can also be a pair (tuple) of
+                                 (connection, read) timeouts.
+        :param _request_auth: set to override the auth_settings for an a single
+                              request; this effectively ignores the authentication
+                              in the spec for a single request.
+        :type _request_auth: dict, optional
+        :type _content_type: string, optional: force content-type for the request
+        :return: Returns the result object.
+                 If the method is called asynchronously,
+                 returns the request thread.
+        :rtype: tuple(RepositoryDeletionList, status_code(int), headers(HTTPHeaderDict))
+        """
+
+        _params = locals()
+
+        _all_params = [
+            'prefix',
+            'after',
+            'amount'
+        ]
+        _all_params.extend(
+            [
+                'async_req',
+                '_return_http_data_only',
+                '_preload_content',
+                '_request_timeout',
+                '_request_auth',
+                '_content_type',
+                '_headers'
+            ]
+        )
+
+        # validate the arguments
+        for _key, _val in _params['kwargs'].items():
+            if _key not in _all_params:
+                raise ApiTypeError(
+                    "Got an unexpected keyword argument '%s'"
+                    " to method list_repository_deletions" % _key
+                )
+            _params[_key] = _val
+        del _params['kwargs']
+
+        _collection_formats = {}
+
+        # process the path parameters
+        _path_params = {}
+
+        # process the query parameters
+        _query_params = []
+        if _params.get('prefix') is not None:  # noqa: E501
+            _query_params.append(('prefix', _params['prefix']))
+
+        if _params.get('after') is not None:  # noqa: E501
+            _query_params.append(('after', _params['after']))
+
+        if _params.get('amount') is not None:  # noqa: E501
+            _query_params.append(('amount', _params['amount']))
+
+        # process the header parameters
+        _header_params = dict(_params.get('_headers', {}))
+        # process the form parameters
+        _form_params = []
+        _files = {}
+        # process the body parameter
+        _body_params = None
+        # set the HTTP header `Accept`
+        _header_params['Accept'] = self.api_client.select_header_accept(
+            ['application/json'])  # noqa: E501
+
+        # authentication setting
+        _auth_settings = ['basic_auth', 'cookie_auth', 'oidc_auth', 'saml_auth', 'jwt_token']  # noqa: E501
+
+        _response_types_map = {
+            '200': "RepositoryDeletionList",
+            '400': "Error",
+            '401': "Error",
+            '429': None,
+        }
+
+        return self.api_client.call_api(
+            '/repository_deletions', 'GET',
             _path_params,
             _query_params,
             _header_params,
