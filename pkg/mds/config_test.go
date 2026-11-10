@@ -274,7 +274,7 @@ metadata_search:
 		require.Empty(t, cfg.RepositoryNames())
 		require.Contains(t, log(), "Metadata Search is disabled")
 
-		opts := indexerOptions(cfg, NewHealth(cfg.RepositoryNames()), Recorder{}, nil)
+		opts := indexerOptions(cfg, nil, nil, "", NewHealth(cfg.RepositoryNames()), Recorder{}, nil)
 		require.Empty(t, opts.Repositories, "an empty map indexes nothing")
 	})
 
@@ -328,7 +328,7 @@ metadata_search:
 		require.NoError(t, err, "the removed keys are not part of the section any more")
 
 		// The behaviour they used to configure is fixed at the values the keys documented.
-		opts := indexerOptions(cfg, NewHealth(cfg.RepositoryNames()), Recorder{}, nil)
+		opts := indexerOptions(cfg, nil, nil, "", NewHealth(cfg.RepositoryNames()), Recorder{}, nil)
 		require.Equal(t, indexer.DefaultRequestTimeout, opts.RequestTimeout)
 		require.Equal(t, indexer.BackfillHistory, opts.Backfill, "X11: the first sync starts at branch creation")
 		require.Equal(t, indexer.DefaultSeedLookback, opts.SeedLookback)
@@ -518,7 +518,7 @@ func TestIndexerOptionsFromConfig(t *testing.T) {
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
 
-	opts := indexerOptions(cfg, NewHealth(cfg.RepositoryNames()), Recorder{}, nil)
+	opts := indexerOptions(cfg, nil, nil, "", NewHealth(cfg.RepositoryNames()), Recorder{}, nil)
 	require.Equal(t, "http://lakefs:8000", opts.Endpoint)
 	require.Equal(t, "AKIAEXAMPLE", opts.AccessKeyID)
 	require.Equal(t, "secret", opts.SecretKey)

@@ -41,6 +41,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/kv/kvparams"
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/mds/indexer"
+	"github.com/treeverse/lakefs/pkg/mds/reader"
 	"github.com/treeverse/lakefs/pkg/mds/table"
 	"github.com/treeverse/lakefs/pkg/stats"
 	"github.com/treeverse/lakefs/pkg/upload"
@@ -228,6 +229,10 @@ func TestIndexerTickAgainstALakeFSServer(t *testing.T) {
 	require.NoError(t, err)
 
 	idx, err := indexer.New(indexer.Options{
+		// RA4b: the indexer runs on the server's KV store and block adapter, so it reads and
+		// writes the repositories through an in-process reader over the same catalog the test
+		// server serves. Only the table files go over REST, with the principal's credentials.
+		LakeFS:      reader.New(env.catalog, 0),
 		Endpoint:    env.url,
 		AccessKeyID: env.accessKeyID,
 		SecretKey:   env.secretKey,

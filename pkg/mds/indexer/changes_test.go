@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"github.com/treeverse/lakefs/pkg/mds/client"
 	"github.com/treeverse/lakefs/pkg/mds/indexer"
+	"github.com/treeverse/lakefs/pkg/mds/reader"
 )
 
 // TestChangeSetFromDiff pins §4.3 step 1: added and changed entries become upserts, removed entries
@@ -19,13 +19,13 @@ import (
 func TestChangeSetFromDiff(t *testing.T) {
 	e := newEnv(t)
 	e.fake.addCommit("repo", "main", "s1", nil,
-		[]client.ObjectStat{object("a", 10), object("b", 20), object("keep", 30)})
+		[]reader.ObjectStat{object("a", 10), object("b", 20), object("keep", 30)})
 	e.tick()
 
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{
 		added("c", 40),
-		{Path: "a", Type: client.ChangeChanged, SizeBytes: 11, Right: &client.ObjectStat{
+		{Path: "a", Type: reader.ChangeChanged, SizeBytes: 11, Right: &reader.ObjectStat{
 			Path: "a", SizeBytes: 11, ETag: "etag-a2", Mtime: object("a", 11).Mtime,
 		}},
 		removed("b"),
@@ -49,15 +49,15 @@ func TestChangeSetFromDiff(t *testing.T) {
 // mtime - is read with statObject instead (§4.3 step 1).
 func TestChangeSetFallsBackToStatObject(t *testing.T) {
 	e := newEnv(t)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.tick()
 
-	empty := client.ObjectStat{Path: "b"} // no checksum, no mtime: not a usable stat
+	empty := reader.ObjectStat{Path: "b"} // no checksum, no mtime: not a usable stat
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"},
-		[]client.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{
-		{Path: "b", Type: client.ChangeAdded, SizeBytes: 20, Right: &empty},
-		{Path: "c", Type: client.ChangeAdded, SizeBytes: 30}, // no right side at all
+		[]reader.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{
+		{Path: "b", Type: reader.ChangeAdded, SizeBytes: 20, Right: &empty},
+		{Path: "c", Type: reader.ChangeAdded, SizeBytes: 30}, // no right side at all
 	})
 	e.tick()
 
@@ -78,8 +78,8 @@ func TestChangeSetFallsBackToStatObject(t *testing.T) {
 // fallback.
 func TestStatFallbackCoversEveryNeededField(t *testing.T) {
 	mtime := object("b", 20).Mtime
-	right := func(mutate func(*client.ObjectStat)) *client.ObjectStat {
-		stat := client.ObjectStat{Path: "b", SizeBytes: 20, ETag: "etag-b", Mtime: mtime}
+	right := func(mutate func(*reader.ObjectStat)) *reader.ObjectStat {
+		stat := reader.ObjectStat{Path: "b", SizeBytes: 20, ETag: "etag-b", Mtime: mtime}
 		if mutate != nil {
 			mutate(&stat)
 		}
@@ -88,54 +88,54 @@ func TestStatFallbackCoversEveryNeededField(t *testing.T) {
 
 	cases := []struct {
 		name     string
-		change   client.Change
+		change   reader.Change
 		wantStat bool
 	}{
 		{
 			name:   "complete right side",
-			change: client.Change{Path: "b", Type: client.ChangeAdded, SizeBytes: 20, Right: right(nil)},
+			change: reader.Change{Path: "b", Type: reader.ChangeAdded, SizeBytes: 20, Right: right(nil)},
 		},
 		{
 			// include_right_stats is not honoured at all: the whole right-side stat is absent.
 			name:     "no right side",
-			change:   client.Change{Path: "b", Type: client.ChangeAdded, SizeBytes: 20},
+			change:   reader.Change{Path: "b", Type: reader.ChangeAdded, SizeBytes: 20},
 			wantStat: true,
 		},
 		{
 			name: "no checksum",
-			change: client.Change{Path: "b", Type: client.ChangeAdded, SizeBytes: 20,
-				Right: right(func(stat *client.ObjectStat) { stat.ETag = "" })},
+			change: reader.Change{Path: "b", Type: reader.ChangeAdded, SizeBytes: 20,
+				Right: right(func(stat *reader.ObjectStat) { stat.ETag = "" })},
 			wantStat: true,
 		},
 		{
 			name: "no modification time",
-			change: client.Change{Path: "b", Type: client.ChangeChanged, SizeBytes: 20,
-				Right: right(func(stat *client.ObjectStat) { stat.Mtime = time.Time{} })},
+			change: reader.Change{Path: "b", Type: reader.ChangeChanged, SizeBytes: 20,
+				Right: right(func(stat *reader.ObjectStat) { stat.Mtime = time.Time{} })},
 			wantStat: true,
 		},
 		{
 			// The size is on the diff entry, not inside the right-side stat, and a size the
 			// server did not report arrives as zero.
 			name:     "no size",
-			change:   client.Change{Path: "b", Type: client.ChangeAdded, Right: right(nil)},
+			change:   reader.Change{Path: "b", Type: reader.ChangeAdded, Right: right(nil)},
 			wantStat: true,
 		},
 		{
 			name: "empty content type and metadata are not missing fields",
-			change: client.Change{Path: "b", Type: client.ChangeAdded, SizeBytes: 20,
-				Right: right(func(stat *client.ObjectStat) { stat.ContentType = ""; stat.UserMetadata = nil })},
+			change: reader.Change{Path: "b", Type: reader.ChangeAdded, SizeBytes: 20,
+				Right: right(func(stat *reader.ObjectStat) { stat.ContentType = ""; stat.UserMetadata = nil })},
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newEnv(t)
-			e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+			e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 			e.tick()
 
 			e.fake.addCommit("repo", "main", "s2", []string{"s1"},
-				[]client.ObjectStat{object("a", 10), object("b", 20)})
-			e.fake.setDiff("repo", "s1", "s2", []client.Change{tc.change})
+				[]reader.ObjectStat{object("a", 10), object("b", 20)})
+			e.fake.setDiff("repo", "s1", "s2", []reader.Change{tc.change})
 			e.tick()
 
 			require.NoError(t, e.health.repositoryError("repo"))
@@ -164,19 +164,19 @@ func TestChangeSetStopsAtRebuildThreshold(t *testing.T) {
 	e := newEnv(t, func(opts *indexer.Options) { opts.RebuildThreshold = threshold })
 	// Two entries per page: a full read of the diff below takes five DiffRefs calls.
 	e.fake.pageSize = 2
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.tick()
 	require.Equal(t, 1, e.fake.rebuildCalls)
 	require.Zero(t, e.fake.diffRefsCalls(), "the first indexing is a rebuild, not a diff")
 
 	// No right-side stats at all, so a change set that was read to the end would stat every entry.
-	objects := make([]client.ObjectStat, 0, entries)
-	upserts := make([]client.Change, 0, entries)
+	objects := make([]reader.ObjectStat, 0, entries)
+	upserts := make([]reader.Change, 0, entries)
 	for i := range entries {
 		path := fmt.Sprintf("p%02d", i)
 		size := int64(10 * (i + 1))
 		objects = append(objects, object(path, size))
-		upserts = append(upserts, client.Change{Path: path, Type: client.ChangeAdded, SizeBytes: size})
+		upserts = append(upserts, reader.Change{Path: path, Type: reader.ChangeAdded, SizeBytes: size})
 	}
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, objects)
 	e.fake.setDiff("repo", "s1", "s2", upserts)
@@ -205,11 +205,11 @@ func TestChangeSetStopsAtRebuildThreshold(t *testing.T) {
 // not know stops the branch instead of silently losing a change.
 func TestUnknownChangeTypeIsRefused(t *testing.T) {
 	e := newEnv(t)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.tick()
 
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{{Path: "a", Type: client.ChangeType("renamed")}})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{{Path: "a", Type: reader.ChangeType("renamed")}})
 	e.tick()
 
 	err := e.health.branch("repo", "main").err
@@ -225,13 +225,13 @@ func TestRebuildThreshold(t *testing.T) {
 	e := newEnv(t, func(opts *indexer.Options) {
 		opts.RebuildThreshold = 1
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.tick()
 	require.Equal(t, 1, e.fake.rebuildCalls)
 
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"},
-		[]client.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20), added("c", 30)})
+		[]reader.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20), added("c", 30)})
 	e.tick()
 
 	require.NoError(t, e.health.repositoryError("repo"))
@@ -251,13 +251,13 @@ func TestRebuildThreshold(t *testing.T) {
 // the commit (and are null when the commit has none), content_type is null when the object has none.
 func TestRowColumnsFromTheCommit(t *testing.T) {
 	e := newEnv(t)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{{
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{{
 		Path:      "a",
 		SizeBytes: 10,
 		Mtime:     object("a", 10).Mtime,
 		ETag:      "etag-a",
 	}})
-	e.fake.setCommit("repo", client.Commit{ID: "s1", Message: "no committer, no date"})
+	e.fake.setCommit("repo", reader.Commit{ID: "s1", Message: "no committer, no date"})
 	e.tick()
 
 	row := e.requireRow("main", "a", "s1", 10)

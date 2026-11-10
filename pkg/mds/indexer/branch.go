@@ -16,7 +16,7 @@ import (
 	"slices"
 
 	"github.com/treeverse/lakefs/pkg/logging"
-	"github.com/treeverse/lakefs/pkg/mds/client"
+	"github.com/treeverse/lakefs/pkg/mds/reader"
 )
 
 // The errors of the bounded pending walk of §4.2 step 5. Both mean "the recorded position cannot be
@@ -56,7 +56,7 @@ func (x *Indexer) runBranch(ctx context.Context, repository, branch string, stat
 // mirror cannot be created fails instead of looping.
 func (x *Indexer) runBranchOnce(ctx context.Context, repository, branch string, state *branchState, mayCreate bool) error {
 	head, err := x.lakeFS.GetCommit(ctx, repository, branch)
-	if errors.Is(err, client.ErrNotFound) {
+	if errors.Is(err, reader.ErrNotFound) {
 		// §4.8: the branch was deleted between the listing and this tick.
 		return nil
 	}
@@ -106,7 +106,7 @@ func (x *Indexer) runBranchOnce(ctx context.Context, repository, branch string, 
 	state.last = last
 
 	// §4.2 step 5: the first-parent commits to apply, oldest first, at most max_commits.
-	var todo []client.Commit
+	var todo []reader.Commit
 	var total int
 	if last != head.ID {
 		var onFirstParent bool
@@ -170,7 +170,7 @@ func (x *Indexer) runBranchOnce(ctx context.Context, repository, branch string, 
 // continueFrom moves the metadata branch for it - back to the tag of the merge base, or to the
 // initialisation commit followed by a full listing at head - and returns the position the tick
 // continues from. It returns last unchanged when the position is on the branch.
-func (x *Indexer) continueFrom(ctx context.Context, repository, branch string, handle *tableHandle, head client.Commit, last string) (string, error) {
+func (x *Indexer) continueFrom(ctx context.Context, repository, branch string, handle *tableHandle, head reader.Commit, last string) (string, error) {
 	if last == head.ID {
 		// §4.2 step 3: the branch is already at its head, so there is nothing to apply and last is
 		// trivially an ancestor of head. Asking lakeFS anyway cost one FindMergeBase per branch per
@@ -179,12 +179,12 @@ func (x *Indexer) continueFrom(ctx context.Context, repository, branch string, h
 	}
 	base, err := x.lakeFS.FindMergeBase(ctx, repository, last, head.ID)
 	switch {
-	case errors.Is(err, client.ErrNoMergeBase):
+	case errors.Is(err, reader.ErrNoMergeBase):
 		// §4.7: a force-moved branch with an unrelated history has no merge base, so no
 		// mds-<merge base> tag can exist. Reset to the initialisation commit and rebuild
 		// at the head instead of failing the branch on the server's 500.
 		return x.rebuildAtHead(ctx, repository, branch, handle, head, "the histories have no merge base")
-	case errors.Is(err, client.ErrNotFound):
+	case errors.Is(err, reader.ErrNotFound):
 		// §4.7: a recorded position can disappear from R while the indexer is down - committed
 		// GC of a force-moved branch, or R deleted and created again (§4.8). Nothing keeps a
 		// position alive in R, so a 404 here is not an outage: it is a position that is gone,
@@ -210,11 +210,11 @@ func (x *Indexer) continueFrom(ctx context.Context, repository, branch string, h
 
 // lastIndexed returns the head commit of R-metadata@b and the source commit it records (§3.3).
 // The source commit is empty on a branch that was created but never indexed.
-func (x *Indexer) lastIndexed(ctx context.Context, repository, branch string) (client.Commit, string, error) {
+func (x *Indexer) lastIndexed(ctx context.Context, repository, branch string) (reader.Commit, string, error) {
 	metadata := metadataRepository(repository)
 	head, err := x.lakeFS.GetCommit(ctx, metadata, branch)
 	if err != nil {
-		return client.Commit{}, "", fmt.Errorf("head of %q@%s: %w", metadata, branch, err)
+		return reader.Commit{}, "", fmt.Errorf("head of %q@%s: %w", metadata, branch, err)
 	}
 	return head, head.Metadata[MetadataKeySourceCommit], nil
 }
@@ -248,7 +248,7 @@ func (h *tableHandle) refresh(ctx context.Context) error {
 // createBranch creates R-metadata@b for a branch that has no mirror yet (§4.5). It seeds from the
 // tag of an indexed ancestor when there is one, and otherwise from the initialisation commit so
 // that startBranch can rebuild from a full listing.
-func (x *Indexer) createBranch(ctx context.Context, repository, branch string, head client.Commit) error {
+func (x *Indexer) createBranch(ctx context.Context, repository, branch string, head reader.Commit) error {
 	metadata := metadataRepository(repository)
 	source, seeded, err := x.seedTag(ctx, repository, head)
 	if err != nil {
@@ -259,7 +259,7 @@ func (x *Indexer) createBranch(ctx context.Context, repository, branch string, h
 			return err
 		}
 	}
-	if err := x.lakeFS.CreateBranch(ctx, metadata, branch, source); err != nil && !errors.Is(err, client.ErrConflict) {
+	if err := x.lakeFS.CreateBranch(ctx, metadata, branch, source); err != nil && !errors.Is(err, reader.ErrConflict) {
 		return fmt.Errorf("create %q@%s from %q: %w", metadata, branch, source, err)
 	}
 	x.log.WithFields(logging.Fields{
@@ -279,14 +279,14 @@ func (x *Indexer) createBranch(ctx context.Context, repository, branch string, h
 // commits at a time and never the commits it has passed (memory O(page)), it looks at most
 // seed_lookback commits (at most one GetTag per commit, so at most seed_lookback tag requests), and
 // it returns at the first tag it finds.
-func (x *Indexer) seedTag(ctx context.Context, repository string, head client.Commit) (string, bool, error) {
+func (x *Indexer) seedTag(ctx context.Context, repository string, head reader.Commit) (string, bool, error) {
 	metadata := metadataRepository(repository)
 	var (
 		after = ""
 		seen  int
 	)
 	for seen < x.seedLookback {
-		commits, hasMore, err := x.lakeFS.LogCommits(ctx, repository, head.ID, client.LogCommitsOptions{
+		commits, hasMore, err := x.lakeFS.LogCommits(ctx, repository, head.ID, reader.LogCommitsOptions{
 			FirstParent: true,
 			After:       after,
 		})
@@ -297,7 +297,7 @@ func (x *Indexer) seedTag(ctx context.Context, repository string, head client.Co
 			tag := tagName(commit.ID)
 			if _, err := x.lakeFS.GetTag(ctx, metadata, tag); err == nil {
 				return tag, true, nil
-			} else if !errors.Is(err, client.ErrNotFound) {
+			} else if !errors.Is(err, reader.ErrNotFound) {
 				return "", false, fmt.Errorf("tag %q of %q: %w", tag, metadata, err)
 			}
 			seen++
@@ -311,7 +311,7 @@ func (x *Indexer) seedTag(ctx context.Context, repository string, head client.Co
 		after = lastNameOf(len(commits), func(i int) string { return commits[i].ID })
 		if after == "" {
 			return "", false, fmt.Errorf("%w: log commits of %s@%s: more results without a cursor",
-				client.ErrBadPagination, repository, head.ID)
+				reader.ErrBadPagination, repository, head.ID)
 		}
 	}
 	return "", false, nil
@@ -325,7 +325,7 @@ func (x *Indexer) seedTag(ctx context.Context, repository string, head client.Co
 // never the history it has passed (memory O(page), not O(history)). The number of requests is the
 // walk itself - the oldest commit of a history, or the first commit before since, is only known
 // once it is reached - and it happens once per branch, on the tick that starts it.
-func (x *Indexer) backfillStart(ctx context.Context, repository string, head client.Commit) (client.Commit, error) {
+func (x *Indexer) backfillStart(ctx context.Context, repository string, head reader.Commit) (reader.Commit, error) {
 	if x.since == nil && x.backfill != BackfillHistory {
 		return head, nil
 	}
@@ -334,12 +334,12 @@ func (x *Indexer) backfillStart(ctx context.Context, repository string, head cli
 		oldest = head
 	)
 	for {
-		commits, hasMore, err := x.lakeFS.LogCommits(ctx, repository, head.ID, client.LogCommitsOptions{
+		commits, hasMore, err := x.lakeFS.LogCommits(ctx, repository, head.ID, reader.LogCommitsOptions{
 			FirstParent: true,
 			After:       after,
 		})
 		if err != nil {
-			return client.Commit{}, fmt.Errorf("log commits of %s@%s: %w", repository, head.ID, err)
+			return reader.Commit{}, fmt.Errorf("log commits of %s@%s: %w", repository, head.ID, err)
 		}
 		for _, commit := range commits {
 			if x.since != nil && commit.CreationDate.Before(*x.since) {
@@ -354,15 +354,15 @@ func (x *Indexer) backfillStart(ctx context.Context, repository string, head cli
 		}
 		after = lastNameOf(len(commits), func(i int) string { return commits[i].ID })
 		if after == "" {
-			return client.Commit{}, fmt.Errorf("%w: log commits of %s@%s: more results without a cursor",
-				client.ErrBadPagination, repository, head.ID)
+			return reader.Commit{}, fmt.Errorf("%w: log commits of %s@%s: more results without a cursor",
+				reader.ErrBadPagination, repository, head.ID)
 		}
 	}
 }
 
 // startBranch indexes a branch that has a table but no recorded position: §4.5 step 2 writes a full
 // listing of the backfill start commit, commits it and tags it. It returns the position it recorded.
-func (x *Indexer) startBranch(ctx context.Context, repository, branch string, handle *tableHandle, head client.Commit) (string, error) {
+func (x *Indexer) startBranch(ctx context.Context, repository, branch string, handle *tableHandle, head reader.Commit) (string, error) {
 	source, err := x.backfillStart(ctx, repository, head)
 	if err != nil {
 		return "", err
@@ -419,7 +419,7 @@ type recovery struct {
 	last string
 
 	// todo is the remaining commits to apply.
-	todo []client.Commit
+	todo []reader.Commit
 
 	// finished reports that a staged Iceberg commit was completed (steps 4-5 of §4.3), so it
 	// counts as one indexed commit.
@@ -441,7 +441,7 @@ type recovery struct {
 // The table property alone cannot tell an empty staging from a foreign staged write that records
 // the same source commit, so the last case asks the branch for its uncommitted changes.
 // §4.4's "crashed after 4" row is handled before this, by ensureTag.
-func (x *Indexer) recoverStaging(ctx context.Context, repository, branch string, handle *tableHandle, last string, todo []client.Commit) (recovery, error) {
+func (x *Indexer) recoverStaging(ctx context.Context, repository, branch string, handle *tableHandle, last string, todo []reader.Commit) (recovery, error) {
 	staged := handle.table.SourceCommit()
 	if len(todo) > 0 && todo[0].ID == staged {
 		if err := x.finishCommit(ctx, repository, branch, todo[0]); err != nil {
@@ -501,24 +501,24 @@ func (x *Indexer) hasUncommittedChanges(ctx context.Context, repository, branch 
 // dereferences stop_at before it walks (pkg/catalog/catalog.go ListCommits). That is a position
 // that is gone, not an outage, so it reports errPositionGone; a 404 about anything else is still an
 // error.
-func (x *Indexer) pending(ctx context.Context, repository string, head client.Commit, last string, limit int) ([]client.Commit, int, bool, error) {
+func (x *Indexer) pending(ctx context.Context, repository string, head reader.Commit, last string, limit int) ([]reader.Commit, int, bool, error) {
 	var (
 		// window is the oldest commits read so far, at most limit+1 of them: the oldest one may
 		// be the recorded position itself, which is not work (§4.3 step 4).
-		window   []client.Commit
+		window   []reader.Commit
 		total    int
 		metStop  = last == ""
 		after    string
 		pageSize int
 	)
 	for {
-		page, hasMore, err := x.lakeFS.LogCommits(ctx, repository, head.ID, client.LogCommitsOptions{
+		page, hasMore, err := x.lakeFS.LogCommits(ctx, repository, head.ID, reader.LogCommitsOptions{
 			FirstParent: true,
 			StopAt:      last,
 			After:       after,
 		})
 		if err != nil {
-			if last != "" && errors.Is(err, client.ErrNotFound) {
+			if last != "" && errors.Is(err, reader.ErrNotFound) {
 				gone, goneErr := x.positionGone(ctx, repository, last)
 				if goneErr != nil {
 					return nil, 0, false, goneErr
@@ -551,7 +551,7 @@ func (x *Indexer) pending(ctx context.Context, repository string, head client.Co
 		}
 		after = lastNameOf(len(page), func(i int) string { return page[i].ID })
 		if after == "" {
-			return nil, 0, false, fmt.Errorf("%w: log commits of %s@%s: more results without a cursor", client.ErrBadPagination, repository, head.ID)
+			return nil, 0, false, fmt.Errorf("%w: log commits of %s@%s: more results without a cursor", reader.ErrBadPagination, repository, head.ID)
 		}
 		if total >= limit+pageSize {
 			// The position is deeper than the commits this tick may read: see the comment above.
@@ -583,7 +583,7 @@ func (x *Indexer) positionGone(ctx context.Context, repository, position string)
 	switch {
 	case err == nil:
 		return false, nil
-	case errors.Is(err, client.ErrNotFound):
+	case errors.Is(err, reader.ErrNotFound):
 		return true, nil
 	}
 	return false, fmt.Errorf("commit %s of %s: %w", position, repository, err)
@@ -594,7 +594,7 @@ func (x *Indexer) positionGone(ctx context.Context, repository, position string)
 // listing of head there (§4.3 step 2), which becomes the new position and is tagged. reason names
 // the state that made the incremental path unusable, so that an operator reading the log can tell
 // a rewrite from an ordinary tick (§9).
-func (x *Indexer) rebuildAtHead(ctx context.Context, repository, branch string, handle *tableHandle, head client.Commit, reason string) (string, error) {
+func (x *Indexer) rebuildAtHead(ctx context.Context, repository, branch string, handle *tableHandle, head reader.Commit, reason string) (string, error) {
 	x.log.WithFields(logging.Fields{
 		"repository": repository,
 		"branch":     branch,
@@ -610,7 +610,7 @@ func (x *Indexer) rebuildAtHead(ctx context.Context, repository, branch string, 
 // the initialisation commit and rebuilt from a full listing at the head. An empty base means the
 // histories are unrelated, or the recorded position is not on the head's first-parent chain, so
 // there is no usable tag and the full listing is the only correct start.
-func (x *Indexer) rewrite(ctx context.Context, repository, branch string, handle *tableHandle, head client.Commit, base string) (string, error) {
+func (x *Indexer) rewrite(ctx context.Context, repository, branch string, handle *tableHandle, head reader.Commit, base string) (string, error) {
 	metadata := metadataRepository(repository)
 	// §4.4: ResetHard does not discard staging in real lakeFS (pkg/graveler/graveler.go ResetHard
 	// has a TODO and only checks the sealed tokens), so a pointer staged by a crashed step 3 would
@@ -637,7 +637,7 @@ func (x *Indexer) rewrite(ctx context.Context, repository, branch string, handle
 				"merge_base": base,
 			}).Info("mds: history rewrite, moved the metadata branch back to the merge base")
 			return base, nil
-		case !errors.Is(err, client.ErrNotFound):
+		case !errors.Is(err, reader.ErrNotFound):
 			return "", fmt.Errorf("tag %q of %q: %w", tag, metadata, err)
 		}
 	}
@@ -674,7 +674,7 @@ func (x *Indexer) rewrite(ctx context.Context, repository, branch string, handle
 }
 
 // applyCommit applies one commit of R to the branch's table and records it (§4.3).
-func (x *Indexer) applyCommit(ctx context.Context, repository, branch string, handle *tableHandle, commit client.Commit) error {
+func (x *Indexer) applyCommit(ctx context.Context, repository, branch string, handle *tableHandle, commit reader.Commit) error {
 	changes, err := x.changeSet(ctx, repository, commit)
 	if err != nil {
 		return err
@@ -726,7 +726,7 @@ func (x *Indexer) applyCommit(ctx context.Context, repository, branch string, ha
 // rebuild writes the full listing of R@commit into the branch's table (§4.3 step 2). A table that
 // already records the commit is left alone (§4.4): the write happened, only its lakeFS commit did
 // not.
-func (x *Indexer) rebuild(ctx context.Context, repository, branch string, tbl Table, commit client.Commit, written *int64) error {
+func (x *Indexer) rebuild(ctx context.Context, repository, branch string, tbl Table, commit reader.Commit, written *int64) error {
 	if tbl.SourceCommit() == commit.ID {
 		return nil
 	}
@@ -741,9 +741,9 @@ func (x *Indexer) rebuild(ctx context.Context, repository, branch string, tbl Ta
 
 // finishCommit does steps 4 and 5 of §4.3: the lakeFS commit of R-metadata@b that records the
 // position, and the mds-<commit> tag that makes the commit addressable through the catalog (§6).
-func (x *Indexer) finishCommit(ctx context.Context, repository, branch string, commit client.Commit) error {
+func (x *Indexer) finishCommit(ctx context.Context, repository, branch string, commit reader.Commit) error {
 	metadata := metadataRepository(repository)
-	indexed, err := x.lakeFS.Commit(ctx, metadata, branch, client.CommitOptions{
+	indexed, err := x.lakeFS.Commit(ctx, metadata, branch, reader.CommitOptions{
 		Message:    fmt.Sprintf(IndexCommitMessage, repository, commit.ID),
 		Metadata:   sourceMetadata(repository, commit.ID),
 		AllowEmpty: false,
@@ -773,16 +773,16 @@ func (x *Indexer) ensureTag(ctx context.Context, repository, branch, commit, ref
 		switch {
 		case err == nil && indexed.Metadata[MetadataKeySourceCommit] == commit:
 			return nil
-		case err != nil && !errors.Is(err, client.ErrNotFound):
+		case err != nil && !errors.Is(err, reader.ErrNotFound):
 			return fmt.Errorf("commit %q of tag %q of %q: %w", existing.CommitID, tag, metadata, err)
 		}
 		// The tag's commit is gone, or it records another source commit: repair it below. lakeFS
 		// never overwrites a tag, even with force (pkg/graveler/graveler.go CreateTag returns
 		// ErrTagAlreadyExists), so the tag is deleted first.
-		if err := x.lakeFS.DeleteTag(ctx, metadata, tag); err != nil && !errors.Is(err, client.ErrNotFound) {
+		if err := x.lakeFS.DeleteTag(ctx, metadata, tag); err != nil && !errors.Is(err, reader.ErrNotFound) {
 			return fmt.Errorf("delete tag %q of %q: %w", tag, metadata, err)
 		}
-	case !errors.Is(err, client.ErrNotFound):
+	case !errors.Is(err, reader.ErrNotFound):
 		return fmt.Errorf("tag %q of %q: %w", tag, metadata, err)
 	}
 	if _, err := x.lakeFS.CreateTag(ctx, metadata, tag, ref, true); err != nil {
@@ -815,7 +815,7 @@ func (x *Indexer) retireDeletedBranches(ctx context.Context, repository, metadat
 				x.logDefaultBranchKeptOnce(repository, metadata, branch.Name)
 				continue
 			}
-			if err := x.lakeFS.DeleteBranch(ctx, metadata, branch.Name); err != nil && !errors.Is(err, client.ErrNotFound) {
+			if err := x.lakeFS.DeleteBranch(ctx, metadata, branch.Name); err != nil && !errors.Is(err, reader.ErrNotFound) {
 				return fmt.Errorf("delete %q@%s: %w", metadata, branch.Name, err)
 			}
 			x.metrics.ClearLag(repository, branch.Name)
@@ -830,7 +830,7 @@ func (x *Indexer) retireDeletedBranches(ctx context.Context, repository, metadat
 		}
 		after = lastNameOf(len(indexed), func(i int) string { return indexed[i].Name })
 		if after == "" {
-			return fmt.Errorf("%w: list branches of %q: more results without a cursor", client.ErrBadPagination, metadata)
+			return fmt.Errorf("%w: list branches of %q: more results without a cursor", reader.ErrBadPagination, metadata)
 		}
 	}
 }

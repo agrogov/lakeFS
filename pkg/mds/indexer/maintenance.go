@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/treeverse/lakefs/pkg/logging"
-	"github.com/treeverse/lakefs/pkg/mds/client"
+	"github.com/treeverse/lakefs/pkg/mds/reader"
 )
 
 // compactMessagePrefix and indexMessagePrefix tell the two kinds of commit of R-metadata apart
@@ -70,7 +70,7 @@ func (x *Indexer) compactIfNeeded(ctx context.Context, repository, branch string
 		return fmt.Errorf("compact %s@%s: %w", repository, branch, err)
 	}
 	metadata := metadataRepository(repository)
-	if _, err := x.lakeFS.Commit(ctx, metadata, branch, client.CommitOptions{
+	if _, err := x.lakeFS.Commit(ctx, metadata, branch, reader.CommitOptions{
 		Message:    fmt.Sprintf(CompactCommitMessage, repository, last),
 		Metadata:   sourceMetadata(repository, last),
 		AllowEmpty: false,
@@ -99,7 +99,7 @@ func (x *Indexer) compactIfNeeded(ctx context.Context, repository, branch string
 //
 // The walk stops at the first compaction commit, after every_commits indexing commits, or at the
 // start of the history - whichever comes first - because the caller only compares the result with
-// every_commits. One page of the log (client.DefaultPageSize) therefore covers the default
+// every_commits. One page of the log (reader.DefaultPageSize) therefore covers the default
 // configuration in a single request.
 func (x *Indexer) indexedSinceCompaction(ctx context.Context, repository, branch string) (int, error) {
 	metadata := metadataRepository(repository)
@@ -107,7 +107,7 @@ func (x *Indexer) indexedSinceCompaction(ctx context.Context, repository, branch
 	indexed := 0
 	after := ""
 	for indexed < limit {
-		commits, hasMore, err := x.lakeFS.LogCommits(ctx, metadata, branch, client.LogCommitsOptions{
+		commits, hasMore, err := x.lakeFS.LogCommits(ctx, metadata, branch, reader.LogCommitsOptions{
 			FirstParent: true,
 			After:       after,
 		})
@@ -131,7 +131,7 @@ func (x *Indexer) indexedSinceCompaction(ctx context.Context, repository, branch
 		after = lastNameOf(len(commits), func(i int) string { return commits[i].ID })
 		if after == "" {
 			return 0, fmt.Errorf("%w: log commits of %q@%s: more results without a cursor",
-				client.ErrBadPagination, metadata, branch)
+				reader.ErrBadPagination, metadata, branch)
 		}
 	}
 	return indexed, nil
@@ -171,7 +171,7 @@ func (x *Indexer) retireTags(ctx context.Context, repository string) error {
 			if !retire {
 				continue
 			}
-			if err := x.lakeFS.DeleteTag(ctx, metadata, tag.Name); err != nil && !errors.Is(err, client.ErrNotFound) {
+			if err := x.lakeFS.DeleteTag(ctx, metadata, tag.Name); err != nil && !errors.Is(err, reader.ErrNotFound) {
 				return fmt.Errorf("delete tag %q of %q: %w", tag.Name, metadata, err)
 			}
 			x.log.WithFields(logging.Fields{
@@ -184,7 +184,7 @@ func (x *Indexer) retireTags(ctx context.Context, repository string) error {
 		}
 		after = lastNameOf(len(tags), func(i int) string { return tags[i].Name })
 		if after == "" {
-			return fmt.Errorf("%w: list tags of %q: more results without a cursor", client.ErrBadPagination, metadata)
+			return fmt.Errorf("%w: list tags of %q: more results without a cursor", reader.ErrBadPagination, metadata)
 		}
 	}
 }
@@ -205,7 +205,7 @@ func (x *Indexer) currentSourceCommits(ctx context.Context, repository string) (
 				continue
 			}
 			head, err := x.lakeFS.GetCommit(ctx, metadata, branch.CommitID)
-			if errors.Is(err, client.ErrNotFound) {
+			if errors.Is(err, reader.ErrNotFound) {
 				continue
 			}
 			if err != nil {
@@ -220,7 +220,7 @@ func (x *Indexer) currentSourceCommits(ctx context.Context, repository string) (
 		}
 		after = lastNameOf(len(branches), func(i int) string { return branches[i].Name })
 		if after == "" {
-			return nil, fmt.Errorf("%w: list branches of %q: more results without a cursor", client.ErrBadPagination, metadata)
+			return nil, fmt.Errorf("%w: list branches of %q: more results without a cursor", reader.ErrBadPagination, metadata)
 		}
 	}
 }
@@ -230,11 +230,11 @@ func (x *Indexer) currentSourceCommits(ctx context.Context, repository string) (
 // is not merely history, it is the tag that addresses the branch's current rows. A tag whose
 // commit or source commit cannot be read any more is expired: it is not resolvable, which is the
 // reason retention exists.
-func (x *Indexer) tagExpired(ctx context.Context, repository string, tag client.Tag, cutoff time.Time, live map[string]struct{}) (bool, error) {
+func (x *Indexer) tagExpired(ctx context.Context, repository string, tag reader.Tag, cutoff time.Time, live map[string]struct{}) (bool, error) {
 	metadata := metadataRepository(repository)
 	indexed, err := x.lakeFS.GetCommit(ctx, metadata, tag.CommitID)
 	switch {
-	case errors.Is(err, client.ErrNotFound):
+	case errors.Is(err, reader.ErrNotFound):
 		return true, nil
 	case err != nil:
 		return false, fmt.Errorf("commit %q of %q: %w", tag.CommitID, metadata, err)
@@ -248,7 +248,7 @@ func (x *Indexer) tagExpired(ctx context.Context, repository string, tag client.
 	}
 	commit, err := x.lakeFS.GetCommit(ctx, repository, source)
 	switch {
-	case errors.Is(err, client.ErrNotFound):
+	case errors.Is(err, reader.ErrNotFound):
 		return true, nil
 	case err != nil:
 		return false, fmt.Errorf("source commit %q of %q: %w", source, repository, err)

@@ -35,18 +35,23 @@ type IcebergStore struct {
 	Endpoint string
 
 	// AccessKeyID and SecretAccessKey are the credentials of the indexer principal (§8), sent as
-	// HTTP basic authentication on every catalog request.
+	// HTTP basic authentication on every catalog request. Both are optional (G11, X7).
 	AccessKeyID     string
 	SecretAccessKey string
 
+	// EncryptSecretKey is auth.encrypt.secret_key of the server configuration. RA5 signs the
+	// service user's login token with it when the credentials above are empty (G12); it must be
+	// the key the server encrypts with.
+	EncryptSecretKey string
+
 	// Storage holds the iceberg-go IO properties used when the catalog does not vend write
-	// credentials (§4.6).
+	// credentials (§4.6). They are the process's own blockstore configuration (X6, RA4b), not a
+	// metadata_search key.
 	Storage iceberg.Properties
 
-	// RequestTimeout bounds every HTTP request this store's catalog client sends (§4.1, §7). It is
-	// the same bound the lakeFS API client of the indexer uses; zero means the table package's
-	// default. Iceberg-go writes data, manifest and metadata files through its own IO, not
-	// through this client, so a long write does not race this timeout.
+	// RequestTimeout bounds every HTTP request this store's catalog client sends (§4.1, §7). Zero
+	// means the table package's default. Iceberg-go writes data, manifest and metadata files
+	// through its own IO, not through this client, so a long write does not race this timeout.
 	RequestTimeout time.Duration
 }
 

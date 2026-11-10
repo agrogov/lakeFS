@@ -14,8 +14,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"github.com/treeverse/lakefs/pkg/logging"
-	"github.com/treeverse/lakefs/pkg/mds/client"
 	"github.com/treeverse/lakefs/pkg/mds/indexer"
+	"github.com/treeverse/lakefs/pkg/mds/reader"
 	"github.com/treeverse/lakefs/pkg/mds/table"
 )
 
@@ -138,7 +138,7 @@ func TestMetadataNamespace(t *testing.T) {
 			e := newEnv(t, func(opts *indexer.Options) {
 				opts.Repositories[0].StorageNamespace = test.configured
 			})
-			e.fake.repositories["repo"] = client.Repository{
+			e.fake.repositories["repo"] = reader.Repository{
 				Name:             "repo",
 				StorageNamespace: test.dataNamespace,
 				DefaultBranch:    "main",
@@ -197,14 +197,14 @@ func TestExistingMetadataNamespaceOverlapIsRefused(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			e := newEnv(t)
-			e.fake.repositories["repo"] = client.Repository{
+			e.fake.repositories["repo"] = reader.Repository{
 				Name:             "repo",
 				StorageNamespace: test.dataNamespace,
 				DefaultBranch:    "main",
 				StorageID:        "storage-repo",
 			}
 			e.fake.addBareMetadataRepository(test.metadataNamespace)
-			e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+			e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 			e.tick()
 
@@ -225,7 +225,7 @@ func TestExistingMetadataNamespaceOverlapIsRefused(t *testing.T) {
 func TestExistingBareMetadataRepositoryIsAccepted(t *testing.T) {
 	e := newEnv(t)
 	init := e.fake.addBareMetadataRepository("s3://bucket/data-metadata")
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 	e.tick()
 
@@ -262,7 +262,7 @@ func TestExistingBareMetadataRepositoryIsAccepted(t *testing.T) {
 // initialisation commit carries lakefs.mds.init before any indexing commit.
 func TestCreateMetadataRepository(t *testing.T) {
 	e := newEnv(t)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 	e.tick()
 
@@ -304,7 +304,7 @@ func TestInterruptedInitialisationIsCompleted(t *testing.T) {
 	e := newEnv(t)
 	e.fake.addRepository("repo-metadata", "s3://bucket/data-metadata", "main")
 	e.fake.setBranchHead("repo-metadata", "main", "")
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 	e.tick()
 
@@ -327,7 +327,7 @@ func TestInitialiseOnTheAutomaticCreationCommit(t *testing.T) {
 	root := e.fake.addCommit("repo-metadata", "main", "created", nil, nil)
 	root.Message = "Repository created"
 	e.fake.setCommit("repo-metadata", root)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 	e.tick()
 
@@ -347,7 +347,7 @@ func TestRefuseForeignRepository(t *testing.T) {
 	e := newEnv(t)
 	e.fake.addRepository("repo-metadata", "s3://bucket/foreign", "main")
 	e.fake.addCommit("repo-metadata", "main", "foreign", nil, nil)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 	e.tick()
 
@@ -368,7 +368,7 @@ func TestRefuseForeignRepositoryAfterAutomaticRoot(t *testing.T) {
 	root.Message = "Repository created"
 	e.fake.setCommit("repo-metadata", root)
 	e.fake.addCommit("repo-metadata", "main", "foreign", []string{"created"}, nil)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 	e.tick()
 
@@ -401,11 +401,11 @@ func TestMissingDataRepositoryIsReported(t *testing.T) {
 			{Name: "repo", Branches: []string{"main"}},
 		}
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 	e.tick()
 
-	require.ErrorIs(t, e.health.repositoryError("gone"), client.ErrNotFound)
+	require.ErrorIs(t, e.health.repositoryError("gone"), reader.ErrNotFound)
 	require.NoError(t, e.health.repositoryError("repo"))
 	require.Equal(t, 1, e.metrics.indexed["repo"])
 }
@@ -416,19 +416,19 @@ func TestMissingDataRepositoryIsReported(t *testing.T) {
 // must be returned as it is instead of re-entering initialise, which recursed without a bound and
 // re-wrapped the same error at every level.
 type persistentInitRejection struct {
-	client.LakeFS
+	reader.LakeFS
 	attempts int
 }
 
-func (r *persistentInitRejection) Commit(ctx context.Context, repository, branch string, opts client.CommitOptions) (client.Commit, error) {
+func (r *persistentInitRejection) Commit(ctx context.Context, repository, branch string, opts reader.CommitOptions) (reader.Commit, error) {
 	if repository == "repo-metadata" && opts.Message == indexer.InitCommitMessage {
 		r.attempts++
 		if r.attempts > 25 {
 			// Bound the probe so the pre-fix recursion ends with a visible failure instead of a
 			// stack or memory exhaustion.
-			return client.Commit{}, fmt.Errorf("probe: gave up after %d initialisation attempts", r.attempts)
+			return reader.Commit{}, fmt.Errorf("probe: gave up after %d initialisation attempts", r.attempts)
 		}
-		return client.Commit{}, fmt.Errorf("commit %q@%s: block: write failed: %w", repository, branch, client.ErrBadRequest)
+		return reader.Commit{}, fmt.Errorf("commit %q@%s: block: write failed: %w", repository, branch, reader.ErrBadRequest)
 	}
 	return r.LakeFS.Commit(ctx, repository, branch, opts)
 }
@@ -439,12 +439,12 @@ func TestPersistentBadRequestOnTheInitialisationCommitDoesNotRecurse(t *testing.
 		rejecter = &persistentInitRejection{LakeFS: opts.LakeFS}
 		opts.LakeFS = rejecter
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 	e.tick()
 
 	err := e.health.repositoryError("repo")
-	require.ErrorIs(t, err, client.ErrBadRequest)
+	require.ErrorIs(t, err, reader.ErrBadRequest)
 	require.Contains(t, err.Error(), "block: write failed", "the original 400 is reported")
 	require.Equal(t, 1, rejecter.attempts, "a 400 with nothing to adopt is not retried")
 	require.Equal(t, 1, e.fake.createTableCalls, "initialise does not re-enter CreateTable")
@@ -475,7 +475,7 @@ func TestInitialisationRefusesAForeignStagedTable(t *testing.T) {
 			foreign.repository = test.repository
 			foreign.rows["planted"] = table.Row{Repository: test.repository, Path: "planted", CommitID: "planted"}
 			e.fake.stage("main", foreign)
-			e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+			e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 			e.tick()
 
@@ -500,7 +500,7 @@ func TestConcurrentInitialisationCommitsOnce(t *testing.T) {
 		replica = &competingReplica{LakeFS: opts.LakeFS}
 		opts.LakeFS = replica
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 	e.tick()
 
@@ -530,7 +530,7 @@ func TestDuplicateInitCommitsAboveTheAutomaticRootAreAccepted(t *testing.T) {
 	root := e.fake.addNonBareMetadataRepository()
 	init1 := e.fake.addInitCommit("init-1", root)
 	init2 := e.fake.addInitCommit("init-2", init1)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 	e.tick()
 
@@ -564,7 +564,7 @@ func TestInitMarkerOutsideTheRunIsStillRefused(t *testing.T) {
 		init1 := e.fake.addInitCommit("init-1", root)
 		e.fake.addCommit("repo-metadata", "main", "foreign", []string{init1}, nil)
 		e.fake.addInitCommit("init-2", "foreign")
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 		e.tick()
 
@@ -579,7 +579,7 @@ func TestInitMarkerOutsideTheRunIsStillRefused(t *testing.T) {
 		root.Message = "created by hand"
 		e.fake.setCommit("repo-metadata", root)
 		e.fake.addInitCommit("init-1", root.ID)
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 		e.tick()
 
@@ -609,7 +609,7 @@ func TestInitialisationCheckStopsAtTheAnswer(t *testing.T) {
 	e.fake.addCommit("repo-metadata", "main", "foreign-1", []string{"init-1"}, nil)
 	e.fake.addCommit("repo-metadata", "main", "foreign-2", []string{"foreign-1"}, nil)
 	e.fake.pageSize = 50
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 	// No branch matches, so the tick is the repository stage alone: the pages counted below are the
 	// initialisation check's, not a branch tick's or the compaction count's.
@@ -636,7 +636,7 @@ func TestInitialisationCheckStopsAtTheAnswer(t *testing.T) {
 // once it returns.
 func TestInitialisationCheckKeepsTheHistoryOutOfMemory(t *testing.T) {
 	const (
-		history = 100_000 // ~10MB of client.Commit values if the walk collects them
+		history = 100_000 // ~10MB of reader.Commit values if the walk collects them
 		// The walk holds one page of 1000 commits plus the tick's own state.
 		maxPeak = 4 << 20
 	)
@@ -648,7 +648,7 @@ func TestInitialisationCheckKeepsTheHistoryOutOfMemory(t *testing.T) {
 		parent = e.fake.addCommit("repo-metadata", "main", fmt.Sprintf("indexed-%06d", i), []string{parent}, nil).ID
 	}
 	e.fake.pageSize = 1_000
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 	// No branch matches, so the tick is the repository stage alone and the metadata log is read by
 	// the initialisation check only.
@@ -672,12 +672,12 @@ func TestInitialisationCheckKeepsTheHistoryOutOfMemory(t *testing.T) {
 // heapSamplingLakeFS records the largest live heap seen while the metadata log is read, i.e. what the
 // walk keeps while it runs.
 type heapSamplingLakeFS struct {
-	client.LakeFS
+	reader.LakeFS
 	peak    uint64
 	samples int
 }
 
-func (h *heapSamplingLakeFS) LogCommits(ctx context.Context, repository, ref string, opts client.LogCommitsOptions) ([]client.Commit, bool, error) {
+func (h *heapSamplingLakeFS) LogCommits(ctx context.Context, repository, ref string, opts reader.LogCommitsOptions) ([]reader.Commit, bool, error) {
 	page, more, err := h.LakeFS.LogCommits(ctx, repository, ref, opts)
 	if repository == "repo-metadata" {
 		h.samples++
@@ -704,19 +704,19 @@ func liveHeap() uint64 {
 // (pkg/graveler/graveler.go:2355); an indexer that does not pass it commits nothing and adopts the
 // commit instead.
 type competingReplica struct {
-	client.LakeFS
+	reader.LakeFS
 	competed bool
 }
 
-func (r *competingReplica) Commit(ctx context.Context, repository, branch string, opts client.CommitOptions) (client.Commit, error) {
+func (r *competingReplica) Commit(ctx context.Context, repository, branch string, opts reader.CommitOptions) (reader.Commit, error) {
 	if !r.competed && repository == "repo-metadata" && opts.Message == indexer.InitCommitMessage {
 		r.competed = true
-		if _, err := r.LakeFS.Commit(ctx, repository, branch, client.CommitOptions{
+		if _, err := r.LakeFS.Commit(ctx, repository, branch, reader.CommitOptions{
 			Message:    indexer.InitCommitMessage,
 			Metadata:   opts.Metadata,
 			AllowEmpty: true,
 		}); err != nil {
-			return client.Commit{}, err
+			return reader.Commit{}, err
 		}
 	}
 	return r.LakeFS.Commit(ctx, repository, branch, opts)
@@ -724,11 +724,11 @@ func (r *competingReplica) Commit(ctx context.Context, repository, branch string
 
 // countingLakeFS counts the pages of the first-parent log of R-metadata a run reads.
 type countingLakeFS struct {
-	client.LakeFS
+	reader.LakeFS
 	pages int
 }
 
-func (c *countingLakeFS) LogCommits(ctx context.Context, repository, ref string, opts client.LogCommitsOptions) ([]client.Commit, bool, error) {
+func (c *countingLakeFS) LogCommits(ctx context.Context, repository, ref string, opts reader.LogCommitsOptions) ([]reader.Commit, bool, error) {
 	if repository == "repo-metadata" {
 		c.pages++
 	}
@@ -758,10 +758,10 @@ func newEnvOn(t *testing.T, f *fake, configure ...func(*indexer.Options)) *env {
 }
 
 // initCommits returns the mds: init commits the fake holds for its metadata repository.
-func initCommits(f *fake) []client.Commit {
+func initCommits(f *fake) []reader.Commit {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var commits []client.Commit
+	var commits []reader.Commit
 	for _, commit := range f.commits[f.metadataRepo] {
 		if commit.Message == indexer.InitCommitMessage {
 			commits = append(commits, commit)
@@ -841,14 +841,14 @@ func (f *fake) addBareMetadataRepository(namespace string) string {
 func TestProtectedMetadataBranchFailsTheRepository(t *testing.T) {
 	t.Run("commit protection", func(t *testing.T) {
 		e := newEnv(t)
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 		e.tick()
 		require.NoError(t, e.health.repositoryError("repo"))
 
 		e.fake.protectBranch("repo-metadata", "main", true, false)
 		e.fake.addCommit("repo", "main", "s2", []string{"s1"},
-			[]client.ObjectStat{object("a", 10), object("b", 20)})
-		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+			[]reader.ObjectStat{object("a", 10), object("b", 20)})
+		e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 		made := len(e.fake.madeCommits())
 
 		e.tick()
@@ -863,14 +863,14 @@ func TestProtectedMetadataBranchFailsTheRepository(t *testing.T) {
 
 	t.Run("staging write protection", func(t *testing.T) {
 		e := newEnv(t)
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 		e.tick()
 		require.NoError(t, e.health.repositoryError("repo"))
 
 		e.fake.protectBranch("repo-metadata", "main", false, true)
 		e.fake.addCommit("repo", "main", "s2", []string{"s1"},
-			[]client.ObjectStat{object("a", 10), object("b", 20)})
-		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+			[]reader.ObjectStat{object("a", 10), object("b", 20)})
+		e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 
 		e.tick()
 
@@ -890,7 +890,7 @@ func TestProtectedMetadataBranchFailsTheRepository(t *testing.T) {
 		e := newEnv(t)
 		e.fake.addNonBareMetadataRepository()
 		e.fake.protectBranch("repo-metadata", "main", false, true)
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 		e.tick()
 
@@ -910,7 +910,7 @@ func TestProtectedMetadataBranchFailsTheRepository(t *testing.T) {
 		e := newEnv(t)
 		e.fake.addNonBareMetadataRepository()
 		e.fake.protectBranch("repo-metadata", "main", true, false)
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 		e.tick()
 
@@ -923,9 +923,9 @@ func TestProtectedMetadataBranchFailsTheRepository(t *testing.T) {
 }
 
 // TestForbiddenMetadataBranchWriteIsNotBranchProtection pins R3I-1 at the branch tick: an
-// authorization refusal answers the same 401/403 as a protection rule (pkg/mds/client/lakefs.go
-// collapses both into client.ErrForbidden, and lakeFS answers an authorization failure 401 by
-// default), and the catalog answers 403 for a permission denial as well. The branch must still
+// authorization refusal answers the same forbidden family as a protection rule (pkg/mds/reader
+// maps the protection refusals into reader.ErrForbidden), and the catalog answers 403 for a
+// permission denial as well. The branch must still
 // report the ErrReadOnlyMetadataRepository family - a companion repository it cannot write is not a
 // transient branch error - but the message must not claim branch protection, because that sends an
 // operator looking for a rule that does not exist instead of at the indexer principal's policy
@@ -933,20 +933,20 @@ func TestProtectedMetadataBranchFailsTheRepository(t *testing.T) {
 func TestForbiddenMetadataBranchWriteIsNotBranchProtection(t *testing.T) {
 	t.Run("the lakeFS API's 401 authorization denial", func(t *testing.T) {
 		e := newEnv(t)
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 		e.tick()
 		require.NoError(t, e.health.repositoryError("repo"))
 
 		e.fake.addCommit("repo", "main", "s2", []string{"s1"},
-			[]client.ObjectStat{object("a", 10), object("b", 20)})
-		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
-		e.fake.applyErr = fmt.Errorf("apply repo@s2: %w: permission denied: no policy grants fs:WriteObject", client.ErrForbidden)
+			[]reader.ObjectStat{object("a", 10), object("b", 20)})
+		e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
+		e.fake.applyErr = fmt.Errorf("apply repo@s2: %w: permission denied: no policy grants fs:WriteObject", reader.ErrForbidden)
 
 		e.tick()
 
 		err := e.health.branch("repo", "main").err
 		require.ErrorIs(t, err, indexer.ErrReadOnlyMetadataRepository, "the refusal still fails the write")
-		require.ErrorIs(t, err, client.ErrForbidden)
+		require.ErrorIs(t, err, reader.ErrForbidden)
 		require.NotContains(t, err.Error(), "a branch protection rule blocks",
 			"branch protection is not what lakeFS answered")
 		require.NotContains(t, err.Error(), "remove the rule")
@@ -959,12 +959,12 @@ func TestForbiddenMetadataBranchWriteIsNotBranchProtection(t *testing.T) {
 
 	t.Run("the catalog's 403 permission refusal", func(t *testing.T) {
 		e := newEnv(t)
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 		e.tick()
 
 		e.fake.addCommit("repo", "main", "s2", []string{"s1"},
-			[]client.ObjectStat{object("a", 10), object("b", 20)})
-		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+			[]reader.ObjectStat{object("a", 10), object("b", 20)})
+		e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 		e.fake.applyErr = fmt.Errorf("apply repo@s2: %w: ForbiddenException: permission denied for catalog:WriteTableData", rest.ErrForbidden)
 
 		e.tick()
@@ -1020,7 +1020,7 @@ func TestInitialisationCreateRefusalIsTheReadOnlyFamily(t *testing.T) {
 					err:        fmt.Errorf("create %s.%s: %w: %s", table.Namespace, table.Name, rest.ErrForbidden, test.body),
 				}
 			})
-			e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+			e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 			e.tick()
 
@@ -1046,15 +1046,15 @@ func TestInitialisationCreateRefusalIsTheReadOnlyFamily(t *testing.T) {
 // once per tick, before any branch is touched, with a message that names the cause and the fix.
 func TestReadOnlyMetadataRepositoryFailsTheRepository(t *testing.T) {
 	e := newEnv(t)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.tick()
 	require.NoError(t, e.health.repositoryError("repo"))
 
 	// R-metadata created with read_only: true, or flagged later by an operator.
 	e.fake.setReadOnly("repo-metadata", true)
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"},
-		[]client.ObjectStat{object("a", 10), object("b", 20)})
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+		[]reader.ObjectStat{object("a", 10), object("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 	made := len(e.fake.madeCommits())
 
 	e.tick()

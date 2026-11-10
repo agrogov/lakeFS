@@ -22,7 +22,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/treeverse/lakefs/pkg/mds/client"
+	"github.com/treeverse/lakefs/pkg/mds/reader"
 	"github.com/treeverse/lakefs/pkg/mds/table"
 )
 
@@ -53,12 +53,12 @@ var errChangeSetFull = errors.New("change set above rebuild_threshold")
 
 // changeSet reads the delta of one commit of R (§4.3 step 1), or stops as soon as it knows that the
 // delta is too large to apply (§4.3 step 2).
-func (x *Indexer) changeSet(ctx context.Context, repository string, commit client.Commit) (changeSet, error) {
+func (x *Indexer) changeSet(ctx context.Context, repository string, commit reader.Commit) (changeSet, error) {
 	if len(commit.Parents) == 0 {
 		// A root commit: every object of it is an upsert. Commits reach here only on a branch that
 		// is indexed commit by commit, so the listing is a delta of one commit and not a backfill.
 		var changes changeSet
-		err := x.eachObject(ctx, repository, commit, func(stat client.ObjectStat) error {
+		err := x.eachObject(ctx, repository, commit, func(stat reader.ObjectStat) error {
 			changes.upserts = append(changes.upserts, rowOf(repository, commit, stat))
 			changes.count++
 			if changes.count > x.rebuildThreshold {
@@ -84,9 +84,9 @@ func (x *Indexer) changeSet(ctx context.Context, repository string, commit clien
 // bound on the work as well as on the memory: a commit that ends up being rebuilt costs neither the
 // rest of its diff nor a single statObject call, and the entries of a commit that stays a delta are
 // all read before the first of them is described.
-func (x *Indexer) diffChangeSet(ctx context.Context, repository string, commit client.Commit) (changeSet, error) {
+func (x *Indexer) diffChangeSet(ctx context.Context, repository string, commit reader.Commit) (changeSet, error) {
 	var (
-		upserted []client.Change
+		upserted []reader.Change
 		deletes  []string
 	)
 	after := ""
@@ -97,9 +97,9 @@ func (x *Indexer) diffChangeSet(ctx context.Context, repository string, commit c
 		}
 		for _, change := range page {
 			switch change.Type {
-			case client.ChangeAdded, client.ChangeChanged:
+			case reader.ChangeAdded, reader.ChangeChanged:
 				upserted = append(upserted, change)
-			case client.ChangeRemoved:
+			case reader.ChangeRemoved:
 				deletes = append(deletes, change.Path)
 			default:
 				return changeSet{}, fmt.Errorf("%w: %q at %q in %s@%s",
@@ -115,7 +115,7 @@ func (x *Indexer) diffChangeSet(ctx context.Context, repository string, commit c
 		after = lastNameOf(len(page), func(i int) string { return page[i].Path })
 		if after == "" {
 			return changeSet{}, fmt.Errorf("%w: diff %s@%s..%s: more results without a cursor",
-				client.ErrBadPagination, repository, commit.Parents[0], commit.ID)
+				reader.ErrBadPagination, repository, commit.Parents[0], commit.ID)
 		}
 	}
 
@@ -141,7 +141,7 @@ func (x *Indexer) diffChangeSet(ctx context.Context, repository string, commit c
 // needs is treated as absent rather than as an object with an empty checksum, no modification time
 // or no size. content_type and metadata are deliberately not part of that: an object may have
 // neither, so an empty value there is a fact about the object and not a gap in the answer.
-func (x *Indexer) objectStatOf(ctx context.Context, repository, ref string, change client.Change) (client.ObjectStat, error) {
+func (x *Indexer) objectStatOf(ctx context.Context, repository, ref string, change reader.Change) (reader.ObjectStat, error) {
 	if rightStatComplete(change) {
 		stat := *change.Right
 		stat.Path = change.Path
@@ -150,7 +150,7 @@ func (x *Indexer) objectStatOf(ctx context.Context, repository, ref string, chan
 	}
 	stat, err := x.lakeFS.StatObject(ctx, repository, ref, change.Path)
 	if err != nil {
-		return client.ObjectStat{}, fmt.Errorf("stat %q in %s@%s: %w", change.Path, repository, ref, err)
+		return reader.ObjectStat{}, fmt.Errorf("stat %q in %s@%s: %w", change.Path, repository, ref, err)
 	}
 	return stat, nil
 }
@@ -163,13 +163,13 @@ func (x *Indexer) objectStatOf(ctx context.Context, repository, ref string, chan
 // A zero-byte object has the same size, so the indexer cannot tell the two apart and calls
 // statObject for a zero-size entry; one extra call per empty object is the price of never writing a
 // size the server did not confirm.
-func rightStatComplete(change client.Change) bool {
+func rightStatComplete(change reader.Change) bool {
 	right := change.Right
 	return right != nil && right.ETag != "" && !right.Mtime.IsZero() && change.SizeBytes != 0
 }
 
 // eachObject walks the full listing of one commit of R, one page at a time (§4.3 step 2).
-func (x *Indexer) eachObject(ctx context.Context, repository string, commit client.Commit, visit func(client.ObjectStat) error) error {
+func (x *Indexer) eachObject(ctx context.Context, repository string, commit reader.Commit, visit func(reader.ObjectStat) error) error {
 	after := ""
 	for {
 		page, hasMore, err := x.lakeFS.ListObjects(ctx, repository, commit.ID, after)
@@ -187,7 +187,7 @@ func (x *Indexer) eachObject(ctx context.Context, repository string, commit clie
 		after = lastNameOf(len(page), func(i int) string { return page[i].Path })
 		if after == "" {
 			return fmt.Errorf("%w: list objects of %s@%s: more results without a cursor",
-				client.ErrBadPagination, repository, commit.ID)
+				reader.ErrBadPagination, repository, commit.ID)
 		}
 	}
 }
@@ -195,9 +195,9 @@ func (x *Indexer) eachObject(ctx context.Context, repository string, commit clie
 // listingRows streams the full listing of one commit of R as table rows (§4.3 step 2). The rows are
 // pulled by the writer, so a rebuild of a large branch is bounded by the writer's batch size and not
 // by the number of objects; count receives how many rows were produced.
-func (x *Indexer) listingRows(ctx context.Context, repository string, commit client.Commit, count *int) table.Rows {
+func (x *Indexer) listingRows(ctx context.Context, repository string, commit reader.Commit, count *int) table.Rows {
 	return func(yield func(table.Row, error) bool) {
-		err := x.eachObject(ctx, repository, commit, func(stat client.ObjectStat) error {
+		err := x.eachObject(ctx, repository, commit, func(stat reader.ObjectStat) error {
 			*count++
 			if !yield(rowOf(repository, commit, stat), nil) {
 				return errStopListing
@@ -217,7 +217,7 @@ var errStopListing = errors.New("listing stopped by the consumer")
 // rowOf builds one row of system.object_metadata (§3.1): the object's stats and the commit that
 // produced it. committer and creation_date are the commit's, the same for every row of the commit
 // and never the object's mtime (§3.1: creation_date is "creation time of the commit commit_id").
-func rowOf(repository string, commit client.Commit, stat client.ObjectStat) table.Row {
+func rowOf(repository string, commit reader.Commit, stat reader.ObjectStat) table.Row {
 	row := table.Row{
 		Repository:   repository,
 		Path:         stat.Path,

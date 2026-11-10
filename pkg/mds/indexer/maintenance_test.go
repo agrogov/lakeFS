@@ -12,8 +12,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/logging"
-	"github.com/treeverse/lakefs/pkg/mds/client"
 	"github.com/treeverse/lakefs/pkg/mds/indexer"
+	"github.com/treeverse/lakefs/pkg/mds/reader"
 )
 
 // TestCompactionByDeleteFiles pins the max_delete_files trigger: once the table carries more delete
@@ -24,16 +24,16 @@ func TestCompactionByDeleteFiles(t *testing.T) {
 		opts.Compaction = indexer.Compaction{MaxDeleteFiles: 1, EveryCommits: 1000}
 	})
 	e.fake.addCommit("repo", "main", "s1", nil,
-		[]client.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
+		[]reader.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
 	e.tick()
 
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{removed("a")})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{removed("a")})
 	e.tick()
 	require.Zero(t, e.fake.compactCalls, "one delete file is within the limit")
 
 	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, nil)
-	e.fake.setDiff("repo", "s2", "s3", []client.Change{removed("b")})
+	e.fake.setDiff("repo", "s2", "s3", []reader.Change{removed("b")})
 	e.tick()
 
 	require.NoError(t, e.health.repositoryError("repo"))
@@ -74,22 +74,22 @@ func TestCompactionEveryCommits(t *testing.T) {
 	e := newEnv(t, func(opts *indexer.Options) {
 		opts.Compaction = indexer.Compaction{MaxDeleteFiles: 1000, EveryCommits: 2}
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.tick()
 	require.Zero(t, e.fake.compactCalls, "one indexed commit is below every_commits")
 
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 	e.tick()
 	require.Equal(t, 1, e.fake.compactCalls, "two indexed commits trigger it")
 
 	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, nil)
-	e.fake.setDiff("repo", "s2", "s3", []client.Change{added("c", 30)})
+	e.fake.setDiff("repo", "s2", "s3", []reader.Change{added("c", 30)})
 	e.tick()
 	require.Equal(t, 1, e.fake.compactCalls, "the count restarts at the compaction commit")
 
 	e.fake.addCommit("repo", "main", "s4", []string{"s3"}, nil)
-	e.fake.setDiff("repo", "s3", "s4", []client.Change{added("d", 40)})
+	e.fake.setDiff("repo", "s3", "s4", []reader.Change{added("d", 40)})
 	e.tick()
 	require.Equal(t, 2, e.fake.compactCalls)
 
@@ -106,10 +106,10 @@ func TestCompactionEveryCommitsSurvivesRestart(t *testing.T) {
 		opts.Compaction = indexer.Compaction{MaxDeleteFiles: 1000, EveryCommits: 3}
 	}
 	e := newEnv(t, configure)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.tick()
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 	e.tick()
 	require.Zero(t, e.fake.compactCalls, "two of three indexed commits are below every_commits")
 
@@ -120,7 +120,7 @@ func TestCompactionEveryCommitsSurvivesRestart(t *testing.T) {
 	require.Zero(t, e.fake.compactCalls, "a restart does not count more commits than were indexed")
 
 	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, nil)
-	e.fake.setDiff("repo", "s2", "s3", []client.Change{added("c", 30)})
+	e.fake.setDiff("repo", "s2", "s3", []reader.Change{added("c", 30)})
 	require.NoError(t, restarted.Tick(t.Context()))
 
 	require.Equal(t, 1, e.fake.compactCalls, "the third indexed commit triggers it, restart or not")
@@ -137,7 +137,7 @@ func TestCompactionEveryCommitsSurvivesRestart(t *testing.T) {
 	require.NoError(t, restarted.Tick(t.Context()))
 	require.Equal(t, 1, e.fake.compactCalls, "a compacted branch is quiet until every_commits again")
 	e.fake.addCommit("repo", "main", "s4", []string{"s3"}, nil)
-	e.fake.setDiff("repo", "s3", "s4", []client.Change{added("d", 40)})
+	e.fake.setDiff("repo", "s3", "s4", []reader.Change{added("d", 40)})
 	require.NoError(t, restarted.Tick(t.Context()))
 	require.Equal(t, 1, e.fake.compactCalls, "one indexed commit after the compaction is below it")
 }
@@ -149,15 +149,15 @@ func TestCompactionEveryCommitsPagesTheLog(t *testing.T) {
 		opts.Compaction = indexer.Compaction{MaxDeleteFiles: 1000, EveryCommits: 3}
 	})
 	e.fake.pageSize = 1
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.tick()
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 	e.tick()
 	require.Zero(t, e.fake.compactCalls)
 
 	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, nil)
-	e.fake.setDiff("repo", "s2", "s3", []client.Change{added("c", 30)})
+	e.fake.setDiff("repo", "s2", "s3", []reader.Change{added("c", 30)})
 	e.tick()
 	require.Equal(t, 1, e.fake.compactCalls, "the count crosses the page boundaries")
 }
@@ -192,12 +192,12 @@ func TestCompactionDisabledByZero(t *testing.T) {
 	// margin, and neither default would leave it alone.
 	indexCommits := func(t *testing.T, e *env, n int) {
 		t.Helper()
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 		parent := "s1"
 		for i := 2; i <= n+1; i++ {
 			commit := fmt.Sprintf("s%d", i)
 			e.fake.addCommit("repo", "main", commit, []string{parent}, nil)
-			e.fake.setDiff("repo", parent, commit, []client.Change{removed("a")})
+			e.fake.setDiff("repo", parent, commit, []reader.Change{removed("a")})
 			parent = commit
 		}
 		e.tick()
@@ -240,11 +240,11 @@ func TestTagRetention(t *testing.T) {
 			opts.Backfill = indexer.BackfillHistory
 			opts.TagRetention = retention
 		})
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 		e.fake.setCommitDate("repo", "s1", now.Add(-72*time.Hour))
 		e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
 		e.fake.setCommitDate("repo", "s2", now)
-		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+		e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 		e.tick()
 		return e
 	}
@@ -281,7 +281,7 @@ func TestTagRetentionKeepsCurrentPosition(t *testing.T) {
 	e := newEnv(t, func(opts *indexer.Options) {
 		opts.TagRetention = 24 * time.Hour
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.fake.setCommitDate("repo", "s1", now.Add(-72*time.Hour))
 
 	e.tick()
@@ -305,7 +305,7 @@ func TestTagRetentionRetiresUnreadableTags(t *testing.T) {
 	e := newEnv(t, func(opts *indexer.Options) {
 		opts.TagRetention = time.Hour
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.fake.setCommitDate("repo", "s1", time.Now().UTC())
 	e.tick()
 

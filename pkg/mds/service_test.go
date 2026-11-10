@@ -336,7 +336,10 @@ func TestServiceStopsOnSIGTERM(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.ListenAddress = "127.0.0.1:0"
 	cfg.Period = 10 * time.Millisecond
-	svc := NewService(cfg, nil)
+	// The process model is what this test pins; the indexer itself is installed by Run only
+	// without a TickFunc (RA4b: and only with an in-process reader, see
+	// TestServiceRunRequiresTheInProcessReader).
+	svc := NewService(cfg, nil, WithTickFunc(func(context.Context) error { return nil }))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	t.Cleanup(stop)
@@ -375,9 +378,20 @@ func TestServiceRunRequiresConfiguration(t *testing.T) {
 func TestServiceRunReportsListenError(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.ListenAddress = "127.0.0.1:70000" // not a valid TCP port
-	err := NewService(cfg, nil).Run(context.Background())
+	err := NewService(cfg, nil, WithTickFunc(func(context.Context) error { return nil })).Run(context.Background())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "listen on")
+}
+
+// TestServiceRunRequiresTheInProcessReader pins the RA4b startup requirement: the indexer reads the
+// repositories in process, so a Service that was not given the reader `mds run` builds cannot
+// install the indexer. Startup fails instead of the first tick.
+func TestServiceRunRequiresTheInProcessReader(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ListenAddress = "127.0.0.1:0"
+	err := NewService(cfg, nil).Run(context.Background())
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.ErrorIs(t, err, indexer.ErrNoLakeFS)
 }
 
 // TestRecorderIncrements pins the Recorder methods of §9 against the collectors.

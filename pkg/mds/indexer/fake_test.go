@@ -1,7 +1,8 @@
 package indexer_test
 
 // fake_test.go is the in-memory lakeFS of the indexer tests: one type implements both seams of
-// the package, client.LakeFS (M2) and indexer.TableStore (M3), because the interesting states of
+// the package, reader.LakeFS (M2, now served in process by RA4b) and indexer.TableStore (M3),
+// because the interesting states of
 // design §4.4 are exactly the states where the two disagree - an Iceberg commit that has no
 // lakeFS commit, or a lakeFS commit whose tag is missing. Nothing here talks HTTP.
 
@@ -19,8 +20,8 @@ import (
 	"github.com/apache/iceberg-go/catalog/rest"
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/logging"
-	"github.com/treeverse/lakefs/pkg/mds/client"
 	"github.com/treeverse/lakefs/pkg/mds/indexer"
+	"github.com/treeverse/lakefs/pkg/mds/reader"
 	"github.com/treeverse/lakefs/pkg/mds/table"
 )
 
@@ -47,15 +48,15 @@ type fake struct {
 	// metadataRepo is the companion repository of this fake; the TableStore methods address it.
 	metadataRepo string
 
-	repositories map[string]client.Repository
+	repositories map[string]reader.Repository
 	// branches is repository -> branch -> head commit ID ("" for a branch without commits).
 	branches map[string]map[string]string
 	// commits is repository -> commit ID -> commit.
-	commits map[string]map[string]client.Commit
+	commits map[string]map[string]reader.Commit
 	// objects is repository -> ref -> the objects of that commit.
-	objects map[string]map[string][]client.ObjectStat
+	objects map[string]map[string][]reader.ObjectStat
 	// diffs is repository -> "left..right" -> the two-dot diff.
-	diffs map[string]map[string][]client.Change
+	diffs map[string]map[string][]reader.Change
 	// tags is repository -> tag -> commit ID.
 	tags map[string]map[string]string
 
@@ -68,12 +69,12 @@ type fake struct {
 	staged map[string]*fakeState
 
 	// The calls the tests assert on.
-	createdRepositories []client.RepositoryOptions
+	createdRepositories []reader.RepositoryOptions
 	createdBranches     []createdBranch
 	deletedBranches     []string
 	resetBranches       []string
 	hardResets          []hardReset
-	commitsMade         []client.CommitOptions
+	commitsMade         []reader.CommitOptions
 	tagsMade            []tagCreation
 	deletedTags         []string
 	statCalls           []string
@@ -132,7 +133,7 @@ type fake struct {
 
 type logCommitsCall struct {
 	repository string
-	opts       client.LogCommitsOptions
+	opts       reader.LogCommitsOptions
 }
 
 type createdBranch struct {
@@ -193,11 +194,11 @@ func (s *fakeState) paths() []string {
 func newFake() *fake {
 	return &fake{
 		now:                   time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
-		repositories:          make(map[string]client.Repository),
+		repositories:          make(map[string]reader.Repository),
 		branches:              make(map[string]map[string]string),
-		commits:               make(map[string]map[string]client.Commit),
-		objects:               make(map[string]map[string][]client.ObjectStat),
-		diffs:                 make(map[string]map[string][]client.Change),
+		commits:               make(map[string]map[string]reader.Commit),
+		objects:               make(map[string]map[string][]reader.ObjectStat),
+		diffs:                 make(map[string]map[string][]reader.Change),
 		tags:                  make(map[string]map[string]string),
 		tableAt:               make(map[string]*fakeState),
 		staged:                make(map[string]*fakeState),
@@ -216,7 +217,7 @@ func (f *fake) addRepository(name, namespace, defaultBranch string) {
 }
 
 func (f *fake) addRepositoryLocked(name, namespace, defaultBranch string) {
-	f.repositories[name] = client.Repository{
+	f.repositories[name] = reader.Repository{
 		Name:             name,
 		StorageNamespace: namespace,
 		DefaultBranch:    defaultBranch,
@@ -224,7 +225,7 @@ func (f *fake) addRepositoryLocked(name, namespace, defaultBranch string) {
 	}
 	f.branches[name] = map[string]string{defaultBranch: ""}
 	if f.commits[name] == nil {
-		f.commits[name] = make(map[string]client.Commit)
+		f.commits[name] = make(map[string]reader.Commit)
 	}
 	if f.tags[name] == nil {
 		f.tags[name] = make(map[string]string)
@@ -236,10 +237,10 @@ func (f *fake) addRepositoryLocked(name, namespace, defaultBranch string) {
 
 // addCommit adds a commit to a repository with the given parents and objects, and moves the branch
 // (when branch is not empty) to it.
-func (f *fake) addCommit(repository, branch, id string, parents []string, objects []client.ObjectStat) client.Commit {
+func (f *fake) addCommit(repository, branch, id string, parents []string, objects []reader.ObjectStat) reader.Commit {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	commit := client.Commit{
+	commit := reader.Commit{
 		ID:           id,
 		Message:      "commit " + id,
 		Parents:      parents,
@@ -256,7 +257,7 @@ func (f *fake) addCommit(repository, branch, id string, parents []string, object
 }
 
 // setCommit stores a commit as it is, for a test that cares about its committer or date.
-func (f *fake) setCommit(repository string, commit client.Commit) {
+func (f *fake) setCommit(repository string, commit reader.Commit) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.commits[repository][commit.ID] = commit
@@ -273,15 +274,15 @@ func (f *fake) deleteCommit(repository, commit string) {
 }
 
 // setObjects sets the objects of one ref (a commit ID in every test here).
-func (f *fake) setObjects(repository, ref string, objects []client.ObjectStat) {
+func (f *fake) setObjects(repository, ref string, objects []reader.ObjectStat) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.setObjectsLocked(repository, ref, objects)
 }
 
-func (f *fake) setObjectsLocked(repository, ref string, objects []client.ObjectStat) {
+func (f *fake) setObjectsLocked(repository, ref string, objects []reader.ObjectStat) {
 	if f.objects[repository] == nil {
-		f.objects[repository] = make(map[string][]client.ObjectStat)
+		f.objects[repository] = make(map[string][]reader.ObjectStat)
 	}
 	f.objects[repository][ref] = objects
 }
@@ -324,11 +325,11 @@ func (f *fake) initCommitID() string {
 }
 
 // setDiff sets the two-dot diff between two commits.
-func (f *fake) setDiff(repository, left, right string, changes []client.Change) {
+func (f *fake) setDiff(repository, left, right string, changes []reader.Change) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.diffs[repository] == nil {
-		f.diffs[repository] = make(map[string][]client.Change)
+		f.diffs[repository] = make(map[string][]reader.Change)
 	}
 	f.diffs[repository][left+".."+right] = changes
 }
@@ -448,7 +449,7 @@ func (f *fake) logCommitsRead(repository string) int {
 }
 
 // madeCommits returns the lakeFS commits the indexer made.
-func (f *fake) madeCommits() []client.CommitOptions {
+func (f *fake) madeCommits() []reader.CommitOptions {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.commitsMade)
@@ -456,21 +457,21 @@ func (f *fake) madeCommits() []client.CommitOptions {
 
 // Repository reads.
 
-func (f *fake) GetRepository(_ context.Context, repository string) (client.Repository, error) {
+func (f *fake) GetRepository(_ context.Context, repository string) (reader.Repository, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	found, ok := f.repositories[repository]
 	if !ok {
-		return client.Repository{}, &client.NotFoundError{Operation: "get repository", Subject: repository}
+		return reader.Repository{}, &reader.NotFoundError{Operation: "get repository", Subject: repository}
 	}
 	return found, nil
 }
 
-func (f *fake) CreateRepository(_ context.Context, opts client.RepositoryOptions) (client.Repository, error) {
+func (f *fake) CreateRepository(_ context.Context, opts reader.RepositoryOptions) (reader.Repository, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.repositories[opts.Name]; ok {
-		return client.Repository{}, fmt.Errorf("create repository %q: %w", opts.Name, client.ErrConflict)
+		return reader.Repository{}, fmt.Errorf("create repository %q: %w", opts.Name, reader.ErrConflict)
 	}
 	branch := opts.DefaultBranch
 	if branch == "" {
@@ -480,7 +481,7 @@ func (f *fake) CreateRepository(_ context.Context, opts client.RepositoryOptions
 	// lakeFS creates a non-bare repository: its default branch starts with the automatic
 	// "Repository created" root commit. The indexer's initialisation commit is the first commit
 	// after it, never the root (design §4.8).
-	root := client.Commit{
+	root := reader.Commit{
 		ID:           fmt.Sprintf("created-%d", f.index),
 		Message:      "Repository created",
 		Committer:    "lakefs",
@@ -496,7 +497,7 @@ func (f *fake) CreateRepository(_ context.Context, opts client.RepositoryOptions
 
 // Branch reads and writes.
 
-func (f *fake) ListBranches(_ context.Context, repository, after string) ([]client.Branch, bool, error) {
+func (f *fake) ListBranches(_ context.Context, repository, after string) ([]reader.Branch, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	names := make([]string, 0, len(f.branches[repository]))
@@ -504,8 +505,8 @@ func (f *fake) ListBranches(_ context.Context, repository, after string) ([]clie
 		names = append(names, name)
 	}
 	slices.Sort(names)
-	return pageOf(names, after, f.pageSize, func(name string) string { return name }, func(name string) client.Branch {
-		return client.Branch{Name: name, CommitID: f.branches[repository][name]}
+	return pageOf(names, after, f.pageSize, func(name string) string { return name }, func(name string) reader.Branch {
+		return reader.Branch{Name: name, CommitID: f.branches[repository][name]}
 	})
 }
 
@@ -513,7 +514,7 @@ func (f *fake) CreateBranch(_ context.Context, repository, branch, source string
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.branches[repository][branch]; ok {
-		return fmt.Errorf("create branch %q: %w", branch, client.ErrConflict)
+		return fmt.Errorf("create branch %q: %w", branch, reader.ErrConflict)
 	}
 	commit, err := f.resolveLocked(repository, source)
 	if err != nil {
@@ -535,7 +536,7 @@ func (f *fake) DeleteBranch(_ context.Context, repository, branch string) error 
 		// returns ErrDeleteDefaultBranch, which pkg/api/controller.go maps to 403, not 400
 		// (handleApiErrorCallback, errors.Is(err, graveler.ErrDeleteDefaultBranch)). Model the
 		// status so an indexer that tries it fails the test instead of silently "succeeding".
-		return fmt.Errorf("delete branch %q: default branch: %w", branch, client.ErrForbidden)
+		return fmt.Errorf("delete branch %q: default branch: %w", branch, reader.ErrForbidden)
 	}
 	delete(f.branches[repository], branch)
 	delete(f.staged, branch)
@@ -592,13 +593,13 @@ func (f *fake) requireWritableBranchLocked(repository, branch string, actions ..
 		return err
 	}
 	if _, ok := f.repositories[repository]; !ok {
-		return &client.NotFoundError{Operation: "get repository", Subject: repository}
+		return &reader.NotFoundError{Operation: "get repository", Subject: repository}
 	}
 	if f.repositories[repository].ReadOnly {
-		return fmt.Errorf("write to branch %q: read-only repository: %w", branch, client.ErrForbidden)
+		return fmt.Errorf("write to branch %q: read-only repository: %w", branch, reader.ErrForbidden)
 	}
 	if _, ok := f.branches[repository][branch]; !ok {
-		return &client.NotFoundError{Operation: "get branch", Subject: branch}
+		return &reader.NotFoundError{Operation: "get branch", Subject: branch}
 	}
 	return nil
 }
@@ -608,7 +609,7 @@ func (f *fake) requireWritableBranchLocked(repository, branch string, actions ..
 // a protection rule or a read_only repository makes pkg/icebergcatalog/tables.go writeError answer
 // 403 ForbiddenException over the graveler message, and iceberg-go's REST client turns that status
 // into rest.ErrForbidden (iceberg-go catalog/rest/rest.go). So a catalog write never produces
-// client.ErrForbidden, and a fake that answered the API sentinel left metadataBranchWriteError's
+// reader.ErrForbidden, and a fake that answered the API sentinel left metadataBranchWriteError's
 // rest.ErrForbidden arm - the one production uses - untested (R3I-5). The graveler message stays in
 // the text so a failure still reads the way lakeFS wrote it.
 func catalogWriteError(err error) error {
@@ -632,11 +633,11 @@ func (f *fake) protectionErrorLocked(repository, branch string, actions ...strin
 		switch action {
 		case fakeProtectionCommit:
 			if f.protectedCommit[key] {
-				return fmt.Errorf("commit to branch %q: cannot commit to protected branch: %w", branch, client.ErrForbidden)
+				return fmt.Errorf("commit to branch %q: cannot commit to protected branch: %w", branch, reader.ErrForbidden)
 			}
 		case fakeProtectionStagingWrite:
 			if f.protectedStagingWrite[key] {
-				return fmt.Errorf("write to branch %q: cannot write to protected branch: %w", branch, client.ErrForbidden)
+				return fmt.Errorf("write to branch %q: cannot write to protected branch: %w", branch, reader.ErrForbidden)
 			}
 		}
 	}
@@ -692,7 +693,7 @@ func (f *fake) findMergeBaseLocked(repository, sourceRef, destinationRef string)
 	}
 	for _, commit := range []string{source, destination} {
 		if _, ok := f.commits[repository][commit]; !ok {
-			return "", &client.NotFoundError{Operation: "get commit", Subject: commit}
+			return "", &reader.NotFoundError{Operation: "get commit", Subject: commit}
 		}
 	}
 	if source == destination {
@@ -721,15 +722,15 @@ func (f *fake) findMergeBaseLocked(repository, sourceRef, destinationRef string)
 			reached[parent] |= flags
 			if reached[parent]&fromSource != 0 && reached[parent]&fromDestination != 0 {
 				if _, ok := f.commits[repository][parent]; !ok {
-					return "", &client.NotFoundError{Operation: "get commit", Subject: parent}
+					return "", &reader.NotFoundError{Operation: "get commit", Subject: parent}
 				}
 				return parent, nil
 			}
 		}
 	}
 	// graveler.FindMergeBase returns ErrNoMergeBase for unrelated histories; pkg/api turns that
-	// into a 500. The fake reports the same typed error the client must produce.
-	return "", client.ErrNoMergeBase
+	// into a 500. The fake reports the same typed error pkg/mds/reader must produce.
+	return "", reader.ErrNoMergeBase
 }
 
 // popNewestLocked removes the queued commit graveler's commit-generation priority queue would pop
@@ -773,7 +774,7 @@ func (f *fake) generationLocked(repository, commitID string) int {
 
 // Commit reads and writes.
 
-func (f *fake) LogCommits(_ context.Context, repository, ref string, opts client.LogCommitsOptions) ([]client.Commit, bool, error) {
+func (f *fake) LogCommits(_ context.Context, repository, ref string, opts reader.LogCommitsOptions) ([]reader.Commit, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.logCalls[repository]++
@@ -790,7 +791,7 @@ func (f *fake) LogCommits(_ context.Context, repository, ref string, opts client
 			return nil, false, err
 		}
 	}
-	var chain []client.Commit
+	var chain []reader.Commit
 	if opts.FirstParent {
 		for current := head; current != ""; {
 			commit, ok := f.commits[repository][current]
@@ -811,7 +812,8 @@ func (f *fake) LogCommits(_ context.Context, repository, ref string, opts client
 		// Without first_parent graveler's ListCommits walks every parent. The fake walks them
 		// breadth first, which is enough to make a dropped FirstParent: true visible (§3.2,
 		// TS-10); the order is not graveler's generation order, and nothing the indexer does
-		// reads a log without first_parent (the client test pins what the client sends).
+		// reads a log without first_parent (pkg/mds/reader passes the flag through to
+		// pkg/catalog's log).
 		queue := []string{head}
 		seen := map[string]bool{}
 		for len(queue) > 0 {
@@ -840,13 +842,13 @@ func (f *fake) LogCommits(_ context.Context, repository, ref string, opts client
 			}
 		}
 	}
-	page, hasMore, err := pageOf(chain, "", f.pageSize, func(commit client.Commit) string { return commit.ID },
-		func(commit client.Commit) client.Commit { return commit })
+	page, hasMore, err := pageOf(chain, "", f.pageSize, func(commit reader.Commit) string { return commit.ID },
+		func(commit reader.Commit) reader.Commit { return commit })
 	f.logCommits[repository] += len(page)
 	return page, hasMore, err
 }
 
-func (f *fake) GetCommit(_ context.Context, repository, commitID string) (client.Commit, error) {
+func (f *fake) GetCommit(_ context.Context, repository, commitID string) (reader.Commit, error) {
 	if done := f.enterDataBranch(repository, commitID); done != nil {
 		defer done()
 	}
@@ -854,16 +856,16 @@ func (f *fake) GetCommit(_ context.Context, repository, commitID string) (client
 	defer f.mu.Unlock()
 	id, err := f.resolveLocked(repository, commitID)
 	if err != nil {
-		return client.Commit{}, err
+		return reader.Commit{}, err
 	}
 	commit, ok := f.commits[repository][id]
 	if !ok {
-		return client.Commit{}, &client.NotFoundError{Operation: "get commit", Subject: commitID}
+		return reader.Commit{}, &reader.NotFoundError{Operation: "get commit", Subject: commitID}
 	}
 	return commit, nil
 }
 
-func (f *fake) Commit(_ context.Context, repository, branch string, opts client.CommitOptions) (client.Commit, error) {
+func (f *fake) Commit(_ context.Context, repository, branch string, opts reader.CommitOptions) (reader.Commit, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	// Real lakeFS resolves the branch before it commits and answers 404 when it (or its
@@ -871,7 +873,7 @@ func (f *fake) Commit(_ context.Context, repository, branch string, opts client.
 	// lakeFS cannot have - a metadata branch whose root commit is an indexing commit - and hid the
 	// 404 a branch deleted under a tick must surface.
 	if err := f.requireWritableBranchLocked(repository, branch, fakeProtectionCommit); err != nil {
-		return client.Commit{}, err
+		return reader.Commit{}, err
 	}
 	var state *fakeState
 	if repository == f.metadataRepo {
@@ -880,7 +882,7 @@ func (f *fake) Commit(_ context.Context, repository, branch string, opts client.
 		case ok:
 			state = staged
 		case !opts.AllowEmpty:
-			return client.Commit{}, fmt.Errorf("commit %q@%s: nothing staged: %w", repository, branch, client.ErrBadRequest)
+			return reader.Commit{}, fmt.Errorf("commit %q@%s: nothing staged: %w", repository, branch, reader.ErrBadRequest)
 		default:
 			if head := f.branches[repository][branch]; head != "" && f.tableAt[head] != nil {
 				state = f.tableAt[head].clone()
@@ -895,7 +897,7 @@ func (f *fake) Commit(_ context.Context, repository, branch string, opts client.
 	if head != "" {
 		parents = []string{head}
 	}
-	commit := client.Commit{
+	commit := reader.Commit{
 		ID:           fmt.Sprintf("index-%d", f.index),
 		Message:      opts.Message,
 		Parents:      parents,
@@ -916,7 +918,7 @@ func (f *fake) Commit(_ context.Context, repository, branch string, opts client.
 
 // Tag reads and writes.
 
-func (f *fake) ListTags(_ context.Context, repository, after string) ([]client.Tag, bool, error) {
+func (f *fake) ListTags(_ context.Context, repository, after string) ([]reader.Tag, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	names := make([]string, 0, len(f.tags[repository]))
@@ -924,46 +926,46 @@ func (f *fake) ListTags(_ context.Context, repository, after string) ([]client.T
 		names = append(names, name)
 	}
 	slices.Sort(names)
-	return pageOf(names, after, f.pageSize, func(name string) string { return name }, func(name string) client.Tag {
-		return client.Tag{Name: name, CommitID: f.tags[repository][name]}
+	return pageOf(names, after, f.pageSize, func(name string) string { return name }, func(name string) reader.Tag {
+		return reader.Tag{Name: name, CommitID: f.tags[repository][name]}
 	})
 }
 
-func (f *fake) CreateTag(_ context.Context, repository, tag, ref string, force bool) (client.Tag, error) {
+func (f *fake) CreateTag(_ context.Context, repository, tag, ref string, force bool) (reader.Tag, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	// Like lakeFS, force never overwrites: pkg/graveler/graveler.go CreateTag uses it only to
 	// pass the read-only check, then returns ErrTagAlreadyExists (409) for any existing tag.
 	if _, ok := f.tags[repository][tag]; ok {
-		return client.Tag{}, fmt.Errorf("create tag %q: %w", tag, client.ErrConflict)
+		return reader.Tag{}, fmt.Errorf("create tag %q: %w", tag, reader.ErrConflict)
 	}
 	commit, err := f.resolveLocked(repository, ref)
 	if err != nil {
-		return client.Tag{}, err
+		return reader.Tag{}, err
 	}
 	if f.tags[repository] == nil {
 		f.tags[repository] = make(map[string]string)
 	}
 	f.tags[repository][tag] = commit
 	f.tagsMade = append(f.tagsMade, tagCreation{repository: repository, tag: tag, ref: ref})
-	return client.Tag{Name: tag, CommitID: commit}, nil
+	return reader.Tag{Name: tag, CommitID: commit}, nil
 }
 
-func (f *fake) GetTag(_ context.Context, repository, tag string) (client.Tag, error) {
+func (f *fake) GetTag(_ context.Context, repository, tag string) (reader.Tag, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	commit, ok := f.tags[repository][tag]
 	if !ok {
-		return client.Tag{}, &client.NotFoundError{Operation: "get tag", Subject: tag}
+		return reader.Tag{}, &reader.NotFoundError{Operation: "get tag", Subject: tag}
 	}
-	return client.Tag{Name: tag, CommitID: commit}, nil
+	return reader.Tag{Name: tag, CommitID: commit}, nil
 }
 
 func (f *fake) DeleteTag(_ context.Context, repository, tag string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.tags[repository][tag]; !ok {
-		return &client.NotFoundError{Operation: "delete tag", Subject: tag}
+		return &reader.NotFoundError{Operation: "delete tag", Subject: tag}
 	}
 	delete(f.tags[repository], tag)
 	f.deletedTags = append(f.deletedTags, tag)
@@ -972,73 +974,73 @@ func (f *fake) DeleteTag(_ context.Context, repository, tag string) error {
 
 // Object reads.
 
-func (f *fake) ListObjects(_ context.Context, repository, ref, after string) ([]client.ObjectStat, bool, error) {
+func (f *fake) ListObjects(_ context.Context, repository, ref, after string) ([]reader.ObjectStat, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.listCalls++
 	objects, ok := f.objects[repository][ref]
 	if !ok {
-		return nil, false, &client.NotFoundError{Operation: "list objects", Subject: ref}
+		return nil, false, &reader.NotFoundError{Operation: "list objects", Subject: ref}
 	}
 	sorted := slices.Clone(objects)
-	slices.SortFunc(sorted, func(a, b client.ObjectStat) int { return cmp.Compare(a.Path, b.Path) })
-	return pageOf(sorted, after, f.pageSize, func(object client.ObjectStat) string { return object.Path },
-		func(object client.ObjectStat) client.ObjectStat { return object })
+	slices.SortFunc(sorted, func(a, b reader.ObjectStat) int { return cmp.Compare(a.Path, b.Path) })
+	return pageOf(sorted, after, f.pageSize, func(object reader.ObjectStat) string { return object.Path },
+		func(object reader.ObjectStat) reader.ObjectStat { return object })
 }
 
-func (f *fake) DiffRefs(_ context.Context, repository, leftRef, rightRef, after string) ([]client.Change, bool, error) {
+func (f *fake) DiffRefs(_ context.Context, repository, leftRef, rightRef, after string) ([]reader.Change, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.diffCalls++
 	changes, ok := f.diffs[repository][leftRef+".."+rightRef]
 	if !ok {
-		return nil, false, &client.NotFoundError{Operation: "diff refs", Subject: leftRef + ".." + rightRef}
+		return nil, false, &reader.NotFoundError{Operation: "diff refs", Subject: leftRef + ".." + rightRef}
 	}
 	sorted := slices.Clone(changes)
-	slices.SortFunc(sorted, func(a, b client.Change) int { return cmp.Compare(a.Path, b.Path) })
-	return pageOf(sorted, after, f.pageSize, func(change client.Change) string { return change.Path },
-		func(change client.Change) client.Change { return change })
+	slices.SortFunc(sorted, func(a, b reader.Change) int { return cmp.Compare(a.Path, b.Path) })
+	return pageOf(sorted, after, f.pageSize, func(change reader.Change) string { return change.Path },
+		func(change reader.Change) reader.Change { return change })
 }
 
 // DiffBranch reports the uncommitted changes of a metadata branch. A staged table pointer is
 // itself an object change on the branch, so any staged state is at least one change.
-func (f *fake) DiffBranch(_ context.Context, repository, branch, after string) ([]client.Change, bool, error) {
+func (f *fake) DiffBranch(_ context.Context, repository, branch, after string) ([]reader.Change, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.branches[repository][branch]; !ok {
-		return nil, false, &client.NotFoundError{Operation: "diff branch", Subject: branch}
+		return nil, false, &reader.NotFoundError{Operation: "diff branch", Subject: branch}
 	}
 	staged, ok := f.staged[branch]
 	if !ok {
 		return nil, false, nil
 	}
 	committed := f.tableAt[f.branches[repository][branch]]
-	var changes []client.Change
+	var changes []reader.Change
 	for path, row := range staged.rows {
 		old, ok := committedRow(committed, path)
 		switch {
 		case !ok:
-			changes = append(changes, client.Change{Path: path, Type: client.ChangeAdded, SizeBytes: row.SizeBytes})
+			changes = append(changes, reader.Change{Path: path, Type: reader.ChangeAdded, SizeBytes: row.SizeBytes})
 		case !reflect.DeepEqual(old, row):
-			changes = append(changes, client.Change{Path: path, Type: client.ChangeChanged, SizeBytes: row.SizeBytes})
+			changes = append(changes, reader.Change{Path: path, Type: reader.ChangeChanged, SizeBytes: row.SizeBytes})
 		}
 	}
 	if committed != nil {
 		for path := range committed.rows {
 			if _, ok := staged.rows[path]; !ok {
-				changes = append(changes, client.Change{Path: path, Type: client.ChangeRemoved})
+				changes = append(changes, reader.Change{Path: path, Type: reader.ChangeRemoved})
 			}
 		}
 	}
 	if len(changes) == 0 {
-		changes = append(changes, client.Change{
+		changes = append(changes, reader.Change{
 			Path: "_lakefs_iceberg/tables/system/object_metadata",
-			Type: client.ChangeChanged,
+			Type: reader.ChangeChanged,
 		})
 	}
-	slices.SortFunc(changes, func(a, b client.Change) int { return cmp.Compare(a.Path, b.Path) })
-	return pageOf(changes, after, f.pageSize, func(change client.Change) string { return change.Path },
-		func(change client.Change) client.Change { return change })
+	slices.SortFunc(changes, func(a, b reader.Change) int { return cmp.Compare(a.Path, b.Path) })
+	return pageOf(changes, after, f.pageSize, func(change reader.Change) string { return change.Path },
+		func(change reader.Change) reader.Change { return change })
 }
 
 func committedRow(state *fakeState, path string) (table.Row, bool) {
@@ -1049,7 +1051,7 @@ func committedRow(state *fakeState, path string) (table.Row, bool) {
 	return row, ok
 }
 
-func (f *fake) StatObject(_ context.Context, repository, ref, path string) (client.ObjectStat, error) {
+func (f *fake) StatObject(_ context.Context, repository, ref, path string) (reader.ObjectStat, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.statCalls = append(f.statCalls, path)
@@ -1058,7 +1060,7 @@ func (f *fake) StatObject(_ context.Context, repository, ref, path string) (clie
 			return object, nil
 		}
 	}
-	return client.ObjectStat{}, &client.NotFoundError{Operation: "stat object", Subject: path}
+	return reader.ObjectStat{}, &reader.NotFoundError{Operation: "stat object", Subject: path}
 }
 
 // Metadata table reads and writes.
@@ -1100,7 +1102,7 @@ func (f *fake) CreateTable(_ context.Context, dataRepository, branch string) (in
 		return nil, catalogWriteError(err)
 	}
 	if f.repositories[f.metadataRepo].ReadOnly {
-		return nil, catalogWriteError(fmt.Errorf("write to branch %q: read-only repository: %w", branch, client.ErrForbidden))
+		return nil, catalogWriteError(fmt.Errorf("write to branch %q: read-only repository: %w", branch, reader.ErrForbidden))
 	}
 	if f.tableExists {
 		return nil, indexer.ErrTableExists
@@ -1119,14 +1121,14 @@ func (f *fake) resolveLocked(repository, ref string) (string, error) {
 	}
 	if commit, ok := f.branches[repository][ref]; ok {
 		if commit == "" {
-			return "", &client.NotFoundError{Operation: "resolve", Subject: ref}
+			return "", &reader.NotFoundError{Operation: "resolve", Subject: ref}
 		}
 		return commit, nil
 	}
 	if commit, ok := f.tags[repository][ref]; ok {
 		return commit, nil
 	}
-	return "", &client.NotFoundError{Operation: "resolve", Subject: ref}
+	return "", &reader.NotFoundError{Operation: "resolve", Subject: ref}
 }
 
 // pageOf returns one page of a listing sorted by key, starting strictly after `after`: the cursor
@@ -1480,8 +1482,8 @@ func (e *env) tick() {
 }
 
 // object returns an ObjectStat.
-func object(path string, size int64) client.ObjectStat {
-	return client.ObjectStat{
+func object(path string, size int64) reader.ObjectStat {
+	return reader.ObjectStat{
 		Path:         path,
 		SizeBytes:    size,
 		Mtime:        time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC),
@@ -1492,14 +1494,14 @@ func object(path string, size int64) client.ObjectStat {
 }
 
 // added is a diff entry that adds an object.
-func added(path string, size int64) client.Change {
+func added(path string, size int64) reader.Change {
 	stat := object(path, size)
-	return client.Change{Path: path, Type: client.ChangeAdded, SizeBytes: size, Right: &stat}
+	return reader.Change{Path: path, Type: reader.ChangeAdded, SizeBytes: size, Right: &stat}
 }
 
 // removed is a diff entry that removes an object.
-func removed(path string) client.Change {
-	return client.Change{Path: path, Type: client.ChangeRemoved}
+func removed(path string) reader.Change {
+	return reader.Change{Path: path, Type: reader.ChangeRemoved}
 }
 
 // TestFakeWriteMethodsRefuseAMissingBranchOrRepository pins the fake against the answers real
@@ -1515,35 +1517,35 @@ func TestFakeWriteMethodsRefuseAMissingBranchOrRepository(t *testing.T) {
 	f.addRepository("repo-metadata", "s3://bucket/data-metadata", "main")
 	init := f.addCommit("repo-metadata", "main", "init", nil, nil)
 
-	_, err := f.Commit(ctx, "repo-metadata", "gone", client.CommitOptions{AllowEmpty: true})
-	require.ErrorIs(t, err, client.ErrNotFound, "commit to a branch that does not exist")
-	require.ErrorIs(t, f.ResetBranch(ctx, "repo-metadata", "gone"), client.ErrNotFound,
+	_, err := f.Commit(ctx, "repo-metadata", "gone", reader.CommitOptions{AllowEmpty: true})
+	require.ErrorIs(t, err, reader.ErrNotFound, "commit to a branch that does not exist")
+	require.ErrorIs(t, f.ResetBranch(ctx, "repo-metadata", "gone"), reader.ErrNotFound,
 		"reset of a branch that does not exist")
-	require.ErrorIs(t, f.HardResetBranch(ctx, "repo-metadata", "gone", init.ID), client.ErrNotFound,
+	require.ErrorIs(t, f.HardResetBranch(ctx, "repo-metadata", "gone", init.ID), reader.ErrNotFound,
 		"hard reset of a branch that does not exist")
 	_, created := f.branchHead("repo-metadata", "gone")
 	require.False(t, created, "a refused write does not create the branch")
 
-	_, err = f.Commit(ctx, "gone", "main", client.CommitOptions{AllowEmpty: true})
-	require.ErrorIs(t, err, client.ErrNotFound, "commit in a repository that does not exist")
-	require.ErrorIs(t, f.ResetBranch(ctx, "gone", "main"), client.ErrNotFound,
+	_, err = f.Commit(ctx, "gone", "main", reader.CommitOptions{AllowEmpty: true})
+	require.ErrorIs(t, err, reader.ErrNotFound, "commit in a repository that does not exist")
+	require.ErrorIs(t, f.ResetBranch(ctx, "gone", "main"), reader.ErrNotFound,
 		"reset in a repository that does not exist")
-	require.ErrorIs(t, f.HardResetBranch(ctx, "gone", "main", init.ID), client.ErrNotFound,
+	require.ErrorIs(t, f.HardResetBranch(ctx, "gone", "main", init.ID), reader.ErrNotFound,
 		"hard reset in a repository that does not exist")
 	_, registered := f.branches["gone"]
 	require.False(t, registered, "a refused write does not create the repository")
 
 	// The refusal of a default-branch delete carries the status lakeFS answers: 403, not 400.
 	err = f.DeleteBranch(ctx, "repo-metadata", "main")
-	require.ErrorIs(t, err, client.ErrForbidden, "lakeFS refuses a default-branch delete with 403")
-	require.NotErrorIs(t, err, client.ErrBadRequest)
+	require.ErrorIs(t, err, reader.ErrForbidden, "lakeFS refuses a default-branch delete with 403")
+	require.NotErrorIs(t, err, reader.ErrBadRequest)
 	head, ok := f.branchHead("repo-metadata", "main")
 	require.True(t, ok)
 	require.Equal(t, init.ID, head)
 
 	// An existing branch without a commit is not a missing branch: a root commit is written.
 	f.addRepository("bare", "s3://bucket/bare", "main")
-	root, err := f.Commit(ctx, "bare", "main", client.CommitOptions{AllowEmpty: true})
+	root, err := f.Commit(ctx, "bare", "main", reader.CommitOptions{AllowEmpty: true})
 	require.NoError(t, err)
 	require.Empty(t, root.Parents, "a root commit has no parent")
 }
@@ -1587,17 +1589,17 @@ func TestFakeLogCommitsHonoursFirstParent(t *testing.T) {
 	f.addCommit("repo", "", "side", []string{"s1"}, nil)
 	f.addCommit("repo", "main", "m", []string{"s2", "side"}, nil)
 
-	firstParent, _, err := f.LogCommits(ctx, "repo", "m", client.LogCommitsOptions{FirstParent: true})
+	firstParent, _, err := f.LogCommits(ctx, "repo", "m", reader.LogCommitsOptions{FirstParent: true})
 	require.NoError(t, err)
 	require.Equal(t, []string{"m", "s2", "s1"}, commitIDs(firstParent), "the first-parent chain only")
 
-	everyParent, _, err := f.LogCommits(ctx, "repo", "m", client.LogCommitsOptions{FirstParent: false})
+	everyParent, _, err := f.LogCommits(ctx, "repo", "m", reader.LogCommitsOptions{FirstParent: false})
 	require.NoError(t, err)
 	require.Equal(t, []string{"m", "s2", "side", "s1"}, commitIDs(everyParent),
 		"every parent's history, so a dropped FirstParent is visible")
 }
 
-func commitIDs(commits []client.Commit) []string {
+func commitIDs(commits []reader.Commit) []string {
 	ids := make([]string, 0, len(commits))
 	for _, commit := range commits {
 		ids = append(ids, commit.ID)

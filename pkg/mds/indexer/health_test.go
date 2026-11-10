@@ -13,8 +13,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"github.com/treeverse/lakefs/pkg/mds/client"
 	"github.com/treeverse/lakefs/pkg/mds/indexer"
+	"github.com/treeverse/lakefs/pkg/mds/reader"
 )
 
 // TestDeletedBranchLeavesHealthWithoutDeletingTheMirror pins IO-3: the /_health entry and the lag
@@ -26,7 +26,7 @@ func TestDeletedBranchLeavesHealthWithoutDeletingTheMirror(t *testing.T) {
 		opts.Repositories[0].Branches = []string{"main", "feature"}
 		opts.DeleteBranches = false
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.fake.setBranchHead("repo", "feature", "s1")
 	e.tick()
 	require.NoError(t, e.health.branch("repo", "feature").err, "feature is indexed")
@@ -59,7 +59,7 @@ func TestBranchStopsMatchingClearsItsLagGauge(t *testing.T) {
 	e := newEnv(t, func(opts *indexer.Options) {
 		opts.Repositories[0].Branches = []string{"main", "feature"}
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.fake.setBranchHead("repo", "feature", "s1")
 	e.tick()
 	require.Contains(t, e.metrics.lags, "repo@feature", "the followed branch reports a lag")
@@ -86,16 +86,16 @@ func TestBranchStopsMatchingClearsItsLagGauge(t *testing.T) {
 // was reported for the failure mode the alert exists for (§9).
 func TestFailedBranchReportsTheRecordedPosition(t *testing.T) {
 	e := newEnv(t)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.tick()
 	require.Equal(t, branchRecord{lastIndexed: "s1", head: "s1"}, e.health.branch("repo", "main"))
 
 	// Two commits pending, and the merge-base read of §4.2 step 4 fails like a transient 500: the
 	// tick fails before it can walk the log.
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, nil)
-	e.fake.setDiff("repo", "s2", "s3", []client.Change{added("c", 30)})
+	e.fake.setDiff("repo", "s2", "s3", []reader.Change{added("c", 30)})
 	e.fake.findMergeBaseErr = errors.New("find merge base: unexpected lakeFS response")
 
 	e.tick()
@@ -116,11 +116,11 @@ func TestFailedBranchReportsTheRecordedPosition(t *testing.T) {
 // left, so an operator sees how far the backlog was worked off.
 func TestFailedBranchReportsThePositionItAdvancedTo(t *testing.T) {
 	e := newEnv(t)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.tick()
 
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, nil)
 	// No diff for s2..s3: changing s3 fails after s2 was applied and committed.
 	e.tick()
@@ -163,7 +163,7 @@ func TestCancelledTickIsNotLeftInProgress(t *testing.T) {
 	e := newEnv(t, func(opts *indexer.Options) {
 		opts.Health = health
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 
 	ctx, cancel := context.WithCancel(t.Context())
 	e.fake.setDataBranchHook(func(string) func() {

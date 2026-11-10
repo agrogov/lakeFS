@@ -8,10 +8,12 @@
 // file: the position moves atomically with the table, because both are in the same lakeFS commit
 // (§4.3 steps 3 and 4).
 //
-// The package is the second half of a REST client. It never imports pkg/catalog or pkg/graveler:
-// every operation on R and on R-metadata goes through pkg/mds/client (M2), and every operation on
-// the table goes through the TableStore seam, whose production implementation (IcebergStore, in
-// iceberg.go) talks to the lakeFS Iceberg REST catalog through pkg/mds/table (M3). Both seams are
+// Every operation on R and on R-metadata goes through the reader.LakeFS seam
+// (METADATA_SEARCH_REALIGN.md RA4b, X13): `mds run` serves it from an in-process pkg/catalog over
+// the same KV store and block adapter as the lakeFS server, so this package never imports
+// pkg/catalog or pkg/graveler. Every operation on the table goes through the TableStore seam,
+// whose production implementation (IcebergStore, in iceberg.go) writes Parquet, Avro and metadata
+// files through the lakeFS Iceberg REST catalog with pkg/mds/table (M3). Both seams are
 // interfaces, so this package's tests drive every crash window of §4.4 and every state machine of
 // §4.5, §4.7 and §4.8 with fakes and without a lakeFS server.
 //
@@ -27,17 +29,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/treeverse/lakefs/pkg/api/apigen"
+	"github.com/apache/iceberg-go"
 	"github.com/treeverse/lakefs/pkg/api/apiutil"
 	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"github.com/treeverse/lakefs/pkg/logging"
-	"github.com/treeverse/lakefs/pkg/mds/client"
+	"github.com/treeverse/lakefs/pkg/mds/reader"
 )
 
 const (
@@ -157,8 +158,13 @@ var (
 	// own companion would be <name>-metadata-metadata.
 	ErrDataRepositoryNamedMetadata = errors.New("a data repository name must not end in the companion repository suffix")
 
-	// ErrNoEndpoint is reported by New when it has to build a client and no endpoint is given.
+	// ErrNoEndpoint is reported by New when it has to build the Iceberg catalog client and no
+	// endpoint is given.
 	ErrNoEndpoint = errors.New("no lakeFS endpoint")
+
+	// ErrNoLakeFS is reported by New when no lakeFS reader is given. `mds run` builds one over the
+	// server's KV store and block adapter (RA4b); there is no client New could build instead.
+	ErrNoLakeFS = errors.New("no lakeFS reader")
 
 	// ErrNoDefaultBranch is reported for a companion repository without a default branch: the
 	// indexer cannot address a table, a commit or an initialisation without one.
@@ -229,32 +235,42 @@ type Compaction struct {
 // documented way to turn a trigger off (§4.9), so their defaults belong to whoever builds the
 // configuration - pkg/mds applies 200 and 500 when the key is absent.
 type Options struct {
-	// LakeFS is the lakeFS client of the indexer (§4.2–§4.9). When nil, New builds one from
-	// Endpoint, AccessKeyID and SecretKey.
-	LakeFS client.LakeFS
+	// LakeFS serves the lakeFS operations of the indexer (§4.2–§4.9): reads of the data
+	// repository and the companion repository, and the commits the indexer makes on the companion.
+	// It is required: `mds run` builds it over the same KV store and block adapter as the lakeFS
+	// server (pkg/mds/reader, RA4b), so there is no client to build from a URL here.
+	LakeFS reader.LakeFS
 
 	// Tables reads and writes the metadata tables (§4.3, §4.9). When nil, New builds an
 	// IcebergStore from Endpoint, AccessKeyID, SecretKey and Storage.
 	Tables TableStore
 
-	// Endpoint is the lakeFS base URL (metadata_search.lakefs_endpoint): the API lives at
-	// /api/v1 and the catalog at /iceberg (§4.1, §4.3 step 3).
+	// Endpoint is the lakeFS base URL (metadata_search.lakefs_endpoint): the Iceberg REST catalog
+	// is mounted at /iceberg below it (§4.1, §4.3 step 3).
 	Endpoint string
 
-	// AccessKeyID and SecretKey are the credentials of the indexer principal (§8). They are sent
-	// as HTTP basic authentication to both the API and the catalog.
+	// AccessKeyID and SecretKey are the credentials of the indexer principal (§8), sent as HTTP
+	// basic authentication to the Iceberg REST catalog. They are optional (G11, X7): with neither
+	// set, the sync authenticates as the service user with a login token it signs itself, using
+	// EncryptSecretKey.
 	AccessKeyID string
 	SecretKey   string
 
-	// There is deliberately no Storage field: the iceberg-go IO properties of a write are the
-	// standard blockstore configuration of the process, not a metadata_search key (X6). The
-	// production TableStore (IcebergStore) is built with them by the process that owns the block
-	// adapter; a configuration section cannot supply them.
+	// EncryptSecretKey is auth.encrypt.secret_key of the server configuration (RA4b). It must be
+	// the same key the server encrypts with, so that the service user's login token the indexer
+	// signs for the Iceberg catalog is one the server accepts (G12, RA5).
+	EncryptSecretKey string
 
-	// RequestTimeout bounds every HTTP request of the lakeFS API client and of the Iceberg REST
-	// catalog (§4.1, §7): a request that has not completed within it fails, so the branch (or
-	// the repository) is reported failed instead of stalling the tick loop. Zero means
-	// DefaultRequestTimeout; it does not mean "no timeout".
+	// Storage is the iceberg-go IO properties of a write: the standard blockstore configuration
+	// of the process, translated by the process that owns the block adapter, not a
+	// metadata_search key (X6). The production TableStore (IcebergStore) writes Parquet, Avro and
+	// metadata files with them when the catalog does not vend credentials.
+	Storage iceberg.Properties
+
+	// RequestTimeout bounds every HTTP request of the Iceberg REST catalog (§4.1, §7): a request
+	// that has not completed within it fails, so the branch (or the repository) is reported failed
+	// instead of stalling the tick loop. Zero means DefaultRequestTimeout; it does not mean "no
+	// timeout".
 	RequestTimeout time.Duration
 
 	// Concurrency is how many branches one repository tick processes in parallel (§4.1).
@@ -320,7 +336,7 @@ type metadataState struct {
 // processes the branches of a repository in parallel, and the health and metrics sinks are
 // concurrency-safe.
 type Indexer struct {
-	lakeFS  client.LakeFS
+	lakeFS  reader.LakeFS
 	tables  TableStore
 	health  Health
 	metrics Metrics
@@ -344,8 +360,9 @@ type Indexer struct {
 	followed          map[string]map[string]struct{}
 }
 
-// New returns an Indexer for opts. When opts.LakeFS or opts.Tables is nil it builds the production
-// implementation from the endpoint and the credentials of §4.6; a test passes fakes instead.
+// New returns an Indexer for opts. opts.LakeFS is required: the production implementation is the
+// in-process reader `mds run` builds from the server configuration (RA4b). Vendor credentials and
+// the IO properties are an option of the Iceberg REST catalog, not of the indexer.
 func New(opts Options) (*Indexer, error) {
 	x := &Indexer{
 		lakeFS:            opts.LakeFS,
@@ -379,36 +396,28 @@ func New(opts Options) (*Indexer, error) {
 	if x.metrics == nil {
 		x.metrics = nopMetrics{}
 	}
-	if x.lakeFS == nil || x.tables == nil {
+	if x.lakeFS == nil {
+		return nil, fmt.Errorf("%w: mds run builds the reader from the server configuration", ErrNoLakeFS)
+	}
+	if x.tables == nil {
 		endpoint := strings.TrimSpace(opts.Endpoint)
 		if endpoint == "" {
-			return nil, fmt.Errorf("%w: cannot build the lakeFS client of the indexer", ErrNoEndpoint)
-		}
-		base, err := apiBaseURL(endpoint)
-		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: cannot build the Iceberg catalog client of the indexer", ErrNoEndpoint)
 		}
 		// The catalog lives at the server root, not under the API path: IcebergStore appends
-		// /iceberg/relative_to/<R>-metadata.<branch>/api itself (§4.3 step 3). Using the API base
+		// /iceberg/relative_to/<R>-metadata.<branch>/api itself (§4.3 step 3). Using an API base
 		// here would send every catalog request to /api/v1/iceberg/... and get a 404.
 		root, err := serverBaseURL(endpoint)
 		if err != nil {
 			return nil, err
 		}
-		if x.lakeFS == nil {
-			lakeFS, err := newLakeFSClient(base, opts.AccessKeyID, opts.SecretKey, x.requestTimeout)
-			if err != nil {
-				return nil, err
-			}
-			x.lakeFS = lakeFS
-		}
-		if x.tables == nil {
-			x.tables = &IcebergStore{
-				Endpoint:        root,
-				AccessKeyID:     opts.AccessKeyID,
-				SecretAccessKey: opts.SecretKey,
-				RequestTimeout:  x.requestTimeout,
-			}
+		x.tables = &IcebergStore{
+			Endpoint:         root,
+			AccessKeyID:      opts.AccessKeyID,
+			SecretAccessKey:  opts.SecretKey,
+			EncryptSecretKey: opts.EncryptSecretKey,
+			Storage:          opts.Storage,
+			RequestTimeout:   x.requestTimeout,
 		}
 	}
 	return x, nil
@@ -649,7 +658,7 @@ func (x *Indexer) listBranches(ctx context.Context, repository string) ([]string
 		}
 		after = lastNameOf(len(branches), func(i int) string { return branches[i].Name })
 		if after == "" {
-			return nil, fmt.Errorf("%w: list branches of %q: more results without a cursor", client.ErrBadPagination, repository)
+			return nil, fmt.Errorf("%w: list branches of %q: more results without a cursor", reader.ErrBadPagination, repository)
 		}
 	}
 }
@@ -679,7 +688,7 @@ func matchBranch(selector, branch string) bool {
 }
 
 // lastNameOf returns the cursor of the page that follows a listing: the name or path of its last
-// item, which is the cursor pkg/mds/client documents. It is empty for an empty page, which is what
+// item, which is the cursor pkg/mds/reader documents. It is empty for an empty page, which is what
 // makes a "more results" answer without an item an error instead of a loop.
 func lastNameOf(count int, name func(int) string) string {
 	if count == 0 {
@@ -689,8 +698,8 @@ func lastNameOf(count int, name func(int) string) string {
 }
 
 // serverBaseURL returns the lakeFS server root of an endpoint: the endpoint with a trailing
-// /api/v1 path removed. The API is mounted under it and the catalog at /iceberg directly below it
-// (§4.3 step 3), so both URLs have to come from this one normalisation.
+// /api/v1 path removed. The Iceberg catalog is mounted at /iceberg directly below it (§4.3 step
+// 3), which is where IcebergStore appends its own path.
 func serverBaseURL(endpoint string) (string, error) {
 	parsed, err := url.Parse(endpoint)
 	if err != nil {
@@ -705,38 +714,6 @@ func serverBaseURL(endpoint string) (string, error) {
 	parsed.RawQuery = ""
 	parsed.Fragment = ""
 	return strings.TrimRight(parsed.String(), "/"), nil
-}
-
-// apiBaseURL returns the lakeFS API base URL of an endpoint: the server root with /api/v1, so that
-// an endpoint that already carries the API path is not doubled.
-func apiBaseURL(endpoint string) (string, error) {
-	root, err := serverBaseURL(endpoint)
-	if err != nil {
-		return "", err
-	}
-	return root + apiutil.BaseURL, nil
-}
-
-// newLakeFSClient builds the typed lakeFS client of pkg/mds/client over the generated client,
-// authenticated as the indexer principal with HTTP basic (§8).
-//
-// The client carries requestTimeout: without it the generated client would fall back to
-// http.DefaultClient, which has no Timeout, and one connection that neither answers nor resets
-// would stall every repository of the tick loop (§4.1, §9). http.Client.Timeout covers the whole
-// exchange, including reading the response body, which is what the generated client does with
-// io.ReadAll.
-func newLakeFSClient(baseURL, accessKeyID, secretKey string, requestTimeout time.Duration) (client.LakeFS, error) {
-	httpClient := &http.Client{Timeout: requestTimeout}
-	api, err := apigen.NewClientWithResponses(baseURL,
-		apigen.WithHTTPClient(httpClient),
-		apigen.WithRequestEditorFn(func(_ context.Context, req *http.Request) error {
-			req.SetBasicAuth(accessKeyID, secretKey)
-			return nil
-		}))
-	if err != nil {
-		return nil, fmt.Errorf("build the lakeFS client of %q: %w", baseURL, err)
-	}
-	return client.New(api, 0), nil
 }
 
 // metadataRepository returns the name of the companion repository of a data repository (§3.3),

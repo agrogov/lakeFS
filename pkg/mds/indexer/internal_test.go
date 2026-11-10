@@ -1,7 +1,7 @@
 package indexer
 
-// internal_test.go tests the small unexported rules of this package directly: the URL the lakeFS
-// client is built for, the storage-namespace prefix test that §3.3 shares with the uncommitted GC,
+// internal_test.go tests the small unexported rules of this package directly: the catalog URL the
+// indexer is built for, the storage-namespace prefix test that §3.3 shares with the uncommitted GC,
 // the branch selectors of §4.1, and the two error mappings at the package's seams (the forbidden
 // write of §3.3/§4.8 and the writer's conflicts of §4.4). The behaviour they feed is covered from
 // the outside in *_test.go; these cases pin the rules themselves, including the inputs that are
@@ -16,39 +16,9 @@ import (
 	icebergtable "github.com/apache/iceberg-go/table"
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/graveler"
-	"github.com/treeverse/lakefs/pkg/mds/client"
+	"github.com/treeverse/lakefs/pkg/mds/reader"
 	"github.com/treeverse/lakefs/pkg/mds/table"
 )
-
-// TestAPIBaseURL pins the API base URL derivation: the endpoint may be the server root or already
-// carry the API path, and both must produce one /api/v1.
-func TestAPIBaseURL(t *testing.T) {
-	tests := []struct {
-		endpoint string
-		want     string
-		wantErr  bool
-	}{
-		{endpoint: "http://lakefs:8000", want: "http://lakefs:8000/api/v1"},
-		{endpoint: "http://lakefs:8000/", want: "http://lakefs:8000/api/v1"},
-		{endpoint: "http://lakefs:8000/api/v1", want: "http://lakefs:8000/api/v1"},
-		{endpoint: "http://lakefs:8000/api/v1/", want: "http://lakefs:8000/api/v1"},
-		{endpoint: "https://lakefs.example.com/lakefs", want: "https://lakefs.example.com/lakefs/api/v1"},
-		{endpoint: "http://lakefs:8000?x=1#frag", want: "http://lakefs:8000/api/v1"},
-		{endpoint: "lakefs:8000", wantErr: true},
-		{endpoint: "", wantErr: true},
-	}
-	for _, test := range tests {
-		t.Run(test.endpoint, func(t *testing.T) {
-			got, err := apiBaseURL(test.endpoint)
-			if test.wantErr {
-				require.ErrorIs(t, err, ErrNoEndpoint)
-				return
-			}
-			require.NoError(t, err)
-			require.Equal(t, test.want, got)
-		})
-	}
-}
 
 // TestMetadataNamespaceRoots pins the namespace rule of §3.3 on the helper itself, with the guide's
 // reading (G10/X10): a namespace derives the companion by appending "-metadata" to it, in every
@@ -236,7 +206,9 @@ func TestCatalogURLFromEndpoint(t *testing.T) {
 	}
 	var urls []string
 	for _, endpoint := range endpoints {
-		idx, err := New(Options{Endpoint: endpoint, AccessKeyID: "key", SecretKey: "secret"})
+		idx, err := New(Options{Endpoint: endpoint, AccessKeyID: "key", SecretKey: "secret",
+			// The reader is not what this test is about; New only requires one (RA4b).
+			LakeFS: reader.New(nil, 0)})
 		require.NoError(t, err)
 		store, ok := idx.tables.(*IcebergStore)
 		require.True(t, ok, "New builds the production IcebergStore")
@@ -256,7 +228,7 @@ func TestCatalogURLFromEndpoint(t *testing.T) {
 }
 
 // TestAutomaticCreationCommitMessage pins the one lakeFS constant this package spells out because
-// the indexer is a REST client and does not import pkg/graveler.
+// the indexer does not import pkg/graveler.
 func TestAutomaticCreationCommitMessage(t *testing.T) {
 	require.Equal(t, graveler.FirstCommitMsg, automaticCreationCommitMessage)
 }
@@ -264,10 +236,9 @@ func TestAutomaticCreationCommitMessage(t *testing.T) {
 // TestMetadataBranchWriteError pins R3I-1: a forbidden write is always the
 // ErrReadOnlyMetadataRepository family (a companion repository that refuses every write must fail the
 // repository, not every branch with a bare 403), but only lakeFS's own protection messages claim
-// branch protection. A 401 authorization denial and a catalog permission refusal carry the same
-// sentinel - pkg/mds/client/lakefs.go collapses 401 and 403 into client.ErrForbidden, and lakeFS
-// answers an authorization failure with 401 by default - so the predicate must read the wrapped
-// message, not the status.
+// branch protection. A catalog permission refusal and a protection refusal both arrive in the
+// reader.ErrForbidden family - pkg/mds/reader maps the protection and read-only refusals into it -
+// so the predicate must read the wrapped message, not the sentinel alone.
 func TestMetadataBranchWriteError(t *testing.T) {
 	const (
 		claimText = "a branch protection rule blocks"
@@ -276,14 +247,14 @@ func TestMetadataBranchWriteError(t *testing.T) {
 
 	t.Run("an authorization refusal is not branch protection", func(t *testing.T) {
 		// The default denial of a principal that lacks the companion repository's grant: lakeFS
-		// answers 401 (pkg/api/controller_authorization_status_test.go) and the client reports it as
-		// client.ErrForbidden.
-		err := fmt.Errorf("apply repo@s2: %w: permission denied: no policy grants fs:WriteObject", client.ErrForbidden)
+		// denies it (pkg/api/controller_authorization_status_test.go pins the 401) and, before RA10,
+		// pkg/mds/reader mapped the refusal into reader.ErrForbidden.
+		err := fmt.Errorf("apply repo@s2: %w: permission denied: no policy grants fs:WriteObject", reader.ErrForbidden)
 
 		got := metadataBranchWriteError("repo-metadata", "main", err)
 
 		require.ErrorIs(t, got, ErrReadOnlyMetadataRepository, "still the same family")
-		require.ErrorIs(t, got, client.ErrForbidden, "the cause stays in the chain")
+		require.ErrorIs(t, got, reader.ErrForbidden, "the cause stays in the chain")
 		require.NotContains(t, got.Error(), claimText, "branch protection is not the diagnosis")
 		require.NotContains(t, got.Error(), remedy, "and the destructive remedy is not offered")
 		require.NotContains(t, got.Error(), "read_only=false")
@@ -313,15 +284,15 @@ func TestMetadataBranchWriteError(t *testing.T) {
 	}{
 		{
 			name: "commit to a protected branch",
-			err:  fmt.Errorf("commit %q@main: %w: cannot commit to protected branch", "repo-metadata", client.ErrForbidden),
+			err:  fmt.Errorf("commit %q@main: %w: cannot commit to protected branch", "repo-metadata", reader.ErrForbidden),
 		},
 		{
 			name: "write to a protected branch",
-			err:  fmt.Errorf("write %q@main: %w: cannot write to protected branch", "repo-metadata", client.ErrForbidden),
+			err:  fmt.Errorf("write %q@main: %w: cannot write to protected branch", "repo-metadata", reader.ErrForbidden),
 		},
 		{
 			name: "a read-only repository",
-			err:  fmt.Errorf("commit %q@main: %w: read-only repository", "repo-metadata", client.ErrForbidden),
+			err:  fmt.Errorf("commit %q@main: %w: read-only repository", "repo-metadata", reader.ErrForbidden),
 		},
 		{
 			name: "the catalog's staging refusal",

@@ -18,10 +18,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/apache/iceberg-go"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/treeverse/lakefs/pkg/httputil"
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/mds/indexer"
+	"github.com/treeverse/lakefs/pkg/mds/reader"
 )
 
 const (
@@ -72,6 +74,13 @@ type Service struct {
 	health  *Health
 	tick    TickFunc
 
+	// lakeFS is the in-process reader of the server's repositories (RA4b), built by `mds run`
+	// from the same KV store and block adapter the lakeFS server uses. storage and secretKey are
+	// what the Iceberg REST catalog of a write needs from the same server configuration.
+	lakeFS    reader.LakeFS
+	storage   iceberg.Properties
+	secretKey string
+
 	mu   sync.RWMutex
 	addr string
 }
@@ -86,6 +95,33 @@ func WithTickFunc(tick TickFunc) ServiceOption {
 		if tick != nil {
 			s.tick = tick
 		}
+	}
+}
+
+// WithLakeFS installs the in-process reader the indexer works through (RA4b, X13). It is required
+// for Run to install the real indexer: `mds run` builds it over the KV store and block adapter of
+// the server configuration, so there is no REST client to build from an endpoint.
+func WithLakeFS(lakeFS reader.LakeFS) ServiceOption {
+	return func(s *Service) {
+		if lakeFS != nil {
+			s.lakeFS = lakeFS
+		}
+	}
+}
+
+// WithStorage sets the iceberg-go IO properties of a table write: the block adapter's own
+// credentials, derived from the standard blockstore.* configuration of the process (X6, RA4b).
+func WithStorage(storage iceberg.Properties) ServiceOption {
+	return func(s *Service) {
+		s.storage = storage
+	}
+}
+
+// WithEncryptSecretKey sets auth.encrypt.secret_key of the server configuration. RA5 signs the
+// Metadata Search service user's login token with it, and it must be the server's own key (G12).
+func WithEncryptSecretKey(secretKey string) ServiceOption {
+	return func(s *Service) {
+		s.secretKey = secretKey
 	}
 }
 
@@ -259,7 +295,7 @@ func (s *Service) installIndexer() error {
 	if s.tick != nil {
 		return nil
 	}
-	idx, err := indexer.New(indexerOptions(s.cfg, s.health, s.metrics, s.log))
+	idx, err := indexer.New(indexerOptions(s.cfg, s.lakeFS, s.storage, s.secretKey, s.health, s.metrics, s.log))
 	if err != nil {
 		return fmt.Errorf("%w: cannot start the indexer: %w", ErrInvalidConfig, err)
 	}
@@ -275,11 +311,14 @@ func (s *Service) installIndexer() error {
 // threshold and the compaction triggers keep their documented defaults, tag retention keeps every
 // mds-* tag, branch deletion is mirrored, and the object-store credentials of a write come from the
 // standard blockstore configuration of the process rather than from a metadata_search key.
-func indexerOptions(cfg *Config, health *Health, metrics Recorder, log logging.Logger) indexer.Options {
+func indexerOptions(cfg *Config, lakeFS reader.LakeFS, storage iceberg.Properties, secretKey string, health *Health, metrics Recorder, log logging.Logger) indexer.Options {
 	opts := indexer.Options{
-		Endpoint:    cfg.LakeFSEndpoint,
-		AccessKeyID: cfg.AccessKeyID,
-		SecretKey:   cfg.SecretKey,
+		LakeFS:           lakeFS,
+		Endpoint:         cfg.LakeFSEndpoint,
+		AccessKeyID:      cfg.AccessKeyID,
+		SecretKey:        cfg.SecretKey,
+		EncryptSecretKey: secretKey,
+		Storage:          storage,
 		// X11: the guide has no backfill key. The first sync of a branch captures metadata "from
 		// the time the branch was created", or from since when it is set, so the branch is always
 		// walked back to its oldest first-parent commit.

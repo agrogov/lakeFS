@@ -21,8 +21,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/treeverse/lakefs/pkg/logging"
-	"github.com/treeverse/lakefs/pkg/mds/client"
 	"github.com/treeverse/lakefs/pkg/mds/indexer"
+	"github.com/treeverse/lakefs/pkg/mds/reader"
 	"github.com/treeverse/lakefs/pkg/mds/table"
 )
 
@@ -59,7 +59,7 @@ func (e *env) requireRow(branch, path, commitID string, size int64) table.Row {
 // lakeFS commit and the mds-<commit> tag make the position addressable.
 func TestBackfillHead(t *testing.T) {
 	e := newEnv(t)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10), object("b", 20)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10), object("b", 20)})
 
 	e.tick()
 
@@ -108,12 +108,12 @@ func TestBackfillSeedsFromAnAncestorTag(t *testing.T) {
 	e := newEnv(t, func(opts *indexer.Options) {
 		opts.Repositories[0].Branches = []string{"main", "feature-*"}
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10), object("b", 20)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10), object("b", 20)})
 	e.tick()
 	require.Equal(t, 1, e.fake.rebuildCalls)
 
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 25)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 25)})
 	// R@feature-x branches from s1 and has one commit of its own, s2.
 	e.fake.setBranchHead("repo", "feature-x", "s2")
 
@@ -140,11 +140,11 @@ func TestBackfillHistory(t *testing.T) {
 	e := newEnv(t, func(opts *indexer.Options) {
 		opts.Backfill = indexer.BackfillHistory
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, nil)
-	e.fake.setDiff("repo", "s2", "s3", []client.Change{removed("a")})
+	e.fake.setDiff("repo", "s2", "s3", []reader.Change{removed("a")})
 
 	e.tick()
 
@@ -172,13 +172,13 @@ func TestBackfillHistorySince(t *testing.T) {
 		opts.Backfill = indexer.BackfillHistory
 		opts.Since = &since
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.fake.setCommitDate("repo", "s1", base)
-	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, []client.ObjectStat{object("a", 10), object("b", 20)})
+	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, []reader.ObjectStat{object("a", 10), object("b", 20)})
 	e.fake.setCommitDate("repo", "s2", since)
-	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, []client.ObjectStat{object("b", 20)})
+	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, []reader.ObjectStat{object("b", 20)})
 	e.fake.setCommitDate("repo", "s3", since.Add(time.Hour))
-	e.fake.setDiff("repo", "s2", "s3", []client.Change{removed("a")})
+	e.fake.setDiff("repo", "s2", "s3", []reader.Change{removed("a")})
 
 	e.tick()
 
@@ -198,7 +198,7 @@ func TestMaxCommitsBoundsATick(t *testing.T) {
 	e := newEnv(t, func(opts *indexer.Options) {
 		opts.MaxCommits = 2
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.tick()
 
 	paths := []string{"b", "c", "d", "e"}
@@ -206,7 +206,7 @@ func TestMaxCommitsBoundsATick(t *testing.T) {
 	for i, path := range paths {
 		commit := fmt.Sprintf("t%d", i+2)
 		e.fake.addCommit("repo", "main", commit, []string{parent}, nil)
-		e.fake.setDiff("repo", parent, commit, []client.Change{added(path, int64(10*(i+2)))})
+		e.fake.setDiff("repo", parent, commit, []reader.Change{added(path, int64(10*(i+2)))})
 		parent = commit
 	}
 
@@ -233,7 +233,7 @@ func TestPendingPagesTheLog(t *testing.T) {
 	t.Run("every commit of the backlog is applied", func(t *testing.T) {
 		e := newEnv(t)
 		e.fake.pageSize = 2
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 		e.tick()
 		calls, read := e.fake.logCommitsCalls("repo"), e.fake.logCommitsRead("repo")
 
@@ -242,7 +242,7 @@ func TestPendingPagesTheLog(t *testing.T) {
 		for i := 2; i <= 6; i++ {
 			id, path := fmt.Sprintf("s%d", i), fmt.Sprintf("p%d", i)
 			e.fake.addCommit("repo", "main", id, []string{parent}, nil)
-			e.fake.setDiff("repo", parent, id, []client.Change{added(path, int64(10*i))})
+			e.fake.setDiff("repo", parent, id, []reader.Change{added(path, int64(10*i))})
 			parent = id
 		}
 
@@ -263,12 +263,12 @@ func TestPendingPagesTheLog(t *testing.T) {
 			opts.MaxCommits = 1
 		})
 		e.fake.pageSize = 2
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 		e.tick()
 		e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+		e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 		e.fake.addCommit("repo", "main", "s3", []string{"s2"}, nil)
-		e.fake.setDiff("repo", "s2", "s3", []client.Change{added("c", 30)})
+		e.fake.setDiff("repo", "s2", "s3", []reader.Change{added("c", 30)})
 		calls := e.fake.logCommitsCalls("repo")
 
 		e.tick()
@@ -292,15 +292,15 @@ func TestPendingPagesTheLog(t *testing.T) {
 			opts.Repositories[0].Branches = []string{"main", "side"}
 		})
 		e.fake.pageSize = 1
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 		e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+		e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 		// side1 is reachable from the merge only through its second parent.
 		e.fake.addCommit("repo", "side", "side1", []string{"s1"}, nil)
-		e.fake.setDiff("repo", "s1", "side1", []client.Change{added("x", 99)})
+		e.fake.setDiff("repo", "s1", "side1", []reader.Change{added("x", 99)})
 		e.fake.addCommit("repo", "main", "m", []string{"s2", "side1"},
-			[]client.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
-		e.fake.setDiff("repo", "s2", "m", []client.Change{added("c", 30)})
+			[]reader.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
+		e.fake.setDiff("repo", "s2", "m", []reader.Change{added("c", 30)})
 		e.tick()
 		require.Equal(t, []string{"a", "b", "c"}, e.paths("main"))
 
@@ -333,19 +333,19 @@ func TestFarBehindBranchIsRebuiltInsteadOfWalked(t *testing.T) {
 		opts.MaxCommits = 1
 	})
 	e.fake.pageSize = 2
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.tick()
 	require.Equal(t, 1, e.fake.rebuildCalls)
 	initCommit := e.fake.initCommitID()
 	require.NotEmpty(t, initCommit)
 
 	// 40 pending commits: far deeper than the commits one tick may read.
-	objects := []client.ObjectStat{object("a", 10)}
+	objects := []reader.ObjectStat{object("a", 10)}
 	parent := "s1"
 	for i := 2; i <= 41; i++ {
 		id, path := fmt.Sprintf("s%02d", i), fmt.Sprintf("p%02d", i)
 		e.fake.addCommit("repo", "main", id, []string{parent}, nil)
-		e.fake.setDiff("repo", parent, id, []client.Change{added(path, int64(i))})
+		e.fake.setDiff("repo", parent, id, []reader.Change{added(path, int64(i))})
 		objects = append(objects, object(path, int64(i)))
 		parent = id
 	}
@@ -391,15 +391,15 @@ func TestMergeUsesTheFirstParent(t *testing.T) {
 	e := newEnv(t, func(opts *indexer.Options) {
 		opts.Backfill = indexer.BackfillHistory
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 	// A side branch that is never on the first-parent chain.
 	e.fake.addCommit("repo", "", "side", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "side", []client.Change{added("x", 99)})
+	e.fake.setDiff("repo", "s1", "side", []reader.Change{added("x", 99)})
 	// The merge: first parent s2, second parent side, and it brings c in.
 	merge := e.fake.addCommit("repo", "main", "m", []string{"s2", "side"}, nil)
-	e.fake.setDiff("repo", "s2", "m", []client.Change{added("c", 30)})
+	e.fake.setDiff("repo", "s2", "m", []reader.Change{added("c", 30)})
 
 	e.tick()
 
@@ -425,17 +425,17 @@ func TestRecovery(t *testing.T) {
 	indexed := func(t *testing.T) *env {
 		t.Helper()
 		e := newEnv(t)
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 		e.tick()
 		e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+		e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 		return e
 	}
 	// indexedOnce is an environment where main is indexed at s1 and nothing else is pending.
 	indexedOnce := func(t *testing.T) *env {
 		t.Helper()
 		e := newEnv(t)
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 		e.tick()
 		return e
 	}
@@ -629,11 +629,11 @@ func TestHardResetRewriteWithTag(t *testing.T) {
 	e := newEnv(t, func(opts *indexer.Options) {
 		opts.Backfill = indexer.BackfillHistory
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, nil)
-	e.fake.setDiff("repo", "s2", "s3", []client.Change{added("c", 30)})
+	e.fake.setDiff("repo", "s2", "s3", []reader.Change{added("c", 30)})
 	e.tick()
 	require.Equal(t, []string{"a", "b", "c"}, e.paths("main"))
 
@@ -659,11 +659,11 @@ func TestHardResetRewriteWithoutTag(t *testing.T) {
 	e := newEnv(t, func(opts *indexer.Options) {
 		opts.Backfill = indexer.BackfillHistory
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
-	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, []client.ObjectStat{object("a", 10), object("b", 20)})
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
-	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, []client.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
-	e.fake.setDiff("repo", "s2", "s3", []client.Change{added("c", 30)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, []reader.ObjectStat{object("a", 10), object("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
+	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, []reader.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
+	e.fake.setDiff("repo", "s2", "s3", []reader.Change{added("c", 30)})
 	e.tick()
 
 	initCommit := e.fake.initCommitID()
@@ -695,11 +695,11 @@ func TestRewriteWithStagedChanges(t *testing.T) {
 		e := newEnv(t, func(opts *indexer.Options) {
 			opts.Backfill = indexer.BackfillHistory
 		})
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
-		e.fake.addCommit("repo", "main", "s2", []string{"s1"}, []client.ObjectStat{object("a", 10), object("b", 20)})
-		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
-		e.fake.addCommit("repo", "main", "s3", []string{"s2"}, []client.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
-		e.fake.setDiff("repo", "s2", "s3", []client.Change{added("c", 30)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s2", []string{"s1"}, []reader.ObjectStat{object("a", 10), object("b", 20)})
+		e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
+		e.fake.addCommit("repo", "main", "s3", []string{"s2"}, []reader.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
+		e.fake.setDiff("repo", "s2", "s3", []reader.Change{added("c", 30)})
 		e.tick()
 		require.Equal(t, []string{"a", "b", "c"}, e.paths("main"))
 
@@ -771,16 +771,16 @@ func TestRewriteWithStagedChanges(t *testing.T) {
 }
 
 // TestUnrelatedHistoriesRewrite pins §4.7 when R@b is force-moved to a commit with no common
-// ancestor. graveler answers ErrNoMergeBase and pkg/api returns a 500; the client types it and the
-// indexer takes the fallback instead of failing the branch on every tick.
+// ancestor. graveler answers ErrNoMergeBase and pkg/api returns a 500; pkg/mds/reader types it and
+// the indexer takes the fallback instead of failing the branch on every tick.
 func TestUnrelatedHistoriesRewrite(t *testing.T) {
 	e := newEnv(t, func(opts *indexer.Options) {
 		opts.Backfill = indexer.BackfillHistory
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.tick()
 
-	e.fake.addCommit("repo", "", "other", nil, []client.ObjectStat{object("z", 99)})
+	e.fake.addCommit("repo", "", "other", nil, []reader.ObjectStat{object("z", 99)})
 	e.fake.setBranchHead("repo", "main", "other")
 	initCommit := e.fake.initCommitID()
 	require.NotEmpty(t, initCommit)
@@ -808,14 +808,14 @@ func TestPositionReachableOnlyThroughSecondParent(t *testing.T) {
 		opts.Backfill = indexer.BackfillHistory
 		opts.Repositories[0].Branches = []string{"main", "side"}
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 	// The side commit is reachable from the merge only through its second parent.
 	e.fake.addCommit("repo", "side", "side1", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "side1", []client.Change{added("x", 99)})
-	e.fake.addCommit("repo", "main", "m", []string{"s2", "side1"}, []client.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
-	e.fake.setDiff("repo", "s2", "m", []client.Change{added("c", 30)})
+	e.fake.setDiff("repo", "s1", "side1", []reader.Change{added("x", 99)})
+	e.fake.addCommit("repo", "main", "m", []string{"s2", "side1"}, []reader.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
+	e.fake.setDiff("repo", "s2", "m", []reader.Change{added("c", 30)})
 	e.tick()
 	require.Equal(t, []string{"a", "b", "c"}, e.paths("main"))
 
@@ -846,9 +846,9 @@ func TestPositionReachableOnlyThroughSecondParent(t *testing.T) {
 // position that is gone, so the tick takes the full-rebuild fallback §4.7 already has.
 func TestCollectedPositionIsRebuilt(t *testing.T) {
 	e := newEnv(t)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
-	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, []client.ObjectStat{object("a", 10), object("b", 20)})
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, []reader.ObjectStat{object("a", 10), object("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 	e.tick()
 	require.Equal(t, []string{"a", "b"}, e.paths("main"))
 	require.Equal(t, "s2", e.health.branch("repo", "main").lastIndexed)
@@ -856,7 +856,7 @@ func TestCollectedPositionIsRebuilt(t *testing.T) {
 	// Committed GC collects s2 (no branch refers to it any more) and R@main is re-created on an
 	// unrelated root, which is what deleting and re-creating R looks like to the indexer.
 	e.fake.deleteCommit("repo", "s2")
-	e.fake.addCommit("repo", "", "fresh", nil, []client.ObjectStat{object("z", 99)})
+	e.fake.addCommit("repo", "", "fresh", nil, []reader.ObjectStat{object("z", 99)})
 	e.fake.setBranchHead("repo", "main", "fresh")
 	initCommit := e.fake.initCommitID()
 	require.NotEmpty(t, initCommit)
@@ -891,13 +891,13 @@ func TestCollectedPositionIsRebuilt(t *testing.T) {
 // dereferences stop_at before it walks, so the log answers 404 there too (the fake models that).
 func TestCollectedPositionDuringTheWalkIsRebuilt(t *testing.T) {
 	e := newEnv(t)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.tick()
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 	e.fake.addCommit("repo", "main", "s3", []string{"s2"},
-		[]client.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
-	e.fake.setDiff("repo", "s2", "s3", []client.Change{added("c", 30)})
+		[]reader.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
+	e.fake.setDiff("repo", "s2", "s3", []reader.Change{added("c", 30)})
 	initCommit := e.fake.initCommitID()
 	require.NotEmpty(t, initCommit)
 	rebuilds := e.fake.rebuildCalls
@@ -925,7 +925,7 @@ func TestCollectedPositionDuringTheWalkIsRebuilt(t *testing.T) {
 // paid one request per tick and a transient 404 on it failed a branch that had no work.
 func TestCaughtUpBranchDoesNotReadTheMergeBase(t *testing.T) {
 	e := newEnv(t)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.tick()
 	require.NoError(t, e.health.branch("repo", "main").err)
 
@@ -935,7 +935,7 @@ func TestCaughtUpBranchDoesNotReadTheMergeBase(t *testing.T) {
 	require.Zero(t, e.fake.findMergeBaseCalls, "a branch at its head makes no merge-base read")
 
 	// A transient 404 on the merge base does not touch a branch that is already caught up.
-	e.fake.findMergeBaseErr = &client.NotFoundError{Operation: "find merge base", Subject: "s1"}
+	e.fake.findMergeBaseErr = &reader.NotFoundError{Operation: "find merge base", Subject: "s1"}
 	e.tick()
 	rec := e.health.branch("repo", "main")
 	require.NoError(t, rec.err)
@@ -951,18 +951,18 @@ func TestCaughtUpBranchDoesNotReadTheMergeBase(t *testing.T) {
 // branch to the initialisation commit and rebuild it.
 func TestNotFoundThatIsNotThePositionIsAFailure(t *testing.T) {
 	e := newEnv(t)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.tick()
-	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, []client.ObjectStat{object("a", 10), object("b", 20)})
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, []reader.ObjectStat{object("a", 10), object("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 	rebuilds := e.fake.rebuildCalls
-	e.fake.findMergeBaseErr = &client.NotFoundError{Operation: "find merge base", Subject: "s2"}
+	e.fake.findMergeBaseErr = &reader.NotFoundError{Operation: "find merge base", Subject: "s2"}
 
 	e.tick()
 
 	err := e.health.branch("repo", "main").err
 	require.Error(t, err, "a 404 that is not about the recorded position is still an error")
-	require.ErrorIs(t, err, client.ErrNotFound, "and it is not swallowed")
+	require.ErrorIs(t, err, reader.ErrNotFound, "and it is not swallowed")
 	require.Empty(t, e.fake.hardResets, "the recorded position exists, so nothing is rebuilt")
 	require.Equal(t, rebuilds, e.fake.rebuildCalls)
 	require.Equal(t, []string{"a"}, e.paths("main"), "the table is left at the recorded position")
@@ -983,7 +983,7 @@ func TestBranchDelete(t *testing.T) {
 			opts.Repositories[0].Branches = []string{"main", "feature"}
 			opts.DeleteBranches = deleteBranches
 		})
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 		e.fake.setBranchHead("repo", "feature", "s1")
 		e.tick()
 		require.Len(t, e.fake.createdBranches, 1, "feature is seeded from mds-s1")
@@ -1031,14 +1031,14 @@ func TestMetadataDefaultBranchIsNeverRetired(t *testing.T) {
 		opts.DeleteBranches = true
 		opts.Log = logger
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.fake.setCommitDate("repo", "s1", now.Add(-72*time.Hour))
 	e.tick()
 
 	// A tag that retention may retire, to prove it still runs after the default-branch skip.
 	e.fake.addCommit("repo", "", "old-source", nil, nil)
 	e.fake.setCommitDate("repo", "old-source", now.Add(-72*time.Hour))
-	e.fake.setCommit("repo-metadata", client.Commit{
+	e.fake.setCommit("repo-metadata", reader.Commit{
 		ID: "old-index",
 		Metadata: map[string]string{
 			indexer.MetadataKeySourceCommit:     "old-source",
@@ -1050,7 +1050,7 @@ func TestMetadataDefaultBranchIsNeverRetired(t *testing.T) {
 	// R renames its default branch to trunk and deletes main. R-metadata keeps main as its own
 	// default branch.
 	e.fake.branches["repo"]["trunk"] = "s1"
-	e.fake.repositories["repo"] = client.Repository{
+	e.fake.repositories["repo"] = reader.Repository{
 		Name:             "repo",
 		StorageNamespace: "s3://bucket/data",
 		DefaultBranch:    "trunk",
@@ -1079,7 +1079,7 @@ func TestBranchStopsMatchingDropsItsHealth(t *testing.T) {
 	e := newEnv(t, func(opts *indexer.Options) {
 		opts.Repositories[0].Branches = []string{"main", "feature"}
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.fake.setBranchHead("repo", "feature", "s1")
 	e.tick()
 	require.True(t, e.health.hasBranch("repo", "feature"))
@@ -1103,16 +1103,16 @@ func TestBranchStopsMatchingDropsItsHealth(t *testing.T) {
 // happens - the mirror is neither advanced nor deleted.
 func TestBranchStopsMatchingKeepsItsTable(t *testing.T) {
 	e := newEnv(t)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.fake.setBranchHead("repo", "feature", "s1")
 	e.tick()
 
-	// A metadata branch that the configuration no longer matches, created through the same client
+	// A metadata branch that the configuration no longer matches, created through the same reader
 	// the indexer uses.
 	initCommit := e.fake.initCommitID()
 	require.NoError(t, e.fake.CreateBranch(t.Context(), "repo-metadata", "feature", initCommit))
 	// R@feature moves on while the selector says "main" only.
-	e.fake.addCommit("repo", "feature", "s2", []string{"s1"}, []client.ObjectStat{object("a", 10), object("b", 20)})
+	e.fake.addCommit("repo", "feature", "s2", []string{"s1"}, []reader.ObjectStat{object("a", 10), object("b", 20)})
 	before, _ := e.fake.branchHead("repo-metadata", "feature")
 
 	e.tick()
@@ -1159,11 +1159,11 @@ func (t *reloadHookTable) Refresh(ctx context.Context) error {
 // delta again instead of only committing the staged table.
 func TestReloadTableBeforeApplyingCommit(t *testing.T) {
 	e := newEnv(t)
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.tick()
 
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 
 	store := &reloadHookStore{TableStore: e.fake}
 	store.onReload = func() {
@@ -1211,14 +1211,14 @@ func TestBackfillHeadSince(t *testing.T) {
 		opts.Since = &since
 		// Backfill is left at its default, head.
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.fake.setCommitDate("repo", "s1", base)
 	e.fake.addCommit("repo", "main", "s2", []string{"s1"},
-		[]client.ObjectStat{object("a", 10), object("b", 20)})
+		[]reader.ObjectStat{object("a", 10), object("b", 20)})
 	e.fake.setCommitDate("repo", "s2", base.Add(48*time.Hour))
-	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, []client.ObjectStat{object("b", 20)})
+	e.fake.addCommit("repo", "main", "s3", []string{"s2"}, []reader.ObjectStat{object("b", 20)})
 	e.fake.setCommitDate("repo", "s3", since.Add(time.Hour))
-	e.fake.setDiff("repo", "s2", "s3", []client.Change{removed("a")})
+	e.fake.setDiff("repo", "s2", "s3", []reader.Change{removed("a")})
 
 	e.tick()
 
@@ -1243,19 +1243,19 @@ func TestSeedLookbackBoundsTheSeedingWalk(t *testing.T) {
 		e := newEnv(t, func(opts *indexer.Options) {
 			opts.Repositories[0].Branches = []string{"main"}
 		})
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 		e.tick()
 		require.Equal(t, 1, e.fake.rebuildCalls)
 
 		e.fake.addCommit("repo", "main", "s2", []string{"s1"},
-			[]client.ObjectStat{object("a", 10), object("b", 20)})
-		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+			[]reader.ObjectStat{object("a", 10), object("b", 20)})
+		e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 		e.fake.addCommit("repo", "main", "s3", []string{"s2"},
-			[]client.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
-		e.fake.setDiff("repo", "s2", "s3", []client.Change{added("c", 30)})
+			[]reader.ObjectStat{object("a", 10), object("b", 20), object("c", 30)})
+		e.fake.setDiff("repo", "s2", "s3", []reader.Change{added("c", 30)})
 		e.fake.addCommit("repo", "main", "s4", []string{"s3"},
-			[]client.ObjectStat{object("a", 10), object("b", 20), object("c", 30), object("d", 40)})
-		e.fake.setDiff("repo", "s3", "s4", []client.Change{added("d", 40)})
+			[]reader.ObjectStat{object("a", 10), object("b", 20), object("c", 30), object("d", 40)})
+		e.fake.setDiff("repo", "s3", "s4", []reader.Change{added("d", 40)})
 
 		e.fake.setBranchHead("repo", "feature", "s4")
 		return e
@@ -1373,7 +1373,7 @@ func TestConcurrencyBoundsBranchesInFlight(t *testing.T) {
 	})
 	for i := 1; i <= branches; i++ {
 		branch := fmt.Sprintf("b%d", i)
-		e.fake.addCommit("repo", branch, "s1-"+branch, nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", branch, "s1-"+branch, nil, []reader.ObjectStat{object("a", 10)})
 	}
 	e.tick()
 	require.Equal(t, branches, e.fake.rebuildCalls, "every branch is backfilled")
@@ -1385,8 +1385,8 @@ func TestConcurrencyBoundsBranchesInFlight(t *testing.T) {
 		branch := fmt.Sprintf("b%d", i)
 		commit := "s2-" + branch
 		e.fake.addCommit("repo", branch, commit, []string{"s1-" + branch},
-			[]client.ObjectStat{object("a", 10), object("b", 20)})
-		e.fake.setDiff("repo", "s1-"+branch, commit, []client.Change{added("b", 20)})
+			[]reader.ObjectStat{object("a", 10), object("b", 20)})
+		e.fake.setDiff("repo", "s1-"+branch, commit, []reader.Change{added("b", 20)})
 	}
 
 	e.tick()
@@ -1407,13 +1407,13 @@ func TestConcurrencyBoundsBranchesInFlight(t *testing.T) {
 // before the indexer commits to it. It is the probe TS-3 describes: a branch (or its repository)
 // that disappears while a tick is writing is a 404 in real lakeFS, not a silent success.
 type deleteMetadataBranchBeforeCommit struct {
-	client.LakeFS
+	reader.LakeFS
 	repository string
 	branch     string
 	once       sync.Once
 }
 
-func (w *deleteMetadataBranchBeforeCommit) Commit(ctx context.Context, repository, branch string, opts client.CommitOptions) (client.Commit, error) {
+func (w *deleteMetadataBranchBeforeCommit) Commit(ctx context.Context, repository, branch string, opts reader.CommitOptions) (reader.Commit, error) {
 	if repository == w.repository && branch == w.branch {
 		w.once.Do(func() { _ = w.LakeFS.DeleteBranch(ctx, w.repository, w.branch) })
 	}
@@ -1429,13 +1429,13 @@ func TestMetadataBranchDeletedDuringATickFails(t *testing.T) {
 	e := newEnv(t, func(opts *indexer.Options) {
 		opts.Repositories[0].Branches = []string{"main", "feature"}
 	})
-	e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+	e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 	e.fake.setBranchHead("repo", "feature", "s1")
 	e.tick()
 	require.Len(t, e.fake.createdBranches, 1, "the feature mirror is created")
 
 	e.fake.addCommit("repo", "feature", "s2", []string{"s1"}, nil)
-	e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+	e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 
 	wrapped := &deleteMetadataBranchBeforeCommit{
 		LakeFS:     e.fake,
@@ -1455,7 +1455,7 @@ func TestMetadataBranchDeletedDuringATickFails(t *testing.T) {
 
 	err = e.health.branch("repo", "feature").err
 	require.Error(t, err, "a commit to a branch that is gone is not a success")
-	require.ErrorIs(t, err, client.ErrNotFound, "it is the 404 lakeFS answers")
+	require.ErrorIs(t, err, reader.ErrNotFound, "it is the 404 lakeFS answers")
 	require.NoError(t, e.health.branch("repo", "main").err, "the other branch is unaffected")
 	_, ok := e.fake.branchHead("repo-metadata", "feature")
 	require.False(t, ok, "the fake does not re-create the branch under an indexing commit")
@@ -1504,10 +1504,10 @@ func TestErrorMessagesNameTheRepositoryBeforeTheBranch(t *testing.T) {
 
 	t.Run("before applying a commit", func(t *testing.T) {
 		e := newEnv(t)
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 		e.tick()
 		e.fake.addCommit("repo", "main", "s2", []string{"s1"}, nil)
-		e.fake.setDiff("repo", "s1", "s2", []client.Change{added("b", 20)})
+		e.fake.setDiff("repo", "s1", "s2", []reader.Change{added("b", 20)})
 
 		idx, err := indexer.New(indexer.Options{
 			LakeFS:       e.fake,
@@ -1524,7 +1524,7 @@ func TestErrorMessagesNameTheRepositoryBeforeTheBranch(t *testing.T) {
 
 	t.Run("after discarding staging", func(t *testing.T) {
 		e := newEnv(t)
-		e.fake.addCommit("repo", "main", "s1", nil, []client.ObjectStat{object("a", 10)})
+		e.fake.addCommit("repo", "main", "s1", nil, []reader.ObjectStat{object("a", 10)})
 		e.tick()
 		committed, ok := e.fake.tableState("main")
 		require.True(t, ok)
@@ -1561,6 +1561,8 @@ func TestReloadReusesTheBranchCatalog(t *testing.T) {
 	buildIndexer := func(endpoint string) *indexer.Indexer {
 		t.Helper()
 		idx, err := indexer.New(indexer.Options{
+			// RA4b: the repositories are read in process; only the table files go over REST.
+			LakeFS:      reader.New(env.catalog, 0),
 			Endpoint:    endpoint,
 			AccessKeyID: env.accessKeyID,
 			SecretKey:   env.secretKey,

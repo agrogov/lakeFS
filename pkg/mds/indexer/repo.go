@@ -20,14 +20,14 @@ import (
 	"github.com/apache/iceberg-go/catalog/rest"
 	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"github.com/treeverse/lakefs/pkg/logging"
-	"github.com/treeverse/lakefs/pkg/mds/client"
+	"github.com/treeverse/lakefs/pkg/mds/reader"
 	"github.com/treeverse/lakefs/pkg/mds/table"
 )
 
 // automaticCreationCommitMessage is the message lakeFS gives the root commit of a non-bare
 // repository (pkg/graveler.FirstCommitMsg). A companion repository is created non-bare, so its
 // default branch starts with this commit and the initialisation commit is the first commit after
-// it. The indexer is a REST client and does not import pkg/graveler, so the string is spelled here;
+// it. The indexer does not import pkg/graveler, so the string is spelled here;
 // a test pins it to the real constant.
 const automaticCreationCommitMessage = "Repository created"
 
@@ -56,11 +56,11 @@ var protectedBranchWriteCauses = []string{
 }
 
 // claimsProtectedBranchWrite reports whether err carries one of lakeFS's own protection messages.
-// The wrapped cause is what decides: the HTTP status is the same 401/403 for a protection rule, a
-// read_only repository and a principal that lacks fs:WriteObject
+// The wrapped cause is what decides: a protection rule, a read_only repository and (before RA10) a
+// principal that lacks the catalog permission all arrive as the same 403 family
 // (pkg/api/controller_authorization_status_test.go: an authorization failure is 401 by default, and
-// 403 when auth.authorization_failure_status opts in), and pkg/mds/client/lakefs.go collapses both
-// statuses into client.ErrForbidden. Claiming protection from the status alone told an operator to
+// 403 when auth.authorization_failure_status opts in), and pkg/mds/reader maps the protection
+// refusals into reader.ErrForbidden. Claiming protection from the status alone told an operator to
 // look for a rule when the missing grant was the indexer's (R3I-1).
 func claimsProtectedBranchWrite(err error) bool {
 	message := err.Error()
@@ -92,7 +92,7 @@ func metadataBranchWriteError(metadata, branch string, err error) error {
 	if err == nil || errors.Is(err, ErrReadOnlyMetadataRepository) {
 		return err
 	}
-	if !errors.Is(err, client.ErrForbidden) && !errors.Is(err, rest.ErrForbidden) {
+	if !errors.Is(err, reader.ErrForbidden) && !errors.Is(err, rest.ErrForbidden) {
 		return err
 	}
 	if claimsProtectedBranchWrite(err) {
@@ -151,7 +151,7 @@ func (x *Indexer) ensureMetadataRepository(ctx context.Context, repository Repos
 
 	meta, err := x.lakeFS.GetRepository(ctx, metadata)
 	switch {
-	case errors.Is(err, client.ErrNotFound):
+	case errors.Is(err, reader.ErrNotFound):
 		meta, err = x.createMetadataRepository(ctx, repository, data)
 		if err != nil {
 			return "", err
@@ -188,23 +188,23 @@ func (x *Indexer) ensureMetadataRepository(ctx context.Context, repository Repos
 // createMetadataRepository creates R-metadata for a configured data repository (§3.3) and returns
 // it. A concurrent replica that created it first is not an error: the initialisation that follows
 // then completes it.
-func (x *Indexer) createMetadataRepository(ctx context.Context, repository Repository, data client.Repository) (client.Repository, error) {
+func (x *Indexer) createMetadataRepository(ctx context.Context, repository Repository, data reader.Repository) (reader.Repository, error) {
 	namespace, err := metadataNamespace(repository.Name, data.StorageNamespace, repository.StorageNamespace)
 	if err != nil {
-		return client.Repository{}, err
+		return reader.Repository{}, err
 	}
 	metadata := metadataRepository(repository.Name)
-	created, err := x.lakeFS.CreateRepository(ctx, client.RepositoryOptions{
+	created, err := x.lakeFS.CreateRepository(ctx, reader.RepositoryOptions{
 		Name:             metadata,
 		StorageNamespace: namespace,
 		DefaultBranch:    data.DefaultBranch,
 		StorageID:        data.StorageID,
 	})
-	if errors.Is(err, client.ErrConflict) {
+	if errors.Is(err, reader.ErrConflict) {
 		return x.lakeFS.GetRepository(ctx, metadata)
 	}
 	if err != nil {
-		return client.Repository{}, fmt.Errorf("create companion repository %q in %q: %w", metadata, namespace, err)
+		return reader.Repository{}, fmt.Errorf("create companion repository %q in %q: %w", metadata, namespace, err)
 	}
 	x.log.WithFields(logging.Fields{
 		"repository":        repository.Name,
@@ -235,7 +235,7 @@ func (x *Indexer) ensureInitialised(ctx context.Context, repository, metadata, d
 
 	_, err := x.lakeFS.GetCommit(ctx, metadata, branch)
 	switch {
-	case errors.Is(err, client.ErrNotFound):
+	case errors.Is(err, reader.ErrNotFound):
 		// An empty repository: R-metadata was created but its initialisation commit is missing.
 		x.log.WithFields(logging.Fields{"repository": repository, "metadata": metadata}).
 			Warn("mds: completing an interrupted initialisation")
@@ -319,24 +319,24 @@ func (x *Indexer) verifyInitCommit(ctx context.Context, repository, metadata, br
 type initScan struct {
 	// commits counts the commits visited, and first is the newest of them.
 	commits int
-	first   client.Commit
+	first   reader.Commit
 
 	// markerSeen reports that an initialisation commit was visited, and initCommit is the one
 	// closest to the root visited so far, i.e. the oldest member of the run.
 	markerSeen bool
-	initCommit client.Commit
+	initCommit reader.Commit
 
 	// gap is the first commit below the run that carries no marker. A run is accepted only when
 	// that commit is lakeFS's automatic creation root; a marker below the gap, or a second gap,
 	// ends the walk with a refusal.
-	gap     client.Commit
+	gap     reader.Commit
 	gapSeen bool
 	refused bool
 }
 
 // visit consumes one commit of the walk, newest first, and reports whether the walk can stop. The
 // walk visits nothing below an automatic creation root: it has no parent.
-func (s *initScan) visit(commit client.Commit) (bool, error) {
+func (s *initScan) visit(commit reader.Commit) (bool, error) {
 	if s.commits == 0 {
 		s.first = commit
 	}
@@ -386,13 +386,13 @@ func (s *initScan) freshAutomaticRoot() bool {
 }
 
 // isInitCommit reports whether a commit carries §4.8's initialisation marker.
-func isInitCommit(commit client.Commit) bool {
+func isInitCommit(commit reader.Commit) bool {
 	return commit.Metadata[MetadataKeyInit] == MetadataKeyInitValue
 }
 
 // isAutomaticCreationCommit reports whether commit is lakeFS's automatic root commit of a non-bare
 // repository.
-func isAutomaticCreationCommit(commit client.Commit) bool {
+func isAutomaticCreationCommit(commit reader.Commit) bool {
 	return len(commit.Parents) == 0 && commit.Message == automaticCreationCommitMessage
 }
 
@@ -425,7 +425,7 @@ func (x *Indexer) initialise(ctx context.Context, repository, metadata, branch s
 	}
 	x.closeTable(tbl, metadata, branch)
 
-	commit, err := x.lakeFS.Commit(ctx, metadata, branch, client.CommitOptions{
+	commit, err := x.lakeFS.Commit(ctx, metadata, branch, reader.CommitOptions{
 		Message: InitCommitMessage,
 		Metadata: map[string]string{
 			MetadataKeyInit:             MetadataKeyInitValue,
@@ -440,7 +440,7 @@ func (x *Indexer) initialise(ctx context.Context, repository, metadata, branch s
 		// winner, which the branch then carries for ever.
 		AllowEmpty: false,
 	})
-	if errors.Is(err, client.ErrBadRequest) {
+	if errors.Is(err, reader.ErrBadRequest) {
 		// A 400 is "lost the race" only when re-verification adopts another replica's init commit.
 		// A branch that still shows only the automatic root has nothing to adopt, so the 400 is a
 		// real refusal (block.ErrWriteFailed, a validation error, an HTTP intermediary): return it
@@ -486,10 +486,10 @@ func (x *Indexer) initCommit(repository string) (string, error) {
 // walkFirstParent calls visit for every commit of the first-parent log of a branch, newest first,
 // and stops when visit asks it to. It keeps no history of its own: callers that need one would hold
 // the whole repository in memory (TS-5).
-func (x *Indexer) walkFirstParent(ctx context.Context, repository, branch string, visit func(client.Commit) (bool, error)) error {
+func (x *Indexer) walkFirstParent(ctx context.Context, repository, branch string, visit func(reader.Commit) (bool, error)) error {
 	after := ""
 	for {
-		page, hasMore, err := x.lakeFS.LogCommits(ctx, repository, branch, client.LogCommitsOptions{
+		page, hasMore, err := x.lakeFS.LogCommits(ctx, repository, branch, reader.LogCommitsOptions{
 			FirstParent: true,
 			After:       after,
 		})
@@ -511,7 +511,7 @@ func (x *Indexer) walkFirstParent(ctx context.Context, repository, branch string
 		after = lastNameOf(len(page), func(i int) string { return page[i].ID })
 		if after == "" {
 			return fmt.Errorf("%w: log commits of %q@%s: more results without a cursor",
-				client.ErrBadPagination, repository, branch)
+				reader.ErrBadPagination, repository, branch)
 		}
 	}
 }
