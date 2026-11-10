@@ -102,14 +102,27 @@ func (s *IcebergStore) CreateTable(ctx context.Context, dataRepository, branch s
 	return &icebergTable{catalog: cat, table: tbl}, nil
 }
 
-// catalog builds the REST catalog of one branch of R-metadata (§4.3 step 3).
+// catalog builds the REST catalog of one branch of R-metadata (§4.3 step 3). It authenticates as
+// the sync identity: HTTP basic with the configured access key pair when the operator set one, or a
+// login token this process signs for mds-service-user with auth.encrypt.secret_key when it did not
+// (G12, RA5). A fresh token is minted per catalog, so a token that expires does not outlive the
+// client that carries it.
 func (s *IcebergStore) catalog(ctx context.Context, dataRepository, branch string) (*rest.Catalog, error) {
+	token := ""
+	if s.AccessKeyID == "" && s.SecretAccessKey == "" {
+		signed, err := table.SignServiceLoginToken(s.EncryptSecretKey, time.Now())
+		if err != nil {
+			return nil, fmt.Errorf("sign the %s login token: %w", table.ServiceUserName, err)
+		}
+		token = signed
+	}
 	return table.NewCatalog(ctx, table.CatalogConfig{
 		Endpoint:        s.Endpoint,
 		Repository:      metadataRepository(dataRepository),
 		Branch:          branch,
 		AccessKeyID:     s.AccessKeyID,
 		SecretAccessKey: s.SecretAccessKey,
+		AccessToken:     token,
 		Storage:         s.Storage,
 		RequestTimeout:  s.RequestTimeout,
 	})

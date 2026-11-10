@@ -179,20 +179,6 @@ const (
 	MetadataSearchInitValue         = "true"
 	MetadataSearchInitCommitMessage = "mds: init"
 
-	// MetadataSearchIndexerPrincipal is the user the indexer authenticates as (design §8: the
-	// `mds-indexer` user that the pkg/mds bootstrap creates). It is the third fact of the
-	// ownership proof: an initialisation commit that anyone could write is not proof that the
-	// indexer created the repository, and a principal allowed fs:CreateCommit on R-metadata can
-	// write the marker and the message. The literal is restated here for the same reason as the
-	// marker above: this package must not import pkg/mds.
-	//
-	// CreateCommitRecord now reserves this committer for this principal: pkg/api/controller.go
-	// refuses a commit record whose committer is this literal unless the authenticated caller is
-	// `mds-indexer`, so holding only fs:CreateCommit on R-metadata no longer mints the proof. The
-	// catalog still cannot tell how a commit record was written; a path that does not pass through
-	// CreateCommitRecord (refs-restore's LoadCommits) is outside that check.
-	MetadataSearchIndexerPrincipal = "mds-indexer"
-
 	metadataSearchInitPageSize = 256
 
 	// metadataSearchInitCacheMaxRepositories bounds the positive ownership cache. An entry is one
@@ -559,18 +545,22 @@ func (r *MetadataSearchResolver) objectsRef(ctx context.Context, dataRepo, ref s
 	return mapped, nil
 }
 
-// VerifyResolved implements ResolvedTableVerifier: R-metadata is R's index only when it was created
-// by the indexer (MDS-SEC-3). Two independent facts have to hold, because either one alone can be
-// written by whoever created R-metadata:
+// VerifyResolved implements ResolvedTableVerifier: R-metadata is R's index only when the table
+// says so and carries the indexer's initialisation commit. Two independent facts have to hold,
+// because either one alone can be written by whoever created R-metadata:
 //
 //   - the table property lakefs.mds.repository names R (§3.1); and
-//   - the served ref's first-parent history carries the indexer's initialisation commit (§4.8):
-//     message "mds: init", metadata lakefs.mds.init=true, committed by the indexer principal
-//     `mds-indexer`, and positioned as the first commit directly above the repository's root
-//     commit - or as that root commit itself, for a companion repository created bare, which is
-//     the form the indexer accepts there too. That commit is written by the indexer after it
-//     creates the table, so it also commits the table and makes the repository's history the state
-//     a forger cannot reproduce by editing metadata.json.
+//   - the served ref's first-parent history carries the initialisation commit (§4.8): message
+//     "mds: init" and metadata lakefs.mds.init=true, positioned as the first commit directly above
+//     the repository's root commit - or as that root commit itself, for a companion repository
+//     created bare, which is the form the indexer accepts there too. That commit is written by the
+//     indexer after it creates the table, so it also commits the table and makes the repository's
+//     history the state a forger cannot reproduce by editing metadata.json.
+//
+// The committer is deliberately not part of the proof (METADATA_SEARCH_REALIGN.md X4): the guide
+// says the sync may run "as another user instead" with MDSCatalogAccess, so a check pinned to one
+// committer name would refuse a legitimate sync. The marker and the position are what the indexer
+// writes; who it authenticated as is an operator decision, not a fact about the table.
 //
 // A repository someone else created under the companion name can copy the property, but it has no
 // initialisation commit on the history the resolver is about to serve. It is answered as an absent
@@ -765,12 +755,12 @@ func (r *MetadataSearchResolver) initCommitPage(ctx context.Context, lister comm
 	return page, hasMore, nil
 }
 
-// isMetadataSearchInitCommit reports whether commit carries the indexer's initialisation marker
-// and committer. The metadata marker, the message and the principal are all required, so a commit
-// that merely copied one of them is not mistaken for the indexer's.
+// isMetadataSearchInitCommit reports whether commit carries the indexer's initialisation marker.
+// The metadata marker and the message are both required, so a commit that merely copied one of
+// them is not mistaken for the indexer's. The committer is not checked: the guide lets the sync run
+// as another user with MDSCatalogAccess (X4).
 func isMetadataSearchInitCommit(commit *catalog.CommitLog) bool {
 	return commit != nil &&
-		commit.Committer == MetadataSearchIndexerPrincipal &&
 		commit.Message == MetadataSearchInitCommitMessage &&
 		commit.Metadata[MetadataSearchInitProperty] == MetadataSearchInitValue
 }

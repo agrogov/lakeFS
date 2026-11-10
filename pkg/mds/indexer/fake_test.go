@@ -26,13 +26,10 @@ import (
 )
 
 // fakeIndexerPrincipal is the name lakeFS records as the committer of every commit the indexer
-// makes. A commit's committer is not part of the request: pkg/api/controller.go (Commit) passes
-// user.Committer() of the authenticated principal, and §8's indexer user is mds-indexer
-// (pkg/mds/bootstrap/bootstrap.go, UserName). The catalog reads the same name back off the commit as
-// the third fact of its ownership proof (pkg/icebergcatalog.MetadataSearchIndexerPrincipal); the
-// fake used to record "indexer", which no code reads, but which made the fake's history a shape
-// real lakeFS never writes - and a shape the catalog would refuse.
-const fakeIndexerPrincipal = "mds-indexer"
+// makes: the sync identity mds-service-user (pkg/mds/table.ServiceUserName, pkg/mds/bootstrap). The
+// catalog does not read the committer (METADATA_SEARCH_REALIGN.md X4), so this is about the shape
+// real lakeFS writes, not about an ownership proof.
+const fakeIndexerPrincipal = table.ServiceUserName
 
 // fake is the whole lakeFS of a test: repositories, refs, commits, tags, objects and the metadata
 // table of every branch of the one companion repository the test indexes into.

@@ -73,11 +73,17 @@ type CatalogConfig struct {
 	// Branch is the branch of R-metadata the writes land on: the branch of the data repository
 	// that is being indexed (§3.3, §4.2).
 	Branch string
-	// AccessKeyID and SecretAccessKey are the credentials of the indexer principal. They are sent
-	// as HTTP basic authentication, which the catalog accepts on every route (design §5,
+	// AccessKeyID and SecretAccessKey are the credentials of the user the sync runs as when the
+	// operator configured a pair (metadata_search.access_key_id/secret_key). They are sent as HTTP
+	// basic authentication, which the catalog accepts on every route (design §5,
 	// pkg/icebergcatalog/auth.go), so no OAuth round trip is needed.
 	AccessKeyID     string
 	SecretAccessKey string
+	// AccessToken is a bearer token the caller signed for the service identity, used instead of
+	// the access key pair when the operator configured none (G12, RA5): the sync signs a login
+	// token for mds-service-user with auth.encrypt.secret_key, and the catalog verifies it with
+	// the same key. A caller sets one or the other; a token that is present is what is sent.
+	AccessToken string
 	// Storage is passed to iceberg-go with rest.WithAdditionalProps: the IO properties
 	// (s3.endpoint, s3.region, s3.access-key-id, s3.secret-access-key, s3.path-style-access, and the
 	// adls.* properties of an Azure blockstore) used when the catalog does not vend write
@@ -100,7 +106,7 @@ func (c CatalogConfig) Validate() error {
 		return fmt.Errorf("%w: no repository", ErrInvalidCatalogConfig)
 	case strings.TrimSpace(c.Branch) == "":
 		return fmt.Errorf("%w: no branch", ErrInvalidCatalogConfig)
-	case c.AccessKeyID == "" || c.SecretAccessKey == "":
+	case c.AccessToken == "" && (c.AccessKeyID == "" || c.SecretAccessKey == ""):
 		return fmt.Errorf("%w: no credentials", ErrInvalidCatalogConfig)
 	}
 	return nil
@@ -127,17 +133,22 @@ func (c CatalogConfig) URI() (string, error) {
 	return strings.TrimRight(strings.TrimSpace(c.Endpoint), "/") + RelativeToPath + "/" + warehouse + "/api", nil
 }
 
-// Authorization returns the HTTP basic Authorization header value of the configured credentials.
+// Authorization returns the Authorization header value of the configured credential: the bearer
+// token when the caller signed one for the service identity, HTTP basic otherwise.
 func (c CatalogConfig) Authorization() string {
+	if c.AccessToken != "" {
+		return "Bearer " + c.AccessToken
+	}
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(c.AccessKeyID+":"+c.SecretAccessKey))
 }
 
 // NewCatalog builds the iceberg-go REST client for one branch of a companion repository (design
-// §4.3 step 3): rest.NewCatalog over the relative_to URI, HTTP basic credentials and the IO
-// properties the process supplies from its blockstore configuration.
+// §4.3 step 3): rest.NewCatalog over the relative_to URI, the identity's Authorization header and
+// the IO properties the process supplies from its blockstore configuration.
 //
-// The two options are the ones design §4.6 names. rest.WithHeaders carries the basic credentials
-// on every request, including the GET /v1/config the client starts with. rest.WithAdditionalProps
+// The two options are the ones design §4.6 names. rest.WithHeaders carries the credential on every
+// request, including the GET /v1/config the client starts with: HTTP basic for an access key pair,
+// or a bearer token the caller signed for mds-service-user (G12, RA5). rest.WithAdditionalProps
 // carries the IO properties into the table's IO, which is what lets the transaction write
 // Parquet, Avro and metadata files when the catalog does not vend credentials - iceberg-go does
 // not implement S3 remote signing.

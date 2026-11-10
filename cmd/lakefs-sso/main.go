@@ -13,10 +13,9 @@
 //     builders, each of which is disabled unless its config section is enabled, and
 //     installs the Iceberg catalog's process-wide controls (the _lakefs_iceberg/ deny
 //     policy, the uncommitted-GC grace, and the table-pointer merge-conflict hook)
-//     with a third builder that mounts no route, and creates the Metadata Search
-//     principals and policies (METADATA_SEARCH_DESIGN.md §8) with a fourth builder that
-//     mounts no route either and does nothing unless iceberg.metadata_search.enabled is
-//     true.
+//     with a third builder that mounts no route, and provisions the Metadata Search sync
+//     identity (METADATA_SEARCH_REALIGN.md RA5: mds-service-user and MDSCatalogAccess) with a
+//     fourth builder that mounts no route either and runs on every start.
 //
 // Merge-friendliness: the upstream cmd/lakefs directory is untouched except for
 // cmd/lakefs/cmd/hooks.go (new file) and 2 lines in cmd/lakefs/cmd/run.go.
@@ -77,14 +76,14 @@ func main() {
 		return icebergcatalog.Bootstrap(ctx, deps, guardGroups())
 	})
 
-	// Create the Metadata Search principals and policies (METADATA_SEARCH_DESIGN.md §8) when
-	// iceberg.metadata_search.enabled is true. The builder mounts no route: it exists so the
-	// mds-indexer user, the MetadataSearchIndexers group and the two policies are in place before the
-	// first indexer request is authorized. It gets the same guardGroups() the reserved-prefix deny gets
-	// above, so mds-metadata-repo-protect covers exactly the principals iceberg-reserved-prefix-protect
-	// covers; the bootstrap itself never attaches it to MetadataSearchIndexers.
+	// Provision the Metadata Search sync identity (METADATA_SEARCH_REALIGN.md RA5, G12): the
+	// mds-service-user principal and the MDSCatalogAccess policy the sync writes the metadata tables
+	// through the Iceberg REST catalog with. The builder mounts no route, runs on every start as the
+	// guide says lakeFS does, and also removes the principals and policies of the earlier design. It
+	// needs no catalog and no configuration: the policy is installation-wide, so there is no
+	// companion repository to list and the identity exists before the first indexer request.
 	lakefsCmd.AddExtraRoutesBuilder(func(ctx context.Context, deps lakefsCmd.ServerDeps, _ *chi.Mux) error {
-		return bootstrap.RoutesBuilder(ctx, deps, guardGroups())
+		return bootstrap.RoutesBuilder(ctx, deps)
 	})
 
 	// Map the refs of a data repository to the companion repository's refs, so a tag or a commit read

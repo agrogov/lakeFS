@@ -18,6 +18,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/kv/kvparams"
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/mds"
+	"github.com/treeverse/lakefs/pkg/mds/bootstrap"
 	"github.com/treeverse/lakefs/pkg/mds/reader"
 	"github.com/treeverse/lakefs/pkg/upload"
 
@@ -118,6 +119,22 @@ process; the metadata tables are written through the lakeFS Iceberg REST catalog
 func runMDS(ctx context.Context, fullCfg config.Config, cfg *mds.Config) error {
 	log := logging.ContextUnavailable().WithField(logging.ServiceNameFieldKey, "mds")
 
+	secretKey := fullCfg.AuthConfig().GetBaseAuthConfig().Encrypt.SecretKey.SecureValue()
+
+	// The guide's startup check (METADATA_SEARCH_REALIGN.md RA5, G12): lakefs_endpoint must answer
+	// as the lakeFS Iceberg REST catalog, or the process stops (after two minutes of retries). A
+	// catalog that rejects the identity is only logged: the service starts anyway and every sync
+	// cycle retries the same authentication.
+	if err := bootstrap.CheckCatalog(ctx, bootstrap.CatalogCheckConfig{
+		Endpoint:         cfg.LakeFSEndpoint,
+		AccessKeyID:      cfg.AccessKeyID,
+		SecretKey:        cfg.SecretKey,
+		EncryptSecretKey: secretKey,
+		Log:              log,
+	}); err != nil {
+		return err
+	}
+
 	kvStore, cat, err := openMDSCatalog(ctx, fullCfg)
 	if err != nil {
 		return err
@@ -140,7 +157,7 @@ func runMDS(ctx context.Context, fullCfg config.Config, cfg *mds.Config) error {
 	return mds.NewService(cfg, log,
 		mds.WithLakeFS(reader.New(cat, 0)),
 		mds.WithStorage(storage),
-		mds.WithEncryptSecretKey(fullCfg.AuthConfig().GetBaseAuthConfig().Encrypt.SecretKey.SecureValue()),
+		mds.WithEncryptSecretKey(secretKey),
 	).Run(ctx)
 }
 

@@ -34,6 +34,7 @@ import (
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
 	cmdpkg "github.com/treeverse/lakefs/cmd/lakefs/cmd"
+	"github.com/treeverse/lakefs/contrib/auth/acl"
 	"github.com/treeverse/lakefs/pkg/auth"
 	"github.com/treeverse/lakefs/pkg/auth/crypt"
 	authmodel "github.com/treeverse/lakefs/pkg/auth/model"
@@ -45,6 +46,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/kv/kvparams"
 	"github.com/treeverse/lakefs/pkg/logging"
+	"github.com/treeverse/lakefs/pkg/mds/bootstrap"
 	"github.com/treeverse/lakefs/pkg/mds/indexer"
 	"github.com/treeverse/lakefs/pkg/mds/table"
 	"github.com/treeverse/lakefs/pkg/upload"
@@ -52,9 +54,9 @@ import (
 
 const (
 	testSecretKey       = "mds-run-test-encrypt-secret-key-0123456789"
-	testAccessKeyID     = "AKIAMDSRUNTEST0000001"
+	testAccessKeyID     = "AKIAIOSFODNN7EXAMPLE"
 	testSecretAccessKey = "mds-run-test-secret-access-key-0123456789"
-	testPrincipal       = "mds-indexer"
+	testOtherUser       = "sync-runner"
 	testDataRepository  = "data"
 	testBranch          = "main"
 )
@@ -99,6 +101,7 @@ type serverFixture struct {
 	cfg      *config.ConfigImpl
 	cat      *lakefscatalog.Catalog
 	server   *httptest.Server
+	auth     *acl.AuthService
 	head     *lakefscatalog.CommitLog
 	dataNS   string
 	metaRepo string
@@ -137,12 +140,14 @@ func newServerFixture(t *testing.T) *serverFixture {
 	require.NoError(t, err, "open the shared KV store")
 	t.Cleanup(kvStore.Close)
 
-	authService := auth.NewBasicAuthService(kvStore, crypt.NewSecretStore([]byte(testSecretKey)),
-		authparams.ServiceCache{Enabled: false}, logging.FromContext(ctx))
-	_, err = authService.CreateUser(ctx, &authmodel.User{Username: testPrincipal})
-	require.NoError(t, err, "create the indexer principal")
-	_, err = authService.AddCredentials(ctx, testPrincipal, testAccessKeyID, testSecretAccessKey)
-	require.NoError(t, err, "add the indexer principal's credentials")
+	authService := acl.NewAuthService(kvStore, crypt.NewSecretStore([]byte(testSecretKey)),
+		authparams.ServiceCache{Enabled: false})
+	// The lakeFS server provisions the sync identity on start (the guide's G12, RA5). The catalog
+	// below is served by the same auth service, so the indexer's signed token is verified and
+	// authorized exactly as it would be in a running lakeFS.
+	inForce, err := bootstrap.EnsureSyncIdentity(ctx, authService, time.Now())
+	require.NoError(t, err)
+	require.True(t, inForce)
 
 	cat, err := lakefscatalog.New(context.WithoutCancel(ctx), lakefscatalog.Config{
 		Config:       cfg,
@@ -181,6 +186,7 @@ func newServerFixture(t *testing.T) *serverFixture {
 		cfg:      cfg,
 		cat:      cat,
 		server:   httptest.NewServer(mux),
+		auth:     authService,
 		head:     head,
 		dataNS:   dataNS,
 		metaRepo: icebergcatalog.MetadataRepository(testDataRepository),
@@ -204,9 +210,14 @@ func dataEntry(t *testing.T, path string) lakefscatalog.DBEntry {
 
 // configFile writes the server configuration plus the metadata_search section the indexer reads.
 // It names the server's own database, blockstore and auth key, which is what the official chart
-// gives the MDS pod.
-func (f *serverFixture) configFile() string {
+// gives the MDS pod. An empty accessKeyID/secretKey pair is the guide's default: the sync runs as
+// mds-service-user and signs its own login token.
+func (f *serverFixture) configFile(accessKeyID, secretKey string) string {
 	f.t.Helper()
+	keys := ""
+	if accessKeyID != "" || secretKey != "" {
+		keys = fmt.Sprintf("  access_key_id: %s\n  secret_key: %s\n", accessKeyID, secretKey)
+	}
 	document := fmt.Sprintf(`logging:
   format: text
   level: NONE
@@ -241,9 +252,7 @@ iceberg:
 
 metadata_search:
   lakefs_endpoint: %s
-  access_key_id: %s
-  secret_key: %s
-  listen_address: 127.0.0.1:0
+%s  listen_address: 127.0.0.1:0
   period: 50ms
   concurrency: 1
   max_commits: 100
@@ -251,7 +260,7 @@ metadata_search:
     %s:
       branches: [%s]
 `, f.kvPath, testSecretKey, f.root, filepath.Join(f.root, "mds-cache"), f.server.URL,
-		testAccessKeyID, testSecretAccessKey, testDataRepository, testBranch)
+		keys, testDataRepository, testBranch)
 
 	path := filepath.Join(f.t.TempDir(), "config.yaml")
 	require.NoError(f.t, os.WriteFile(path, []byte(document), 0o600), "write the mds configuration file")
@@ -267,51 +276,16 @@ metadata_search:
 	return path
 }
 
-// TestMDSRunAgainstAnInProcessServer runs the command as the chart invokes it and asserts that the
-// indexer read the data repository from the shared KV store, wrote the table through the REST
-// catalog into the shared blockstore, and committed the indexed position to the shared KV store.
+// TestMDSRunAgainstAnInProcessServer runs the command as the chart invokes it, with the guide's
+// default configuration (no access keys: the sync runs as mds-service-user with a token it signs
+// itself), and asserts that the indexer read the data repository from the shared KV store, wrote the
+// table through the REST catalog into the shared blockstore, and committed the indexed position to
+// the shared KV store.
 func TestMDSRunAgainstAnInProcessServer(t *testing.T) {
 	f := newServerFixture(t)
-	ctx, cancel := context.WithCancel(t.Context())
+	cancel, done := f.startMDSRun(t, "", "")
 	defer cancel()
-
-	root := cmdpkg.GetRoot()
-	root.AddCommand(newMDSCommand())
-	root.SetArgs([]string{"mds", "run", "--config", f.configFile()})
-	// cobra keeps the context of the command it executed, so a repeated run of this test in one
-	// process would execute with the previous run's (cancelled) context. Clear it: the child picks
-	// up this execution's context from the root.
-	clearCommandContexts(root)
-
-	done := make(chan error, 1)
-	go func() {
-		done <- root.ExecuteContext(ctx)
-	}()
-
-	// The indexer creates the companion repository and commits one indexed source commit; the tag
-	// mds-<C> is written after the commit.
-	isIndexed := func() bool {
-		ctx := context.WithoutCancel(t.Context())
-		commit, err := f.cat.GetCommit(ctx, f.metaRepo, testBranch)
-		if err != nil || commit.Metadata[indexer.MetadataKeySourceCommit] != f.head.Reference {
-			return false
-		}
-		// finishCommit writes the commit and then the mds-<C> tag; the tick is done with the
-		// branch only when both are there.
-		tag, err := f.cat.GetTag(ctx, f.metaRepo, indexer.TagPrefix+f.head.Reference)
-		return err == nil && tag == commit.Reference
-	}
-	deadline := time.Now().Add(30 * time.Second)
-	for !isIndexed() {
-		select {
-		case err := <-done:
-			t.Fatalf("mds run returned before indexing: %v", err)
-		case <-time.After(100 * time.Millisecond):
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("mds run did not index the data repository's head")
-		}
-	}
+	f.waitIndexed(t, done)
 
 	// The companion repository is the indexer's own, in the namespace the guide derives for it.
 	metadata, err := f.cat.GetRepository(t.Context(), f.metaRepo)
@@ -320,8 +294,8 @@ func TestMDSRunAgainstAnInProcessServer(t *testing.T) {
 		"the companion namespace is the data namespace with the suffix appended")
 	require.False(t, metadata.ReadOnly)
 
-	// The commits were made in process, by the Metadata Search principal: the same identity the
-	// server-side ownership proof checks.
+	// The commits were made in process, by the sync identity (mds-service-user); the catalog no
+	// longer reads the committer (X4), but the shape real lakeFS writes is worth pinning.
 	commits, _, err := f.cat.ListCommits(t.Context(), f.metaRepo, testBranch, lakefscatalog.LogParams{Amount: 100})
 	require.NoError(t, err)
 	var initCommit *lakefscatalog.CommitLog
@@ -329,9 +303,9 @@ func TestMDSRunAgainstAnInProcessServer(t *testing.T) {
 	for _, commit := range commits {
 		if len(commit.Parents) > 0 {
 			// The repository's root commit is lakeFS's own; every commit the indexer made names
-			// the Metadata Search principal.
-			require.Equal(t, icebergcatalog.MetadataSearchIndexerPrincipal, commit.Committer,
-				"the indexer commits as the Metadata Search principal")
+			// the sync identity.
+			require.Equal(t, table.ServiceUserName, commit.Committer,
+				"the indexer commits as the sync identity")
 		}
 		if commit.Metadata[indexer.MetadataKeyInit] == indexer.MetadataKeyInitValue {
 			initCommit = commit
@@ -350,13 +324,15 @@ func TestMDSRunAgainstAnInProcessServer(t *testing.T) {
 	require.Equal(t, indexed.Reference, tag)
 
 	// The table a reader sees through the catalog: the rows of the data repository's commit, read
-	// back from the blockstore the indexer wrote them to.
+	// back from the blockstore the indexer wrote them to. The reader signs the service user's login
+	// token, exactly as the indexer does, so this also proves the token works for a read.
+	token, err := table.SignServiceLoginToken(testSecretKey, time.Now())
+	require.NoError(t, err)
 	readCatalog, err := table.NewCatalog(t.Context(), table.CatalogConfig{
-		Endpoint:        f.server.URL,
-		Repository:      f.metaRepo,
-		Branch:          testBranch,
-		AccessKeyID:     testAccessKeyID,
-		SecretAccessKey: testSecretAccessKey,
+		Endpoint:    f.server.URL,
+		Repository:  f.metaRepo,
+		Branch:      testBranch,
+		AccessToken: token,
 	})
 	require.NoError(t, err, "build the reading catalog")
 	t.Cleanup(func() { _ = readCatalog.Close() })
@@ -386,6 +362,79 @@ func TestMDSRunAgainstAnInProcessServer(t *testing.T) {
 		t.Fatal("mds run did not return after its context was cancelled")
 	}
 }
+
+// TestMDSRunAsAnotherUserWithMDSCatalogAccess is the guide's "to run the sync as another user
+// instead, set access_key_id and secret_key ... attach the MDSCatalogAccess policy to it": the
+// configured user holds the policy, and the sync writes the same table without a signed token.
+func TestMDSRunAsAnotherUserWithMDSCatalogAccess(t *testing.T) {
+	f := newServerFixture(t)
+	_, err := f.auth.CreateUser(t.Context(), &authmodel.User{Username: testOtherUser, CreatedAt: time.Now()})
+	require.NoError(t, err)
+	_, err = f.auth.AddCredentials(t.Context(), testOtherUser, testAccessKeyID, testSecretAccessKey)
+	require.NoError(t, err)
+	require.NoError(t, f.auth.AttachPolicyToUser(t.Context(), bootstrap.PolicyName, testOtherUser))
+
+	cancel, done := f.startMDSRun(t, testAccessKeyID, testSecretAccessKey)
+	defer cancel()
+	f.waitIndexed(t, done)
+
+	commit, err := f.cat.GetCommit(t.Context(), f.metaRepo, testBranch)
+	require.NoError(t, err)
+	require.Equal(t, f.head.Reference, commit.Metadata[indexer.MetadataKeySourceCommit],
+		"a user with MDSCatalogAccess runs the sync end to end")
+}
+
+// startMDSRun executes `mds run --config <file>` the way the official chart invokes it and returns
+// the cancel function and the command's error channel.
+func (f *serverFixture) startMDSRun(t *testing.T, accessKeyID, secretKey string) (context.CancelFunc, <-chan error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	root := cmdpkg.GetRoot()
+	addMDSRunCommandOnce.Do(func() { root.AddCommand(newMDSCommand()) })
+	root.SetArgs([]string{"mds", "run", "--config", f.configFile(accessKeyID, secretKey)})
+	// cobra keeps the context of the command it executed, so a repeated run in one process would
+	// execute with the previous run's (cancelled) context. Clear it: the child picks up this
+	// execution's context from the root.
+	clearCommandContexts(root)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- root.ExecuteContext(ctx)
+	}()
+	return cancel, done
+}
+
+// waitIndexed blocks until the indexer has committed the data repository's head and written the
+// mds-<C> tag, or fails the test when the command returns first or the deadline passes.
+func (f *serverFixture) waitIndexed(t *testing.T, done <-chan error) {
+	t.Helper()
+	isIndexed := func() bool {
+		ctx := context.WithoutCancel(t.Context())
+		commit, err := f.cat.GetCommit(ctx, f.metaRepo, testBranch)
+		if err != nil || commit.Metadata[indexer.MetadataKeySourceCommit] != f.head.Reference {
+			return false
+		}
+		// finishCommit writes the commit and then the mds-<C> tag; the tick is done with the
+		// branch only when both are there.
+		tag, err := f.cat.GetTag(ctx, f.metaRepo, indexer.TagPrefix+f.head.Reference)
+		return err == nil && tag == commit.Reference
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for !isIndexed() {
+		select {
+		case err := <-done:
+			t.Fatalf("mds run returned before indexing: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("mds run did not index the data repository's head")
+		}
+	}
+}
+
+// addMDSRunCommandOnce guards the one AddCommand of the process-wide root command: two tests run
+// `mds run`, and cobra does not expect the same subcommand twice.
+var addMDSRunCommandOnce sync.Once
 
 // clearCommandContexts clears the context cobra stored on every command, so the next
 // ExecuteContext hands the executed command the context of that execution.

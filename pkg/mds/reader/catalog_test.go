@@ -23,6 +23,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/kv/kvparams"
 	"github.com/treeverse/lakefs/pkg/mds/reader"
+	"github.com/treeverse/lakefs/pkg/mds/table"
 	"github.com/treeverse/lakefs/pkg/upload"
 )
 
@@ -342,8 +343,8 @@ func TestCommitAsTheIndexerPrincipal(t *testing.T) {
 		AllowEmpty: false,
 	})
 	require.NoError(t, err)
-	require.Equal(t, icebergcatalog.MetadataSearchIndexerPrincipal, commit.Committer,
-		"the in-process commit names the same principal the REST API recorded")
+	require.Equal(t, table.ServiceUserName, commit.Committer,
+		"the in-process commit names the sync identity")
 	require.Equal(t, map[string]string{"lakefs.mds.init": "true"}, commit.Metadata)
 	require.NotEmpty(t, commit.ID)
 

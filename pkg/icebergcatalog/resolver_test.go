@@ -183,13 +183,10 @@ func newResolverFixtureWithoutInitCommit(t *testing.T) *resolverFixture {
 	return newResolverFixtureWithCompanion(t, tablesTestRepo, false)
 }
 
-// newResolverFixtureWithInitCommitter builds a companion repository whose init commit carries the
-// marker and the message but is committed by committer: the ownership proof must not accept a
-// commit written by anyone other than the indexer principal.
-func newResolverFixtureWithInitCommitter(t *testing.T, committer string) *resolverFixture {
-	t.Helper()
-	return newResolverFixtureWithCompanionAndInit(t, tablesTestRepo, true, committer)
-}
+// testInitCommitter is the committer the fixtures record on the initialisation commit. The catalog
+// no longer reads it (METADATA_SEARCH_REALIGN.md X4: the sync may run as another user), so any name
+// works; a non-indexer name keeps that explicit in the fixtures.
+const testInitCommitter = "mallory"
 
 // newResolverFixtureWithBareCompanion builds the fixture with the companion repository in the bare
 // shape the indexer accepts (METADATA_SEARCH_DESIGN.md §4.8, pkg/mds/indexer/repo.go
@@ -214,7 +211,7 @@ func newResolverFixtureWithBareCompanion(t *testing.T, initCommitter string) *re
 // commit on the mirrored branch.
 func newResolverFixtureWithCompanion(t *testing.T, repositoryProperty string, initCommit bool) *resolverFixture {
 	t.Helper()
-	return newResolverFixtureWithCompanionAndInit(t, repositoryProperty, initCommit, MetadataSearchIndexerPrincipal)
+	return newResolverFixtureWithCompanionAndInit(t, repositoryProperty, initCommit, testInitCommitter)
 }
 
 // newResolverFixtureWithCompanionAndInit builds the fixture with an explicit init-commit committer.
@@ -371,7 +368,7 @@ func putResolverObject(t *testing.T, cat *catalog.Catalog, repository, location,
 // does when it creates the namespace and the table.
 func commitResolverInit(t *testing.T, cat *catalog.Catalog, repository, branch, dataRepo string) {
 	t.Helper()
-	commitResolverInitAs(t, cat, repository, branch, dataRepo, MetadataSearchIndexerPrincipal, false)
+	commitResolverInitAs(t, cat, repository, branch, dataRepo, testInitCommitter, false)
 }
 
 // commitResolverInitAs is commitResolverInit with an explicit committer: the ownership proof reads
@@ -399,7 +396,7 @@ func addResolverInitCommitRecord(t *testing.T, cat *catalog.Catalog, repository,
 	require.NoErrorf(t, err, "head of %s@%s", repository, branch)
 	commit := graveler.Commit{
 		Version:      graveler.CommitVersion(head.Version),
-		Committer:    MetadataSearchIndexerPrincipal,
+		Committer:    testInitCommitter,
 		Message:      MetadataSearchInitCommitMessage,
 		MetaRangeID:  graveler.MetaRangeID(head.MetaRangeID),
 		CreationDate: head.CreationDate,
@@ -1107,18 +1104,13 @@ func TestMetadataSearchCompanionRepositoryProof(t *testing.T) {
 		require.ErrorAs(t, err, &noTable)
 	})
 
-	t.Run("an init commit written by a non-indexer is not served", func(t *testing.T) {
-		// The marker and the message are not proof of who wrote the commit: anyone with
-		// fs:CreateCommit on R-metadata can copy them. The genuine indexer principal is mds-indexer.
-		f := newResolverFixtureWithInitCommitter(t, "mallory")
-		requireEnvelope(t, f.request(t, http.MethodGet, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
-			http.StatusNotFound, ErrTypeNoSuchTable)
-		requireEnvelope(t, f.request(t, http.MethodHead, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
-			http.StatusNotFound, ErrTypeNoSuchTable)
-		_, err := newTableScopeResolver(f.store)(t.Context(), resolverTreeObjectsAddress(tablesTestRepo, tablesTestRef),
-			func(context.Context, Address) error { return nil })
-		var noTable *NoSuchTableException
-		require.ErrorAs(t, err, &noTable)
+	t.Run("an init commit written by another sync user is served (X4)", func(t *testing.T) {
+		// The guide lets the sync run as another user with MDSCatalogAccess, so the committer is not
+		// part of the proof: the marker, the message and the position are what the indexer writes,
+		// and who it authenticated as is the operator's choice.
+		f := newResolverFixtureWithCompanionAndInit(t, tablesTestRepo, true, "another-sync-user")
+		require.Equal(t, http.StatusOK, f.request(t, http.MethodGet, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", "").Code)
+		require.Equal(t, http.StatusNoContent, f.request(t, http.MethodHead, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", "").Code)
 	})
 
 	t.Run("a bare companion whose init commit is the root is served", func(t *testing.T) {
@@ -1127,11 +1119,11 @@ func TestMetadataSearchCompanionRepositoryProof(t *testing.T) {
 		// repo_test.go TestExistingBareMetadataRepositoryIsAccepted). The two sides have to agree:
 		// a root init commit cannot be added to an existing history, so accepting it keeps the
 		// position rule's protection and stops refusing a companion the indexer indexes.
-		f := newResolverFixtureWithBareCompanion(t, MetadataSearchIndexerPrincipal)
+		f := newResolverFixtureWithBareCompanion(t, testInitCommitter)
 		head, err := f.catalog.GetCommit(f.ctx, resolverMetaRepo, tablesTestRef)
 		require.NoError(t, err)
 		require.Empty(t, head.Parents, "the fixture is the bare shape: the init commit is the root")
-		require.Equal(t, MetadataSearchIndexerPrincipal, head.Committer)
+		require.Equal(t, testInitCommitter, head.Committer)
 		require.Equal(t, http.StatusOK, f.request(t, http.MethodGet, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", "").Code)
 		require.Equal(t, http.StatusNoContent,
 			f.request(t, http.MethodHead, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", "").Code)
@@ -1139,18 +1131,6 @@ func TestMetadataSearchCompanionRepositoryProof(t *testing.T) {
 		_, err = newTableScopeResolver(f.store)(t.Context(), resolverTreeObjectsAddress(tablesTestRepo, tablesTestRef),
 			func(context.Context, Address) error { return nil })
 		require.NoError(t, err)
-	})
-
-	t.Run("a bare companion's root commit written by a non-indexer is not served", func(t *testing.T) {
-		// Accepting the root form must not drop the committer fact: the root position is reachable
-		// by creating the repository bare and committing the marker as the authenticated principal
-		// (pkg/api/controller.go, Commit takes the committer from the authenticated user), so a root
-		// mds: init commit that is not the indexer's is still not proof.
-		f := newResolverFixtureWithBareCompanion(t, "mallory")
-		requireEnvelope(t, f.request(t, http.MethodGet, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
-			http.StatusNotFound, ErrTypeNoSuchTable)
-		requireEnvelope(t, f.request(t, http.MethodHead, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
-			http.StatusNotFound, ErrTypeNoSuchTable)
 	})
 
 	t.Run("an init commit that is not the first commit above the root is not served", func(t *testing.T) {
@@ -1162,7 +1142,7 @@ func TestMetadataSearchCompanionRepositoryProof(t *testing.T) {
 			"operator", nil, nil, nil, false)
 		require.NoError(t, err, "commit the table before the forged init commit")
 		commitResolverInitAs(t, f.catalog, resolverMetaRepo, tablesTestRef, tablesTestRepo,
-			MetadataSearchIndexerPrincipal, true)
+			testInitCommitter, true)
 		requireEnvelope(t, f.request(t, http.MethodGet, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
 			http.StatusNotFound, ErrTypeNoSuchTable)
 		requireEnvelope(t, f.request(t, http.MethodHead, resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", ""),
@@ -1201,7 +1181,7 @@ func newResolverCommitChain(n int) *resolverCommitChain {
 			commit.Parents = []string{chain.commits[i-1].Reference}
 		}
 		if i == 1 {
-			commit.Committer = MetadataSearchIndexerPrincipal
+			commit.Committer = testInitCommitter
 			commit.Message = MetadataSearchInitCommitMessage
 			commit.Metadata = catalog.Metadata{MetadataSearchInitProperty: MetadataSearchInitValue}
 		}
@@ -1273,7 +1253,7 @@ func newBareResolverCommitChain() *resolverCommitChain {
 	chain := &resolverCommitChain{heads: make(map[string]int, 1)}
 	chain.commits = []*catalog.CommitLog{{
 		Reference: "commit-00000",
-		Committer: MetadataSearchIndexerPrincipal,
+		Committer: testInitCommitter,
 		Message:   MetadataSearchInitCommitMessage,
 		Metadata:  catalog.Metadata{MetadataSearchInitProperty: MetadataSearchInitValue},
 	}}
@@ -1318,7 +1298,7 @@ func TestMetadataSearchInitCommitAtTheRoot(t *testing.T) {
 	// (MDS_REVIEW_3 R3S-4: a look-alike marker is not the immutable commit).
 	chain.commits = append(chain.commits, &catalog.CommitLog{
 		Reference: "commit-lookalike",
-		Committer: MetadataSearchIndexerPrincipal,
+		Committer: testInitCommitter,
 		Message:   MetadataSearchInitCommitMessage,
 		Metadata:  catalog.Metadata{MetadataSearchInitProperty: MetadataSearchInitValue},
 	})

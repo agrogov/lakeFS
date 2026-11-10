@@ -14,8 +14,8 @@ import (
 	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/catalog"
 	"github.com/treeverse/lakefs/pkg/graveler"
-	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"github.com/treeverse/lakefs/pkg/kv"
+	"github.com/treeverse/lakefs/pkg/mds/table"
 )
 
 // CatalogAPI is the part of *catalog.Catalog this package uses. It is an interface so a test can
@@ -194,7 +194,7 @@ func (c *Catalog) GetCommit(ctx context.Context, repository, commitID string) (C
 // Commit implements CommitWriter. §4.3 step 4 commits the staged metadata table and the
 // index position together; §4.8 writes the initialisation commit the same way.
 func (c *Catalog) Commit(ctx context.Context, repository, branch string, opts CommitOptions) (Commit, error) {
-	commit, err := c.catalog.Commit(ctx, repository, branch, opts.Message, icebergcatalog.MetadataSearchIndexerPrincipal,
+	commit, err := c.catalog.Commit(ctx, repository, branch, opts.Message, table.ServiceUserName,
 		catalog.Metadata(opts.Metadata), nil, nil, opts.AllowEmpty)
 	if err != nil {
 		return Commit{}, mapError("commit", branch, err)
