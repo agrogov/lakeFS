@@ -379,7 +379,9 @@ func (s *credentialService) handleLoadCredentials(w http.ResponseWriter, r *http
 	if !ok {
 		return
 	}
-	isBranch, err := s.refIsBranch(r.Context(), addr)
+	// A root system.metadata tree address is asked about the data repository it names: the branch
+	// question and the permission are the guide's ARNs on R (resolver.go, systemTreeAuthz).
+	isBranch, err := s.refIsBranch(r.Context(), authzAddress(addr))
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -425,7 +427,12 @@ func (s *credentialService) Vend(ctx context.Context, caller Caller, req Request
 		return nil, &AuthorizationError{Username: caller.Username, Operation: req.Op,
 			Err: errNoAuthorizer}
 	}
-	if err := s.authz.Authorize(ctx, caller, req); err != nil {
+	// The permission of a root system.metadata tree address is checked on the data repository's
+	// catalog ARNs, which is the address the resolver authorizes too (resolver.go,
+	// systemTreeAuthz); every other address is authorized as it is.
+	authzReq := req
+	authzReq.Address = authzAddress(req.Address)
+	if err := s.authz.Authorize(ctx, caller, authzReq); err != nil {
 		return nil, err
 	}
 	// The table is resolved here, after the decision above and through the registered table
@@ -445,14 +452,20 @@ func (s *credentialService) Vend(ctx context.Context, caller Caller, req Request
 	}
 	// A write session is scoped to the table that was actually read. When a table resolver
 	// redirects the write, the requested namespace may be ordinary while the target is reserved
-	// (§5.4): the session must not write the companion repository's files. TableCredentials turns
-	// this refusal into a read session, exactly as it does for a write denial; a direct write Vend
-	// gets the refusal.
-	if req.Op == OpWriteTableData && !s.writableNamespace(scope.Target) {
-		return nil, &ReservedNamespaceError{
-			Repo:      scope.Target.Repo,
-			Ref:       scope.Target.Ref,
-			Namespace: scope.Target.Namespace,
+	// (§5.4): the session must not write the companion repository's files. The requested address is
+	// checked too, so the root system.metadata tree - whose target is an ordinary namespace of the
+	// hidden companion repository - is never given a write session (G8: metadata tables are always
+	// read-only). TableCredentials turns this refusal into a read session, exactly as it does for a
+	// write denial; a direct write Vend gets the refusal.
+	if req.Op == OpWriteTableData {
+		for _, addr := range []Address{req.Address, scope.Target} {
+			if !s.writableNamespace(addr) {
+				return nil, &ReservedNamespaceError{
+					Repo:      addr.Repo,
+					Ref:       addr.Ref,
+					Namespace: addr.Namespace,
+				}
+			}
 		}
 	}
 	return s.vendScope(ctx, caller, req.Address, scope, access), nil
@@ -925,6 +938,7 @@ func (s *credentialService) writeError(w http.ResponseWriter, err error) {
 	var (
 		denied       *PermissionDeniedError
 		readOnly     *ReadOnlyRefError
+		reserved     *ReservedNamespaceError
 		authzFailure *AuthorizationError
 		noTable      *NoSuchTableException
 	)
@@ -935,6 +949,11 @@ func (s *credentialService) writeError(w http.ResponseWriter, err error) {
 		writeIcebergError(w, http.StatusBadRequest, ErrTypeBadRequest, err.Error())
 	case errors.Is(err, ErrCredentialVendingDisabled):
 		writeIcebergError(w, http.StatusNotImplemented, ErrTypeNotImplemented, err.Error())
+	case errors.As(err, &reserved):
+		// A write session for a namespace the resolver reserved - the root system.metadata tree is
+		// one, at every level (resolver.go, METADATA_SEARCH_REALIGN.md): metadata tables are always
+		// read-only (G8).
+		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, reserved.Error())
 	case errors.As(err, &readOnly):
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, readOnly.Message())
 	case errors.As(err, &denied):

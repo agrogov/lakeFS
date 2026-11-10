@@ -342,6 +342,10 @@ func (n *namespaceService) handleListNamespaces(w http.ResponseWriter, r *http.R
 	switch {
 	case parent.Repo == "":
 		namespaces, listErr = n.listRepositories(ctx, caller)
+	case n.store.hasSystemTree() && parent.Repo == SystemNamespace:
+		// The root `system.metadata` tree (resolver.go, METADATA_SEARCH_REALIGN.md RA1): its levels
+		// are ordinary catalog addresses, but nothing below them is a marker.
+		namespaces, listErr = n.listSystemNamespaces(ctx, caller, parent)
 	case parent.Ref == "":
 		namespaces, listErr = n.listBranches(ctx, caller, parent.Repo)
 	default:
@@ -378,6 +382,15 @@ func (n *namespaceService) handleGetNamespace(w http.ResponseWriter, r *http.Req
 	if !ok {
 		return
 	}
+	if n.store.hasSystemTree() && addr.Repo == SystemNamespace {
+		// A node of the root tree (resolver.go): authorizeGetNamespace established that it exists.
+		// The tree is marker-less, so the properties are always empty.
+		writeJSON(w, http.StatusOK, getNamespaceResponse{
+			Namespace:  clientNamespace(r, systemTreeNamespace(addr)),
+			Properties: map[string]string{},
+		})
+		return
+	}
 	marker, err := n.store.GetNamespace(r.Context(), addr)
 	if err != nil {
 		n.writeError(w, err)
@@ -401,6 +414,11 @@ func (n *namespaceService) handleHeadNamespace(w http.ResponseWriter, r *http.Re
 	if !ok {
 		return
 	}
+	if n.store.hasSystemTree() && addr.Repo == SystemNamespace {
+		// A node of the root tree: authorizeGetNamespace established that it exists.
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if _, err := n.store.GetNamespace(r.Context(), addr); err != nil {
 		n.writeError(w, err)
 		return
@@ -415,12 +433,27 @@ func (n *namespaceService) authorizeGetNamespace(w http.ResponseWriter, r *http.
 	if !n.checkPrefix(w, r) {
 		return Address{}, false
 	}
-	addr, ok := n.namespaceTarget(w, r)
-	if !ok {
+	addr, err := ParseNamespace(chi.URLParam(r, "namespace"))
+	if err != nil {
+		n.writeError(w, err)
 		return Address{}, false
 	}
 	caller, ok := n.caller(w, r)
 	if !ok {
+		return Address{}, false
+	}
+	if handled, err := n.readSystemNamespace(r.Context(), caller, addr); handled {
+		if err != nil {
+			n.writeError(w, err)
+			return Address{}, false
+		}
+		return addr, true
+	}
+	if addr.Ref == "" || len(addr.Namespace) == 0 {
+		// GET/HEAD address a namespace, not the repository or the branch level: a namespace object
+		// only exists where a marker entry can exist (§6.1).
+		n.writeError(w, fmt.Errorf("%w: a namespace address needs a repository, a ref and at least one namespace level",
+			ErrInvalidIdentifier))
 		return Address{}, false
 	}
 	if err := n.authz.Authorize(r.Context(), caller, Request{Op: OpGetNamespace, Address: addr}); err != nil {
@@ -711,7 +744,14 @@ func (n *namespaceService) authorizeWrite(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		var readOnly *ReadOnlyRefError
 		if kind == refMissing && errors.As(err, &readOnly) {
-			// Only the ref rule objected: the caller may write, but the ref does not exist.
+			// Only the ref rule objected: the caller may write, but the ref does not exist. A
+			// namespace a resolver reserved answers its own refusal first: the root system.metadata
+			// tree is not a lakeFS repository at all, so every write into it is the 403 of the
+			// reservation (resolver.go).
+			if reserved := n.store.RequireWritableNamespace(addr); reserved != nil {
+				n.writeError(w, reserved)
+				return false
+			}
 			n.writeError(w, &NoSuchWarehouseException{Repo: addr.Repo, Ref: addr.Ref})
 			return false
 		}
@@ -921,6 +961,18 @@ func (n *namespaceService) listRepositories(ctx context.Context, caller Caller) 
 			return nil, err
 		}
 	}
+	// The root `system.metadata` tree is visible exactly when a metadata repository exists
+	// (METADATA_SEARCH_REALIGN.md RA1/X5): there is no server flag, the state of the repositories
+	// is the answer.
+	if n.store.hasSystemTree() {
+		exists, err := n.store.SystemMetadataExists(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			namespaces = withSystemRoot(namespaces)
+		}
+	}
 	return namespaces, nil
 }
 
@@ -992,44 +1044,177 @@ func (n *namespaceService) listChildNamespaces(ctx context.Context, caller Calle
 	return namespaces, nil
 }
 
+// ---------------------------------------------------------------------------------------------
+// The root `system.metadata` tree (resolver.go; METADATA_SEARCH_REALIGN.md RA1: G1, G2, G6)
+// ---------------------------------------------------------------------------------------------
+//
+// The tree is marker-less, so none of its nodes is discovered by walking entries: existence is
+// derived from the companion repository R-metadata and its branches (Store.SystemMetadataExists,
+// SystemMetadataRepositories, SystemMetadataBranches and SystemObjectsExists).
+//
+// Its three listing levels mirror the catalog's own (handleListNamespaces), because the tree's
+// addresses are ordinary catalog addresses:
+//
+//	parent=system                      → metadata
+//	parent=system<sep>metadata         → the readable data repositories whose objects table resolves
+//	parent=system<sep>metadata<sep>R   → R's synced branches
+//
+// and GET/HEAD answer the four levels themselves (readSystemNamespace). Every permission check is
+// made on the guide's catalog ARNs - namespace/<R>/system - never on the tree's own address
+// (resolver.go, systemTreeAuthz), so the guide's grant alone is enough (G7).
+
+// readSystemNamespace authorizes and answers a GET/HEAD of a node of the root tree. handled reports
+// whether addr is a node of the tree, i.e. whether the request was answered here; a nil error means
+// the node exists.
+func (n *namespaceService) readSystemNamespace(ctx context.Context, caller Caller, addr Address) (handled bool, err error) {
+	if !n.store.hasSystemTree() || addr.Repo != SystemNamespace {
+		return false, nil
+	}
+	if addr.HasTable() || addr.HasView() {
+		return true, &SystemNamespaceNotFoundException{Node: systemTreeNamespace(addr).Dotted()}
+	}
+	switch {
+	case isSystemTreeRoot(addr), isSystemMetadataLevel(addr):
+		// The two levels above the data repositories say that Metadata Search has at least one
+		// repository, which is a lakeFS-level fact. They need the permission that makes the root
+		// of the namespace tree visible at all, the repository listing (§5's first level).
+		if err := n.systemTreeRootGate(ctx, caller); err != nil {
+			return true, err
+		}
+		exists, err := n.store.SystemMetadataExists(ctx)
+		if err != nil {
+			return true, err
+		}
+		if !exists {
+			return true, &SystemNamespaceNotFoundException{Node: systemTreeNamespace(addr).Dotted()}
+		}
+		return true, nil
+	case addr.Ref == MetadataNamespace && len(addr.Namespace) == 1:
+		dataRepo := addr.Namespace[0]
+		if err := n.authz.Authorize(ctx, caller, Request{Op: OpGetNamespace, Address: systemNamespaceAuthz(dataRepo)}); err != nil {
+			return true, err
+		}
+		branches, err := n.store.SystemMetadataBranches(ctx, dataRepo)
+		if err != nil {
+			return true, err
+		}
+		if len(branches) == 0 {
+			return true, &SystemNamespaceNotFoundException{Node: systemTreeNamespace(addr).Dotted()}
+		}
+		return true, nil
+	case addr.Ref == MetadataNamespace && len(addr.Namespace) == 2:
+		dataRepo, ref := addr.Namespace[0], addr.Namespace[1]
+		if err := n.authz.Authorize(ctx, caller, Request{Op: OpGetNamespace, Address: systemNamespaceAuthz(dataRepo)}); err != nil {
+			return true, err
+		}
+		exists, err := n.store.SystemObjectsExists(ctx, dataRepo, ref)
+		if err != nil {
+			return true, err
+		}
+		if !exists {
+			return true, &SystemNamespaceNotFoundException{Node: systemTreeNamespace(addr).Dotted()}
+		}
+		return true, nil
+	default:
+		// The tree has no deeper node: there is no namespace below a ref level.
+		return true, &SystemNamespaceNotFoundException{Node: systemTreeNamespace(addr).Dotted()}
+	}
+}
+
+// listSystemNamespaces is the listing half of the root tree: the children of one of its nodes.
+// A node the caller may not read is answered the way the catalog answers it everywhere else - the
+// listing's own authorization refusal - and a data repository the caller may not read is hidden
+// from the `system.metadata` listing, exactly like the repository listing hides it.
+func (n *namespaceService) listSystemNamespaces(ctx context.Context, caller Caller, parent Address) ([]Namespace, error) {
+	if !isSystemTreeRoot(parent) && !isSystemMetadataLevel(parent) && parent.Ref != MetadataNamespace {
+		// The root name is the tree's: a level of it that the tree does not have does not exist.
+		return nil, &SystemNamespaceNotFoundException{Node: systemTreeNamespace(parent).Dotted()}
+	}
+	switch {
+	case isSystemTreeRoot(parent):
+		if err := n.systemTreeRootGate(ctx, caller); err != nil {
+			return nil, err
+		}
+		exists, err := n.store.SystemMetadataExists(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, nil
+		}
+		return []Namespace{{SystemNamespace, MetadataNamespace}}, nil
+	case isSystemMetadataLevel(parent):
+		repositories, err := n.store.SystemMetadataRepositories(ctx)
+		if err != nil {
+			return nil, err
+		}
+		namespaces := make([]Namespace, 0, len(repositories))
+		for _, repository := range repositories {
+			err := n.authz.Authorize(ctx, caller, Request{Op: OpListNamespaces, Address: systemNamespaceAuthz(repository.Name)})
+			switch {
+			case err == nil:
+				namespaces = append(namespaces, Namespace{SystemNamespace, MetadataNamespace, repository.Name})
+			case IsDenial(err):
+				continue
+			default:
+				return nil, err
+			}
+		}
+		return namespaces, nil
+	case parent.Ref == MetadataNamespace && len(parent.Namespace) == 1:
+		dataRepo := parent.Namespace[0]
+		// Catalog ARNs are branch-agnostic (authz.go), so every branch of R is the same namespace
+		// ARN: one decision on it is the per-entry filter this listing would run for each branch.
+		if err := n.authz.Authorize(ctx, caller, Request{Op: OpListNamespaces, Address: systemNamespaceAuthz(dataRepo)}); err != nil {
+			return nil, err
+		}
+		branches, err := n.store.SystemMetadataBranches(ctx, dataRepo)
+		if err != nil {
+			return nil, err
+		}
+		namespaces := make([]Namespace, 0, len(branches))
+		for _, branch := range branches {
+			namespaces = append(namespaces, fullNamespace(parent, branch))
+		}
+		return namespaces, nil
+	default:
+		// system.metadata.<R>.<ref> has no child namespaces. Tags and commits are never listed.
+		return nil, nil
+	}
+}
+
+// systemTreeRootGate authorizes the two levels of the tree above the data repositories.
+func (n *namespaceService) systemTreeRootGate(ctx context.Context, caller Caller) error {
+	return n.authz.Authorize(ctx, caller, Request{Op: OpListNamespaces})
+}
+
+// withSystemRoot adds the root tree's `system` to a repository listing, in name order and without
+// duplicating a repository of the same name: the root name is reserved for the tree, so the tree
+// wins.
+func withSystemRoot(namespaces []Namespace) []Namespace {
+	root := Namespace{SystemNamespace}
+	for _, namespace := range namespaces {
+		if namespace.Dotted() == root.Dotted() {
+			return namespaces
+		}
+	}
+	merged := make([]Namespace, 0, len(namespaces)+1)
+	merged = append(merged, namespaces...)
+	merged = append(merged, root)
+	sort.SliceStable(merged, func(i, j int) bool { return merged[i].Dotted() < merged[j].Dotted() })
+	return merged
+}
+
 // allRepositories walks the repository listing to the end. The catalog lists repositories in
 // pages; the namespace tree needs the whole filtered set before it can paginate by namespace, so
 // the pages are concatenated here.
 func (n *namespaceService) allRepositories(ctx context.Context) ([]*catalog.Repository, error) {
-	var (
-		repositories []*catalog.Repository
-		after        string
-	)
-	for {
-		page, hasMore, err := n.lister.ListRepositories(ctx, catalog.ListRepositoriesLimitMax, "", "", after)
-		if err != nil {
-			return nil, err
-		}
-		repositories = append(repositories, page...)
-		if !hasMore || len(page) == 0 {
-			return repositories, nil
-		}
-		after = page[len(page)-1].Name
-	}
+	return walkRepositories(ctx, n.lister)
 }
 
 // allBranches walks the branch listing of repo to the end.
 func (n *namespaceService) allBranches(ctx context.Context, repo string) ([]*catalog.Branch, error) {
-	var (
-		branches []*catalog.Branch
-		after    string
-	)
-	for {
-		page, hasMore, err := n.lister.ListBranches(ctx, repo, "", catalog.ListBranchesLimitMax, after)
-		if err != nil {
-			return nil, err
-		}
-		branches = append(branches, page...)
-		if !hasMore || len(page) == 0 {
-			return branches, nil
-		}
-		after = page[len(page)-1].Name
-	}
+	return walkBranches(ctx, n.lister, repo)
 }
 
 // allEntries walks the entry listing below prefix on ref to the end.
@@ -1151,6 +1336,7 @@ func (n *namespaceService) writeError(w http.ResponseWriter, err error) {
 		readOnly     *ReadOnlyRefError
 		reserved     *ReservedNamespaceError
 		authzFailure *AuthorizationError
+		noSystem     *SystemNamespaceNotFoundException
 		noNamespace  *NoSuchNamespaceException
 		noWarehouse  *NoSuchWarehouseException
 		notEmpty     *NamespaceNotEmptyException
@@ -1158,6 +1344,9 @@ func (n *namespaceService) writeError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrInvalidIdentifier):
 		writeIcebergError(w, http.StatusBadRequest, ErrTypeBadRequest, err.Error())
+	case errors.As(err, &noSystem):
+		// A node of the root system.metadata tree that does not exist (resolver.go).
+		writeIcebergError(w, http.StatusNotFound, ErrTypeNoSuchNamespace, noSystem.Error())
 	case errors.As(err, &readOnly):
 		writeIcebergError(w, http.StatusForbidden, ErrorTypeForbidden, readOnly.Message())
 	case errors.As(err, &reserved):

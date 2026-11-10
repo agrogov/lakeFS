@@ -475,6 +475,24 @@ func (s *tableService) handleListTables(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	if s.store.hasSystemTree() && addr.Repo == SystemNamespace {
+		identifiers, err := s.systemTableIdentifiers(r, caller, addr)
+		if err != nil {
+			s.writeError(w, err)
+			return
+		}
+		page, next, err := paginate(identifiers, r.URL.Query().Get("pageToken"), pageSize)
+		if err != nil {
+			s.writeError(w, err)
+			return
+		}
+		if page == nil {
+			page = []tableIdentifier{}
+		}
+		writeJSON(w, http.StatusOK, listTablesResponse{Identifiers: page, NextPageToken: next})
+		return
+	}
+
 	names, err := s.tableNames(r.Context(), addr)
 	if err != nil {
 		s.writeError(w, err)
@@ -983,6 +1001,9 @@ func (s *tableService) authorizeTableWrite(w http.ResponseWriter, r *http.Reques
 // repository that does not exist is propagated instead: it is the 404 NoSuchWarehouseException of
 // §5, not a read-only ref.
 func (s *tableService) isBranchRef(ctx context.Context, addr Address) (bool, error) {
+	// A root system.metadata tree address names the data repository and ref as namespace levels; the
+	// branch question is about them, not about the reserved root repository.
+	addr = branchCheckAddress(addr)
 	_, err := s.lister.GetBranchReference(ctx, addr.Repo, addr.Ref)
 	switch {
 	case err == nil:
@@ -1060,9 +1081,14 @@ func (s *tableService) authorizeTableRead(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return Address{}, false
 	}
+	// The permission of a root system.metadata tree address is on the data repository's catalog
+	// ARNs, never on the tree's own address (resolver.go, systemTreeAuthz): no policy can grant
+	// `system`, and the guide's grant names R/system/object_metadata. Every other address is
+	// authorized as it is.
+	authzAddr := authzAddress(addr)
 	refIsBranch := true
 	if op.IsWrite() {
-		refIsBranch, err = s.isBranchRef(r.Context(), addr)
+		refIsBranch, err = s.isBranchRef(r.Context(), authzAddr)
 		if err != nil {
 			s.writeError(w, err)
 			return Address{}, false
@@ -1070,20 +1096,71 @@ func (s *tableService) authorizeTableRead(w http.ResponseWriter, r *http.Request
 	}
 	if err := s.authz.Authorize(r.Context(), caller, Request{
 		Op:          op,
-		Address:     addr,
+		Address:     authzAddr,
 		RefIsBranch: refIsBranch,
 	}); err != nil {
 		s.writeError(w, err)
 		return Address{}, false
 	}
-	resolved, err := s.store.ResolveAuthorized(r.Context(), addr, func(ctx context.Context, authzAddr Address) error {
-		return s.authz.Authorize(ctx, caller, Request{Op: op, Address: authzAddr, RefIsBranch: refIsBranch})
+	resolved, err := s.store.ResolveAuthorized(r.Context(), addr, func(ctx context.Context, resolvedAuthz Address) error {
+		return s.authz.Authorize(ctx, caller, Request{Op: op, Address: resolvedAuthz, RefIsBranch: refIsBranch})
 	})
 	if err != nil {
 		s.writeError(w, err)
 		return Address{}, false
 	}
 	return resolved.Target, true
+}
+
+// systemTableIdentifiers is the table listing of a node of the root system.metadata tree
+// (resolver.go): system.metadata.<R> lists no table (its children are branches) and
+// system.metadata.<R>.<ref> lists `objects`.
+//
+// Existence and authorization come first, in that order: a node that does not exist is the 404 an
+// absent namespace answers, and the names the filter evaluates are the guide's table name
+// `object_metadata` - the name its ARNs are written with (G7) - while the name the client reads is
+// `objects`. The listing therefore runs the same filter as every other listing (FilterTables) and
+// the guide's grant keeps its meaning.
+func (s *tableService) systemTableIdentifiers(r *http.Request, caller Caller, addr Address) ([]tableIdentifier, error) {
+	ctx := r.Context()
+	if addr.Ref != MetadataNamespace || len(addr.Namespace) == 0 || len(addr.Namespace) > 2 {
+		return nil, &SystemNamespaceNotFoundException{Node: systemTreeNamespace(addr).Dotted()}
+	}
+	dataRepo := addr.Namespace[0]
+	if err := s.authz.Authorize(ctx, caller, Request{Op: OpGetNamespace, Address: systemNamespaceAuthz(dataRepo)}); err != nil {
+		return nil, err
+	}
+	switch len(addr.Namespace) {
+	case 1:
+		branches, err := s.store.SystemMetadataBranches(ctx, dataRepo)
+		if err != nil {
+			return nil, err
+		}
+		if len(branches) == 0 {
+			return nil, &SystemNamespaceNotFoundException{Node: systemTreeNamespace(addr).Dotted()}
+		}
+		return []tableIdentifier{}, nil
+	default:
+		ref := addr.Namespace[1]
+		exists, err := s.store.SystemObjectsExists(ctx, dataRepo, ref)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, &SystemNamespaceNotFoundException{Node: systemTreeNamespace(addr).Dotted()}
+		}
+		visible, err := s.authz.FilterTables(ctx, caller, systemNamespaceAuthz(dataRepo), []string{ObjectMetadataTable})
+		if err != nil {
+			return nil, err
+		}
+		if len(visible) == 0 {
+			return []tableIdentifier{}, nil
+		}
+		return []tableIdentifier{{
+			Namespace: clientNamespace(r, systemTreeNamespace(addr)),
+			Name:      ObjectsTable,
+		}}, nil
+	}
 }
 
 // namespaceAddress parses and validates the namespace path parameter of a listing. Listing tables
@@ -1377,6 +1454,7 @@ func (s *tableService) writeError(w http.ResponseWriter, err error) {
 		readOnly     *ReadOnlyRefError
 		reserved     *ReservedNamespaceError
 		authzFailure *AuthorizationError
+		noSystem     *SystemNamespaceNotFoundException
 		noTable      *NoSuchTableException
 		noNamespace  *NoSuchNamespaceException
 	)
@@ -1384,6 +1462,9 @@ func (s *tableService) writeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrInvalidIdentifier), errors.Is(err, ErrInvalidCreateTable),
 		errors.Is(err, ErrInvalidTableLocation):
 		writeIcebergError(w, http.StatusBadRequest, ErrTypeBadRequest, err.Error())
+	case errors.As(err, &noSystem):
+		// A node of the root system.metadata tree that does not exist (resolver.go).
+		writeIcebergError(w, http.StatusNotFound, ErrTypeNoSuchNamespace, noSystem.Error())
 	case errors.Is(err, ErrAlreadyExists):
 		// A create whose name is taken: the table the client asked for exists, so this is not a
 		// lost commit the client should retry as-is (§6.2).

@@ -366,15 +366,18 @@ func (s *remoteSigningService) handleSign(w http.ResponseWriter, r *http.Request
 	}
 
 	refIsBranch := false
+	// The permission and the branch question of a root system.metadata tree address are about the
+	// data repository it names, not about the reserved root repository (resolver.go, systemTreeAuthz).
+	authzAddr := authzAddress(addr)
 	if op == OpWriteTableData {
-		refIsBranch, err = s.refIsBranch(r.Context(), addr)
+		refIsBranch, err = s.refIsBranch(r.Context(), authzAddr)
 		if err != nil {
 			s.writeError(w, err)
 			return
 		}
 	}
 	if err := s.authz.Authorize(r.Context(), caller, Request{
-		Op: op, Address: addr, RefIsBranch: refIsBranch,
+		Op: op, Address: authzAddr, RefIsBranch: refIsBranch,
 	}); err != nil {
 		s.writeError(w, err)
 		return
@@ -493,6 +496,9 @@ func (s *remoteSigningService) refIsBranch(ctx context.Context, addr Address) (b
 	if s.refs == nil {
 		return false, nil
 	}
+	// A tree address names the data repository and ref as namespace levels; the branch question is
+	// about them (resolver.go, branchCheckAddress).
+	addr = branchCheckAddress(addr)
 	_, err := s.refs.GetBranchReference(ctx, addr.Repo, addr.Ref)
 	switch {
 	case err == nil:

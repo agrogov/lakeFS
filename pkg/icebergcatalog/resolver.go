@@ -8,7 +8,16 @@ package icebergcatalog
 //
 //	R.<ref>.system.object_metadata  →  <R>-metadata.<mapped ref>.system.object_metadata
 //
-// The catalog is the only place that knows that mapping, so it is the only place that has to
+// The current guide has moved that address to the root of the catalog, and this file serves both
+// forms of it:
+//
+//	system.metadata.<R>.<ref>.objects  →  <R>-metadata.<mapped ref>.system.object_metadata
+//
+// The root tree - its nodes, its listings, its permissions and its reservation - is the section
+// "The root `system.metadata` tree" at the end of this file; the per-repository form above is the
+// one the guide deprecates (METADATA_SEARCH_REALIGN.md G5, removed by RA3).
+//
+// The catalog is the only place that knows those mappings, so it is the only place that has to
 // change: this file is a hook, not a feature. A TableResolver is registered by the server
 // (WithTableResolver); while none is registered the catalog behaves exactly as it did before this
 // file existed - every address resolves to itself, nothing is listed, no namespace is reserved.
@@ -92,6 +101,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 
@@ -108,6 +118,21 @@ const (
 	// ObjectMetadataTable is the name of the virtual table: the system metadata of every object
 	// of the data repository, indexed per branch (§3.1).
 	ObjectMetadataTable = "object_metadata"
+
+	// MetadataNamespace and ObjectsTable name the root tree of the current Metadata Search guide
+	// (fetched 2026-11-09, METADATA_SEARCH_REALIGN.md G1): the tables are addressed at the root of
+	// the lakeFS catalog as
+	//
+	//	system.metadata.<data repo>.<ref>.objects
+	//
+	// i.e. in the reserved root repository `system`, on its `metadata` ref, one namespace per data
+	// repository and, inside it, one namespace per ref. Neither name belongs to a data repository:
+	// there is no `system` namespace inside a repository any more (the old identifier lives only in
+	// the deprecated separate catalog, G5).
+	MetadataNamespace = "metadata"
+
+	// ObjectsTable is the table name of the root tree: one table per data repository ref.
+	ObjectsTable = "objects"
 
 	// MetadataRepositorySuffix is the suffix that names the companion repository of a data
 	// repository R: R-metadata (§3.2). It is the one naming convention the catalog and the
@@ -337,8 +362,9 @@ func IsMetadataRepository(repo string) bool {
 }
 
 // MetadataSearchResolver is the built-in TableResolver of METADATA_SEARCH_DESIGN.md §5.2: it
-// serves R.<ref>.system.object_metadata out of R-metadata, and reserves the system namespace of
-// every data repository (§5.4).
+// serves R.<ref>.system.object_metadata and system.metadata.R.<ref>.objects out of R-metadata, and
+// reserves the system namespace of every data repository and the whole root system tree (§5.4,
+// METADATA_SEARCH_REALIGN.md RA1).
 //
 // Register it only while the Metadata Search feature is enabled (iceberg.metadata_search.enabled,
 // §5.5): the resolver is what makes the virtual table and the reserved namespace exist, so a
@@ -399,10 +425,27 @@ func NewMetadataSearchResolver(branches BranchLister, mapper RefMapper) *Metadat
 // so the client gets the 404 NoSuchWarehouseException (or the 500) the same address would answer
 // without the hook.
 func (r *MetadataSearchResolver) Resolve(ctx context.Context, addr Address) (ResolvedTable, bool, error) {
+	if dataRepo, ref, ok := systemObjectsAddress(addr); ok {
+		// The root tree's table: system.metadata.<R>.<ref>.objects → the companion table of R.
+		mapped, err := r.objectsRef(ctx, dataRepo, ref, addr)
+		if err != nil {
+			return ResolvedTable{}, true, err
+		}
+		authz, _ := systemTreeAuthz(addr)
+		return ResolvedTable{
+			Target: Address{
+				Repo:      MetadataRepository(dataRepo),
+				Ref:       mapped,
+				Namespace: Namespace{SystemNamespace},
+				Table:     ObjectMetadataTable,
+			},
+			Authz: authz,
+		}, true, nil
+	}
 	if !isObjectMetadataAddress(addr) {
 		return ResolvedTable{}, false, nil
 	}
-	ref, err := r.metadataRef(ctx, addr)
+	ref, err := r.objectsRef(ctx, addr.Repo, addr.Ref, addr)
 	if err != nil {
 		return ResolvedTable{}, true, err
 	}
@@ -417,22 +460,27 @@ func (r *MetadataSearchResolver) Resolve(ctx context.Context, addr Address) (Res
 	}, true, nil
 }
 
-// metadataRef maps the ref of the data repository onto a ref of the companion repository: the same
-// name for a branch (§5.2), the RefMapper's answer for a tag or a commit.
+// objectsRef maps the ref of the data repository onto a ref of the companion repository: the same
+// name for a branch (§5.2), the RefMapper's answer for a tag or a commit. It is the mapping of both
+// addressing forms: the old per-repository table and the root system tree name the same companion
+// table, so they must not be able to disagree.
 //
 // A ref the catalog cannot look up is returned as the missing warehouse it is, never silently
 // treated as "not a branch": the difference decides between 404 NoSuchWarehouseException and 404
 // NoSuchTableException, and only the catalog can tell them apart. A nil BranchLister assumes every
 // ref is a branch: without a lister there is nothing to ask, and the identity mapping is the
 // documented default.
-func (r *MetadataSearchResolver) metadataRef(ctx context.Context, addr Address) (string, error) {
+//
+// requested is the address the client named; it only names the table a 404 is about, so a caller of
+// either addressing form gets the answer for its own address.
+func (r *MetadataSearchResolver) objectsRef(ctx context.Context, dataRepo, ref string, requested Address) (string, error) {
 	if r.branches == nil {
-		return addr.Ref, nil
+		return ref, nil
 	}
-	_, err := r.branches.GetBranchReference(ctx, addr.Repo, addr.Ref)
+	_, err := r.branches.GetBranchReference(ctx, dataRepo, ref)
 	switch {
 	case err == nil:
-		return addr.Ref, nil
+		return ref, nil
 	case errors.Is(err, graveler.ErrBranchNotFound), errors.Is(err, graveler.ErrInvalidBranchID):
 		// A tag or a commit: no branch of that name exists, so there is no mirrored branch to read
 		// and the RefMapper decides whether the index has a table for it.
@@ -443,13 +491,13 @@ func (r *MetadataSearchResolver) metadataRef(ctx context.Context, addr Address) 
 		// No mapper: a tag or a commit has no mirrored branch, and returning the branch of the same
 		// name would answer a question nobody asked. §5.2: NoSuchTableException.
 		return "", &NoSuchTableException{
-			Repo:      addr.Repo,
-			Ref:       addr.Ref,
-			Namespace: addr.Namespace,
-			Table:     addr.Table,
+			Repo:      requested.Repo,
+			Ref:       requested.Ref,
+			Namespace: requested.Namespace,
+			Table:     requested.Table,
 		}
 	}
-	mapped, err := r.mapper.MapRef(ctx, addr.Repo, addr.Ref)
+	mapped, err := r.mapper.MapRef(ctx, dataRepo, ref)
 	if err != nil {
 		// A *NoSuchTableException is the mapper's refusal of an unindexed ref and is answered as
 		// the 404 it is; anything else is a failure to resolve and stays one.
@@ -457,7 +505,7 @@ func (r *MetadataSearchResolver) metadataRef(ctx context.Context, addr Address) 
 	}
 	if mapped == "" {
 		return "", fmt.Errorf("%w: the ref mapper returned an empty ref for %q of %q",
-			ErrInvalidResolution, addr.Ref, addr.Repo)
+			ErrInvalidResolution, ref, dataRepo)
 	}
 	return mapped, nil
 }
@@ -485,8 +533,14 @@ func (r *MetadataSearchResolver) metadataRef(ctx context.Context, addr Address) 
 // promises for an unindexed ref: from the caller's side there is no object_metadata table on that
 // ref of R, and there is nothing else it could mean.
 func (r *MetadataSearchResolver) VerifyResolved(ctx context.Context, requested, target Address, tbl *Table) error {
+	// The tree's address carries the data repository as a namespace level, so the property is
+	// compared with the repository the address names, not with the reserved root repository.
+	dataRepo := requested.Repo
+	if repo, _, ok := systemObjectsAddress(requested); ok {
+		dataRepo = repo
+	}
 	if tbl == nil || tbl.Metadata == nil ||
-		tbl.Metadata.Properties()[MetadataSearchRepositoryProperty] != requested.Repo {
+		tbl.Metadata.Properties()[MetadataSearchRepositoryProperty] != dataRepo {
 		return noSuchMetadataTable(requested)
 	}
 	carries, err := r.firstParentCarriesInitCommit(ctx, target)
@@ -762,17 +816,24 @@ func (r *MetadataSearchResolver) VirtualTables(addr Address) []string {
 }
 
 // ReservedNamespace implements VirtualTableSource: system is read-only for clients on a data
-// repository (§5.4). In the companion repository it is an ordinary namespace, which is what lets the
-// indexer create, commit and drop tables there.
+// repository (§5.4), and the whole root tree is read-only on the reserved root repository. In the
+// companion repository the namespace is ordinary, which is what lets the indexer create, commit and
+// drop tables there.
 func (r *MetadataSearchResolver) ReservedNamespace(addr Address) bool {
+	if addr.Repo == SystemNamespace {
+		// The root tree (METADATA_SEARCH_REALIGN.md RA1): every write into the reserved root
+		// repository is refused, at every level and with or without a namespace below it.
+		return true
+	}
 	return reservesSystemNamespace(addr) && len(addr.Namespace) > 0 && addr.Namespace[0] == SystemNamespace
 }
 
 // reservesSystemNamespace reports whether addr names a data repository, i.e. one that has a
 // companion repository and whose system namespace therefore belongs to the resolver. An empty
-// repository is not one.
+// repository is not one, and neither is the reserved root repository: the tree there is not a data
+// repository's virtual namespace but the root tree itself, which has its own rules.
 func reservesSystemNamespace(addr Address) bool {
-	return addr.Repo != "" && !IsMetadataRepository(addr.Repo)
+	return addr.Repo != "" && addr.Repo != SystemNamespace && !IsMetadataRepository(addr.Repo)
 }
 
 // isObjectMetadataAddress reports whether addr is the virtual table of §5.2: the system namespace,
@@ -931,4 +992,407 @@ func mergeListings(discovered, virtual []string) []string {
 	merged = append(merged, virtual...)
 	slices.Sort(merged)
 	return merged
+}
+
+// ---------------------------------------------------------------------------------------------
+// The root `system.metadata` tree (METADATA_SEARCH_REALIGN.md RA1: G1, G2, G6, G7, G8)
+// ---------------------------------------------------------------------------------------------
+//
+// The current guide addresses the metadata tables at the root of the lakeFS catalog:
+//
+//	system.metadata.<data repo>.<ref>.objects
+//
+// The address is an ordinary catalog address (ident.go): `system` is the repository level,
+// `metadata` the ref level, the next level is the data repository R and the level after it is R's
+// ref; `objects` is the table. There is no `system` namespace inside any data repository - this
+// tree is the only one, and every write into it is refused (ReservedNamespace).
+//
+// The physical table stays where the guide puts it: on each matching branch of R-metadata, as the
+// ordinary table `<R>-metadata.<mapped ref>.system.object_metadata`. Resolve sends a table read
+// there, exactly like the old per-repository address did.
+//
+// The rest of this section is the tree's own vocabulary, shared by the resolver and the listing and
+// data-plane handlers of the catalog:
+//
+//   - the predicates below say which node an address names;
+//   - systemTreeAuthz maps a node onto the catalog ARN the caller's permission is checked against.
+//     It is the guide's ARN (G7): table/<R>/system/object_metadata for the table and
+//     namespace/<R>/system for the nodes above it. The tree's own address is never authorized - it
+//     must not be, or the guide's grant alone would not be enough;
+//   - the Store methods at the end answer which nodes exist, derived from the companion repository
+//     and its branches. The whole tree is marker-less: no entry says a node exists, so existence is
+//     the state of R-metadata, and the ownership proof is the load-time check (VerifyResolved).
+
+// SystemNamespaceNotFoundException is the 404 of a node of the root system tree that does not exist.
+// It is answered as 404 NoSuchNamespaceException, the status an absent marker-less namespace has.
+type SystemNamespaceNotFoundException struct {
+	// Node is the dotted address of the node, e.g. "system.metadata.lakehouse.main".
+	Node string
+}
+
+// Error implements error.
+func (e *SystemNamespaceNotFoundException) Error() string {
+	return fmt.Sprintf("no such namespace %q", e.Node)
+}
+
+// isSystemTreeRoot reports whether addr is the root of the tree, the reserved `system` repository.
+func isSystemTreeRoot(addr Address) bool {
+	return addr.Repo == SystemNamespace && addr.Ref == "" && len(addr.Namespace) == 0 &&
+		!addr.HasTable() && !addr.HasView()
+}
+
+// isSystemMetadataLevel reports whether addr is the `system.metadata` level of the tree.
+func isSystemMetadataLevel(addr Address) bool {
+	return addr.Repo == SystemNamespace && addr.Ref == MetadataNamespace && len(addr.Namespace) == 0 &&
+		!addr.HasTable() && !addr.HasView()
+}
+
+// isDataRepositoryName reports whether name can be the data repository level of the tree: the
+// reserved root name is the tree itself and a -metadata name is a companion, not a data repository.
+func isDataRepositoryName(name string) bool {
+	return name != SystemNamespace && !IsMetadataRepository(name)
+}
+
+// systemObjectsAddress reports whether addr is the root tree's table,
+// system.metadata.<R>.<ref>.objects, and returns the data repository and ref it names.
+//
+// A companion repository's own name is not a data repository (a repository whose name ends in
+// -metadata has no companion of its own), and neither is the reserved root name, so those refs are
+// not addresses of the tree. Everything else is decided by the load: an unindexed data repository
+// has no companion table and answers the 404 an absent table answers.
+func systemObjectsAddress(addr Address) (dataRepo, ref string, ok bool) {
+	if addr.Repo != SystemNamespace || addr.Ref != MetadataNamespace ||
+		len(addr.Namespace) != 2 || addr.Table != ObjectsTable || addr.View != "" {
+		return "", "", false
+	}
+	dataRepo, ref = addr.Namespace[0], addr.Namespace[1]
+	if !isDataRepositoryName(dataRepo) {
+		return "", "", false
+	}
+	return dataRepo, ref, true
+}
+
+// dataRepositoryRef returns the data repository and ref a tree address is about: the two namespace
+// levels below `system.metadata`. It is the mapping the Q-I4 branch check needs, because the tree
+// address's own repository level is the reserved root and has no branch.
+func dataRepositoryRef(addr Address) (dataRepo, ref string, ok bool) {
+	if addr.Repo != SystemNamespace || addr.Ref != MetadataNamespace || len(addr.Namespace) < 2 {
+		return "", "", false
+	}
+	return addr.Namespace[0], addr.Namespace[1], true
+}
+
+// branchCheckAddress is the address a branch question is asked about: the data repository and ref
+// for a tree address, and the address itself everywhere else.
+func branchCheckAddress(addr Address) Address {
+	if dataRepo, ref, ok := dataRepositoryRef(addr); ok {
+		return Address{Repo: dataRepo, Ref: ref}
+	}
+	return addr
+}
+
+// systemTreeAuthz maps a root-tree address onto the catalog address the caller's permission is
+// checked against, and reports whether addr belongs to the tree at all.
+//
+// The mapping is the one the guide's permissions name (METADATA_SEARCH_REALIGN.md G7): the data
+// repository R, its `system` namespace and the table name `object_metadata`, even though the tree's
+// table is called `objects`. That is deliberate: the ARNs of the tree are the ARNs of the physical
+// table, so one policy grants the old per-repository address, the new root-tree address and the
+// data-plane session of both. The nodes above the table check the same namespace ARN.
+//
+// No ref is resolved here: catalog ARNs are branch-agnostic (authz.go), so the ref level only has to
+// be a non-empty level for RequiredNode. The tree uses the ref it names, or `metadata` - the tree's
+// own level above the ref - when the node is the data repository itself.
+func systemTreeAuthz(addr Address) (Address, bool) {
+	if addr.Repo != SystemNamespace || addr.Ref != MetadataNamespace || len(addr.Namespace) == 0 {
+		return Address{}, false
+	}
+	dataRepo := addr.Namespace[0]
+	ref := MetadataNamespace
+	if len(addr.Namespace) > 1 {
+		ref = addr.Namespace[1]
+	}
+	authz := Address{Repo: dataRepo, Ref: ref, Namespace: Namespace{SystemNamespace}}
+	switch {
+	case addr.HasView():
+		// The tree has no views: a view address is not part of it.
+		return Address{}, false
+	case addr.Table == ObjectsTable && len(addr.Namespace) == 2:
+		authz.Table = ObjectMetadataTable
+	case addr.Table != "":
+		// A table name the tree does not have. It is not an address of the tree, and mapping it onto
+		// the namespace ARN would pair a table operation with a namespace address, so it is left to
+		// the ordinary path (and its own 403/404).
+		return Address{}, false
+	}
+	return authz, true
+}
+
+// authzAddress is the address a request's permission is checked against: the data repository's
+// catalog ARN for a root-tree address, and the address itself everywhere else.
+func authzAddress(addr Address) Address {
+	if authz, ok := systemTreeAuthz(addr); ok {
+		return authz
+	}
+	return addr
+}
+
+// systemNamespaceAuthz is the catalog address of R's `system` namespace for a permission check that
+// is not about one ref: the nodes above the ref level and the listings. The ARN is branch-agnostic,
+// so the ref level is the tree's own `metadata` and is never resolved.
+func systemNamespaceAuthz(dataRepo string) Address {
+	return Address{Repo: dataRepo, Ref: MetadataNamespace, Namespace: Namespace{SystemNamespace}}
+}
+
+// systemTreeNamespace is the namespace a client named, in the shape of the spec's Namespace type:
+// the tree's own levels followed by the levels below them. It differs from fullNamespace only at the
+// root, which has no ref level.
+func systemTreeNamespace(addr Address) Namespace {
+	levels := make(Namespace, 0, macroLevels+len(addr.Namespace))
+	levels = append(levels, addr.Repo)
+	if addr.Ref != "" {
+		levels = append(levels, addr.Ref)
+	}
+	levels = append(levels, addr.Namespace...)
+	return levels
+}
+
+// metadataTreeLister is the lakeFS listing surface the root tree needs: the repositories, so the
+// companion repositories can be found, and their branches, so the synced refs can be named.
+// *catalog.Catalog implements it; a resolver registered with a lister that does not leaves the tree
+// with no listings and no nodes, which is the fail-closed direction.
+type metadataTreeLister interface {
+	ListRepositories(ctx context.Context, limit int, prefix, searchString, after string, opts ...catalog.ListRepositoriesOptionsFunc) ([]*catalog.Repository, bool, error)
+	ListBranches(ctx context.Context, repositoryID string, prefix string, limit int, after string, opts ...graveler.ListOptionsFunc) ([]*catalog.Branch, bool, error)
+}
+
+// SystemMetadataRepository is one data repository the root tree lists: its name and the companion
+// branches whose `objects` table resolves, in name order.
+type SystemMetadataRepository struct {
+	// Name is the data repository R (not the companion repository).
+	Name string
+
+	// Branches are R's synced branches: the branches of R-metadata that hold
+	// system.object_metadata. Tags and commits are never listed.
+	Branches []string
+}
+
+// hasSystemTree reports whether this store's registered resolver is the built-in Metadata Search
+// resolver, i.e. whether the catalog serves the root system tree. A custom resolver does not create
+// the tree: it is the built-in one's capability.
+func (s *Store) hasSystemTree() bool {
+	_, ok := s.resolver.(*MetadataSearchResolver)
+	return ok
+}
+
+// systemTreeLister returns the listing surface of the resolver the tree is served by.
+func (s *Store) systemTreeLister() (metadataTreeLister, bool) {
+	resolver, ok := s.resolver.(*MetadataSearchResolver)
+	if !ok {
+		return nil, false
+	}
+	lister, ok := resolver.branches.(metadataTreeLister)
+	return lister, ok
+}
+
+// SystemMetadataExists reports whether at least one metadata repository exists, i.e. whether the
+// root tree has any content. It is what makes `system` visible in the repository listing and what
+// makes the two levels above the data repositories exist; there is no server flag any more
+// (METADATA_SEARCH_REALIGN.md X5), the state of the repositories is the answer.
+//
+// "A metadata repository" is a companion repository R-metadata whose data repository R also exists:
+// a stray -metadata name is not an index of anything.
+func (s *Store) SystemMetadataExists(ctx context.Context) (bool, error) {
+	repositories, err := s.listAllRepositories(ctx)
+	if err != nil {
+		return false, err
+	}
+	names := make(map[string]struct{}, len(repositories))
+	for _, repository := range repositories {
+		names[repository.Name] = struct{}{}
+	}
+	for _, repository := range repositories {
+		if !IsMetadataRepository(repository.Name) {
+			continue
+		}
+		if dataRepo := strings.TrimSuffix(repository.Name, MetadataRepositorySuffix); isDataRepositoryName(dataRepo) {
+			if _, ok := names[dataRepo]; ok {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// SystemMetadataRepositories returns every data repository whose `objects` table resolves on at
+// least one branch, in name order. It is what `system.metadata` lists; the caller still has to be
+// authorized for each repository, which the listing does per name.
+func (s *Store) SystemMetadataRepositories(ctx context.Context) ([]SystemMetadataRepository, error) {
+	repositories, err := s.listAllRepositories(ctx)
+	if err != nil {
+		return nil, err
+	}
+	names := make(map[string]struct{}, len(repositories))
+	for _, repository := range repositories {
+		names[repository.Name] = struct{}{}
+	}
+	indexed := make([]SystemMetadataRepository, 0, len(repositories))
+	for _, repository := range repositories {
+		if !IsMetadataRepository(repository.Name) {
+			continue
+		}
+		dataRepo := strings.TrimSuffix(repository.Name, MetadataRepositorySuffix)
+		if _, ok := names[dataRepo]; !ok || !isDataRepositoryName(dataRepo) {
+			continue
+		}
+		branches, err := s.SystemMetadataBranches(ctx, dataRepo)
+		if err != nil {
+			return nil, err
+		}
+		if len(branches) == 0 {
+			continue
+		}
+		indexed = append(indexed, SystemMetadataRepository{Name: dataRepo, Branches: branches})
+	}
+	sort.Slice(indexed, func(i, j int) bool { return indexed[i].Name < indexed[j].Name })
+	return indexed, nil
+}
+
+// SystemMetadataBranches returns R's synced branches: the branches of R-metadata that hold the
+// system.object_metadata table, in name order. Tags and commits are never listed, and a data
+// repository with no companion has no synced branch.
+//
+// A branch counts as synced when its table pointer exists. The pointer is the one entry that makes
+// a table exist (§6.1), the same existence the drop and the metrics sink use; whether the table also
+// proves it is R's index is the load-time check (VerifyResolved), which a listing does not have to
+// pay for every branch of every repository.
+func (s *Store) SystemMetadataBranches(ctx context.Context, dataRepo string) ([]string, error) {
+	branches, err := s.listAllBranches(ctx, MetadataRepository(dataRepo))
+	if err != nil {
+		if isMissingWarehouse(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	synced := make([]string, 0, len(branches))
+	for _, branch := range branches {
+		exists, err := s.systemObjectsPointerExists(ctx, dataRepo, branch.Name)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			synced = append(synced, branch.Name)
+		}
+	}
+	sort.Strings(synced)
+	return synced, nil
+}
+
+// SystemObjectsExists reports whether `system.metadata.<R>.<ref>.objects` resolves: the ref is
+// mapped by the resolver's ref rules (branch → itself, tag or commit → the RefMapper's answer) and
+// the companion table must exist on the mapped ref.
+func (s *Store) SystemObjectsExists(ctx context.Context, dataRepo, ref string) (bool, error) {
+	resolver, ok := s.resolver.(*MetadataSearchResolver)
+	if !ok {
+		return false, nil
+	}
+	requested := Address{
+		Repo:      SystemNamespace,
+		Ref:       MetadataNamespace,
+		Namespace: Namespace{dataRepo, ref},
+		Table:     ObjectsTable,
+	}
+	mapped, err := resolver.objectsRef(ctx, dataRepo, ref, requested)
+	if err != nil {
+		var noTable *NoSuchTableException
+		if errors.As(err, &noTable) || isMissingWarehouse(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return s.systemObjectsPointerExists(ctx, dataRepo, mapped)
+}
+
+// systemObjectsPointerExists reports whether dataRepo's objects table exists on mappedRef of its
+// companion repository. It reads the pointer entry, the one thing that makes a table exist.
+func (s *Store) systemObjectsPointerExists(ctx context.Context, dataRepo, mappedRef string) (bool, error) {
+	if s.catalog == nil {
+		return false, nil
+	}
+	addr := Address{
+		Repo:      MetadataRepository(dataRepo),
+		Ref:       mappedRef,
+		Namespace: Namespace{SystemNamespace},
+		Table:     ObjectMetadataTable,
+	}
+	pointerPath, err := tablePointerPath(addr)
+	if err != nil {
+		return false, err
+	}
+	_, err = s.catalog.GetEntry(ctx, addr.Repo, addr.Ref, pointerPath, catalog.GetEntryParams{})
+	switch {
+	case err == nil:
+		return true, nil
+	case isMissingWarehouse(err):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+// listAllRepositories walks the whole repository listing of the tree's lister.
+func (s *Store) listAllRepositories(ctx context.Context) ([]*catalog.Repository, error) {
+	lister, ok := s.systemTreeLister()
+	if !ok {
+		return nil, nil
+	}
+	return walkRepositories(ctx, lister)
+}
+
+// listAllBranches walks the whole branch listing of repo on the tree's lister.
+func (s *Store) listAllBranches(ctx context.Context, repo string) ([]*catalog.Branch, error) {
+	lister, ok := s.systemTreeLister()
+	if !ok {
+		return nil, nil
+	}
+	return walkBranches(ctx, lister, repo)
+}
+
+// walkRepositories concatenates the pages of a repository listing that the catalog's own
+// iterators order by name.
+func walkRepositories(ctx context.Context, lister metadataTreeLister) ([]*catalog.Repository, error) {
+	var (
+		repositories []*catalog.Repository
+		after        string
+	)
+	for {
+		page, hasMore, err := lister.ListRepositories(ctx, catalog.ListRepositoriesLimitMax, "", "", after)
+		if err != nil {
+			return nil, err
+		}
+		repositories = append(repositories, page...)
+		if !hasMore || len(page) == 0 {
+			return repositories, nil
+		}
+		after = page[len(page)-1].Name
+	}
+}
+
+// walkBranches concatenates the pages of the branch listing of repo.
+func walkBranches(ctx context.Context, lister metadataTreeLister, repo string) ([]*catalog.Branch, error) {
+	var (
+		branches []*catalog.Branch
+		after    string
+	)
+	for {
+		page, hasMore, err := lister.ListBranches(ctx, repo, "", catalog.ListBranchesLimitMax, after)
+		if err != nil {
+			return nil, err
+		}
+		branches = append(branches, page...)
+		if !hasMore || len(page) == 0 {
+			return branches, nil
+		}
+		after = page[len(page)-1].Name
+	}
 }

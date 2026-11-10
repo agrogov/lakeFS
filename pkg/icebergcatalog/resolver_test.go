@@ -25,7 +25,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -1395,4 +1397,617 @@ func TestMetadataSearchErrorMapping(t *testing.T) {
 	rec = httptest.NewRecorder()
 	(&namespaceService{}).writeError(rec, err)
 	requireEnvelope(t, rec, http.StatusForbidden, ErrorTypeForbidden)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The root `system.metadata` tree (resolver.go; METADATA_SEARCH_REALIGN.md RA1: G1, G2, G6, G7, G8)
+// ---------------------------------------------------------------------------------------------
+//
+// The guide of 2026-11-09 addresses the metadata tables at the root of the lakeFS catalog:
+//
+//	system.metadata.<data repo>.<ref>.objects
+//
+// The tests below drive the real catalog the way a client does: the root listing, the two levels
+// above the data repositories, the data repository and its refs, and the table itself - on a branch,
+// a tag, a commit and a dotted tag given as separate namespace levels (G6). The state is the fixture
+// of the old virtual table: the data repository of tables_test.go and its companion
+// `lakehouse-metadata`, whose `system.object_metadata` table is the indexer's.
+
+const (
+	// resolverTreeObjectsTable is the tree's table name, spelled out so a test reads as the address
+	// a client sends.
+	resolverTreeObjectsTable = "objects"
+)
+
+// resolverTreeNodes is the namespace path parameter of one node of the root tree, e.g.
+// resolverTreeNodes(tablesTestRepo, tablesTestRef) for system.metadata.<R>.<ref>.
+func resolverTreeNodes(levels ...string) string {
+	return nodes(append([]string{SystemNamespace, MetadataNamespace}, levels...)...)
+}
+
+// resolverTreeLoadTarget is the load/head URL of system.metadata.<levels…>.objects.
+func resolverTreeLoadTarget(levels ...string) string {
+	return tablesLoadTarget(resolverTreeNodes(levels...), resolverTreeObjectsTable, nil)
+}
+
+// resolverTreeNamespaceTarget is the GET/HEAD URL of one node of the tree. It is built from the
+// levels themselves because the two top nodes (system and system.metadata) are not below a ref.
+func resolverTreeNamespaceTarget(levels ...string) string {
+	return namespacesTarget(levels...)
+}
+
+// resolverSystemNamespaceAddress is the catalog address of R's system namespace, which is the
+// address of the guide's namespace ARNs (G7).
+func resolverSystemNamespaceAddress(dataRepo string) Address {
+	return Address{Repo: dataRepo, Ref: MetadataNamespace, Namespace: Namespace{SystemNamespace}}
+}
+
+// resolverGuideGrant is the Metadata Search guide's grant for one data repository, verbatim (G7):
+// catalog:ReadTable and catalog:ReadTableData on table/<repo>/system/object_metadata, and
+// catalog:GetNamespace and catalog:ListNamespaces on namespace/<repo>/system. It has no fs: action.
+func resolverGuideGrant(repo string) model.Statements {
+	return model.Statements{
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{permissions.CatalogReadTableAction, permissions.CatalogReadTableDataAction},
+			Resource: permissions.CatalogTableArn(repo, SystemNamespace, ObjectMetadataTable),
+		},
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{permissions.CatalogGetNamespaceAction, permissions.CatalogListNamespacesAction},
+			Resource: permissions.CatalogNamespaceArn(repo, SystemNamespace),
+		},
+	}
+}
+
+// resolverGrantSeq hands every granted principal its own access key: the fixture authenticates real
+// requests, so two principals must not share a key.
+var resolverGrantSeq atomic.Int64
+
+// grant adds a principal with statements and the credential the fixture's requests use.
+func (f *resolverFixture) grant(t *testing.T, username string, statements model.Statements) {
+	t.Helper()
+	f.authz.user(t, username)
+	f.authz.attachStatements(t, "grant-"+username, username, statements)
+	credential := resolverCredential{
+		accessKeyID:     fmt.Sprintf("AKIATREE%03d", resolverGrantSeq.Add(1)),
+		secretAccessKey: "metadata-tree-test-secret-0000-" + username,
+	}
+	_, err := f.authz.svc.AddCredentials(t.Context(), username,
+		credential.accessKeyID, credential.secretAccessKey)
+	require.NoErrorf(t, err, "add credentials for %s", username)
+	f.credentials[username] = credential
+}
+
+// resolverTreeRefMapper is a RefMapper for the tree's tag and commit tests: a fixed map of the refs
+// the index knows about to the companion branch that holds their snapshot. It stands where the
+// indexer's own mapper (pkg/mds/refmap) stands; the mapping question is not what these tests pin.
+type resolverTreeRefMapper struct {
+	refs map[string]string
+}
+
+func (m *resolverTreeRefMapper) MapRef(_ context.Context, _, ref string) (string, error) {
+	if mapped, ok := m.refs[ref]; ok {
+		return mapped, nil
+	}
+	return "", &NoSuchTableException{
+		Repo: "unused", Ref: ref,
+		Namespace: Namespace{SystemNamespace}, Table: ObjectMetadataTable,
+	}
+}
+
+// TestMetadataSearchSystemTreeRead covers the read half of the tree (G1, G2): the listings of every
+// level, GET and HEAD of every node, the table itself, an unindexed repository, and the fact that a
+// caller needs no access to the companion repository.
+func TestMetadataSearchSystemTreeRead(t *testing.T) {
+	f := newResolverFixture(t)
+	// guided holds the guide's grant and nothing else: no fs: action, no access to R-metadata.
+	f.grant(t, "guided", resolverGuideGrant(tablesTestRepo))
+	// tree-lister may also list tables, which the guide's grant deliberately does not include.
+	f.grant(t, "tree-lister", append(resolverGuideGrant(tablesTestRepo),
+		model.Statement{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{permissions.CatalogListTablesAction},
+			Resource: permissions.CatalogNamespaceArn(tablesTestRepo, SystemNamespace),
+		},
+		model.Statement{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{permissions.CatalogListTablesAction},
+			Resource: permissions.CatalogTableArn(tablesTestRepo, SystemNamespace, ObjectMetadataTable),
+		}))
+	// root-reader may list repositories and nothing else: the two levels above the data repositories
+	// only say that Metadata Search has a repository.
+	f.grant(t, "root-reader", model.Statements{{
+		Effect:   model.StatementEffectAllow,
+		Action:   []string{permissions.ListRepositoriesAction},
+		Resource: permissions.All,
+	}})
+
+	// An unindexed data repository: it exists and has a branch, but no companion repository.
+	_, err := f.catalog.CreateRepository(f.ctx, "unindexed", "",
+		fmt.Sprintf("mem://iceberg-mds-unindexed-%d", tablesFixtureSeq.Add(1)), tablesTestRef, false)
+	require.NoError(t, err, "create the unindexed repository")
+
+	t.Run("every level is listed", func(t *testing.T) {
+		root := decodeListNamespaces(t, f.request(t, http.MethodGet, listTarget(nil, nil), "root-reader", ""))
+		require.Equal(t, []Namespace{{SystemNamespace}}, root.Namespaces,
+			"the root tree is visible as system when a metadata repository exists")
+
+		systemLevel := decodeListNamespaces(t, f.request(t, http.MethodGet,
+			listTarget([]string{SystemNamespace}, nil), "root-reader", ""))
+		require.Equal(t, []Namespace{{SystemNamespace, MetadataNamespace}}, systemLevel.Namespaces)
+
+		repositories := decodeListNamespaces(t, f.request(t, http.MethodGet,
+			listTarget([]string{SystemNamespace, MetadataNamespace}, nil), "guided", ""))
+		require.Equal(t, []Namespace{{SystemNamespace, MetadataNamespace, tablesTestRepo}}, repositories.Namespaces,
+			"only a readable repository whose objects table resolves is listed, and unindexed is neither")
+
+		branches := decodeListNamespaces(t, f.request(t, http.MethodGet,
+			listTarget([]string{SystemNamespace, MetadataNamespace, tablesTestRepo}, nil), "guided", ""))
+		require.Equal(t, []Namespace{{SystemNamespace, MetadataNamespace, tablesTestRepo, tablesTestRef}},
+			branches.Namespaces, "R's synced branches; its tag is never listed")
+
+		listing := decodeListTables(t, f.request(t, http.MethodGet,
+			tablesListTarget(resolverTreeNodes(tablesTestRepo, tablesTestRef), nil), "tree-lister", ""))
+		require.Equal(t, []string{resolverTreeObjectsTable}, tableNamesOf(listing))
+		require.Equal(t, Namespace{SystemNamespace, MetadataNamespace, tablesTestRepo, tablesTestRef},
+			listing.Identifiers[0].Namespace, "the identifier is the full address a client can load")
+	})
+
+	t.Run("get and head answer every existing node", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			user   string
+			target string
+			want   Namespace
+		}{
+			{"system", "root-reader", resolverTreeNamespaceTarget(SystemNamespace), Namespace{SystemNamespace}},
+			{"system.metadata", "root-reader",
+				resolverTreeNamespaceTarget(SystemNamespace, MetadataNamespace),
+				Namespace{SystemNamespace, MetadataNamespace}},
+			{"system.metadata.R", "guided",
+				resolverTreeNamespaceTarget(SystemNamespace, MetadataNamespace, tablesTestRepo),
+				Namespace{SystemNamespace, MetadataNamespace, tablesTestRepo}},
+			{"system.metadata.R.ref", "guided",
+				resolverTreeNamespaceTarget(SystemNamespace, MetadataNamespace, tablesTestRepo, tablesTestRef),
+				Namespace{SystemNamespace, MetadataNamespace, tablesTestRepo, tablesTestRef}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				response := decodeGetNamespace(t, f.request(t, http.MethodGet, tc.target, tc.user, ""))
+				require.Equal(t, tc.want, response.Namespace)
+				require.NotNil(t, response.Properties)
+				require.Empty(t, response.Properties, "the tree is marker-less, so a node has no properties")
+
+				head := f.request(t, http.MethodHead, tc.target, tc.user, "")
+				require.Equal(t, http.StatusNoContent, head.Code, "body: %s", head.Body.String())
+			})
+		}
+	})
+
+	t.Run("the table loads from the companion repository", func(t *testing.T) {
+		body := decodeLoadTable(t, f.request(t, http.MethodGet,
+			resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "guided", ""))
+		require.Equal(t, f.metaLocation, body.MetadataLocation)
+		require.JSONEq(t, f.metaMetadataJSON, string(mustMarshalRaw(t, body.Metadata)))
+		require.Equal(t, http.StatusNoContent, f.request(t, http.MethodHead,
+			resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "guided", "").Code)
+	})
+
+	t.Run("a caller needs no access to the companion repository", func(t *testing.T) {
+		direct := tablesLoadTarget(nodes(resolverMetaRepo, tablesTestRef, SystemNamespace),
+			resolverObjectMetadataTable, nil)
+		requireEnvelope(t, f.request(t, http.MethodGet, direct, "guided", ""),
+			http.StatusForbidden, ErrorTypeForbidden)
+	})
+
+	t.Run("an unindexed repository does not resolve and its nodes do not exist", func(t *testing.T) {
+		requireEnvelope(t, f.request(t, http.MethodGet,
+			resolverTreeLoadTarget("unindexed", tablesTestRef), "carol", ""),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+		requireEnvelope(t, f.request(t, http.MethodHead,
+			resolverTreeLoadTarget("unindexed", tablesTestRef), "carol", ""),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+		requireEnvelope(t, f.request(t, http.MethodGet,
+			resolverTreeNamespaceTarget(SystemNamespace, MetadataNamespace, "unindexed"), "carol", ""),
+			http.StatusNotFound, ErrTypeNoSuchNamespace)
+
+		// carol may read every catalog ARN, so the listing is her whole view of the tree.
+		repositories := decodeListNamespaces(t, f.request(t, http.MethodGet,
+			listTarget([]string{SystemNamespace, MetadataNamespace}, nil), "carol", ""))
+		for _, namespace := range repositories.Namespaces {
+			require.NotEqualf(t, Namespace{SystemNamespace, MetadataNamespace, "unindexed"}, namespace,
+				"a repository without a companion table is not listed")
+		}
+	})
+
+	t.Run("a missing ref is not a node", func(t *testing.T) {
+		requireEnvelope(t, f.request(t, http.MethodGet,
+			resolverTreeNamespaceTarget(SystemNamespace, MetadataNamespace, tablesTestRepo, "dev"), "carol", ""),
+			http.StatusNotFound, ErrTypeNoSuchNamespace)
+		requireEnvelope(t, f.request(t, http.MethodGet,
+			resolverTreeLoadTarget(tablesTestRepo, "dev"), "carol", ""),
+			http.StatusNotFound, ErrTypeNoSuchTable)
+	})
+}
+
+// TestMetadataSearchSystemTreeRefs covers the refs of the tree: a branch maps to itself, a tag and a
+// commit go through the RefMapper (G1), and a dotted tag works when it is given as its own namespace
+// level (G6). It is also the promise that tags and commits are never listed.
+func TestMetadataSearchSystemTreeRefs(t *testing.T) {
+	previous := MetadataSearchRefMapper
+	t.Cleanup(func() { MetadataSearchRefMapper = previous })
+	mapper := &resolverTreeRefMapper{refs: map[string]string{}}
+	MetadataSearchRefMapper = func(BranchLister) RefMapper { return mapper }
+
+	f := newResolverFixture(t)
+	f.grant(t, "guided", resolverGuideGrant(tablesTestRepo))
+
+	head, err := f.catalog.GetCommit(f.ctx, tablesTestRepo, tablesTestRef)
+	require.NoError(t, err, "head of the data repository")
+	_, err = f.catalog.CreateTag(f.ctx, tablesTestRepo, "v0.2.1", head.Reference)
+	require.NoError(t, err, "create the dotted tag")
+
+	for _, ref := range []string{tablesTestTag, "v0.2.1", head.Reference} {
+		mapper.refs[ref] = tablesTestRef
+	}
+
+	for _, tc := range []struct {
+		name string
+		ref  string
+	}{
+		{"branch", tablesTestRef},
+		{"tag", tablesTestTag},
+		{"commit", head.Reference},
+		{"dotted tag as one namespace level", "v0.2.1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The dotted tag is passed as a single level, never split on its dot (G6).
+			body := decodeLoadTable(t, f.request(t, http.MethodGet,
+				resolverTreeLoadTarget(tablesTestRepo, tc.ref), "guided", ""))
+			require.Equal(t, f.metaLocation, body.MetadataLocation)
+			require.Equal(t, http.StatusNoContent, f.request(t, http.MethodHead,
+				resolverTreeLoadTarget(tablesTestRepo, tc.ref), "guided", "").Code)
+			require.Equal(t, http.StatusNoContent, f.request(t, http.MethodHead,
+				resolverTreeNamespaceTarget(SystemNamespace, MetadataNamespace, tablesTestRepo, tc.ref),
+				"guided", "").Code)
+		})
+	}
+
+	t.Run("tags and commits are never listed", func(t *testing.T) {
+		branches := decodeListNamespaces(t, f.request(t, http.MethodGet,
+			listTarget([]string{SystemNamespace, MetadataNamespace, tablesTestRepo}, nil), "guided", ""))
+		require.Equal(t, []Namespace{{SystemNamespace, MetadataNamespace, tablesTestRepo, tablesTestRef}},
+			branches.Namespaces, "only the companion's branches are listed, never a tag or a commit")
+	})
+
+	t.Run("a node above an unreadable repository is refused", func(t *testing.T) {
+		requireEnvelope(t, f.request(t, http.MethodGet,
+			resolverTreeNamespaceTarget(SystemNamespace, MetadataNamespace, tablesTestRepo, tablesTestRef),
+			"bob", ""), http.StatusForbidden, ErrorTypeForbidden)
+	})
+}
+
+// TestMetadataSearchSystemTreeWrites covers the reservation of the whole tree (G1): every write
+// answers 403 ForbiddenException, at every level, for a caller that may write the catalog everywhere
+// - so the refusal is the reservation and not a missing permission.
+func TestMetadataSearchSystemTreeWrites(t *testing.T) {
+	f := newResolverFixture(t)
+	// carol holds catalog:* on every catalog ARN (authzWriteStatements of tables_test.go).
+	const user = "carol"
+
+	createTableBody := fmt.Sprintf(`{"name":%q,"schema":{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"x","required":true,"type":"long"}]}}`,
+		"clients_table")
+	refLevel := resolverTreeNodes(tablesTestRepo, tablesTestRef)
+
+	t.Run("create table", func(t *testing.T) {
+		requireEnvelope(t, f.request(t, http.MethodPost,
+			tablesCreateTarget(refLevel), user, createTableBody), http.StatusForbidden, ErrorTypeForbidden)
+	})
+
+	t.Run("register", func(t *testing.T) {
+		body := fmt.Sprintf(`{"name":%q,"metadata-location":%q}`, "clients_table", f.metaLocation)
+		requireEnvelope(t, f.request(t, http.MethodPost,
+			"/v1/"+CatalogPrefix+"/namespaces/"+refLevel+"/register", user, body),
+			http.StatusForbidden, ErrorTypeForbidden)
+	})
+
+	t.Run("drop table", func(t *testing.T) {
+		requireEnvelope(t, f.request(t, http.MethodDelete,
+			resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), user, ""),
+			http.StatusForbidden, ErrorTypeForbidden)
+		// Nothing was dropped: the tree still resolves.
+		require.Equal(t, http.StatusOK, f.request(t, http.MethodGet,
+			resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "carol", "").Code)
+	})
+
+	t.Run("commit", func(t *testing.T) {
+		body := `{"requirements":[],"updates":[{"action":"set-properties","updates":{"owner":"mallory"}}]}`
+		requireEnvelope(t, f.request(t, http.MethodPost,
+			resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), user, body),
+			http.StatusForbidden, ErrorTypeForbidden)
+	})
+
+	t.Run("create namespace", func(t *testing.T) {
+		body := fmt.Sprintf(`{"namespace":[%q,%q,%q,%q,%q]}`,
+			SystemNamespace, MetadataNamespace, tablesTestRepo, tablesTestRef, "child")
+		requireEnvelope(t, f.request(t, http.MethodPost, "/v1/"+CatalogPrefix+"/namespaces", user, body),
+			http.StatusForbidden, ErrorTypeForbidden)
+	})
+
+	t.Run("update namespace properties", func(t *testing.T) {
+		body := `{"updates":{"owner":"mallory"}}`
+		requireEnvelope(t, f.request(t, http.MethodPost,
+			resolverTreeNamespaceTarget(SystemNamespace, MetadataNamespace, tablesTestRepo, tablesTestRef)+"/properties",
+			user, body), http.StatusForbidden, ErrorTypeForbidden)
+	})
+
+	t.Run("drop namespace", func(t *testing.T) {
+		requireEnvelope(t, f.request(t, http.MethodDelete,
+			resolverTreeNamespaceTarget(SystemNamespace, MetadataNamespace, tablesTestRepo, tablesTestRef),
+			user, ""), http.StatusForbidden, ErrorTypeForbidden)
+	})
+}
+
+// TestMetadataSearchSystemTreeGuideGrant is G7 and RA10 together: the guide's grant alone - catalog
+// actions only, no fs: action, nothing on R-metadata - reads, heads and lists the tree, and a caller
+// without catalog:ReadTable on the guide's ARN is refused.
+func TestMetadataSearchSystemTreeGuideGrant(t *testing.T) {
+	f := newResolverFixture(t)
+	f.grant(t, "guided", resolverGuideGrant(tablesTestRepo))
+	f.grant(t, "fs-only", model.Statements{{
+		Effect:   model.StatementEffectAllow,
+		Action:   []string{permissions.ReadRepositoryAction},
+		Resource: permissions.All,
+	}})
+
+	for _, statements := range resolverGuideGrant(tablesTestRepo) {
+		for _, action := range statements.Action {
+			require.NotContains(t, action, "fs:",
+				"the guide's grant for Metadata Search alone has catalog actions only")
+		}
+	}
+
+	t.Run("the guide's grant alone reads and lists", func(t *testing.T) {
+		require.Equal(t, http.StatusOK, f.request(t, http.MethodGet,
+			resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "guided", "").Code)
+		require.Equal(t, http.StatusNoContent, f.request(t, http.MethodHead,
+			resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "guided", "").Code)
+
+		require.Equal(t, http.StatusOK, f.request(t, http.MethodGet,
+			resolverTreeNamespaceTarget(SystemNamespace, MetadataNamespace, tablesTestRepo), "guided", "").Code)
+		require.Equal(t, http.StatusOK, f.request(t, http.MethodGet,
+			resolverTreeNamespaceTarget(SystemNamespace, MetadataNamespace, tablesTestRepo, tablesTestRef),
+			"guided", "").Code)
+
+		repositories := decodeListNamespaces(t, f.request(t, http.MethodGet,
+			listTarget([]string{SystemNamespace, MetadataNamespace}, nil), "guided", ""))
+		require.Equal(t, []Namespace{{SystemNamespace, MetadataNamespace, tablesTestRepo}}, repositories.Namespaces)
+
+		branches := decodeListNamespaces(t, f.request(t, http.MethodGet,
+			listTarget([]string{SystemNamespace, MetadataNamespace, tablesTestRepo}, nil), "guided", ""))
+		require.Equal(t, []Namespace{{SystemNamespace, MetadataNamespace, tablesTestRepo, tablesTestRef}},
+			branches.Namespaces)
+	})
+
+	t.Run("without catalog:ReadTable on the ARN the read is refused", func(t *testing.T) {
+		// fs:ReadRepository is not a catalog permission (authz.go): the catalog action is the whole
+		// requirement, so this caller is refused like a caller with no grant at all.
+		requireEnvelope(t, f.request(t, http.MethodGet,
+			resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "fs-only", ""),
+			http.StatusForbidden, ErrorTypeForbidden)
+		requireEnvelope(t, f.request(t, http.MethodGet,
+			resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "bob", ""),
+			http.StatusForbidden, ErrorTypeForbidden)
+	})
+}
+
+// TestMetadataSearchSystemTreeDataPlane is G8 on the new address: vended credentials and remote
+// signing of the tree resolve the companion table and are read-only, and the caller needed nothing on
+// R-metadata. The fixture's object store can vend and sign, so the two data-plane paths are real.
+func TestMetadataSearchSystemTreeDataPlane(t *testing.T) {
+	f := newSignResolverFixture(t)
+	f.authz.user(t, "guided")
+	f.authz.attachStatements(t, "grant-guided", "guided", resolverGuideGrant(tablesTestRepo))
+
+	tree := Address{
+		Repo:      SystemNamespace,
+		Ref:       MetadataNamespace,
+		Namespace: Namespace{tablesTestRepo, tablesTestRef},
+		Table:     ObjectsTable,
+	}
+
+	t.Run("vended credentials are the companion table's, read-only", func(t *testing.T) {
+		stsFake := &credsFakeSTS{}
+		service := NewCredentialService(f.store, NewAuthorizer(f.authz.svc), f.catalog,
+			&Config{Prefix: CatalogPrefix, CredentialsVending: credsTestVending()}, stsFake, nil)
+		require.True(t, service.Enabled(), "the fake object store can vend")
+
+		// A write request on a branch: the tree is read-only, so the session must be a read one.
+		credentials, err := service.TableCredentials(t.Context(), Caller{Username: "guided"}, tree, true)
+		require.NoError(t, err)
+		require.Len(t, credentials, 1)
+		require.Equal(t, f.metaTableLocation, credentials[0].Prefix,
+			"the session is scoped to the companion table the tree resolves to")
+		require.Equal(t, 1, stsFake.calls, "the write attempt must not reach STS")
+
+		document := policyOf(t, stsFake.input)
+		require.NotContains(t, document.Statement[0].Action, "s3:PutObject",
+			"G8: vended credentials for metadata tables are always read-only")
+		require.Contains(t, document.Statement[0].Action, "s3:GetObject")
+	})
+
+	t.Run("the credentials endpoint vends the guide's caller a read session", func(t *testing.T) {
+		service := NewCredentialService(f.store, NewAuthorizer(f.authz.svc), f.catalog,
+			&Config{Prefix: CatalogPrefix, CredentialsVending: credsTestVending()}, &credsFakeSTS{}, nil)
+		router, err := newRouter(namespacesUser, &Config{},
+			testServer(&Config{Prefix: CatalogPrefix}, service.Routes()...))
+		require.NoError(t, err, "build the credentials router")
+
+		req := httptest.NewRequest(http.MethodGet,
+			credentialsTargetFor(resolverTreeNodes(tablesTestRepo, tablesTestRef), resolverTreeObjectsTable), nil)
+		req.Header.Set("X-Test-User", "guided")
+		req.Header.Set(AccessDelegationHeader, VendedCredentialsDelegation)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+
+		vended := requireVendedWithPrefix(t, rec, f.metaTableLocation)
+		require.NotEmpty(t, vended.Config[accessKeyIDProperty])
+	})
+
+	t.Run("remote signing resolves the companion table", func(t *testing.T) {
+		body := fmt.Sprintf(`{"region":"us-east-1","uri":%q,"method":"GET","headers":{}}`, f.metaDataURI)
+		rec := f.requestWithBody(t, http.MethodPost,
+			signTargetFor(resolverTreeNodes(tablesTestRepo, tablesTestRef), resolverTreeObjectsTable),
+			"alice", body)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	})
+
+	t.Run("a write signature for the tree is refused", func(t *testing.T) {
+		// G8: the tree is read-only, so no write signature is ever issued for the companion table's
+		// files - even to a caller who may write every catalog ARN (carol).
+		body := fmt.Sprintf(`{"region":"us-east-1","uri":%q,"method":"PUT","headers":{}}`, f.metaDataURI)
+		rec := f.requestWithBody(t, http.MethodPost,
+			signTargetFor(resolverTreeNodes(tablesTestRepo, tablesTestRef), resolverTreeObjectsTable),
+			"carol", body)
+		requireEnvelope(t, rec, http.StatusForbidden, ErrorTypeForbidden)
+	})
+}
+
+// requestWithBody is the sign fixture's request helper with a JSON body.
+func (f *signResolverFixture) requestWithBody(t *testing.T, method, target, user, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	req.Header.Set("X-Test-User", user)
+	req.Header.Set("Content-Type", contentTypeJSON)
+	rec := httptest.NewRecorder()
+	f.router.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestMetadataSearchSystemTreeWithoutMetadataRepository is X5: there is no server flag any more, so
+// the tree exists exactly while a metadata repository does. With the resolver registered and no
+// companion repository in the catalog, the root listing does not gain `system` and the two levels
+// above the data repositories do not exist.
+func TestMetadataSearchSystemTreeWithoutMetadataRepository(t *testing.T) {
+	base := newTablesFixture(t)
+	base.authz.attachStatements(t, "list-repositories", "alice", model.Statements{{
+		Effect:   model.StatementEffectAllow,
+		Action:   []string{permissions.ListRepositoriesAction},
+		Resource: permissions.All,
+	}})
+
+	cfg := &Config{Prefix: CatalogPrefix}
+	store := NewStore(base.catalog, base.catalog.BlockAdapter,
+		WithTableResolver(NewMetadataSearchResolver(base.catalog, nil)))
+	service := NewNamespaceService(store, base.authz.authz, base.catalog, cfg)
+	router, err := newRouter(tablesUser, cfg, catalogServerWith(cfg, service.Routes()...))
+	require.NoError(t, err, "build catalog router")
+
+	request := func(target string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req.Header.Set("X-Test-User", "alice")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	root := decodeListNamespaces(t, request(listTarget(nil, nil)))
+	require.Equal(t, []Namespace{{tablesTestRepo}}, root.Namespaces,
+		"system is listed only when a metadata repository exists")
+
+	requireEnvelope(t, request(resolverTreeNamespaceTarget(SystemNamespace)),
+		http.StatusNotFound, ErrTypeNoSuchNamespace)
+	requireEnvelope(t, request(resolverTreeNamespaceTarget(SystemNamespace, MetadataNamespace)),
+		http.StatusNotFound, ErrTypeNoSuchNamespace)
+
+	systemLevel := decodeListNamespaces(t, request(listTarget([]string{SystemNamespace}, nil)))
+	require.Empty(t, systemLevel.Namespaces, "system lists nothing while no companion repository exists")
+}
+
+// TestMetadataSearchSystemTreeAuthzAddress pins the address the caller's permission is checked
+// against (G7): the guide's ARNs name the data repository and the table object_metadata, not the
+// tree's own address - so the guide's grant works unchanged and no policy can grant `system`.
+func TestMetadataSearchSystemTreeAuthzAddress(t *testing.T) {
+	tableAddress := Address{
+		Repo:      SystemNamespace,
+		Ref:       MetadataNamespace,
+		Namespace: Namespace{tablesTestRepo, tablesTestRef},
+		Table:     ObjectsTable,
+	}
+	tableAuthz, ok := systemTreeAuthz(tableAddress)
+	require.True(t, ok)
+	require.Equal(t, Address{
+		Repo:      tablesTestRepo,
+		Ref:       tablesTestRef,
+		Namespace: Namespace{SystemNamespace},
+		Table:     ObjectMetadataTable,
+	}, tableAuthz)
+
+	node, err := RequiredNode(Request{Op: OpReadTable, Address: tableAuthz})
+	require.NoError(t, err)
+	require.Equal(t, permissions.CatalogTableArn(tablesTestRepo, SystemNamespace, ObjectMetadataTable),
+		node.Permission.Resource, "the guide's table ARN, arn:lakefs:catalog:::table/<R>/system/object_metadata")
+	require.Equal(t, permissions.CatalogReadTableAction, node.Permission.Action)
+
+	namespaceAuthz, ok := systemTreeAuthz(Address{
+		Repo: SystemNamespace, Ref: MetadataNamespace, Namespace: Namespace{tablesTestRepo},
+	})
+	require.True(t, ok)
+	require.Equal(t, systemNamespaceAuthz(tablesTestRepo), namespaceAuthz)
+	node, err = RequiredNode(Request{Op: OpGetNamespace, Address: namespaceAuthz})
+	require.NoError(t, err)
+	require.Equal(t, permissions.CatalogNamespaceArn(tablesTestRepo, SystemNamespace),
+		node.Permission.Resource, "the guide's namespace ARN, arn:lakefs:catalog:::namespace/<R>/system")
+
+	// Every address outside the tree is authorized as it is.
+	ordinary := Address{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{"inventory"}, Table: "orders"}
+	require.Equal(t, ordinary, authzAddress(ordinary))
+
+	// The whole tree is reserved: the two top nodes and every level below them.
+	resolver := NewMetadataSearchResolver(nil, nil)
+	for _, addr := range []Address{
+		{Repo: SystemNamespace},
+		{Repo: SystemNamespace, Ref: MetadataNamespace},
+		{Repo: SystemNamespace, Ref: MetadataNamespace, Namespace: Namespace{tablesTestRepo}},
+		tableAddress,
+	} {
+		require.Truef(t, resolver.ReservedNamespace(addr), "address %v is part of the reserved tree", addr)
+	}
+	require.True(t, resolver.ReservedNamespace(Address{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{"system"}}),
+		"the per-repository reservation is unchanged; RA3 removes it")
+	require.False(t, resolver.ReservedNamespace(Address{Repo: tablesTestRepo, Ref: tablesTestRef, Namespace: Namespace{"inventory"}}))
+}
+
+// TestMetadataSearchSystemTreeCompanionProof is MDS-SEC-3 at the new address: the root tree serves a
+// companion table only when the table says it indexes the data repository the address names. A
+// repository someone else created under the companion name must not be served under the server's own
+// identity, at either address.
+func TestMetadataSearchSystemTreeCompanionProof(t *testing.T) {
+	f := newResolverFixtureWithTableProperty(t, "another-repo")
+	f.grant(t, "guided", resolverGuideGrant(tablesTestRepo))
+
+	requireEnvelope(t, f.request(t, http.MethodGet,
+		resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "guided", ""),
+		http.StatusNotFound, ErrTypeNoSuchTable)
+	requireEnvelope(t, f.request(t, http.MethodHead,
+		resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "guided", ""),
+		http.StatusNotFound, ErrTypeNoSuchTable)
+}
+
+// credentialsTargetFor is the credentials URL of one namespace and table, e.g. the root tree's table.
+func credentialsTargetFor(namespaceParam, table string) string {
+	return "/v1/" + CatalogPrefix + "/namespaces/" + namespaceParam +
+		"/tables/" + url.PathEscape(table) + "/credentials"
+}
+
+// requireVendedWithPrefix asserts a successful credentials response whose one session is scoped to
+// prefix.
+func requireVendedWithPrefix(t *testing.T, rec *httptest.ResponseRecorder, prefix string) StorageCredential {
+	t.Helper()
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	var response LoadCredentialsResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response), "body: %s", rec.Body.String())
+	require.Len(t, response.StorageCredentials, 1)
+	require.Equal(t, prefix, response.StorageCredentials[0].Prefix)
+	return response.StorageCredentials[0]
 }
