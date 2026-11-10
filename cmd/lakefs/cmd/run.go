@@ -162,6 +162,11 @@ var runCmd = &cobra.Command{
 		}
 		deleteScheduler.StartAsync()
 
+		// Repository storage deletion runs in the server process only: `mds run` has no catalog
+		// worker loop.  The settle interval is the repository cache expiry, because another replica
+		// can answer with the deleted repository from its cache until then.
+		c.StartRepositoryDeletionWorker(ctx, catalog.WithRepositoryDeletionSettle(baseCfg.Graveler.RepositoryCache.Expiry))
+
 		// initial setup - support only when a local database is configured.
 		// local database lock will make sure that only one instance will run the setup.
 		if (kvParams.Type == local.DriverName || kvParams.Type == mem.DriverName) &&
