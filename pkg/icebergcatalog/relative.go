@@ -14,6 +14,19 @@ package icebergcatalog
 //	/iceberg/relative_to/{repo}.{branch}/api/v1/…/namespaces/{ns…}       (§5 row 4)
 //	/iceberg/relative_to/{repo}/api/v1/…/namespaces/{ref<sep>ns…}        (§5 row 5)
 //
+// The two rows above are the data-repository warehouses of §5. The current Metadata Search guide
+// adds two root-tree warehouses, so one catalog also serves the metadata tables it addresses at
+// `system.metadata` (METADATA_SEARCH_REALIGN.md G3):
+//
+//	/iceberg/relative_to/system.metadata/api/v1/…/namespaces/{repo<sep>ref}/tables/objects
+//	/iceberg/relative_to/system.metadata.{data repo}/api/v1/…/namespaces/{ref}/tables/objects
+//
+// i.e. `<repo>.<ref>.objects` and `<ref>.objects`, which is the addressing a DuckDB ATTACH on the
+// warehouse uses. The first fixes the two root levels, the second fixes the root levels and one
+// data repository; the client names only what is below them, and this file prefixes those levels
+// to the address exactly as it does for §5 rows 4 and 5 (the catalog then sees the ordinary
+// address `system.metadata.<repo>.<ref>.objects`, resolver.go).
+//
 // Both are published lakeFS recipes: the relative_to form is what DuckDB and Starburst use,
 // because their ATTACH / CREATE CATALOG syntax (and the `warehouse` client property) has room
 // for a URL but not for a repository and a ref inside the identifier
@@ -25,9 +38,11 @@ package icebergcatalog
 // parameter (relativeToPattern). RelativeTo is the middleware that turns the second mount into
 // the first:
 //
-//  1. it parses the warehouse segment into a Scope (ident.go ParseWarehouse): {repo} fixes the
-//     repository, {repo}.{branch} fixes the repository and the ref;
-//  2. it binds that Scope to the request context, so the handlers of namespaces.go and tables.go
+//  1. it parses the warehouse segment into the levels the URL fixes (parseWarehouseLevels): {repo}
+//     fixes the repository, {repo}.{branch} fixes the repository and the ref, and the two root-tree
+//     forms fix `system.metadata` and `system.metadata.{data repo}` (ident.go ParseWarehouse is the
+//     `{repo}[.{branch}]` parser those levels come from for the §5 rows);
+//  2. it binds those levels to the request context, so the handlers of namespaces.go and tables.go
 //     can tell which form they are serving (requestScope) and translate between the two
 //     addresses;
 //  3. it prefixes the client's own levels with the fixed ones, joined with the Iceberg namespace
@@ -36,8 +51,8 @@ package icebergcatalog
 //  4. it delegates to the same handler chain, so both forms run the same code and authorize the
 //     same way.
 //
-// The two forms therefore answer the same *address*, and not the same bytes. That distinction is
-// the whole of D-4: an address that /iceberg/api names [repo, ref, ns…] is named [ns…] by a
+// The forms therefore answer the same *address*, and not the same bytes. That distinction is the
+// whole of D-4: an address that /iceberg/api names [repo, ref, ns…] is named [ns…] by a
 // relative_to client, and [ref<sep>ns…] by a client whose URL fixed only the repository, because
 // the repository and the ref are fixed by the URL and were never the client's to name. A client
 // that sent ["inv"] has to read ["inv"] back - not ["repo", "main", "inv"], which it has no way
@@ -96,6 +111,12 @@ package icebergcatalog
 //     address outside the fixed scope cannot be produced by these handlers - the rewrite can only
 //     append to those levels - and if one ever were, returning it unchanged is the honest answer
 //     rather than a value that silently loses a level.
+//   - The root-tree warehouses are not a second way into the data repositories: they fix the
+//     reserved `system` repository and the `metadata` level below it, so a client of
+//     `system.metadata.{data repo}` still names only ref-and-below levels, and a client of
+//     `system.metadata` names the data repository and its ref as ordinary namespace levels. The
+//     data repository of the second form is a single level, split below in
+//     systemMetadataWarehouseLevels, whatever the client sends.
 //   - No I/O and no lookup happen here. A warehouse segment that does not parse names no
 //     warehouse of this catalog, and is answered 404 NoSuchWarehouseException right away (§5,
 //     errors.go). Whether a segment that *does* parse names a repository and a ref that exist is
@@ -142,9 +163,10 @@ const (
 )
 
 // ErrInvalidWarehouse is wrapped when the warehouse segment of a relative_to URL does not name a
-// repository, or a repository and a ref (§5). Unlike ErrInvalidIdentifier it is not a client
-// syntax error about an Iceberg identifier but a warehouse that this catalog cannot name at all,
-// so the answer is 404 NoSuchWarehouseException, not 400.
+// repository, a repository and a ref (§5), or one of the root-tree warehouses of
+// METADATA_SEARCH_REALIGN.md G3 (`system.metadata`, `system.metadata.{data repo}`). Unlike
+// ErrInvalidIdentifier it is not a client syntax error about an Iceberg identifier but a warehouse
+// that this catalog cannot name at all, so the answer is 404 NoSuchWarehouseException, not 400.
 var ErrInvalidWarehouse = errors.New("the warehouse segment does not name a repository[.ref]")
 
 // RelativeTo returns the middleware that binds the warehouse of a relative_to request and hands
@@ -160,7 +182,7 @@ var ErrInvalidWarehouse = errors.New("the warehouse segment does not name a repo
 // NoSuchWarehouseException (§5) and never reaches a handler.
 func RelativeTo(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		scope, relative, err := relativeScope(r)
+		fixed, relative, err := relativeScope(r)
 		if err != nil {
 			// The message names the shape the client has to use, because a warehouse is the one
 			// part of the address the catalog does not correct for the client.
@@ -170,32 +192,46 @@ func RelativeTo(next http.Handler) http.Handler {
 			return
 		}
 		if relative {
-			bindRelativeScope(scope, r)
-			// The scope also travels with the request, because two of the three rewrites - and the
-			// un-prefixing of the response - happen inside the handlers (see the file comment). The
-			// route context chi carries in the same context is preserved: WithContext only adds a
+			bindRelativeScope(fixed, r)
+			// The fixed levels also travel with the request, because two of the three rewrites - and
+			// the un-prefixing of the response - happen inside the handlers (see the file comment).
+			// The route context chi carries in the same context is preserved: WithContext only adds a
 			// value to it.
-			r = r.WithContext(withRequestScope(r.Context(), scope))
+			r = r.WithContext(withRequestScope(r.Context(), fixed))
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// requestScopeKey is the context key under which RelativeTo stores the Scope it bound. It is a
-// private struct type, so no other package can collide with it or forge one.
+// fixedLevels is the part of a relative_to address that the URL fixes: the levels the catalog
+// names in front of the client's own, in order. It is the Scope of ident.go generalised by one
+// level, because the root Metadata Search tree fixes up to three:
+//
+//	/iceberg/relative_to/{repo}/api                      → {repo}
+//	/iceberg/relative_to/{repo}.{branch}/api             → {repo, branch}
+//	/iceberg/relative_to/system.metadata/api             → {system, metadata}
+//	/iceberg/relative_to/system.metadata.{data repo}/api → {system, metadata, data repo}
+//
+// Everything this file does - the rewrite into the catalog, the un-prefixing of responses and the
+// namespace in a create body - is a function of exactly this list, so the forms need no branches
+// of their own beyond parsing.
+type fixedLevels []string
+
+// requestScopeKey is the context key under which RelativeTo stores the fixedLevels it bound. It is
+// a private type, so no other package can collide with it or forge one.
 type requestScopeKey struct{}
 
-// withRequestScope binds scope to ctx: from here on the request is one of the relative_to forms.
-func withRequestScope(ctx context.Context, scope Scope) context.Context {
-	return context.WithValue(ctx, requestScopeKey{}, scope)
+// withRequestScope binds fixed to ctx: from here on the request is one of the relative_to forms.
+func withRequestScope(ctx context.Context, fixed fixedLevels) context.Context {
+	return context.WithValue(ctx, requestScopeKey{}, fixed)
 }
 
 // requestScope is withRequestScope's reader. The bool reports whether the request answers one of
 // the relative_to forms; a request on the /iceberg/api mount carries no scope, and every helper
 // below is the identity for it.
-func requestScope(r *http.Request) (Scope, bool) {
-	scope, ok := r.Context().Value(requestScopeKey{}).(Scope)
-	return scope, ok
+func requestScope(r *http.Request) (fixedLevels, bool) {
+	fixed, ok := r.Context().Value(requestScopeKey{}).(fixedLevels)
+	return fixed, ok
 }
 
 // clientNamespace returns full - a namespace as the catalog names it internally, with the
@@ -214,11 +250,10 @@ func requestScope(r *http.Request) (Scope, bool) {
 // because bindRelativeScope always supplies a parent - is returned unchanged rather than as an
 // empty namespace.
 func clientNamespace(r *http.Request, full Namespace) Namespace {
-	scope, ok := requestScope(r)
+	fixed, ok := requestScope(r)
 	if !ok {
 		return full
 	}
-	fixed := scopeLevels(scope)
 	if len(full) <= len(fixed) {
 		return full
 	}
@@ -240,11 +275,10 @@ func clientNamespace(r *http.Request, full Namespace) Namespace {
 // body is still read through the iceberg.max_request_body bound of the catalog's own middleware
 // stack, which runs behind RelativeTo.
 func absoluteNamespaceLevels(r *http.Request, levels []string) []string {
-	scope, ok := requestScope(r)
+	fixed, ok := requestScope(r)
 	if !ok {
 		return levels
 	}
-	fixed := scopeLevels(scope)
 	absolute := make([]string, 0, len(fixed)+len(levels))
 	absolute = append(absolute, fixed...)
 	return append(absolute, levels...)
@@ -254,16 +288,71 @@ func absoluteNamespaceLevels(r *http.Request, levels []string) []string {
 // the request belongs to the relative_to form: a request without the warehouse URL parameter (the
 // /iceberg/api mount, whose route pattern is relativeToPattern without a warehouse) is not, and
 // must be served untouched.
-func relativeScope(r *http.Request) (Scope, bool, error) {
+func relativeScope(r *http.Request) (fixedLevels, bool, error) {
 	if !hasURLParam(r, warehouseParam) {
-		return Scope{}, false, nil
+		return nil, false, nil
 	}
-	scope, err := ParseWarehouse(chi.URLParam(r, warehouseParam))
+	segment := chi.URLParam(r, warehouseParam)
+	fixed, err := parseWarehouseLevels(segment)
 	if err != nil {
-		return Scope{}, false, fmt.Errorf("%w %q: %w", ErrInvalidWarehouse,
-			chi.URLParam(r, warehouseParam), err)
+		return nil, false, fmt.Errorf("%w %q: %w", ErrInvalidWarehouse, segment, err)
 	}
-	return scope, true, nil
+	return fixed, true, nil
+}
+
+// parseWarehouseLevels parses the warehouse segment into the levels it fixes (fixedLevels).
+//
+// The root Metadata Search tree has its own two warehouse forms (METADATA_SEARCH_REALIGN.md G3):
+// `system.metadata` fixes {system, metadata}, and `system.metadata.{data repo}` fixes one more
+// level. The first is also what ident.go ParseWarehouse answers for the segment - the tree's
+// `system` repository with the fixed `metadata` ref - so only the third level is new. Everything
+// else is the §5 form, unchanged: `{repo}` fixes the repository and `{repo}.{branch}` fixes the
+// repository and the ref, with the ref split at the first dot so a tag may carry dots.
+//
+// `system.metadata.{data repo}` has a single level below `metadata` because a lakeFS repository
+// name cannot contain a dot, so `system.metadata.a.b` names no warehouse and is answered 404
+// NoSuchWarehouseException like every other segment that does not parse.
+func parseWarehouseLevels(segment string) (fixedLevels, error) {
+	if fixed, ok, err := systemMetadataWarehouseLevels(segment); ok {
+		return fixed, err
+	}
+	scope, err := ParseWarehouse(segment)
+	if err != nil {
+		return nil, err
+	}
+	return scopeLevels(scope), nil
+}
+
+// systemMetadataWarehouseLevels recognises the root-tree warehouses of METADATA_SEARCH_REALIGN.md
+// G3: the segment is `system.metadata.` followed by exactly one level, the data repository R. It
+// reports whether the segment has that shape, so a segment below another repository stays with
+// ParseWarehouse and its §5 rules.
+//
+// The segment is decoded once, like every path parameter, before the shape is decided - so an
+// escaped warehouse (`%73ystem.metadata`) is the tree too - and R is validated as a lakeFS
+// repository name. A segment that begins with `system.metadata.` is never handed back to
+// ParseWarehouse: there it would be read as the repository `system` and a ref called
+// `metadata.{R}`, which is not the address the client meant (the guide's tags may carry dots, but
+// `system` is the reserved root of the catalog, so a data repository is what follows).
+func systemMetadataWarehouseLevels(segment string) (fixedLevels, bool, error) {
+	decoded, err := unescapeSegment(segment)
+	if err != nil {
+		// Let ParseWarehouse report the encoding error: it decodes the same segment.
+		return nil, false, nil
+	}
+	prefix := SystemNamespace + "." + MetadataNamespace + "."
+	if !strings.HasPrefix(decoded, prefix) {
+		return nil, false, nil
+	}
+	dataRepo, extra, hasExtra := strings.Cut(strings.TrimPrefix(decoded, prefix), ".")
+	if hasExtra {
+		return nil, true, fmt.Errorf("%w: %q names %q below %s.%s, and a data repository is one level",
+			ErrInvalidIdentifier, decoded, dataRepo+"."+extra, SystemNamespace, MetadataNamespace)
+	}
+	if err := validateRepo(dataRepo); err != nil {
+		return nil, true, err
+	}
+	return fixedLevels{SystemNamespace, MetadataNamespace, dataRepo}, true, nil
 }
 
 // bindRelativeScope rewrites a relative_to request into the equivalent /iceberg/api request: the
@@ -272,12 +361,12 @@ func relativeScope(r *http.Request) (Scope, bool, error) {
 // everything else is left alone. The one address this function does not rewrite is the namespace
 // in the body of a create: that request is decoded by the handler, which prepends the same levels
 // with absoluteNamespaceLevels (D-2, see the file comment).
-func bindRelativeScope(scope Scope, r *http.Request) {
+func bindRelativeScope(fixed fixedLevels, r *http.Request) {
 	rctx := chi.RouteContext(r.Context())
 	if rctx == nil {
 		return
 	}
-	if path, ok := prefixNamespacePath(rctx.RoutePath, scope); ok {
+	if path, ok := prefixNamespacePath(rctx.RoutePath, fixed); ok {
 		// A namespaces or tables address. The route path is what the catalog's own router matches
 		// next (chi strips the mount prefix into RoutePath before calling the mounted handler), so
 		// rewriting it is what makes the handlers read the address the /iceberg/api form would
@@ -295,15 +384,17 @@ func bindRelativeScope(scope Scope, r *http.Request) {
 	if parent := r.URL.Query().Get(parentParam); parent != "" {
 		// ListNamespaces below a parent: the parent is already decoded by net/url, so the levels
 		// are joined decoded and re-encoded by url.Values when the query is written back.
-		setQueryParam(r, parentParam, joinLevels(
-			append(scopeLevels(scope), parent), NamespaceSeparator))
+		levels := make([]string, 0, len(fixed)+1)
+		levels = append(levels, fixed...)
+		setQueryParam(r, parentParam, joinLevels(append(levels, parent), NamespaceSeparator))
 		return
 	}
 	if strings.HasSuffix(r.URL.Path, namespacesCollectionPath) {
 		// ListNamespaces with no parent. On the /iceberg/api form that lists repositories; on a
 		// relative_to URL the warehouse is fixed, so it lists one level below the warehouse
-		// itself: the namespaces of {repo}.{branch} (§5 row 4) or the refs of {repo} (§5 row 5).
-		setQueryParam(r, parentParam, joinLevels(scopeLevels(scope), NamespaceSeparator))
+		// itself: the namespaces of {repo}.{branch} (§5 row 4), the refs of {repo} (§5 row 5), the
+		// data repositories of system.metadata and the refs of system.metadata.{data repo} (G3).
+		setQueryParam(r, parentParam, joinLevels(fixed, NamespaceSeparator))
 	}
 }
 
@@ -314,24 +405,25 @@ func bindRelativeScope(scope Scope, r *http.Request) {
 //
 // The separator is inserted in its encoded form; a handler decodes its path parameter exactly
 // once (ident.go unescapeSegment), which is also how it reads the /iceberg/api form.
-func prefixNamespacePath(routePath string, scope Scope) (string, bool) {
+func prefixNamespacePath(routePath string, fixed fixedLevels) (string, bool) {
 	marker := "/" + namespacesSegment + "/"
 	start := strings.Index(routePath, marker)
 	if start < 0 {
 		return routePath, false
 	}
 	start += len(marker)
-	warehouse := joinLevels(scopeLevels(scope), EncodedNamespaceSeparator)
+	warehouse := joinLevels(fixed, EncodedNamespaceSeparator)
 	if warehouse == "" {
 		return routePath, false
 	}
 	return routePath[:start] + warehouse + EncodedNamespaceSeparator + routePath[start:], true
 }
 
-// scopeLevels is the warehouse part of an address: the repository, and the ref when the URL
-// fixed one. §5 rows 4 and 5 differ in exactly this: {repo}.{branch} fixes two levels, {repo}
-// one.
-func scopeLevels(scope Scope) []string {
+// scopeLevels is the warehouse part of a `{repo}[.{branch}]` address: the repository, and the ref
+// when the URL fixed one. §5 rows 4 and 5 differ in exactly this: {repo}.{branch} fixes two
+// levels, {repo} one. The root-tree forms are parsed by systemMetadataWarehouseLevels directly,
+// because their third level is below the ref and so is not part of a Scope.
+func scopeLevels(scope Scope) fixedLevels {
 	levels := make([]string, 0, macroLevels)
 	levels = append(levels, scope.Repo)
 	if scope.Ref != "" {

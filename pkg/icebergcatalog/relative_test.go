@@ -250,6 +250,60 @@ func TestRelativeToBindsTheWarehouse(t *testing.T) {
 		}
 	})
 
+	t.Run("the root metadata tree fixes two or three levels", func(t *testing.T) {
+		// METADATA_SEARCH_REALIGN.md G3: the client of system.metadata names <repo>.<ref> and the
+		// client of system.metadata.<R> names <ref>; both reach the tree address
+		// system.metadata.<repo>.<ref>.objects through the one rewrite.
+		cases := []struct {
+			name      string
+			warehouse string
+			client    string
+		}{
+			{name: "system.metadata", warehouse: "system.metadata", client: nodes("lakehouse", "main")},
+			{name: "system.metadata.<R>", warehouse: "system.metadata.lakehouse", client: nodes("main")},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				target := warehouseTarget(tc.warehouse,
+					"/v1/"+CatalogPrefix+"/namespaces/"+tc.client+"/tables/objects")
+				rec, got := serve(t, mux, capture, target)
+				require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+				require.Equal(t, Address{
+					Repo: SystemNamespace, Ref: MetadataNamespace,
+					Namespace: Namespace{"lakehouse", "main"}, Table: ObjectsTable,
+				}, parse(t, got))
+			})
+		}
+	})
+
+	t.Run("a root metadata warehouse lists one level below itself", func(t *testing.T) {
+		cases := []struct {
+			name      string
+			warehouse string
+			want      Address
+		}{
+			{
+				name:      "system.metadata lists the data repositories",
+				warehouse: "system.metadata",
+				want:      Address{Repo: SystemNamespace, Ref: MetadataNamespace},
+			},
+			{
+				name:      "system.metadata.<R> lists the refs",
+				warehouse: "system.metadata.lakehouse",
+				want: Address{Repo: SystemNamespace, Ref: MetadataNamespace,
+					Namespace: Namespace{"lakehouse"}},
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				target := warehouseTarget(tc.warehouse, "/v1/"+CatalogPrefix+"/namespaces")
+				rec, got := serve(t, mux, capture, target)
+				require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+				require.Equal(t, tc.want, parseParent(t, got))
+			})
+		}
+	})
+
 	t.Run("pagination is passed through", func(t *testing.T) {
 		target := warehouseTarget("lakehouse.main",
 			"/v1/"+CatalogPrefix+"/namespaces?pageSize=2&pageToken="+encodePageToken(2))
@@ -268,6 +322,13 @@ func TestRelativeToBindsTheWarehouse(t *testing.T) {
 			"an empty ref":              "lakehouse.",
 			"a separator in the repo":   "lakehouse%1Fmain",
 			"a namespace separator ref": "lakehouse.main%1Fother",
+			// The root metadata tree (G3): a data repository is exactly one level and is a lakeFS
+			// repository name, so a second level or a name the repository rules reject is no
+			// warehouse. The answer is the same 404 NoSuchWarehouseException as every other
+			// warehouse that does not parse.
+			"a second level below the data repository": "system.metadata.lakehouse.main",
+			"an invalid data repository":               "system.metadata.Lakehouse",
+			"an empty data repository":                 "system.metadata.",
 		}
 		for name, warehouse := range cases {
 			t.Run(name, func(t *testing.T) {
@@ -278,6 +339,70 @@ func TestRelativeToBindsTheWarehouse(t *testing.T) {
 			})
 		}
 	})
+}
+
+// TestRelativeToWarehouseLevels pins the levels the rewrite puts in front of the client's own for
+// every warehouse form. The rewrite is exactly the fixed levels followed by the client's, joined
+// with the namespace separator, so this table is the whole of the parser's contract:
+//
+//   - the pre-existing `{repo}` and `{repo}.{branch}` rows (METADATA_SEARCH_PLAN §5 rows 4 and 5)
+//     fix one and two levels and must not move: RA2 extends the parser, it does not change them;
+//   - the two root Metadata Search tree rows (METADATA_SEARCH_REALIGN.md G3) fix two and three
+//     levels, and the client of each names the levels below them.
+//
+// The last two rows rewrite to the same address as the first two would from a client that named
+// the tree itself: the catalog only ever sees the levels of `want`, whichever warehouse named it.
+// The recorded parameter is compared after one decode, because that is the single decode a handler
+// performs (ident.go unescapeSegment); the insertions are escaped and the client's own part is
+// whatever net/http and chi canonicalise it to, so comparing before the decode would pin that
+// canonicalisation rather than this package's rewrite.
+func TestRelativeToWarehouseLevels(t *testing.T) {
+	mux, capture := newBindingStub()
+
+	cases := []struct {
+		name      string
+		warehouse string
+		client    string // the namespace path parameter the client sends, already encoded
+		want      []string
+	}{
+		{
+			name:      "repo",
+			warehouse: "lakehouse",
+			client:    nodes("main", "inventory"),
+			want:      []string{"lakehouse", "main", "inventory"},
+		},
+		{
+			name:      "repo.branch",
+			warehouse: "lakehouse.main",
+			client:    nodes("inventory"),
+			want:      []string{"lakehouse", "main", "inventory"},
+		},
+		{
+			name:      "system.metadata",
+			warehouse: "system.metadata",
+			client:    nodes("lakehouse", "main"),
+			want:      []string{"system", "metadata", "lakehouse", "main"},
+		},
+		{
+			name:      "system.metadata.<R>",
+			warehouse: "system.metadata.lakehouse",
+			client:    nodes("main"),
+			want:      []string{"system", "metadata", "lakehouse", "main"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := warehouseTarget(tc.warehouse,
+				"/v1/"+CatalogPrefix+"/namespaces/"+tc.client+"/tables/objects")
+			rec, got := serve(t, mux, capture, target)
+			require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+			decoded, err := url.PathUnescape(got.namespace)
+			require.NoError(t, err, "the rewritten parameter must be valid percent-encoding")
+			require.Equal(t, strings.Join(tc.want, NamespaceSeparator), decoded,
+				"the rewrite must be exactly the fixed levels and the client's own")
+		})
+	}
 }
 
 // relativeToFixture is the catalog the way a client reaches it: the router RoutesBuilder mounts -
@@ -852,6 +977,147 @@ func TestRelativeToRoundTripThroughTheMountedCatalog(t *testing.T) {
 		for _, identifier := range tables.Identifiers {
 			require.Equal(t, []string{nsTestRepo, nsTestRef, "inventory", "books"},
 				[]string(identifier.Namespace))
+		}
+	})
+}
+
+// TestRelativeToSystemMetadataTree is the G3 half of METADATA_SEARCH_REALIGN.md RA2: the two root
+// metadata warehouses of the current guide address the same tables as the /iceberg/api address
+// system.metadata.<R>.<ref>.objects, in the terms a DuckDB ATTACH on the warehouse uses -
+// `<repo>.<ref>.objects` on relative_to/system.metadata/api and `<ref>.objects` on
+// relative_to/system.metadata.<R>/api.
+//
+// The fixture is the Metadata Search state of resolver_test.go: the data repository of tables_test.go
+// and its companion `lakehouse-metadata`, whose system.object_metadata table is the index the tree
+// serves. The requests go through the router RoutesBuilder mounts, so the production relative_to
+// mount and the production tree are both on the path.
+func TestRelativeToSystemMetadataTree(t *testing.T) {
+	f := newResolverFixture(t)
+
+	// treeWarehouse is the root tree's two fixed levels; dataWarehouse adds the data repository.
+	treeWarehouse := SystemNamespace + "." + MetadataNamespace
+	dataWarehouse := treeWarehouse + "." + tablesTestRepo
+
+	cases := []struct {
+		name      string
+		warehouse string
+		namespace Namespace
+		// parent is the listing that names the data repository level in the client's terms: the
+		// data repository itself when the warehouse fixes only the tree, and nothing when the
+		// warehouse fixes the repository (its refs hang directly below the warehouse).
+		parent []string
+	}{
+		{
+			name:      "system.metadata addresses tables as <repo>.<ref>.objects",
+			warehouse: treeWarehouse,
+			namespace: Namespace{tablesTestRepo, tablesTestRef},
+			parent:    []string{tablesTestRepo},
+		},
+		{
+			name:      "system.metadata.<R> addresses tables as <ref>.objects",
+			warehouse: dataWarehouse,
+			namespace: Namespace{tablesTestRef},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			warehouse := func(catalogPath string) string {
+				return warehouseTarget(tc.warehouse, catalogPath)
+			}
+			loadPath := tablesLoadTarget(nodes(tc.namespace...), ObjectsTable, nil)
+
+			// LoadTable and HeadTable: the table the client names is the metadata table the tree
+			// serves, so the warehouse named the address the guide publishes.
+			loaded := decodeLoadTable(t, f.request(t, http.MethodGet, warehouse(loadPath), "alice", ""))
+			require.Equal(t, f.metaLocation, loaded.MetadataLocation)
+			require.Equal(t, http.StatusNoContent,
+				f.request(t, http.MethodHead, warehouse(loadPath), "alice", "").Code)
+
+			// ListTables: the identifier comes back in the client's own terms, never as the tree's
+			// [system, metadata, …] address (D-4).
+			tables := decodeListTables(t, f.request(t, http.MethodGet,
+				warehouse(tablesListTarget(nodes(tc.namespace...), nil)), "alice", ""))
+			require.Equal(t, []string{ObjectsTable}, tableNamesOf(tables))
+			require.Equal(t, tc.namespace, tables.Identifiers[0].Namespace)
+
+			// ListNamespaces one level below the data repository: the synced refs, in the client's
+			// own terms - [data repo, ref] for a client that names the repository itself, [ref] for a
+			// client whose warehouse fixed it.
+			refs := decodeListNamespaces(t, f.request(t, http.MethodGet,
+				warehouse(listTarget(tc.parent, nil)), "alice", ""))
+			require.Equal(t, []Namespace{append(append(Namespace{}, tc.parent...), tablesTestRef)},
+				refs.Namespaces)
+		})
+	}
+
+	t.Run("system.metadata lists the data repositories", func(t *testing.T) {
+		listed := decodeListNamespaces(t, f.request(t, http.MethodGet,
+			warehouseTarget(treeWarehouse, listTarget(nil, nil)), "alice", ""))
+		require.Equal(t, []Namespace{{tablesTestRepo}}, listed.Namespaces)
+	})
+
+	t.Run("both warehouses load the same table as the tree address", func(t *testing.T) {
+		direct := f.request(t, http.MethodGet,
+			resolverTreeLoadTarget(tablesTestRepo, tablesTestRef), "alice", "")
+		require.Equal(t, http.StatusOK, direct.Code, "body: %s", direct.Body.String())
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				rec := f.request(t, http.MethodGet, warehouseTarget(tc.warehouse,
+					tablesLoadTarget(nodes(tc.namespace...), ObjectsTable, nil)), "alice", "")
+				require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+				require.Equal(t, direct.Body.String(), rec.Body.String(),
+					"a relative_to warehouse must answer the tree address's bytes")
+			})
+		}
+	})
+
+	t.Run("the pre-existing repo[.branch] warehouses answer exactly as before", func(t *testing.T) {
+		// A table of the data repository, not the tree: the address the two §5 rows cover. The
+		// answer is compared byte for byte with /iceberg/api, because RA2 must not move it.
+		namespace := Namespace{"inventory", "books"}
+		direct := f.request(t, http.MethodGet,
+			tablesLoadTarget(nodes(append([]string{tablesTestRepo, tablesTestRef}, namespace...)...),
+				"orders", nil), "alice", "")
+		require.Equal(t, http.StatusOK, direct.Code, "body: %s", direct.Body.String())
+
+		for _, form := range []relativeForm{
+			{
+				name:      "repo.branch",
+				warehouse: tablesTestRepo + "." + tablesTestRef,
+				target: warehouseTarget(tablesTestRepo+"."+tablesTestRef,
+					tablesLoadTarget(nodes(namespace...), "orders", nil)),
+			},
+			{
+				name:      "repo",
+				warehouse: tablesTestRepo,
+				target: warehouseTarget(tablesTestRepo,
+					tablesLoadTarget(nodes(append([]string{tablesTestRef}, namespace...)...),
+						"orders", nil)),
+			},
+		} {
+			t.Run(form.name, func(t *testing.T) {
+				rec := f.request(t, http.MethodGet, form.target, "alice", "")
+				require.Equal(t, direct.Code, rec.Code, "body: %s", rec.Body.String())
+				require.Equal(t, direct.Body.String(), rec.Body.String(),
+					"the pre-existing form must answer the same bytes it always did")
+			})
+		}
+	})
+
+	t.Run("an invalid warehouse still answers the existing 404", func(t *testing.T) {
+		for _, warehouse := range []string{
+			treeWarehouse + ".Lakehouse",
+			treeWarehouse + "." + tablesTestRepo + "." + tablesTestRef,
+			treeWarehouse + ".",
+		} {
+			t.Run(warehouse, func(t *testing.T) {
+				rec := f.request(t, http.MethodGet, warehouseTarget(warehouse,
+					tablesLoadTarget(nodes(tablesTestRef), ObjectsTable, nil)), "alice", "")
+				apiError := requireEnvelope(t, rec, http.StatusNotFound, ErrTypeNoSuchWarehouse)
+				require.Contains(t, apiError.Message, RelativeToBasePath)
+			})
 		}
 	})
 }
