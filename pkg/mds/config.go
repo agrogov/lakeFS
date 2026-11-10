@@ -17,9 +17,8 @@ import (
 	"strings"
 	"time"
 
-	icebergio "github.com/apache/iceberg-go/io"
 	"github.com/spf13/viper"
-	"github.com/treeverse/lakefs/pkg/icebergcatalog"
+	"github.com/treeverse/lakefs/pkg/logging"
 )
 
 const (
@@ -28,27 +27,17 @@ const (
 	// only iceberg.metadata_search.enabled, and the indexer reads only this section.
 	ConfigKey = "metadata_search"
 
-	// BackfillHead indexes only the head of a branch when it is first indexed: the objects of
-	// the head commit are written as a single full listing (§4.5 step 2). It is the default.
-	BackfillHead = "head"
-
-	// BackfillHistory starts at the branch's oldest first-parent commit, like upstream's
-	// "branch creation" mode (§4.5 step 2).
-	BackfillHistory = "history"
-
-	// maxRepositoryIDLength is the longest lakeFS repository ID:
-	// validator.ReValidRepositoryID accepts 3 to 63 characters.
-	maxRepositoryIDLength = 63
+	// deprecatedEndpointSuffix is the suffix the deprecated lakefs_mds_endpoint has to end in
+	// (guide G10): that key named the separate Metadata Search catalog, which the guide retired in
+	// favor of the lakeFS catalog at <lakefs_endpoint>/iceberg/api. A value without the suffix is
+	// a base URL, which is what lakefs_endpoint is, so it is refused with a message that names the
+	// rename instead of being guessed.
+	deprecatedEndpointSuffix = "/mds/iceberg/api"
 )
 
-// MaxRepositoryNameLength is the longest data repository name the indexer accepts: the companion
-// repository is R + icebergcatalog.MetadataRepositorySuffix, and a lakeFS repository ID is at
-// most 63 characters, so R may be at most 54 (§3.3, §7).
-const MaxRepositoryNameLength = maxRepositoryIDLength - len(icebergcatalog.MetadataRepositorySuffix)
-
-// The documented defaults of the metadata_search section (§7). A key that is written with a
-// value that Validate rejects (for example period: 0) is not defaulted: the default applies only
-// when the key is absent.
+// The documented defaults of the metadata_search section that the guide's key list still has
+// (G10, G11). Every other setting this package used to read is now fixed behaviour: the keys are
+// gone from the guide, so there is nothing left to validate or default (X6).
 const (
 	// DefaultListenAddress is where /_health, /metrics and /_pprof/ are served (§7, §9).
 	DefaultListenAddress = "0.0.0.0:8080"
@@ -56,38 +45,11 @@ const (
 	// DefaultPeriod is the interval between two ticks of the indexer (§4.1).
 	DefaultPeriod = 60 * time.Second
 
-	// DefaultRequestTimeout bounds one HTTP request of the indexer's lakeFS API client and of its
-	// Iceberg REST catalog client (§4.1, §7).
-	DefaultRequestTimeout = 60 * time.Second
-
 	// DefaultConcurrency is how many branches an indexer processes in parallel (§4.1).
 	DefaultConcurrency = 25
 
 	// DefaultMaxCommits bounds the number of source commits one branch applies per tick (§4.2).
 	DefaultMaxCommits = 1000
-
-	// DefaultSeedLookback bounds how far back the first indexing of a branch looks for an
-	// indexed ancestor to seed from (§4.5 step 1).
-	DefaultSeedLookback = 1000
-
-	// DefaultRebuildThreshold is the change-set size above which a commit is indexed by
-	// rebuilding the branch's table from a full listing instead of applying a delta (§4.3).
-	DefaultRebuildThreshold = 100_000
-
-	// DefaultDeleteBranches is whether deleting a matching branch of the data repository also
-	// deletes the mirrored branch of R-metadata (§4.8). Its tags stay.
-	DefaultDeleteBranches = true
-
-	// DefaultTagRetention is how long mds-* tags are kept; 0 keeps them forever (§4.9).
-	DefaultTagRetention time.Duration = 0
-
-	// DefaultCompactionMaxDeleteFiles is the number of position-delete files that triggers a
-	// compaction of a branch's table (§4.9).
-	DefaultCompactionMaxDeleteFiles = 200
-
-	// DefaultCompactionEveryCommits is the number of indexed commits after which a branch's
-	// table is compacted (§4.9).
-	DefaultCompactionEveryCommits = 500
 )
 
 // ErrInvalidConfig is wrapped by every configuration error, so a caller can tell a bad
@@ -95,8 +57,9 @@ const (
 // problem, joined into a single error (§7).
 var ErrInvalidConfig = errors.New("invalid metadata_search configuration")
 
-// The static errors of the branch-selector rule of §4.1. Validate wraps them with the offending
-// selector, so an operator sees the value and errors.Is can still tell the rule apart.
+// The static errors of the branch-selector warning. They are reported as warnings, never as
+// startup failures: the guide's validation list has no branch rule, and a selector that matches
+// nothing is not a configuration error the process can decide about.
 var (
 	// errEmptyBranchSelector reports a metadata_search.repositories.<R>.branches entry that is
 	// the empty string, which matches no branch.
@@ -107,116 +70,48 @@ var (
 	errBranchGlobStar = errors.New(`only a single trailing "*" is supported in a branch pattern`)
 )
 
-// CompactionConfig is the metadata_search.compaction section (§4.9): when a branch's table is
-// rewritten to drop the position-delete files that the merge-on-read delta writes accumulate.
-//
-// A threshold of 0 disables its trigger and a negative value is refused by Validate: 0 is the
-// documented way to turn a trigger off, so it is never replaced by the default here (IO-6). The
-// defaults apply only when the key is absent from the configuration.
-type CompactionConfig struct {
-	// MaxDeleteFiles is the number of delete files that triggers a compaction; 0 disables the
-	// trigger, the default when the key is absent is 200.
-	MaxDeleteFiles int `mapstructure:"max_delete_files"`
-
-	// EveryCommits is the number of indexed commits after which a compaction runs; 0 disables the
-	// trigger, the default when the key is absent is 500.
-	EveryCommits int `mapstructure:"every_commits"`
-}
-
-// AzureConfig is the metadata_search.azure section (METADATA_SEARCH_AZURE.md D3): the Azure
-// credentials and endpoint the indexer's iceberg-go IO uses to read and write the files of the
-// metadata tables of a companion repository on an Azure blockstore.
-//
-// It is a section of its own rather than keys in metadata_search.storage because the storage map
-// is decoded from the configuration file only (the env-var rule of docs/metadata-search.md): a
-// Kubernetes secret mounted as LAKEFS_METADATA_SEARCH_AZURE_STORAGE_ACCESS_KEY could not be put
-// there. Every key below is read through applyViperOverrides, so each is its own environment
-// variable, and StorageProperties translates it into the adls.* IO property of iceberg-go.
-//
-// The indexer deliberately does not fall back to blockstore.azure.*: it is a separate process with
-// its own lakeFS credentials and its own identity, and silently borrowing the server's storage key
-// would hide a misconfiguration of that identity (D3).
-type AzureConfig struct {
-	// StorageAccount is the Azure storage account name. It is dimensioned for the shared-key
-	// credentials (iceberg-go builds the container URL from it) and paired with ClientID for a
-	// managed identity.
-	StorageAccount string `mapstructure:"storage_account"`
-
-	// StorageAccessKey is the shared key of StorageAccount. Empty means the credential chain of
-	// iceberg-go: the default Azure credential, or a managed identity when UseManagedIdentity is
-	// set.
-	StorageAccessKey string `mapstructure:"storage_access_key"` //nolint:gosec // a configuration field, not a credential value
-
-	// UseManagedIdentity makes iceberg-go use azidentity.ManagedIdentityCredential instead of the
-	// default credential chain, which also tries a managed identity. Pair it with ClientID to
-	// select a user-assigned identity.
-	UseManagedIdentity bool `mapstructure:"use_managed_identity"`
-
-	// ClientID selects a user-assigned managed identity by client ID. It only takes effect when
-	// UseManagedIdentity is set.
-	ClientID string `mapstructure:"client_id"`
-
-	// Endpoint is the storage domain iceberg-go builds its service URL from
-	// (adls.endpoint), e.g. blob.core.windows.net for the public cloud. It is required for any
-	// other cloud and for Azurite, because iceberg-go ignores the storage domain of the table
-	// location.
-	Endpoint string `mapstructure:"endpoint"`
-
-	// Protocol is the scheme of that service URL (adls.protocol): http or https. Empty means
-	// https, like iceberg-go's own default.
-	Protocol string `mapstructure:"protocol"`
-}
-
-// StorageProperties returns the iceberg-go IO properties of the section (D3), one property per
-// key that is set: the translation table of the design, so that an operator writes
-// storage_account rather than adls.auth.shared-key.account.name in the configuration file.
-//
-// A setting that is empty is not translated, because iceberg-go's own default is what an empty
-// value means: no protocol is https, no managed identity is the default credential chain, and no
-// endpoint is the public blob domain.
-func (a AzureConfig) StorageProperties() map[string]string {
-	props := make(map[string]string)
-	setProperty := func(key, value string) {
-		if value != "" {
-			props[key] = value
-		}
-	}
-	setProperty(icebergio.ADLSSharedKeyAccountName, a.StorageAccount)
-	setProperty(icebergio.ADLSSharedKeyAccountKey, a.StorageAccessKey)
-	if a.UseManagedIdentity {
-		props[icebergio.ADLSManagedIdentityEnabled] = "true"
-	}
-	setProperty(icebergio.ADLSClientID, a.ClientID)
-	setProperty(icebergio.ADLSEndpoint, a.Endpoint)
-	setProperty(icebergio.ADLSProtocol, a.Protocol)
-	return props
-}
-
 // RepositoryConfig is one entry of metadata_search.repositories (§7): a data repository to index
 // and the branches of it that are mirrored into R-metadata.
 type RepositoryConfig struct {
 	// Branches are the branches to index: exact names, or a prefix followed by a single
-	// trailing "*" glob (§4.1). At least one is required.
+	// trailing "*" glob (§4.1). An empty list indexes nothing and is not a startup error (X8).
 	Branches []string `mapstructure:"branches"`
 
-	// StorageNamespace overrides the storage namespace of R-metadata (§3.3). Empty means the
-	// namespace is derived from R's: <ns>-metadata when R's namespace has a path component, and
-	// a bucket-root namespace requires this key to be set.
+	// StorageNamespace overrides the storage namespace of R-metadata (§3.3). Empty means
+	// "-metadata" is appended to R's own namespace, in every case: a bucket root
+	// (s3://bucket -> s3://bucket-metadata) and an Azure container root
+	// (https://acct.blob.core.windows.net/c -> https://acct.blob.core.windows.net/c-metadata)
+	// included, exactly as the guide says (X10).
 	StorageNamespace string `mapstructure:"storage_namespace"`
 }
 
 // Config is the top-level "metadata_search:" section of the lakeFS configuration (§7). It is
 // populated by LoadConfig from viper and never by the server's own configuration unmarshalling,
 // which knows nothing about this section.
+//
+// The key list is the guide's (G10, G11): lakefs_endpoint, the deprecated lakefs_mds_endpoint,
+// the optional access_key_id/secret_key pair, listen_address, period, concurrency, max_commits,
+// since and repositories. The object-store credentials the indexer writes with are the standard
+// blockstore.* settings of the process, not a key of this section (X6).
 type Config struct {
-	// LakeFSMDSEndpoint is the base URL of lakeFS: the API lives at /api/v1 and the Iceberg
-	// catalog at /iceberg (§4.1). Required.
+	// LakeFSEndpoint is the base URL of lakeFS: the API lives at /api/v1 and the Iceberg catalog
+	// at /iceberg, so writes go to <LakeFSEndpoint>/iceberg/api (§4.1, G10). Required, unless the
+	// deprecated lakefs_mds_endpoint is the only endpoint set. LoadConfig stores the resolved base
+	// URL here, so this field is always the effective endpoint of a loaded configuration.
+	LakeFSEndpoint string `mapstructure:"lakefs_endpoint"`
+
+	// LakeFSMDSEndpoint is the deprecated spelling of LakeFSEndpoint (G10). It named the separate
+	// Metadata Search catalog, so it is only accepted when it ends in /mds/iceberg/api, which is
+	// stripped with a warning. Our own configurations used it as a base URL; that form fails
+	// validation with a message that names the rename.
 	LakeFSMDSEndpoint string `mapstructure:"lakefs_mds_endpoint"`
 
-	// AccessKeyID is the access key of the mds-indexer principal (§8). Required.
+	// AccessKeyID is the access key of the principal the indexer writes as (§8). Optional: it is
+	// set together with SecretKey or not at all (G11, X7), so an installation that provisions the
+	// service user itself leaves both empty.
 	AccessKeyID string `mapstructure:"access_key_id"`
 
-	// SecretKey is the secret key of the mds-indexer principal (§8). Required.
+	// SecretKey is the secret key of that principal. Optional, and set together with AccessKeyID.
 	SecretKey string `mapstructure:"secret_key"` //nolint:gosec // a configuration field, not a credential value
 
 	// ListenAddress is the address of the indexer's own HTTP server: /_health, /metrics and
@@ -226,62 +121,22 @@ type Config struct {
 	// Period is the interval between two ticks (§4.1). Must be positive.
 	Period time.Duration `mapstructure:"period"`
 
-	// RequestTimeout bounds every HTTP request the indexer sends, on the lakeFS API client and on
-	// the Iceberg REST catalog client alike (§4.1). It is what keeps one connection that neither
-	// answers nor resets from stalling the tick loop while /_health stays 200 (§9). Must be
-	// positive.
-	RequestTimeout time.Duration `mapstructure:"request_timeout"`
-
-	// Concurrency is how many branches one tick processes in parallel (§4.1). Must be positive.
+	// Concurrency is how many branches one tick processes in parallel (§4.1). Must be at least 1.
 	Concurrency int `mapstructure:"concurrency"`
 
-	// MaxCommits bounds the number of source commits one branch applies per tick (§4.2). Must
-	// be positive.
+	// MaxCommits bounds the number of source commits one branch applies per tick (§4.2). Must be
+	// at least 1.
 	MaxCommits int `mapstructure:"max_commits"`
 
 	// Since is the RFC 3339 timestamp that bounds a backfill of a branch: only commits created
-	// at or after it are listed (§4.5 step 2). It is kept as the text the operator wrote so
-	// that Validate can report a bad value with the value in it; SinceTime returns the parsed
-	// form. It is read by applyViperOverrides rather than by the mapstructure decode, because a
-	// bare YAML timestamp arrives as a time.Time and the text is what this setting is.
+	// at or after it are listed (§4.5 step 2). It is kept as the text the operator wrote so that
+	// a bad value can be reported with the value in it; SinceTime returns the parsed form. It is
+	// read by applyViperOverrides rather than by the mapstructure decode, because a bare YAML
+	// timestamp arrives as a time.Time and the text is what this setting is.
 	Since string `mapstructure:"-"`
 
-	// Backfill is BackfillHead (default) or BackfillHistory (§4.5 step 2).
-	Backfill string `mapstructure:"backfill"`
-
-	// SeedLookback is how many first-parent commits of a branch the first indexing walks back
-	// looking for an indexed ancestor to seed from (§4.5 step 1). Must be positive.
-	SeedLookback int `mapstructure:"seed_lookback"`
-
-	// RebuildThreshold is the number of upserts plus deletes above which a commit is indexed by
-	// a full rebuild of the branch's table instead of a delta (§4.3 step 2). Must be positive.
-	RebuildThreshold int `mapstructure:"rebuild_threshold"`
-
-	// DeleteBranches mirrors the deletion of a matching branch to R-metadata (§4.8). Default
-	// true.
-	DeleteBranches bool `mapstructure:"delete_branches"`
-
-	// TagRetention is how long mds-* tags are kept, 0 keeping them forever (§4.9). A negative
-	// duration is refused by Validate.
-	TagRetention time.Duration `mapstructure:"tag_retention"`
-
-	// Compaction configures the table maintenance of §4.9.
-	Compaction CompactionConfig `mapstructure:"compaction"`
-
-	// Storage holds the iceberg-go IO properties (s3.endpoint, s3.access-key-id, ...) used when
-	// the catalog does not vend write credentials (§4.6). Optional.
-	//
-	// LoadConfig merges the azure.* properties of Azure into this map (D3), so this is the single
-	// property map the indexer hands to iceberg-go, and the indexer needs to know nothing about
-	// Azure. An explicit key written here wins over the translated one.
-	Storage map[string]string `mapstructure:"storage"`
-
-	// Azure configures the Azure credentials and endpoint of that IO (D3). Optional: without it
-	// iceberg-go uses the default Azure credential chain.
-	Azure AzureConfig `mapstructure:"azure"`
-
-	// Repositories are the data repositories to index, by repository name (§7). At least one is
-	// required.
+	// Repositories are the data repositories to index, by repository name (§7). An empty map
+	// means Metadata Search is disabled: it is not a startup error (X8).
 	Repositories map[string]RepositoryConfig `mapstructure:"repositories"`
 
 	// since is the parsed form of Since; nil when the key is absent or empty. It is unexported
@@ -302,15 +157,17 @@ func LoadConfig() (*Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	cfg.applyAzureStorage()
 	return cfg, nil
 }
 
 // applyViperOverrides re-reads every scalar key through viper. viper.UnmarshalKey decodes only
 // the config-file map, so per-key environment variables such as
 // LAKEFS_METADATA_SEARCH_SECRET_KEY (§7) would otherwise be silently ignored. Nested values
-// (repositories, storage, compaction) are read by the UnmarshalKey decode above.
+// (repositories) are read by the UnmarshalKey decode above.
 func (c *Config) applyViperOverrides() {
+	if viper.IsSet(ConfigKey + ".lakefs_endpoint") {
+		c.LakeFSEndpoint = viper.GetString(ConfigKey + ".lakefs_endpoint")
+	}
 	if viper.IsSet(ConfigKey + ".lakefs_mds_endpoint") {
 		c.LakeFSMDSEndpoint = viper.GetString(ConfigKey + ".lakefs_mds_endpoint")
 	}
@@ -326,85 +183,20 @@ func (c *Config) applyViperOverrides() {
 	if viper.IsSet(ConfigKey + ".period") {
 		c.Period = viper.GetDuration(ConfigKey + ".period")
 	}
-	if viper.IsSet(ConfigKey + ".request_timeout") {
-		c.RequestTimeout = viper.GetDuration(ConfigKey + ".request_timeout")
-	}
 	if viper.IsSet(ConfigKey + ".concurrency") {
 		c.Concurrency = viper.GetInt(ConfigKey + ".concurrency")
 	}
 	if viper.IsSet(ConfigKey + ".max_commits") {
 		c.MaxCommits = viper.GetInt(ConfigKey + ".max_commits")
 	}
-	if viper.IsSet(ConfigKey + ".backfill") {
-		c.Backfill = viper.GetString(ConfigKey + ".backfill")
-	}
 	if since, ok := viperTimeString(ConfigKey + ".since"); ok {
 		c.Since = since
-	}
-	if viper.IsSet(ConfigKey + ".seed_lookback") {
-		c.SeedLookback = viper.GetInt(ConfigKey + ".seed_lookback")
-	}
-	if viper.IsSet(ConfigKey + ".rebuild_threshold") {
-		c.RebuildThreshold = viper.GetInt(ConfigKey + ".rebuild_threshold")
-	}
-	if viper.IsSet(ConfigKey + ".delete_branches") {
-		c.DeleteBranches = viper.GetBool(ConfigKey + ".delete_branches")
-	}
-	if viper.IsSet(ConfigKey + ".tag_retention") {
-		c.TagRetention = viper.GetDuration(ConfigKey + ".tag_retention")
-	}
-	if viper.IsSet(ConfigKey + ".compaction.max_delete_files") {
-		c.Compaction.MaxDeleteFiles = viper.GetInt(ConfigKey + ".compaction.max_delete_files")
-	}
-	if viper.IsSet(ConfigKey + ".compaction.every_commits") {
-		c.Compaction.EveryCommits = viper.GetInt(ConfigKey + ".compaction.every_commits")
-	}
-	// The Azure section is scalar end to end, so every key here is a
-	// LAKEFS_METADATA_SEARCH_AZURE_* environment variable (D3).
-	if viper.IsSet(ConfigKey + ".azure.storage_account") {
-		c.Azure.StorageAccount = viper.GetString(ConfigKey + ".azure.storage_account")
-	}
-	if viper.IsSet(ConfigKey + ".azure.storage_access_key") {
-		c.Azure.StorageAccessKey = viper.GetString(ConfigKey + ".azure.storage_access_key")
-	}
-	if viper.IsSet(ConfigKey + ".azure.use_managed_identity") {
-		c.Azure.UseManagedIdentity = viper.GetBool(ConfigKey + ".azure.use_managed_identity")
-	}
-	if viper.IsSet(ConfigKey + ".azure.client_id") {
-		c.Azure.ClientID = viper.GetString(ConfigKey + ".azure.client_id")
-	}
-	if viper.IsSet(ConfigKey + ".azure.endpoint") {
-		c.Azure.Endpoint = viper.GetString(ConfigKey + ".azure.endpoint")
-	}
-	if viper.IsSet(ConfigKey + ".azure.protocol") {
-		c.Azure.Protocol = viper.GetString(ConfigKey + ".azure.protocol")
-	}
-}
-
-// applyAzureStorage merges the adls.* IO properties of the azure section into the storage map
-// (D3), which is what the indexer passes to iceberg-go verbatim. An explicit metadata_search.storage
-// key wins: the map is the documented escape hatch that reaches iceberg-go as-is, including the
-// properties this section has no key for (adls.sas-token.<host>, adls.connection-string.<account>,
-// and any S3 property of the same installation).
-func (c *Config) applyAzureStorage() {
-	props := c.Azure.StorageProperties()
-	if len(props) == 0 {
-		return
-	}
-	if c.Storage == nil {
-		c.Storage = make(map[string]string, len(props))
-	}
-	for key, value := range props {
-		if _, ok := c.Storage[key]; ok {
-			continue
-		}
-		c.Storage[key] = value
 	}
 }
 
 // setDefaults fills every absent setting with its documented default (§7). A key the
-// installation wrote is never replaced, so an explicit 0 or false stays visible to Validate
-// instead of being silently turned into the default: viper.IsSet is what distinguishes the two.
+// installation wrote is never replaced, so an explicit 0 stays visible to Validate instead of
+// being silently turned into the default: viper.IsSet is what distinguishes the two.
 func (c *Config) setDefaults() {
 	set := func(key string) bool { return viper.IsSet(ConfigKey + "." + key) }
 	if !set("listen_address") || c.ListenAddress == "" {
@@ -413,159 +205,138 @@ func (c *Config) setDefaults() {
 	if !set("period") {
 		c.Period = DefaultPeriod
 	}
-	if !set("request_timeout") {
-		c.RequestTimeout = DefaultRequestTimeout
-	}
 	if !set("concurrency") {
 		c.Concurrency = DefaultConcurrency
 	}
 	if !set("max_commits") {
 		c.MaxCommits = DefaultMaxCommits
 	}
-	if !set("backfill") {
-		c.Backfill = BackfillHead
-	}
-	if !set("seed_lookback") {
-		c.SeedLookback = DefaultSeedLookback
-	}
-	if !set("rebuild_threshold") {
-		c.RebuildThreshold = DefaultRebuildThreshold
-	}
-	if !set("delete_branches") {
-		c.DeleteBranches = DefaultDeleteBranches
-	}
-	if !set("tag_retention") {
-		c.TagRetention = DefaultTagRetention
-	}
-	if !set("compaction.max_delete_files") {
-		c.Compaction.MaxDeleteFiles = DefaultCompactionMaxDeleteFiles
-	}
-	if !set("compaction.every_commits") {
-		c.Compaction.EveryCommits = DefaultCompactionEveryCommits
-	}
 }
 
-// Validate checks the metadata_search section (§7) and reports one error per problem: the
-// returned error joins every finding, so an operator fixes the whole section in one pass instead
-// of rediscovering the next problem on the next start. It also parses Since, which SinceTime
-// then returns.
+// Validate checks the section against the guide's validation list (G11): an endpoint is set, the
+// optional credential pair is complete, period > 0, concurrency >= 1 and max_commits >= 1.
+// Nothing else fails startup: a repository name, an unparsable `since` or an unsupported branch
+// selector is a warning, and an empty repositories or branches list disables work instead of
+// stopping the process (X7, X8, X9).
+//
+// It reports one error per problem: the returned error joins every finding, so an operator fixes
+// the whole section in one pass instead of rediscovering the next problem on the next start.
 func (c *Config) Validate() error {
 	var problems []error
 	invalid := func(format string, args ...any) {
 		problems = append(problems, fmt.Errorf("%w: %s", ErrInvalidConfig, fmt.Sprintf(format, args...)))
 	}
 
-	if strings.TrimSpace(c.LakeFSMDSEndpoint) == "" {
-		invalid("%s.lakefs_mds_endpoint is required", ConfigKey)
-	}
-	if strings.TrimSpace(c.AccessKeyID) == "" {
-		invalid("%s.access_key_id is required", ConfigKey)
-	}
-	if strings.TrimSpace(c.SecretKey) == "" {
-		invalid("%s.secret_key is required", ConfigKey)
+	c.resolveEndpoint(invalid)
+	// The guide's optional credential pair: both or neither (G11, X7).
+	hasAccessKey := strings.TrimSpace(c.AccessKeyID) != ""
+	hasSecretKey := strings.TrimSpace(c.SecretKey) != ""
+	if hasAccessKey != hasSecretKey {
+		invalid("%s.access_key_id and %s.secret_key must be set together, or both left empty",
+			ConfigKey, ConfigKey)
 	}
 	if c.Period <= 0 {
 		invalid("%s.period must be positive, got %s", ConfigKey, c.Period)
 	}
-	if c.RequestTimeout <= 0 {
-		invalid("%s.request_timeout must be positive, got %s", ConfigKey, c.RequestTimeout)
+	if c.Concurrency < 1 {
+		invalid("%s.concurrency must be at least 1, got %d", ConfigKey, c.Concurrency)
 	}
-	if c.Concurrency <= 0 {
-		invalid("%s.concurrency must be positive, got %d", ConfigKey, c.Concurrency)
+	if c.MaxCommits < 1 {
+		invalid("%s.max_commits must be at least 1, got %d", ConfigKey, c.MaxCommits)
 	}
-	if c.MaxCommits <= 0 {
-		invalid("%s.max_commits must be positive, got %d", ConfigKey, c.MaxCommits)
-	}
-	if c.SeedLookback <= 0 {
-		invalid("%s.seed_lookback must be positive, got %d", ConfigKey, c.SeedLookback)
-	}
-	if c.RebuildThreshold <= 0 {
-		invalid("%s.rebuild_threshold must be positive, got %d", ConfigKey, c.RebuildThreshold)
-	}
-	// The maintenance settings are the two places where 0 is a documented value: it turns a
-	// compaction trigger off, and it keeps every mds-* tag (§4.9). Negative values are not.
-	if c.TagRetention < 0 {
-		invalid("%s.tag_retention must not be negative, got %s; 0 keeps every mds-* tag", ConfigKey, c.TagRetention)
-	}
-	if c.Compaction.MaxDeleteFiles < 0 {
-		invalid("%s.compaction.max_delete_files must not be negative, got %d; 0 disables the trigger",
-			ConfigKey, c.Compaction.MaxDeleteFiles)
-	}
-	if c.Compaction.EveryCommits < 0 {
-		invalid("%s.compaction.every_commits must not be negative, got %d; 0 disables the trigger",
-			ConfigKey, c.Compaction.EveryCommits)
-	}
-	switch c.Backfill {
-	case BackfillHead, BackfillHistory:
-	default:
-		invalid("%s.backfill must be %q or %q, got %q", ConfigKey, BackfillHead, BackfillHistory, c.Backfill)
-	}
-	c.validateAzure(invalid)
-	c.validateRepositories(invalid)
 
-	c.since = nil
-	if c.Since != "" {
-		parsed, err := time.Parse(time.RFC3339, c.Since)
-		if err != nil {
-			invalid("%s.since %q is not an RFC 3339 timestamp: %v", ConfigKey, c.Since, err)
-		} else {
-			c.since = &parsed
-		}
+	c.resolveSince()
+	c.warnRepositories()
+	if len(c.Repositories) == 0 {
+		logging.ContextUnavailable().Warnf(
+			"mds: %s.repositories is empty, so Metadata Search is disabled and nothing is indexed", ConfigKey)
 	}
 	return errors.Join(problems...)
 }
 
-// validateAzure checks the metadata_search.azure section (D3): a shared key needs the account name
-// it belongs to, because iceberg-go builds the container URL from the account and refuses the pair
-// only later, at the first write, with an error that does not name the setting; and a protocol
-// other than http/https is rejected by the storage SDK at that same late point.
-func (c *Config) validateAzure(invalid func(format string, args ...any)) {
-	if c.Azure.StorageAccessKey != "" && c.Azure.StorageAccount == "" {
-		invalid("%s.azure.storage_access_key requires %s.azure.storage_account, iceberg-go builds the container URL from the account name",
-			ConfigKey, ConfigKey)
-	}
-	switch c.Azure.Protocol {
-	case "", "http", "https":
+// resolveEndpoint sets LakeFSEndpoint to the lakeFS base URL the indexer writes to. lakefs_endpoint
+// is the guide's key (G10); lakefs_mds_endpoint is the deprecated spelling and only accepted when
+// it ends in /mds/iceberg/api, whose suffix is stripped with a warning. A lakefs_mds_endpoint that
+// is a base URL - which is what our own configurations (hr2) carry - is refused with a message
+// that names the rename, instead of being guessed into the wrong catalog.
+func (c *Config) resolveEndpoint(invalid func(format string, args ...any)) {
+	log := logging.ContextUnavailable()
+	endpoint := strings.TrimRight(strings.TrimSpace(c.LakeFSEndpoint), "/")
+	deprecated := strings.TrimRight(strings.TrimSpace(c.LakeFSMDSEndpoint), "/")
+	switch {
+	case endpoint != "":
+		c.LakeFSEndpoint = endpoint
+		if deprecated != "" {
+			log.WithField("deprecated_key", ConfigKey+".lakefs_mds_endpoint").
+				Warn("mds: both lakefs_endpoint and its deprecated spelling lakefs_mds_endpoint are set, using lakefs_endpoint")
+		}
+	case deprecated == "":
+		invalid("%s.lakefs_endpoint is required: the lakeFS base URL, e.g. http://lakefs:8000", ConfigKey)
+	case strings.HasSuffix(deprecated, deprecatedEndpointSuffix):
+		stripped := strings.TrimSuffix(deprecated, deprecatedEndpointSuffix)
+		if stripped == "" {
+			invalid("%s.lakefs_mds_endpoint %q is not a lakeFS base URL: set %s.lakefs_endpoint to the base URL instead",
+				ConfigKey, c.LakeFSMDSEndpoint, ConfigKey)
+			return
+		}
+		c.LakeFSEndpoint = stripped
+		log.WithFields(logging.Fields{
+			"deprecated_key": ConfigKey + ".lakefs_mds_endpoint",
+			"endpoint":       stripped,
+		}).Warnf("mds: %s.lakefs_mds_endpoint is deprecated in favor of %s.lakefs_endpoint, using %q",
+			ConfigKey, ConfigKey, stripped)
 	default:
-		invalid("%s.azure.protocol must be \"http\" or \"https\", got %q", ConfigKey, c.Azure.Protocol)
+		invalid("%s.lakefs_mds_endpoint is deprecated and is only accepted when it ends in %q, got %q: "+
+			"that is a lakeFS base URL, so rename the key to %s.lakefs_endpoint",
+			ConfigKey, deprecatedEndpointSuffix, c.LakeFSMDSEndpoint, ConfigKey)
 	}
 }
 
-// validateRepositories checks every metadata_search.repositories entry: the repository name rules
-// of §3.3 (it must leave room for the -metadata suffix and must not itself look like a companion
-// repository), the requirement that a repository lists branches, and the branch-glob rule of §4.1
-// (only a single trailing "*" is supported).
-func (c *Config) validateRepositories(invalid func(format string, args ...any)) {
-	if len(c.Repositories) == 0 {
-		invalid("%s.repositories must list at least one repository", ConfigKey)
+// resolveSince parses the optional since bound. A value that is not RFC 3339 does not fail startup
+// (X6: the guide's validation list has no since rule); it is reported as a warning and dropped, so
+// the branch is captured "from the time the branch was created", which is the guide's default
+// (X11), instead of failing the process on a value an operator can fix in a running deployment.
+func (c *Config) resolveSince() {
+	c.since = nil
+	if c.Since == "" {
 		return
 	}
+	parsed, err := time.Parse(time.RFC3339, c.Since)
+	if err != nil {
+		logging.ContextUnavailable().WithField("since", c.Since).Warn(
+			"mds: metadata_search.since is not an RFC 3339 timestamp, ignoring it; metadata is captured from the time the branch was created")
+		return
+	}
+	c.since = &parsed
+}
+
+// warnRepositories reports the repository settings a data repository may carry that would
+// otherwise silently index nothing (§4.1): a branch selector that no branch can match. It is a
+// warning and never an error: the guide has no startup rule about repositories (X9).
+func (c *Config) warnRepositories() {
+	log := logging.ContextUnavailable()
 	for _, name := range c.RepositoryNames() {
-		repo := c.Repositories[name]
-		if strings.HasSuffix(name, icebergcatalog.MetadataRepositorySuffix) {
-			invalid("%s.repositories.%s: a data repository name must not end in %q, that is the companion repository suffix",
-				ConfigKey, name, icebergcatalog.MetadataRepositorySuffix)
-		}
-		if len(name) > MaxRepositoryNameLength {
-			invalid("%s.repositories.%s: a data repository name must not be longer than %d characters, because %q is appended to it",
-				ConfigKey, name, MaxRepositoryNameLength, icebergcatalog.MetadataRepositorySuffix)
-		}
-		if len(repo.Branches) == 0 {
-			invalid("%s.repositories.%s.branches must list at least one branch", ConfigKey, name)
+		repository := c.Repositories[name]
+		if len(repository.Branches) == 0 {
+			log.WithField("repository", name).Warnf(
+				"mds: %s.repositories.%s.branches is empty, so no branch of %q is indexed", ConfigKey, name, name)
 			continue
 		}
-		for i, glob := range repo.Branches {
-			if err := validateBranchGlob(glob); err != nil {
-				invalid("%s.repositories.%s.branches[%d]: %v", ConfigKey, name, i, err)
+		for _, selector := range repository.Branches {
+			if err := validateBranchGlob(selector); err != nil {
+				log.WithFields(logging.Fields{
+					"repository": name,
+					"selector":   selector,
+				}).Warnf("mds: %s.repositories.%s.branches: %v, so no branch matches it",
+					ConfigKey, name, err)
 			}
 		}
 	}
 }
 
 // validateBranchGlob checks the branch selector of §4.1: an exact branch name, or a prefix
-// followed by a single trailing "*". A "*" anywhere else is refused rather than treated as a
-// pattern nothing matches, because a branch that silently stays unindexed is exactly the failure
-// an operator cannot see.
+// followed by a single trailing "*". It is a warning, not a startup failure: a "*" anywhere else
+// is reported rather than silently treated as a pattern nothing matches.
 func validateBranchGlob(glob string) error {
 	if glob == "" {
 		return errEmptyBranchSelector
@@ -593,7 +364,7 @@ func (c *Config) RepositoryNames() []string {
 // viperTimeString reads a timestamp setting the way viper holds it: a quoted YAML value or an
 // environment variable arrives as a string, while an unquoted RFC 3339 value arrives as a
 // time.Time, because YAML resolves bare timestamps. Either way the result is the text in RFC 3339
-// form, so Validate can quote it back and the indexer can parse it.
+// form, so a warning can quote it back and the indexer can parse it.
 func viperTimeString(key string) (string, bool) {
 	switch value := viper.Get(key).(type) {
 	case nil:
@@ -607,8 +378,8 @@ func viperTimeString(key string) (string, bool) {
 	}
 }
 
-// SinceTime returns the parsed metadata_search.since timestamp, and false when the key is absent
-// or empty.
+// SinceTime returns the parsed metadata_search.since timestamp, and false when the key is absent,
+// empty, or not an RFC 3339 timestamp.
 func (c *Config) SinceTime() (time.Time, bool) {
 	if c == nil || c.since == nil {
 		return time.Time{}, false

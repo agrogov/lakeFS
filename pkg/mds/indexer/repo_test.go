@@ -54,14 +54,14 @@ func TestMetadataNamespace(t *testing.T) {
 			want:          "s3://other/metadata",
 		},
 		{
-			name:          "bucket root cannot be derived",
+			name:          "bucket root appends to the bucket name",
 			dataNamespace: "s3://bucket",
-			wantErr:       indexer.ErrBucketRootNamespace,
+			want:          "s3://bucket-metadata",
 		},
 		{
-			name:          "bucket root with a slash cannot be derived",
+			name:          "bucket root with a slash appends to the bucket name",
 			dataNamespace: "s3://bucket/",
-			wantErr:       indexer.ErrBucketRootNamespace,
+			want:          "s3://bucket-metadata",
 		},
 		{
 			name:          "bucket root with an explicit namespace is fine",
@@ -99,14 +99,19 @@ func TestMetadataNamespace(t *testing.T) {
 			want:          "https://acct.blob.core.windows.net/data/repo-metadata",
 		},
 		{
-			name:          "azure container root cannot be derived",
+			name:          "azure container root appends to the container name",
 			dataNamespace: "https://acct.blob.core.windows.net/data",
-			wantErr:       indexer.ErrBucketRootNamespace,
+			want:          "https://acct.blob.core.windows.net/data-metadata",
 		},
 		{
-			name:          "azure container root with the http scheme cannot be derived",
+			name:          "azure container root with the http scheme appends to the container name",
 			dataNamespace: "http://acct.azurite.test/data",
-			wantErr:       indexer.ErrBucketRootNamespace,
+			want:          "http://acct.azurite.test/data-metadata",
+		},
+		{
+			name:          "a data repository without a namespace has nothing to append to",
+			dataNamespace: "",
+			wantErr:       indexer.ErrNoStorageNamespace,
 		},
 		{
 			name:          "azure container root with an explicit namespace is fine",

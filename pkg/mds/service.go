@@ -35,6 +35,24 @@ const (
 	shutdownTimeout = 10 * time.Second
 )
 
+// The Metadata Search settings that the guide's key list does not have (X6) are fixed behaviour now:
+// the values below are the defaults the removed keys had, so an installation that never wrote them
+// keeps indexing exactly as it did.
+const (
+	// fixedDeleteBranches mirrors the deletion of a matching branch to R-metadata, with its tags
+	// kept (§4.8). The removed key was metadata_search.delete_branches, default true.
+	fixedDeleteBranches = true
+
+	// fixedCompactionMaxDeleteFiles is the number of position-delete files that triggers a
+	// compaction of a branch's table (§4.9). The removed key was
+	// metadata_search.compaction.max_delete_files, default 200.
+	fixedCompactionMaxDeleteFiles = 200
+
+	// fixedCompactionEveryCommits is the number of indexed commits between two compactions
+	// (§4.9). The removed key was metadata_search.compaction.every_commits, default 500.
+	fixedCompactionEveryCommits = 500
+)
+
 // ErrNotConfigured is returned by Run when the service has no configuration at all. A missing
 // section is reported by LoadConfig as ErrInvalidConfig; this error is the programming-error
 // guard of a Service built by hand.
@@ -145,7 +163,7 @@ func (s *Service) Run(ctx context.Context) error {
 		"address":     listener.Addr().String(),
 		"period":      s.cfg.Period,
 		"concurrency": s.cfg.Concurrency,
-		"backfill":    s.cfg.Backfill,
+		"backfill":    indexer.BackfillHistory,
 	}).Info("mds: indexer started")
 
 	loopErr := s.tickUntilDone(ctx, serveErr)
@@ -251,27 +269,35 @@ func (s *Service) installIndexer() error {
 
 // indexerOptions maps the metadata_search section of §7 onto the indexer's own configuration. The
 // indexer does not import this package, so this is the one place where the two meet.
+//
+// The section has the guide's key list and nothing else (G10, G11, X6). Everything the removed keys
+// used to configure is fixed behaviour here: the request bound, the seed lookback, the rebuild
+// threshold and the compaction triggers keep their documented defaults, tag retention keeps every
+// mds-* tag, branch deletion is mirrored, and the object-store credentials of a write come from the
+// standard blockstore configuration of the process rather than from a metadata_search key.
 func indexerOptions(cfg *Config, health *Health, metrics Recorder, log logging.Logger) indexer.Options {
 	opts := indexer.Options{
-		Endpoint:         cfg.LakeFSMDSEndpoint,
-		AccessKeyID:      cfg.AccessKeyID,
-		SecretKey:        cfg.SecretKey,
-		Storage:          cfg.Storage,
-		RequestTimeout:   cfg.RequestTimeout,
-		Concurrency:      cfg.Concurrency,
-		MaxCommits:       cfg.MaxCommits,
-		Backfill:         cfg.Backfill,
-		SeedLookback:     cfg.SeedLookback,
-		RebuildThreshold: cfg.RebuildThreshold,
-		DeleteBranches:   cfg.DeleteBranches,
-		TagRetention:     cfg.TagRetention,
+		Endpoint:    cfg.LakeFSEndpoint,
+		AccessKeyID: cfg.AccessKeyID,
+		SecretKey:   cfg.SecretKey,
+		// X11: the guide has no backfill key. The first sync of a branch captures metadata "from
+		// the time the branch was created", or from since when it is set, so the branch is always
+		// walked back to its oldest first-parent commit.
+		Backfill:         indexer.BackfillHistory,
+		RequestTimeout:   indexer.DefaultRequestTimeout,
+		SeedLookback:     indexer.DefaultSeedLookback,
+		RebuildThreshold: indexer.DefaultRebuildThreshold,
+		DeleteBranches:   fixedDeleteBranches,
+		TagRetention:     0,
 		Compaction: indexer.Compaction{
-			MaxDeleteFiles: cfg.Compaction.MaxDeleteFiles,
-			EveryCommits:   cfg.Compaction.EveryCommits,
+			MaxDeleteFiles: fixedCompactionMaxDeleteFiles,
+			EveryCommits:   fixedCompactionEveryCommits,
 		},
-		Health:  health,
-		Metrics: metrics,
-		Log:     log,
+		Concurrency: cfg.Concurrency,
+		MaxCommits:  cfg.MaxCommits,
+		Health:      health,
+		Metrics:     metrics,
+		Log:         log,
 	}
 	if since, ok := cfg.SinceTime(); ok {
 		opts.Since = &since

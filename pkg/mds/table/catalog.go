@@ -19,9 +19,10 @@ import (
 	icebergtable "github.com/apache/iceberg-go/table"
 
 	// Blank imports: the indexer writes its Parquet, Avro and metadata files through iceberg-go's
-	// IO. With vended credentials the catalog hands the client a session, and without them
-	// metadata_search.storage supplies static keys (design §4.6). The imports register the S3 and
-	// Azure schemes in iceberg-go's IO registry: s3, s3a and s3n here, abfs, abfss, wasb and wasbs
+	// IO. With vended credentials the catalog hands the client a session; without them the process
+	// supplies the IO properties of its blockstore configuration (metadata_search has no storage
+	// key of its own, X6). The imports register the S3 and Azure schemes in iceberg-go's IO
+	// registry: s3, s3a and s3n here, abfs, abfss, wasb and wasbs
 	// from the Azure backend (METADATA_SEARCH_AZURE.md D3). The file and local schemes are
 	// registered by iceberg-go itself and the local block adapter is not part of a supported
 	// Metadata Search deployment.
@@ -36,7 +37,7 @@ const (
 
 	// RelativeToPath is the addressing form the indexer uses (design §4.3 step 3):
 	//
-	//	<lakefs_mds_endpoint>/iceberg/relative_to/<R-metadata>.<branch>/api
+	//	<lakefs_endpoint>/iceberg/relative_to/<R-metadata>.<branch>/api
 	//
 	// It fixes the repository and the branch in the URL, so the table identifier the writer sends
 	// is the plain <namespace>.<table> of §3.1 rather than an address.
@@ -64,7 +65,7 @@ const DefaultRequestTimeout = 60 * time.Second
 // CatalogConfig is what the indexer needs to reach the Iceberg REST catalog of one branch of a
 // companion repository (design §4.3 step 3, §4.6).
 type CatalogConfig struct {
-	// Endpoint is the lakeFS base URL (metadata_search.lakefs_mds_endpoint), e.g.
+	// Endpoint is the lakeFS base URL (metadata_search.lakefs_endpoint), e.g.
 	// http://lakefs:8000. The API and the catalog both live under it.
 	Endpoint string
 	// Repository is the companion repository R-metadata (§3.3), not the data repository.
@@ -77,10 +78,12 @@ type CatalogConfig struct {
 	// pkg/icebergcatalog/auth.go), so no OAuth round trip is needed.
 	AccessKeyID     string
 	SecretAccessKey string
-	// Storage is passed to iceberg-go with rest.WithAdditionalProps (§4.6): the IO properties
+	// Storage is passed to iceberg-go with rest.WithAdditionalProps: the IO properties
 	// (s3.endpoint, s3.region, s3.access-key-id, s3.secret-access-key, s3.path-style-access, and the
-	// adls.* properties of METADATA_SEARCH_AZURE.md D3) used when the catalog does not vend write
-	// credentials. Empty means "the catalog vends, or the client's own environment is enough".
+	// adls.* properties of an Azure blockstore) used when the catalog does not vend write
+	// credentials. They come from the standard blockstore.* configuration of the process, which is
+	// where the object-store credentials of a write live now (X6); metadata_search has no storage
+	// or azure section. Empty means "the catalog vends, or the client's own environment is enough".
 	Storage iceberg.Properties
 	// RequestTimeout bounds every HTTP request of the client this configuration builds (§4.1,
 	// §7). Zero means DefaultRequestTimeout; it does not mean "no timeout". It is the transport's
@@ -130,12 +133,12 @@ func (c CatalogConfig) Authorization() string {
 }
 
 // NewCatalog builds the iceberg-go REST client for one branch of a companion repository (design
-// §4.3 step 3, §4.6): rest.NewCatalog over the relative_to URI, HTTP basic credentials and the
-// static IO properties of metadata_search.storage.
+// §4.3 step 3): rest.NewCatalog over the relative_to URI, HTTP basic credentials and the IO
+// properties the process supplies from its blockstore configuration.
 //
 // The two options are the ones design §4.6 names. rest.WithHeaders carries the basic credentials
 // on every request, including the GET /v1/config the client starts with. rest.WithAdditionalProps
-// carries the storage properties into the table's IO, which is what lets the transaction write
+// carries the IO properties into the table's IO, which is what lets the transaction write
 // Parquet, Avro and metadata files when the catalog does not vend credentials - iceberg-go does
 // not implement S3 remote signing.
 //
@@ -160,11 +163,10 @@ func NewCatalog(ctx context.Context, cfg CatalogConfig) (*rest.Catalog, error) {
 		timeout = DefaultRequestTimeout
 	}
 	// iceberg-go keeps the map it is given and writes the server's /v1/config properties into it,
-	// while the indexer builds one catalog per branch concurrently from the same Storage map, so
-	// each catalog gets its own copy (a shared map is a fatal "concurrent map writes"). The storage
-	// map carries the adls.* properties of the metadata_search.azure section as well as the raw
-	// metadata_search.storage keys: pkg/mds merges the former under the latter, so an explicit key
-	// still wins, and every catalog this function builds gets the same merged set.
+	// while the indexer builds one catalog per branch concurrently from the same storage map, so
+	// each catalog gets its own copy (a shared map is a fatal "concurrent map writes"). The map is
+	// an argument of the caller - the process' blockstore-derived IO properties - not a
+	// metadata_search key, which no longer exists (X6).
 	return rest.NewCatalog(ctx, CatalogName, uri,
 		rest.WithHeaders(map[string]string{"Authorization": cfg.Authorization()}),
 		rest.WithAdditionalProps(maps.Clone(cfg.Storage)),

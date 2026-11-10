@@ -50,55 +50,52 @@ func TestAPIBaseURL(t *testing.T) {
 	}
 }
 
-// TestMetadataNamespaceRoots pins the bucket-root and container-root rules of §3.3 on the helper
-// itself (METADATA_SEARCH_AZURE D4): a namespace with a path component derives the companion in the
-// same bucket, and on Azure in the same container, while a bucket root - and an Azure container
-// root, whose first path segment is the container - is refused with an error that names the
-// container to set an explicit storage_namespace for.
+// TestMetadataNamespaceRoots pins the namespace rule of §3.3 on the helper itself, with the guide's
+// reading (G10/X10): a namespace derives the companion by appending "-metadata" to it, in every
+// case, so a bucket root yields s3://bucket-metadata and an Azure container root yields
+// <container-metadata> (the container name plus the suffix) as well. There is no root refusal any
+// more; the only namespace that has nothing to append to is an empty one.
 func TestMetadataNamespaceRoots(t *testing.T) {
 	tests := []struct {
 		name          string
 		dataNamespace string
 		want          string
-		wantErr       bool
-		wantContainer string
+		wantErr       error
 	}{
 		{name: "s3 path derives", dataNamespace: "s3://bucket/data", want: "s3://bucket/data-metadata"},
-		{name: "s3 bucket root is refused", dataNamespace: "s3://bucket", wantErr: true},
+		{name: "s3 bucket root derives a sibling bucket", dataNamespace: "s3://bucket", want: "s3://bucket-metadata"},
 		{
 			name:          "azure path derives in the same container",
 			dataNamespace: "https://acct.blob.core.windows.net/data/repo",
 			want:          "https://acct.blob.core.windows.net/data/repo-metadata",
 		},
 		{
-			name:          "azure container root is refused",
+			name:          "azure container root derives a sibling container",
 			dataNamespace: "https://acct.blob.core.windows.net/data",
-			wantErr:       true,
-			wantContainer: "data",
+			want:          "https://acct.blob.core.windows.net/data-metadata",
 		},
 		{
-			name:          "azure container root with the http scheme is refused",
+			name:          "azure container root with the http scheme derives a sibling container",
 			dataNamespace: "http://acct.blob.core.windows.net/data",
-			wantErr:       true,
-			wantContainer: "data",
+			want:          "http://acct.blob.core.windows.net/data-metadata",
 		},
 		{
-			name:          "azure container root with a trailing slash is refused",
+			name:          "azure container root with a trailing slash derives a sibling container",
 			dataNamespace: "https://acct.blob.core.windows.net/data/",
-			wantErr:       true,
-			wantContainer: "data",
+			want:          "https://acct.blob.core.windows.net/data-metadata",
+		},
+		{
+			name:          "an empty namespace has nothing to append to",
+			dataNamespace: "",
+			wantErr:       ErrNoStorageNamespace,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got, err := metadataNamespace("repo", test.dataNamespace, "")
-			if test.wantErr {
-				require.ErrorIs(t, err, ErrBucketRootNamespace)
+			if test.wantErr != nil {
+				require.ErrorIs(t, err, test.wantErr)
 				require.Empty(t, got)
-				if test.wantContainer != "" {
-					require.Contains(t, err.Error(), fmt.Sprintf("container %q", test.wantContainer),
-						"the refusal names the container to set a storage namespace under")
-				}
 				return
 			}
 			require.NoError(t, err)

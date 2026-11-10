@@ -6,19 +6,18 @@ package indexer
 // the indexer's.
 //
 // R-metadata is what makes the mirror readable through the catalog (§5), so the rules here are
-// about refusing to guess: a bucket-root namespace cannot be derived (§3.3), a namespace that
-// overlaps R's would be swept by R's uncommitted GC (§3.3), and a repository that an operator
-// created by hand is not touched at all (§4.8).
+// about refusing to guess where guessing would lose data: a namespace that overlaps R's would be
+// swept by R's uncommitted GC (§3.3), and a repository that an operator created by hand is not
+// touched at all (§4.8). A bucket-root or container-root namespace is not refused: "-metadata" is
+// appended to it like to any other namespace (G10/X10).
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
 	"strings"
 
 	"github.com/apache/iceberg-go/catalog/rest"
-	"github.com/treeverse/lakefs/pkg/block"
 	"github.com/treeverse/lakefs/pkg/icebergcatalog"
 	"github.com/treeverse/lakefs/pkg/logging"
 	"github.com/treeverse/lakefs/pkg/mds/client"
@@ -520,12 +519,10 @@ func (x *Indexer) walkFirstParent(ctx context.Context, repository, branch string
 // metadataNamespace derives the storage namespace of R-metadata (§3.3):
 //
 //   - an explicit metadata_search.repositories.<R>.storage_namespace is used as it is;
-//   - otherwise R's namespace with "-metadata" appended, and only when R's namespace has a path
-//     component below its root: a bucket-root namespace (s3://bucket) needs the explicit value, and
-//     so does an Azure container-root namespace (https://acct.blob.core.windows.net/container), whose
-//     first path segment is the container and not a prefix to derive from
-//     (METADATA_SEARCH_AZURE D4, block.NamespaceRoot). The derived companion stays in the same
-//     container, because the suffix is appended to R's own path;
+//   - otherwise "-metadata" is appended to R's own namespace, in every case, exactly as the guide
+//     says (G10/X10): s3://bucket becomes s3://bucket-metadata, and an Azure container root
+//     https://acct.blob.core.windows.net/data becomes https://acct.blob.core.windows.net/data-metadata.
+//     There is no bucket-root or container-root exception any more;
 //   - the result must not be inside R's namespace nor contain it, because R's uncommitted GC
 //     sweeps every unreferenced object under R's prefix and would delete R-metadata's files.
 func metadataNamespace(repository, dataNamespace, configured string) (string, error) {
@@ -533,19 +530,7 @@ func metadataNamespace(repository, dataNamespace, configured string) (string, er
 	dataNamespace = strings.TrimRight(strings.TrimSpace(dataNamespace), "/")
 	if namespace == "" {
 		if dataNamespace == "" {
-			return "", fmt.Errorf("%w: repository %q has no storage namespace", ErrBucketRootNamespace, repository)
-		}
-		root, path, err := block.NamespaceRoot(dataNamespace)
-		if err != nil {
-			return "", fmt.Errorf("storage namespace %q of repository %q: %w", dataNamespace, repository, err)
-		}
-		if path == "" {
-			if container, ok := azureContainerOfRoot(root); ok {
-				return "", fmt.Errorf("%w: %q of repository %q is a container root (container %q), set metadata_search.repositories.%s.storage_namespace",
-					ErrBucketRootNamespace, dataNamespace, repository, container, repository)
-			}
-			return "", fmt.Errorf("%w: %q of repository %q is a bucket root, set metadata_search.repositories.%s.storage_namespace",
-				ErrBucketRootNamespace, dataNamespace, repository, repository)
+			return "", fmt.Errorf("%w: repository %q", ErrNoStorageNamespace, repository)
 		}
 		namespace = dataNamespace + icebergcatalog.MetadataRepositorySuffix
 	}
@@ -554,26 +539,6 @@ func metadataNamespace(repository, dataNamespace, configured string) (string, er
 			ErrOverlappingNamespace, namespace, metadataRepository(repository), dataNamespace, repository)
 	}
 	return namespace, nil
-}
-
-// azureContainerOfRoot returns the container an Azure root names, for the refusal above to name it.
-// block.NamespaceRoot returns "<scheme>://<host>/<container>" for an Azure namespace and
-// "<scheme>://<host>" for every other blockstore, so a root is Azure's when it parses to the Azure
-// storage type, and its container is then its only path segment.
-func azureContainerOfRoot(root string) (string, bool) {
-	parsed, err := url.Parse(root)
-	if err != nil {
-		return "", false
-	}
-	storageType, err := block.GetStorageType(parsed)
-	if err != nil || storageType != block.StorageTypeAzure {
-		return "", false
-	}
-	container := strings.Trim(parsed.Path, "/")
-	if container == "" {
-		return "", false
-	}
-	return container, true
 }
 
 // verifyMetadataNamespace refuses a companion repository whose existing storage namespace overlaps

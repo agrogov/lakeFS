@@ -33,7 +33,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/apache/iceberg-go"
 	"github.com/treeverse/lakefs/pkg/api/apigen"
 	"github.com/treeverse/lakefs/pkg/api/apiutil"
 	"github.com/treeverse/lakefs/pkg/icebergcatalog"
@@ -100,9 +99,9 @@ const (
 // (-1) from "behind" (> 0).
 const LagUnknown int64 = -1
 
-// The defaults of an Options field that is left zero. They are the documented defaults of
-// metadata_search (§7); *mds.Service always passes the validated configuration, so these only
-// matter to a caller that builds an Indexer directly.
+// The defaults of an Options field that is left zero. They are the fixed values the removed
+// metadata_search keys documented (X6: the guide's key list has no key for them any more), so a
+// caller that builds an Indexer directly gets the same behaviour as `lakefs-sso mds run`.
 const (
 	DefaultConcurrency      = 1
 	DefaultMaxCommits       = 1000
@@ -110,10 +109,10 @@ const (
 	DefaultRebuildThreshold = 100_000
 
 	// DefaultRequestTimeout is how long one HTTP request of either client may take before it is
-	// abandoned (metadata_search.request_timeout, §7). Without it a connection that neither
-	// answers nor resets - a wedged load balancer, a dropped NAT entry, a blackholed replica -
-	// blocks the whole tick loop while /_health still reports the tick as merely in progress
-	// (§4.1, §9). pkg/mds/table applies the same default to a catalog built without one.
+	// abandoned (the removed metadata_search.request_timeout key, X6). Without it a connection
+	// that neither answers nor resets - a wedged load balancer, a dropped NAT entry, a blackholed
+	// replica - blocks the whole tick loop while /_health still reports the tick as merely in
+	// progress (§4.1, §9). pkg/mds/table applies the same default to a catalog built without one.
 	DefaultRequestTimeout = 60 * time.Second
 )
 
@@ -138,11 +137,11 @@ var (
 	// commit (§4.8). The indexer never writes into a repository it did not create.
 	ErrForeignRepository = errors.New("the companion repository was not created by the indexer")
 
-	// ErrBucketRootNamespace is reported for a data repository whose storage namespace is a bucket
-	// root - or, on Azure, a container root - and whose metadata repository has no explicit
-	// storage_namespace (§3.3, METADATA_SEARCH_AZURE D4): deriving "-metadata" would need a path
-	// component that does not exist.
-	ErrBucketRootNamespace = errors.New("a bucket-root or container-root storage namespace cannot be derived, set storage_namespace")
+	// ErrNoStorageNamespace is reported for a data repository that lakeFS reports with an empty
+	// storage namespace, which leaves nothing to append the companion suffix to. It is not the
+	// bucket-root or container-root case: those append "-metadata" to the namespace itself (§3.3,
+	// G10/X10).
+	ErrNoStorageNamespace = errors.New("the data repository has no storage namespace")
 
 	// ErrOverlappingNamespace is reported when R-metadata's storage namespace is inside R's or
 	// contains it (§3.3): R's uncommitted GC sweeps every unreferenced object under R's prefix and
@@ -238,7 +237,7 @@ type Options struct {
 	// IcebergStore from Endpoint, AccessKeyID, SecretKey and Storage.
 	Tables TableStore
 
-	// Endpoint is the lakeFS base URL (metadata_search.lakefs_mds_endpoint): the API lives at
+	// Endpoint is the lakeFS base URL (metadata_search.lakefs_endpoint): the API lives at
 	// /api/v1 and the catalog at /iceberg (§4.1, §4.3 step 3).
 	Endpoint string
 
@@ -247,9 +246,10 @@ type Options struct {
 	AccessKeyID string
 	SecretKey   string
 
-	// Storage holds the iceberg-go IO properties used when the catalog does not vend write
-	// credentials (§4.6), e.g. s3.endpoint and s3.access-key-id.
-	Storage map[string]string
+	// There is deliberately no Storage field: the iceberg-go IO properties of a write are the
+	// standard blockstore configuration of the process, not a metadata_search key (X6). The
+	// production TableStore (IcebergStore) is built with them by the process that owns the block
+	// adapter; a configuration section cannot supply them.
 
 	// RequestTimeout bounds every HTTP request of the lakeFS API client and of the Iceberg REST
 	// catalog (§4.1, §7): a request that has not completed within it fails, so the branch (or
@@ -407,7 +407,6 @@ func New(opts Options) (*Indexer, error) {
 				Endpoint:        root,
 				AccessKeyID:     opts.AccessKeyID,
 				SecretAccessKey: opts.SecretKey,
-				Storage:         iceberg.Properties(opts.Storage),
 				RequestTimeout:  x.requestTimeout,
 			}
 		}
@@ -526,8 +525,8 @@ func (x *Indexer) indexRepository(ctx context.Context, repository Repository) er
 	wg.Wait()
 	// §4.8: a matching branch of R that was deleted cannot be enumerated from R any more, so the
 	// state of every branch the previous tick followed and this one does not is cleared here. It
-	// runs whichever delete_branches says: only the deletion of the metadata branch depends on
-	// that flag, never the /_health entry and the lag gauge (IO-3).
+	// runs regardless of DeleteBranches: only the deletion of the metadata branch depends on that
+	// option, never the /_health entry and the lag gauge (IO-3).
 	x.retireUnfollowedBranches(repository.Name, matching)
 
 	if x.deleteBranches {
