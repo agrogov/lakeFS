@@ -225,6 +225,29 @@ func TestCredentialVending(t *testing.T) {
 		require.NotContains(t, objectStatement.Action, "s3:PutObject", "a read session must not write")
 	})
 
+	t.Run("the documentation's read-only policy vends read-only credentials", func(t *testing.T) {
+		// "Read-only access to all tables and namespaces" of the public Iceberg documentation,
+		// attached alone: catalog:ReadTable and catalog:ReadTableData on table/*/*/*, and no fs:
+		// action at all. It must be enough to vend, and the session must be a read session.
+		stsFake := &credsFakeSTS{}
+		authz := newAuthzUser(t, docReadOnlyStatements())
+		service := newTestCredentialService(credsTestAdapter(), authz.authz, credsTestVending(), stsFake, nil)
+		router := newTestCredentialRouter(t, service)
+
+		requireVended(t, getCredentials(t, router, "alice", credsTestRef, VendedCredentialsDelegation))
+		require.Equal(t, 1, stsFake.calls)
+		document := policyOf(t, stsFake.input)
+		var actions []string
+		for _, statement := range document.Statement {
+			actions = append(actions, statement.Action...)
+		}
+		for _, action := range []string{"s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"} {
+			require.NotContains(t, actions, action,
+				"catalog:ReadTableData alone must not vend a write session")
+		}
+		require.Contains(t, actions, "s3:GetObject")
+	})
+
 	t.Run("requires ReadTableData for a read session", func(t *testing.T) {
 		stsFake := &credsFakeSTS{}
 		// The write grant set normally includes the read actions; this is it without the one

@@ -19,8 +19,8 @@ package icebergcatalog
 // already tested on its own:
 //
 //   - authorization is authorizeTableWrite with OpUpdateTable, the §7.2 row for "create / register
-//     / commit / properties / metrics": catalog:UpdateTable on the table ARN, fs:ReadRepository on
-//     the repository and fs:WriteObject on the reserved _lakefs_iceberg/ area. That helper also
+//     / commit / properties / metrics": catalog:UpdateTable on the table ARN, which is the whole
+//     requirement (authz.go: catalog permissions supersede object permissions). That helper also
 //     resolves the ref, so the Q-I4 rule - a commit needs a branch, a tag or a commit ID is 403
 //     "ref is read-only" - is enforced before the body is read, and an unauthorized caller cannot
 //     tell a tag from a branch;

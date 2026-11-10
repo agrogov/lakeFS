@@ -115,8 +115,8 @@ type viewsFixture struct {
 }
 
 // viewsFixtureStatements grants the view and namespace halves of §7.2 (reads and writes) on every
-// catalog ARN, plus fs:ReadRepository on the fixture's repository and fs:WriteObject on the
-// reserved area every catalog write needs.
+// catalog ARN. No fs: action is added: the catalog action is the whole permission of a catalog
+// request (authz.go).
 func viewsFixtureStatements() model.Statements {
 	return append(authzWriteStatements(),
 		model.Statement{
@@ -126,11 +126,6 @@ func viewsFixtureStatements() model.Statements {
 				permissions.CatalogGetNamespaceAction,
 			},
 			Resource: "arn:lakefs:catalog:::*",
-		},
-		model.Statement{
-			Effect:   model.StatementEffectAllow,
-			Action:   []string{permissions.WriteObjectAction},
-			Resource: authzWriteObjectArn,
 		},
 	)
 }

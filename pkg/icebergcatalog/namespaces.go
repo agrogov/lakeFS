@@ -54,8 +54,8 @@ package icebergcatalog
 // The write rules of §7.2 and Q-I4:
 //
 //   - create, update-properties and drop are authorized with
-//     catalog:Create/Update/DeleteNamespace on the namespace ARN, plus fs:ReadRepository and
-//     fs:WriteObject on the reserved _lakefs_iceberg/ area (authz.go, RequiredNode);
+//     catalog:Create/Update/DeleteNamespace on the namespace ARN (authz.go, RequiredNode); that
+//     catalog action is the whole permission, so a catalog-only policy is enough;
 //   - a write must address a branch. A tag or a commit answers 403 ForbiddenException "ref is
 //     read-only", and a ref that resolves to nothing answers 404 NoSuchWarehouseException, the
 //     same answer a read of it gets.

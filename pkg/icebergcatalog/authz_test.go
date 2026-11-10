@@ -25,6 +25,7 @@ import (
 	"github.com/treeverse/lakefs/pkg/auth/model"
 	authparams "github.com/treeverse/lakefs/pkg/auth/params"
 	"github.com/treeverse/lakefs/pkg/datasets"
+	"github.com/treeverse/lakefs/pkg/kv"
 	"github.com/treeverse/lakefs/pkg/kv/kvtest"
 	"github.com/treeverse/lakefs/pkg/permissions"
 )
@@ -39,7 +40,13 @@ const (
 	authzTableArn     = "arn:lakefs:catalog:::table/lakehouse/inventory.books/titles"
 	authzViewArn      = "arn:lakefs:catalog:::view/lakehouse/inventory.books/orders_view"
 	authzRepoArn      = "arn:lakefs:fs:::repository/lakehouse"
-	// §7.2: writes additionally need fs:WriteObject on the reserved _lakefs_iceberg/ area.
+
+	// authzWriteObjectArn is the wildcard object ARN of the reserved _lakefs_iceberg/ area. No
+	// catalog request asks for it any more - a catalog request needs its catalog action only
+	// (authz.go, the public Iceberg documentation's "catalog permissions supersede object
+	// permissions") - but gc_test.go pins the reserved-prefix deny against it: the deny must not
+	// match a request for the whole reserved area, and that wildcard is the shape such a request
+	// has.
 	authzWriteObjectArn = "arn:lakefs:fs:::repository/lakehouse/object/_lakefs_iceberg/*"
 )
 
@@ -91,8 +98,9 @@ func authzAddressFor(op Operation) Address {
 	}
 }
 
-// authzReadStatements grants every catalog read action on every catalog ARN, plus the
-// fs:ReadRepository every request needs (§7.2).
+// authzReadStatements grants every catalog read action on every catalog ARN, and nothing else:
+// the catalog action is the whole permission of a catalog request (authz.go), so no fs: action
+// appears here.
 func authzReadStatements() model.Statements {
 	return model.Statements{
 		{
@@ -108,16 +116,11 @@ func authzReadStatements() model.Statements {
 			},
 			Resource: "arn:lakefs:catalog:::*",
 		},
-		{
-			Effect:   model.StatementEffectAllow,
-			Action:   []string{permissions.ReadRepositoryAction},
-			Resource: authzRepoArn,
-		},
 	}
 }
 
 // authzWriteStatements is authzReadStatements plus the write half of §7.2: the catalog write
-// actions and fs:WriteObject on the reserved _lakefs_iceberg/ area.
+// actions, again on catalog ARNs only.
 func authzWriteStatements() model.Statements {
 	return append(authzReadStatements(),
 		model.Statement{
@@ -135,39 +138,18 @@ func authzWriteStatements() model.Statements {
 				permissions.CatalogDeleteViewAction,
 			},
 			Resource: "arn:lakefs:catalog:::*",
-		},
-		model.Statement{
-			Effect:   model.StatementEffectAllow,
-			Action:   []string{permissions.WriteObjectAction},
-			Resource: authzWriteObjectArn,
-		},
-	)
+		})
 }
 
-// authzFSStatements grants only the fs half of §7.2. A request authorized with it is refused on
-// the catalog action, which is the main deny case of the matrix.
+// authzFSStatements grants every fs: action on every resource and no catalog action at all. The
+// public Iceberg documentation states the rule this case pins ("Iceberg catalog permissions
+// supersede any related object permissions"): a principal holding the whole fs: half is refused
+// every catalog request.
 func authzFSStatements() model.Statements {
-	return model.Statements{
-		{
-			Effect:   model.StatementEffectAllow,
-			Action:   []string{permissions.ReadRepositoryAction},
-			Resource: authzRepoArn,
-		},
-		{
-			Effect:   model.StatementEffectAllow,
-			Action:   []string{permissions.WriteObjectAction},
-			Resource: authzWriteObjectArn,
-		},
-	}
-}
-
-// authzCatalogOnlyStatements grants only the catalog half of §7.2, so a request is refused on
-// fs:ReadRepository.
-func authzCatalogOnlyStatements() model.Statements {
 	return model.Statements{{
 		Effect:   model.StatementEffectAllow,
-		Action:   []string{"catalog:*"},
-		Resource: "arn:lakefs:catalog:::*",
+		Action:   []string{"fs:*"},
+		Resource: permissions.All,
 	}}
 }
 
@@ -192,10 +174,12 @@ func authzGrantsExceptAction(action string) model.Statements {
 }
 
 // authzFixture is an acl.AuthService (the implementation the lakefs-sso binary uses) on an
-// in-memory KV store, plus the Authorizer built on top of it.
+// in-memory KV store, plus the Authorizer built on top of it. The store is kept because the
+// datasets immutability guard reads the dataset repository names from it.
 type authzFixture struct {
 	authz *Authorizer
 	svc   *acl.AuthService
+	store kv.Store
 }
 
 func newAuthzFixture(t *testing.T) *authzFixture {
@@ -203,7 +187,7 @@ func newAuthzFixture(t *testing.T) *authzFixture {
 	store := kvtest.GetStore(t.Context(), t)
 	svc := acl.NewAuthService(store, crypt.NewSecretStore([]byte("iceberg-authz-test-secret")),
 		authparams.ServiceCache{Enabled: false})
-	return &authzFixture{svc: svc, authz: NewAuthorizer(svc)}
+	return &authzFixture{svc: svc, authz: NewAuthorizer(svc), store: store}
 }
 
 // user creates the principal the decisions are made for.
@@ -245,9 +229,9 @@ func newAuthzUser(t *testing.T, statements model.Statements) *authzFixture {
 	return f
 }
 
-// TestAuthzRequiredNode asserts the action and resource columns of the §7.2 matrix, and that the
-// two additional fs requirements are joined with And (not Or) so that a deny on any of them
-// refuses the request.
+// TestAuthzRequiredNode asserts the action and resource columns of the §7.2 matrix: every
+// repository-scoped operation is one catalog leaf on its catalog ARN, and no fs: leaf is added
+// (authz.go; the public Iceberg documentation's example policies grant catalog actions only).
 func TestAuthzRequiredNode(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -260,7 +244,6 @@ func TestAuthzRequiredNode(t *testing.T) {
 			req:  Request{Op: OpListNamespaces, Address: authzNamespaceAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:ListNamespaces", Resource: authzNamespaceArn},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
 			},
 		},
 		{
@@ -268,7 +251,6 @@ func TestAuthzRequiredNode(t *testing.T) {
 			req:  Request{Op: OpListNamespaces, Address: Address{Repo: authzRepo}},
 			want: []permissions.Permission{
 				{Action: "catalog:ListNamespaces", Resource: "arn:lakefs:catalog:::namespace/lakehouse/"},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
 			},
 		},
 		{
@@ -283,34 +265,27 @@ func TestAuthzRequiredNode(t *testing.T) {
 			req:  Request{Op: OpGetNamespace, Address: authzNamespaceAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:GetNamespace", Resource: authzNamespaceArn},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
 			},
 		},
 		{
-			name: "create namespace needs the write area",
+			name: "create namespace",
 			req:  Request{Op: OpCreateNamespace, Address: authzNamespaceAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:CreateNamespace", Resource: authzNamespaceArn},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
-				{Action: "fs:WriteObject", Resource: authzWriteObjectArn},
 			},
 		},
 		{
-			name: "update namespace needs the write area",
+			name: "update namespace",
 			req:  Request{Op: OpUpdateNamespace, Address: authzNamespaceAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:UpdateNamespace", Resource: authzNamespaceArn},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
-				{Action: "fs:WriteObject", Resource: authzWriteObjectArn},
 			},
 		},
 		{
-			name: "delete namespace needs the write area",
+			name: "delete namespace",
 			req:  Request{Op: OpDeleteNamespace, Address: authzNamespaceAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:DeleteNamespace", Resource: authzNamespaceArn},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
-				{Action: "fs:WriteObject", Resource: authzWriteObjectArn},
 			},
 		},
 		{
@@ -318,7 +293,6 @@ func TestAuthzRequiredNode(t *testing.T) {
 			req:  Request{Op: OpListTables, Address: authzNamespaceAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:ListTables", Resource: authzNamespaceArn},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
 			},
 		},
 		{
@@ -326,34 +300,27 @@ func TestAuthzRequiredNode(t *testing.T) {
 			req:  Request{Op: OpReadTable, Address: authzTableAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:ReadTable", Resource: authzTableArn},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
 			},
 		},
 		{
-			name: "create table needs the write area",
+			name: "create table",
 			req:  Request{Op: OpCreateTable, Address: authzTableAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:CreateTable", Resource: authzTableArn},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
-				{Action: "fs:WriteObject", Resource: authzWriteObjectArn},
 			},
 		},
 		{
-			name: "update table needs the write area",
+			name: "update table",
 			req:  Request{Op: OpUpdateTable, Address: authzTableAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:UpdateTable", Resource: authzTableArn},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
-				{Action: "fs:WriteObject", Resource: authzWriteObjectArn},
 			},
 		},
 		{
-			name: "delete table needs the write area",
+			name: "delete table",
 			req:  Request{Op: OpDeleteTable, Address: authzTableAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:DeleteTable", Resource: authzTableArn},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
-				{Action: "fs:WriteObject", Resource: authzWriteObjectArn},
 			},
 		},
 		{
@@ -361,16 +328,13 @@ func TestAuthzRequiredNode(t *testing.T) {
 			req:  Request{Op: OpReadTableData, Address: authzTableAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:ReadTableData", Resource: authzTableArn},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
 			},
 		},
 		{
-			name: "write table data needs the write area",
+			name: "write table data",
 			req:  Request{Op: OpWriteTableData, Address: authzTableAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:WriteTableData", Resource: authzTableArn},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
-				{Action: "fs:WriteObject", Resource: authzWriteObjectArn},
 			},
 		},
 		{
@@ -378,7 +342,6 @@ func TestAuthzRequiredNode(t *testing.T) {
 			req:  Request{Op: OpListViews, Address: authzNamespaceAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:ListViews", Resource: authzNamespaceArn},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
 			},
 		},
 		{
@@ -386,34 +349,27 @@ func TestAuthzRequiredNode(t *testing.T) {
 			req:  Request{Op: OpReadView, Address: authzViewAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:ReadView", Resource: authzViewArn},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
 			},
 		},
 		{
-			name: "create view needs the write area",
+			name: "create view",
 			req:  Request{Op: OpCreateView, Address: authzViewAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:CreateView", Resource: authzViewArn},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
-				{Action: "fs:WriteObject", Resource: authzWriteObjectArn},
 			},
 		},
 		{
-			name: "update view needs the write area",
+			name: "update view",
 			req:  Request{Op: OpUpdateView, Address: authzViewAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:UpdateView", Resource: authzViewArn},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
-				{Action: "fs:WriteObject", Resource: authzWriteObjectArn},
 			},
 		},
 		{
-			name: "delete view needs the write area",
+			name: "delete view",
 			req:  Request{Op: OpDeleteView, Address: authzViewAddress()},
 			want: []permissions.Permission{
 				{Action: "catalog:DeleteView", Resource: authzViewArn},
-				{Action: "fs:ReadRepository", Resource: authzRepoArn},
-				{Action: "fs:WriteObject", Resource: authzWriteObjectArn},
 			},
 		},
 	}
@@ -422,15 +378,16 @@ func TestAuthzRequiredNode(t *testing.T) {
 			t.Parallel()
 			node, err := RequiredNode(tt.req)
 			require.NoError(t, err)
-			// And, never Or: a deny on any leaf must refuse the whole request.
-			require.Equal(t, permissions.NodeTypeAnd, node.Type)
+			// One leaf: the catalog action is the whole requirement, so no fs: deny can refuse
+			// the request and no fs: grant is needed for it.
+			require.Equal(t, permissions.NodeTypeNode, node.Type)
 			require.Equal(t, tt.want, requiredPermissions(node))
 		})
 	}
 }
 
-// TestAuthzMatrix is the §7.2 matrix: every operation is allowed by the grants §7.2 asks for, and
-// refused when any one of them is missing.
+// TestAuthzMatrix is the §7.2 matrix: every operation is allowed by the catalog grant §7.2 asks
+// for, and refused when that one action is missing - no fs: action takes part either way.
 func TestAuthzMatrix(t *testing.T) {
 	t.Parallel()
 	for _, op := range authzAllOps {
@@ -450,6 +407,8 @@ func TestAuthzMatrix(t *testing.T) {
 
 		t.Run(op.String()+"/no catalog grant", func(t *testing.T) {
 			t.Parallel()
+			// fs:* on everything and no catalog action: refused, the documentation's "catalog
+			// permissions supersede any related object permissions".
 			f := newAuthzUser(t, authzFSStatements())
 			err := f.authorize(t, "alice", Request{
 				Op: op, Address: authzAddressFor(op), RefIsBranch: true,
@@ -460,18 +419,12 @@ func TestAuthzMatrix(t *testing.T) {
 			require.Equal(t, http.StatusForbidden, denied.HTTPStatusCode())
 			require.Equal(t, "ForbiddenException", denied.ErrorType())
 			require.Equal(t, op, denied.Operation)
-			// The refusal must name the missing catalog action.
+			// The refusal must name the missing catalog action, and nothing else: the catalog
+			// action is the whole requirement.
 			action, err := op.Action()
 			require.NoError(t, err)
-			require.Contains(t, joinActions(denied.Required), action)
-		})
-
-		t.Run(op.String()+"/no fs:ReadRepository grant", func(t *testing.T) {
-			t.Parallel()
-			f := newAuthzUser(t, authzCatalogOnlyStatements())
-			require.ErrorIs(t, f.authorize(t, "alice", Request{
-				Op: op, Address: authzAddressFor(op), RefIsBranch: true,
-			}), ErrPermissionDenied)
+			require.Equal(t, action, joinActions(denied.Required))
+			require.Equal(t, []permissions.Permission{requiredLeafFor(op)}, denied.Required)
 		})
 
 		t.Run(op.String()+"/only another catalog action granted", func(t *testing.T) {
@@ -490,35 +443,210 @@ func TestAuthzMatrix(t *testing.T) {
 			continue
 		}
 
-		t.Run(op.String()+"/no fs:WriteObject grant", func(t *testing.T) {
+		t.Run(op.String()+"/read grant does not allow a write", func(t *testing.T) {
 			t.Parallel()
-			// Everything except the reserved-area write.
-			f := newAuthzUser(t, append(authzCatalogOnlyStatements(), model.Statement{
-				Effect:   model.StatementEffectAllow,
-				Action:   []string{permissions.ReadRepositoryAction},
-				Resource: authzRepoArn,
-			}))
+			// The read half of the matrix, which is every catalog read action on every catalog
+			// ARN: a write is still refused on its own action.
+			f := newAuthzUser(t, authzReadStatements())
 			require.ErrorIs(t, f.authorize(t, "alice", Request{
 				Op: op, Address: authzAddressFor(op), RefIsBranch: true,
 			}), ErrPermissionDenied)
 		})
 
-		t.Run(op.String()+"/reserved area denied", func(t *testing.T) {
+		t.Run(op.String()+"/fs: deny does not refuse the write", func(t *testing.T) {
 			t.Parallel()
-			// A deny of fs:WriteObject on the reserved prefix refuses the whole write, which is
-			// how the datasets guard and the _lakefs_iceberg guard reach the catalog (§7.2).
+			// The other direction of "catalog permissions supersede object permissions": a deny
+			// of the whole fs: service - the shape the reserved-prefix and datasets denies take -
+			// is not part of the catalog's requirement, so the catalog action still decides.
 			f := newAuthzUser(t, append(authzWriteStatements(), model.Statement{
 				Effect:   model.StatementEffectDeny,
-				Action:   []string{permissions.WriteObjectAction},
-				Resource: authzWriteObjectArn,
+				Action:   []string{"fs:*"},
+				Resource: permissions.All,
 			}))
-			err := f.authorize(t, "alice", Request{Op: op, Address: authzAddressFor(op), RefIsBranch: true})
-			require.ErrorIs(t, err, ErrPermissionDenied)
-			var denied *PermissionDeniedError
-			require.ErrorAs(t, err, &denied)
-			require.Contains(t, denied.Required, permissions.Permission{
-				Action: permissions.WriteObjectAction, Resource: authzWriteObjectArn,
-			}, "the refusal must name the denied reserved-area write")
+			require.NoError(t, f.authorize(t, "alice", Request{
+				Op: op, Address: authzAddressFor(op), RefIsBranch: true,
+			}))
+		})
+	}
+}
+
+// requiredLeafFor is the one permission leaf RequiredNode builds for op's address: the catalog
+// action on the table, view or namespace ARN.
+func requiredLeafFor(op Operation) permissions.Permission {
+	action, err := op.Action()
+	if err != nil {
+		panic(err)
+	}
+	addr := authzAddressFor(op)
+	switch {
+	case op.IsTableOperation():
+		return permissions.Permission{Action: action, Resource: permissions.CatalogTableArn(addr.Repo, addr.Namespace.Dotted(), addr.Table)}
+	case op.IsViewOperation():
+		return permissions.Permission{Action: action, Resource: permissions.CatalogViewArn(addr.Repo, addr.Namespace.Dotted(), addr.View)}
+	default:
+		return permissions.Permission{Action: action, Resource: permissions.CatalogNamespaceArn(addr.Repo, addr.Namespace.Dotted())}
+	}
+}
+
+// The three example policies of the public Iceberg documentation
+// (https://docs.lakefs.io/iceberg/, "Example Policies"), transcribed statement for statement:
+// catalog actions on catalog ARNs and nothing else, which is the shape RA10 makes sufficient.
+
+// docReadOnlyStatements is "Read-only access to all tables and namespaces".
+func docReadOnlyStatements() model.Statements {
+	return model.Statements{
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{permissions.CatalogReadTableAction, permissions.CatalogReadTableDataAction},
+			Resource: "arn:lakefs:catalog:::table/*/*/*",
+		},
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{permissions.CatalogListNamespacesAction, permissions.CatalogGetNamespaceAction},
+			Resource: "arn:lakefs:catalog:::namespace/*/*",
+		},
+	}
+}
+
+// docReadWriteStatements is "Read-write access to all tables in a repository (including data
+// credentials)", on docPolicyRepo.
+func docReadWriteStatements() model.Statements {
+	return model.Statements{{
+		Effect: model.StatementEffectAllow,
+		Action: []string{
+			permissions.CatalogReadTableAction,
+			permissions.CatalogCreateTableAction,
+			permissions.CatalogUpdateTableAction,
+			permissions.CatalogReadTableDataAction,
+			permissions.CatalogWriteTableDataAction,
+		},
+		Resource: permissions.CatalogTableArn(docPolicyRepo, "*", "*"),
+	}}
+}
+
+// docFullAccessStatements is "Full access to tables in a specific repository", on docPolicyRepo.
+func docFullAccessStatements() model.Statements {
+	return model.Statements{
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{"catalog:*"},
+			Resource: permissions.CatalogTableArn(docPolicyRepo, "*", "*"),
+		},
+		{
+			Effect:   model.StatementEffectAllow,
+			Action:   []string{"catalog:*"},
+			Resource: permissions.CatalogNamespaceArn(docPolicyRepo, "*"),
+		},
+	}
+}
+
+// docPolicyRepo is the repository of the two repository-scoped example policies.
+const docPolicyRepo = "my-repo"
+
+// TestAuthzDocExamplePolicies attaches each example policy of the public Iceberg documentation
+// alone and asserts it allows exactly what its title says and nothing else: this is the rule RA10
+// implements ("Iceberg catalog permissions supersede any related object permissions"), and before
+// it every one of these policies was refused because no fs: action was granted.
+func TestAuthzDocExamplePolicies(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		statements model.Statements
+		repo       string
+		allowed    map[Operation]bool
+	}{
+		{
+			name:       "read-only access to all tables and namespaces",
+			statements: docReadOnlyStatements(),
+			repo:       authzRepo,
+			allowed: map[Operation]bool{
+				OpListNamespaces: true,
+				OpGetNamespace:   true,
+				OpReadTable:      true,
+				OpReadTableData:  true,
+			},
+		},
+		{
+			name:       "read-write access to all tables in a repository",
+			statements: docReadWriteStatements(),
+			repo:       docPolicyRepo,
+			allowed: map[Operation]bool{
+				OpReadTable:      true,
+				OpCreateTable:    true,
+				OpUpdateTable:    true,
+				OpReadTableData:  true,
+				OpWriteTableData: true,
+			},
+		},
+		{
+			name:       "full access to tables in a specific repository",
+			statements: docFullAccessStatements(),
+			repo:       docPolicyRepo,
+			allowed: map[Operation]bool{
+				OpListNamespaces:  true,
+				OpGetNamespace:    true,
+				OpCreateNamespace: true,
+				OpUpdateNamespace: true,
+				OpDeleteNamespace: true,
+				OpListTables:      true,
+				OpListViews:       true,
+				OpReadTable:       true,
+				OpCreateTable:     true,
+				OpUpdateTable:     true,
+				OpDeleteTable:     true,
+				OpReadTableData:   true,
+				OpWriteTableData:  true,
+			},
+		},
+		{
+			name:       "the read-write policy of a repository says nothing about another repository",
+			statements: docReadWriteStatements(),
+			repo:       "other-repo",
+			allowed:    map[Operation]bool{},
+		},
+		{
+			name:       "the full-access policy of a repository says nothing about another repository",
+			statements: docFullAccessStatements(),
+			repo:       "other-repo",
+			allowed:    map[Operation]bool{},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			f := newAuthzUser(t, tt.statements)
+			for _, op := range authzAllOps {
+				op := op
+				t.Run(op.String(), func(t *testing.T) {
+					t.Parallel()
+					addr := authzAddressFor(op)
+					addr.Repo = tt.repo
+					err := f.authorize(t, "alice", Request{Op: op, Address: addr, RefIsBranch: true})
+					if tt.allowed[op] {
+						require.NoErrorf(t, err, "the policy must allow %s", op)
+						return
+					}
+					require.ErrorIsf(t, err, ErrPermissionDenied, "the policy must not allow %s", op)
+				})
+			}
+		})
+	}
+}
+
+// TestAuthzFSGrantIsNoCatalogGrant is the other half of "catalog permissions supersede any related
+// object permissions": a principal holding every fs: action on every resource, and no catalog
+// action, is refused every catalog request.
+func TestAuthzFSGrantIsNoCatalogGrant(t *testing.T) {
+	t.Parallel()
+	f := newAuthzUser(t, authzFSStatements())
+	for _, op := range authzAllOps {
+		op := op
+		t.Run(op.String(), func(t *testing.T) {
+			t.Parallel()
+			require.ErrorIs(t, f.authorize(t, "alice", Request{
+				Op: op, Address: authzAddressFor(op), RefIsBranch: true,
+			}), ErrPermissionDenied)
 		})
 	}
 }
@@ -916,10 +1044,12 @@ func TestAuthzFilterViewsAddress(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidAuthzRequest)
 }
 
-// TestAuthzDatasetRepositoryIsReadOnly verifies the §7.2 note that the datasets guard already
-// makes a dataset repository read-only through the catalog, without a catalog-shaped deny:
-// the dataset-<name>-immutable policy denies fs:WriteObject, and fs:WriteObject is part of every
-// catalog write (§7.2). Nothing is duplicated here - the policy comes from pkg/datasets.
+// TestAuthzDatasetRepositoryIsReadOnly verifies the §7.2 note that a dataset repository stays
+// read-only through the catalog, now that a catalog request needs no fs: action of its own. The
+// enforcement is the SEC-2 guard (pkg/datasets/immutability_guard.go, ImmutabilityAuthService):
+// it refuses the catalog write actions of immutabilityDeniedActions on catalog ARNs before the
+// wrapped auth service is consulted, and cmd/lakefs-sso wires it exactly like this (buildAuthService).
+// Nothing is duplicated here - the guard and the immutability policy come from pkg/datasets.
 func TestAuthzDatasetRepositoryIsReadOnly(t *testing.T) {
 	t.Parallel()
 	const dataset = "customer-360"
@@ -940,8 +1070,18 @@ func TestAuthzDatasetRepositoryIsReadOnly(t *testing.T) {
 		{Effect: model.StatementEffectAllow, Action: []string{"fs:*"},
 			Resource: permissions.RepoArn(dataset) + "/*"},
 	})
-	// The immutability guard datasets attaches to the installation's groups (§9.4).
+	// The immutability policy datasets attaches to the installation's groups (§9.4). It is the
+	// defence in depth of SEC-2; the guard below is what decides, as in production.
 	f.attach(t, "writer", datasets.ImmutabilityPolicy(dataset, time.Now()))
+	// The guard reads the dataset repository names from the datasets KV partition.
+	require.NoError(t, datasets.NewStore(f.store).CreateDataset(t.Context(), &datasets.DatasetRecord{
+		Name:      dataset,
+		CreatedAt: time.Now(),
+		State:     datasets.DatasetStateActive,
+		StorageID: "s3",
+		StorageNS: "s3://" + dataset,
+	}), "record the dataset in the store the guard reads")
+	authz := NewAuthorizer(datasets.NewImmutabilityAuthService(f.svc, datasets.NewDatasetRepoSet(f.store)))
 
 	address := func(op Operation) Address {
 		switch {
@@ -957,24 +1097,28 @@ func TestAuthzDatasetRepositoryIsReadOnly(t *testing.T) {
 		op := op
 		t.Run(op.String(), func(t *testing.T) {
 			t.Parallel()
-			err := f.authorize(t, "writer", Request{Op: op, Address: address(op), RefIsBranch: true})
-			if op.IsWrite() {
+			err := authz.Authorize(t.Context(), Caller{Username: "writer"},
+				Request{Op: op, Address: address(op), RefIsBranch: true})
+			if op.IsWrite() && op != OpWriteTableData {
 				require.ErrorIs(t, err, ErrPermissionDenied,
 					"a catalog write into a dataset repository must be refused")
 				return
 			}
+			// OpWriteTableData is the one gap: catalog:WriteTableData is not in
+			// immutabilityDeniedActions (pkg/datasets), so the guard lets a vended write session
+			// through. It is the caller's storage session for the table's data files, not a
+			// catalog change; extending the datasets deny list is a pkg/datasets change that this
+			// card does not own.
 			require.NoError(t, err, "reading a dataset repository through the catalog is allowed")
 		})
 	}
 }
 
-// TestAuthzDatasetDenyCoversCatalogWrites also verifies that the immutability deny lists the
-// catalog lifecycle actions themselves (ICEBERG_CATALOG_PLAN.md §7.2 asks to add them; this task
-// verifies they are already there instead of duplicating them). The data-plane write action
-// catalog:WriteTableData is not in that list - it was added after the datasets deny list was
-// written - and does not need to be: a data-plane write also needs fs:WriteObject, which the same
-// policy denies on repository/<name>/*, so TestAuthzDatasetRepositoryIsReadOnly proves the refusal
-// end to end.
+// TestAuthzDatasetDenyCoversCatalogWrites verifies that the immutability deny lists the catalog
+// lifecycle actions themselves (ICEBERG_CATALOG_PLAN.md §7.2 asks for them, and they are already
+// there). catalog:WriteTableData is not in that list, which is why
+// TestAuthzDatasetRepositoryIsReadOnly names it as the one write a dataset repository still
+// allows through the catalog: the fs:WriteObject leaf that used to refuse it is gone (authz.go).
 func TestAuthzDatasetDenyCoversCatalogWrites(t *testing.T) {
 	t.Parallel()
 	policy := datasets.ImmutabilityPolicy("customer-360", time.Now())
@@ -986,7 +1130,7 @@ func TestAuthzDatasetDenyCoversCatalogWrites(t *testing.T) {
 			denied[action] = struct{}{}
 		}
 	}
-	// §7.2: the catalog lifecycle actions of a namespace and of a table.
+	// §7.2: the catalog lifecycle actions of a namespace, a table and a view.
 	for _, action := range []string{
 		permissions.CatalogCreateNamespaceAction,
 		permissions.CatalogUpdateNamespaceAction,
@@ -994,11 +1138,12 @@ func TestAuthzDatasetDenyCoversCatalogWrites(t *testing.T) {
 		permissions.CatalogCreateTableAction,
 		permissions.CatalogUpdateTableAction,
 		permissions.CatalogDeleteTableAction,
+		permissions.CatalogCreateViewAction,
+		permissions.CatalogUpdateViewAction,
+		permissions.CatalogDeleteViewAction,
 	} {
 		require.Contains(t, denied, action, "the datasets immutability deny must cover %s", action)
 	}
-	require.Contains(t, denied, permissions.WriteObjectAction,
-		"the datasets immutability deny must cover the catalog's fs:WriteObject requirement")
 }
 
 // TestAuthzNoAuthService fails closed: without an auth service every operation is a 500, never an
@@ -1106,7 +1251,8 @@ func TestAuthzRootListing(t *testing.T) {
 	}})
 	require.NoError(t, f.authorize(t, "alice", Request{Op: OpListNamespaces}))
 
-	// fs:ReadRepository on one repository is not enough to enumerate the repository list.
+	// A catalog grant on every catalog ARN is not enough to enumerate the repository list: that
+	// level is fs:ListRepositories on All.
 	g := newAuthzUser(t, authzReadStatements())
 	require.ErrorIs(t, g.authorize(t, "alice", Request{Op: OpListNamespaces}), ErrPermissionDenied)
 }

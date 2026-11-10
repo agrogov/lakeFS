@@ -16,8 +16,8 @@ package icebergcatalog
 // adopts the document instead of creating one:
 //
 //  1. the request is authorized exactly like a create (OpCreateTable, §7.2): catalog:CreateTable on
-//     the table ARN, fs:ReadRepository on the repository, fs:WriteObject on the reserved
-//     _lakefs_iceberg/ area, plus the Q-I4 rule that a write needs a branch - a tag or a commit is
+//     the table ARN - the catalog action is the whole permission, no fs: grant is needed
+//     (authz.go) - plus the Q-I4 rule that a write needs a branch - a tag or a commit is
 //     403 "ref is read-only";
 //  2. the namespace must exist on the branch (its marker is what creates it, §6.1); otherwise 404
 //     NoSuchNamespaceException, as for createTable;
@@ -196,8 +196,8 @@ func (s *registerService) handleRegisterTable(w http.ResponseWriter, r *http.Req
 		return
 	}
 	// The §7.2 row of register is catalog:CreateTable, the row of create, including the Q-I4
-	// branch rule and the fs: rules RequiredNode adds: a register stages a pointer and table files,
-	// which is a write into the reserved _lakefs_iceberg/ area.
+	// branch rule: a register stages a pointer and table files through the catalog's own
+	// CreateEntry, which needs no fs: permission of the caller.
 	if err := s.authz.Authorize(r.Context(), caller, Request{
 		Op:          OpCreateTable,
 		Address:     addr,

@@ -32,11 +32,11 @@ package icebergcatalog
 // must not borrow a prefix the catalog would then be trusting.
 //
 // Authorization is the §7.2 row for vended data access: catalog:ReadTableData for a read session
-// and catalog:WriteTableData for a write session, on the table ARN, plus the fs:ReadRepository
-// every catalog request needs (and fs:WriteObject on the reserved area for a write), which the
-// Authorizer adds itself. A write session additionally needs a branch ref (Q-I4). The
-// authorization decision is taken before the table is resolved, so a caller without the data
-// action learns nothing about the table.
+// and catalog:WriteTableData for a write session, on the table ARN - the catalog action is the
+// whole requirement (authz.go: catalog permissions supersede object permissions), so no fs:
+// grant is needed. A write session additionally needs a branch ref (Q-I4). The authorization
+// decision is taken before the table is resolved, so a caller without the data action learns
+// nothing about the table.
 //
 // Best effort (§8). Vending is a convenience layered on the default mode, not a requirement: if
 // STS fails, is unreachable, or answers without credentials, the request still succeeds and the

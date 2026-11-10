@@ -55,10 +55,11 @@ const (
 	resolverObjectMetadataTable = "object_metadata"
 )
 
-// resolverCatalogReadStatements grants the read half of §7.2 on every catalog ARN and
-// fs:ReadRepository on one repository. It is the shape §5.3 describes: catalog ARNs are
-// branch-agnostic and repository-scoped, so "may browse R" is exactly this grant on R - and it says
-// nothing about R-metadata.
+// resolverCatalogReadStatements grants the read half of §7.2 on the catalog ARNs of one
+// repository. It is the shape §5.3 describes: catalog ARNs are branch-agnostic and
+// repository-scoped, so "may browse R" is exactly this grant on R - and it says nothing about
+// R-metadata. The per-repository form is also what the public Iceberg documentation's example
+// policies have (catalog actions on that repository's ARNs, and no fs: action at all).
 func resolverCatalogReadStatements(repo string) model.Statements {
 	return model.Statements{
 		{
@@ -67,21 +68,28 @@ func resolverCatalogReadStatements(repo string) model.Statements {
 				permissions.CatalogListNamespacesAction,
 				permissions.CatalogGetNamespaceAction,
 				permissions.CatalogListTablesAction,
+				permissions.CatalogListViewsAction,
+			},
+			Resource: permissions.CatalogNamespaceArn(repo, "*"),
+		},
+		{
+			Effect: model.StatementEffectAllow,
+			Action: []string{
 				permissions.CatalogReadTableAction,
 				permissions.CatalogReadTableDataAction,
 			},
-			Resource: "arn:lakefs:catalog:::*",
+			Resource: permissions.CatalogTableArn(repo, "*", "*"),
 		},
 		{
 			Effect:   model.StatementEffectAllow,
-			Action:   []string{permissions.ReadRepositoryAction},
-			Resource: permissions.RepoArn(repo),
+			Action:   []string{permissions.CatalogReadViewAction},
+			Resource: permissions.CatalogViewArn(repo, "*", "*"),
 		},
 	}
 }
 
 // resolverCatalogWriteStatements is resolverCatalogReadStatements plus the write half of §7.2 on the
-// same repository: the catalog write actions and fs:WriteObject on its reserved area.
+// same repository: the catalog write actions on its namespace, table and view ARNs.
 func resolverCatalogWriteStatements(repo string) model.Statements {
 	return append(resolverCatalogReadStatements(repo),
 		model.Statement{
@@ -90,19 +98,27 @@ func resolverCatalogWriteStatements(repo string) model.Statements {
 				permissions.CatalogCreateNamespaceAction,
 				permissions.CatalogUpdateNamespaceAction,
 				permissions.CatalogDeleteNamespaceAction,
+			},
+			Resource: permissions.CatalogNamespaceArn(repo, "*"),
+		},
+		model.Statement{
+			Effect: model.StatementEffectAllow,
+			Action: []string{
 				permissions.CatalogCreateTableAction,
 				permissions.CatalogUpdateTableAction,
 				permissions.CatalogDeleteTableAction,
+				permissions.CatalogWriteTableDataAction,
+			},
+			Resource: permissions.CatalogTableArn(repo, "*", "*"),
+		},
+		model.Statement{
+			Effect: model.StatementEffectAllow,
+			Action: []string{
 				permissions.CatalogCreateViewAction,
 				permissions.CatalogUpdateViewAction,
 				permissions.CatalogDeleteViewAction,
 			},
-			Resource: "arn:lakefs:catalog:::*",
-		},
-		model.Statement{
-			Effect:   model.StatementEffectAllow,
-			Action:   []string{permissions.WriteObjectAction},
-			Resource: permissions.ObjectArn(repo, icebergWriteObjectKey),
+			Resource: permissions.CatalogViewArn(repo, "*", "*"),
 		})
 }
 
@@ -230,8 +246,9 @@ func newResolverFixtureWithCompanionAndInit(t *testing.T, repositoryProperty str
 		commitResolverInitAs(t, base.catalog, resolverMetaRepo, tablesTestRef, tablesTestRepo, initCommitter, false)
 	}
 
-	// alice may read the data repository (tablesReadStatements, fs on lakehouse only), carol may
-	// write it, dana may list one namespace of it, bob may do nothing.
+	// alice may read the data repository (tablesReadStatements: catalog actions on the data
+	// repository's ARNs only), carol may write it, dana may list one namespace of it, bob may do
+	// nothing.
 	base.authz.user(t, "mds-meta")
 	base.authz.attachStatements(t, "meta-reader", "mds-meta", resolverCatalogReadStatements(resolverMetaRepo))
 	base.authz.user(t, "mds-meta-writer")
@@ -761,7 +778,7 @@ func TestMetadataSearchVirtualTableRead(t *testing.T) {
 	})
 
 	t.Run("the caller needs no access to the companion repository", func(t *testing.T) {
-		// alice holds fs:ReadRepository on the data repository only (resolverCatalogReadStatements
+		// alice holds catalog read actions on the data repository only (resolverCatalogReadStatements
 		// is the shape of its grant), so reading the companion repository's table directly is
 		// refused while the virtual table above was served to her.
 		direct := tablesLoadTarget(nodes(resolverMetaRepo, tablesTestRef, SystemNamespace), resolverObjectMetadataTable, nil)

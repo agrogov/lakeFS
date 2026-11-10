@@ -193,8 +193,10 @@ type tablesFixture struct {
 	storageNamespace string
 }
 
-// tablesReadStatements grants the read half of §7.2 on every catalog ARN plus the
-// fs:ReadRepository every catalog request needs, scoped to the fixture's repository.
+// tablesReadStatements grants the read half of §7.2 on the catalog ARNs of the fixture's
+// repository. The repository scope is in the catalog ARNs themselves: a catalog request needs no
+// fs: action (the public Iceberg documentation: "Iceberg catalog permissions supersede any
+// related object permissions"), so scoping the catalog ARNs is what scopes the grant.
 func tablesReadStatements() model.Statements {
 	return model.Statements{
 		{
@@ -203,22 +205,29 @@ func tablesReadStatements() model.Statements {
 				permissions.CatalogListNamespacesAction,
 				permissions.CatalogGetNamespaceAction,
 				permissions.CatalogListTablesAction,
+				permissions.CatalogListViewsAction,
+			},
+			Resource: permissions.CatalogNamespaceArn(tablesTestRepo, "*"),
+		},
+		{
+			Effect: model.StatementEffectAllow,
+			Action: []string{
 				permissions.CatalogReadTableAction,
 				permissions.CatalogReadTableDataAction,
 			},
-			Resource: "arn:lakefs:catalog:::*",
+			Resource: permissions.CatalogTableArn(tablesTestRepo, "*", "*"),
 		},
 		{
 			Effect:   model.StatementEffectAllow,
-			Action:   []string{permissions.ReadRepositoryAction},
-			Resource: permissions.RepoArn(tablesTestRepo),
+			Action:   []string{permissions.CatalogReadViewAction},
+			Resource: permissions.CatalogViewArn(tablesTestRepo, "*", "*"),
 		},
 	}
 }
 
 // tablesOrdersOnlyStatements grants catalog:ListTables on one namespace conditional on
 // catalog:TableName, the per-table filter of §7.2, so a listing can be shown to hide a table the
-// caller may not see.
+// caller may not see. It needs no fs: grant: the catalog action is the whole permission.
 func tablesOrdersOnlyStatements() model.Statements {
 	return model.Statements{
 		{
@@ -228,11 +237,6 @@ func tablesOrdersOnlyStatements() model.Statements {
 			Condition: map[string]map[string][]string{
 				"StringLike": {ConditionFieldTableName: {"ord*"}},
 			},
-		},
-		{
-			Effect:   model.StatementEffectAllow,
-			Action:   []string{permissions.ReadRepositoryAction},
-			Resource: permissions.RepoArn(tablesTestRepo),
 		},
 	}
 }
@@ -274,9 +278,9 @@ func newTablesFixture(t *testing.T) *tablesFixture {
 	authz.user(t, "bob")
 	authz.user(t, "dana")
 	authz.attachStatements(t, "orders-only", "dana", tablesOrdersOnlyStatements())
-	// carol holds the write half of §7.2 (authzWriteStatements): catalog:CreateTable and the other
-	// catalog writes plus fs:WriteObject on the reserved _lakefs_iceberg/ area. The create tests use
-	// her, so "a caller without the write grant" is alice, who holds the read half only.
+	// carol holds the write half of §7.2 (authzWriteStatements): the catalog write actions on the
+	// catalog ARNs. The create tests use her, so "a caller without the write grant" is alice, who
+	// holds the read half only.
 	authz.user(t, "carol")
 	authz.attachStatements(t, "writer", "carol", authzWriteStatements())
 

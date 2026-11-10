@@ -157,8 +157,9 @@ package icebergcatalog
 //
 // Authorization is the §7.2 row for each operation - catalog:ListTables filtered per table by the
 // catalog:TableName condition, catalog:ReadTable on the table ARN, catalog:CreateTable for create
-// and catalog:DeleteTable for drop - plus the fs:ReadRepository every catalog request needs and the
-// fs:WriteObject §7.2 adds for the reserved _lakefs_iceberg/ area of a write. reportMetrics has no
+// and catalog:DeleteTable for drop. The catalog action on the catalog ARN is the whole
+// requirement (authz.go: catalog permissions supersede object permissions), so a catalog-only
+// policy from the public Iceberg documentation is enough. reportMetrics has no
 // row of its own in §7.2; authz.go assigns it to catalog:UpdateTable on the table ARN, the
 // "commit, register, properties, metrics" action of the write half. The listing asks
 // Authorizer.FilterTables, which evaluates the namespace-level gate and the per-table condition in

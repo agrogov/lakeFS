@@ -461,8 +461,13 @@ rename operation at all, so a rename request is the unknown endpoint it always w
 ## Access
 
 Authorisation uses the existing `catalog:*` actions on branch-agnostic ARNs
-(`arn:lakefs:catalog:::namespace/<repo>/<ns>` and `arn:lakefs:catalog:::table/<repo>/<ns>/<table>`), plus
-two lakeFS actions on the repository and its reserved key area:
+(`arn:lakefs:catalog:::namespace/<repo>/<ns>` and `arn:lakefs:catalog:::table/<repo>/<ns>/<table>`).
+That catalog action is the **whole** permission of a catalog request: the repository- or object-level
+`fs:*` actions do not grant catalog access and do not refuse it. This is the rule of the public
+[Iceberg documentation](https://docs.lakefs.io/iceberg/): "Iceberg catalog permissions supersede any
+related object permissions", and its example policies grant `catalog:*` actions on catalog ARNs and
+nothing else. A principal holding `fs:*` on a repository and no `catalog:*` action is therefore
+refused, and one holding only the documented read-only policy can read.
 
 | Operation | Action | Resource |
 |---|---|---|
@@ -480,11 +485,13 @@ two lakeFS actions on the repository and its reserved key area:
 | create / replace view | `catalog:CreateView`, `catalog:UpdateView` | `CatalogViewArn(repo, ns, view)` |
 | drop view | `catalog:DeleteView` | `CatalogViewArn(repo, ns, view)` |
 
-Additionally, every request scoped to a repository needs `fs:ReadRepository` on that repository, every
-write needs `fs:WriteObject` on `ObjectArn(repo, "_lakefs_iceberg/*")` — the reserved entry area — and the
-repository-level listing (no parent namespace) needs `fs:ListRepositories`. Branch protection, repository
-read-only state and the datasets immutability deny therefore all apply to catalog writes without the
-catalog implementing any of them itself.
+The one exception is the repository-level listing: a listing with no parent namespace is a lakeFS
+repository list, not a catalog object, so it needs `fs:ListRepositories` on `All`, and each repository
+is then filtered with its own `catalog:ListNamespaces` decision. Branch protection and a read-only
+repository are not permissions at all: every catalog write goes through `pkg/catalog`'s `CreateEntry`
+without force, so the catalog layer refuses those writes itself. Dataset immutability reaches the
+catalog through the datasets immutability guard, which refuses the catalog write actions on catalog
+ARNs before the auth service is consulted.
 
 `catalog:ReadTableData` and `catalog:WriteTableData` are **new actions** in this build. The built-in
 policies already cover them: the `CatalogRead` policy set includes `catalog:ReadTableData`, and
@@ -657,7 +664,7 @@ A `401` becomes a sentence about the catalog session ("sign in again and retry")
 dialog or in the tab; it is never a login redirect. A `403` also **disables** the management controls and says which
 permissions the operations need (`catalog:CreateNamespace`, `catalog:DeleteNamespace`,
 `catalog:CreateTable`, `catalog:DeleteTable`, on top of the reads' `catalog:ListNamespaces`,
-`catalog:ListTables`, `catalog:ReadTable` and `fs:ReadRepository`): a user the catalog denied once
+`catalog:ListTables` and `catalog:ReadTable`): a user the catalog denied once
 will be denied again, so the tab stops offering what cannot work.
 
 ## Data-plane access
@@ -925,8 +932,8 @@ that calls one gets the catalog's `404`. Multi-table transaction commit (`POST
   cookie is accepted for), and everything else is still an Iceberg client's job: no commit, no register,
   no rename, no data write. It also explores one ref at a time — the one the page shows — with no
   repository or ref picker, and it uses the `/iceberg/api` form only. The permissions it needs are
-  `catalog:ListNamespaces`, `catalog:ListTables`, `catalog:ReadTable` and `fs:ReadRepository` to look,
-  plus `catalog:CreateNamespace`, `catalog:DeleteNamespace`, `catalog:CreateTable` and
+  `catalog:ListNamespaces`, `catalog:ListTables` and `catalog:ReadTable` to look, plus
+  `catalog:CreateNamespace`, `catalog:DeleteNamespace`, `catalog:CreateTable` and
   `catalog:DeleteTable` to manage.
 - **The esti system tests run on S3, and the view suite runs with them.** `esti/iceberg_test.go`
   covers the PyIceberg/DuckDB read path, append → lakeFS commit → GC prepare → still readable, and

@@ -52,8 +52,8 @@ type namespacesFixture struct {
 }
 
 // namespacesReadStatements grants the read half of §7.2 plus the repository-list permission the
-// root level of §5 needs. The fs:ReadRepository grant is scoped to authzRepoArn, which is what
-// makes the root listing hide every other repository in the fixture.
+// root level of §5 needs. No fs: action is granted: a catalog request needs its catalog action
+// only (authz.go), so this is the whole grant a catalog client has to hold.
 func namespacesReadStatements() model.Statements {
 	statements := authzReadStatements()
 	return append(statements, model.Statement{
@@ -76,9 +76,9 @@ func namespacesUser(next http.Handler) http.Handler {
 	})
 }
 
-// namespacesAllRepositoriesStatements grants the catalog read actions and fs:ReadRepository on
-// every repository, so a repository that does not exist is reached by the lookup instead of being
-// refused at the authorization gate.
+// namespacesAllRepositoriesStatements grants catalog:* on every catalog ARN plus the
+// repository-list permission, so a repository that does not exist is reached by the lookup instead
+// of being refused at the authorization gate.
 func namespacesAllRepositoriesStatements() model.Statements {
 	return model.Statements{
 		{
@@ -88,7 +88,7 @@ func namespacesAllRepositoriesStatements() model.Statements {
 		},
 		{
 			Effect:   model.StatementEffectAllow,
-			Action:   []string{permissions.ReadRepositoryAction, permissions.ListRepositoriesAction},
+			Action:   []string{permissions.ListRepositoriesAction},
 			Resource: permissions.All,
 		},
 	}
@@ -462,9 +462,9 @@ func requireForbiddenReadOnly(t *testing.T, rec *httptest.ResponseRecorder) {
 }
 
 // writeFixture is the read fixture (which already carries a committed inventory/books/authors/other
-// tree and a tag) plus the write half of the §7.2 policy: the catalog write actions and
-// fs:WriteObject on the reserved _lakefs_iceberg/ area. Without them every write endpoint would
-// answer 403, which is the read fixture's whole point.
+// tree and a tag) plus the write half of the §7.2 policy: the catalog write actions, on catalog
+// ARNs only (authz.go). Without them every write endpoint would answer 403, which is the read
+// fixture's whole point.
 func writeFixture(t *testing.T) *namespacesFixture {
 	t.Helper()
 	f := newNamespacesFixture(t)
@@ -476,16 +476,9 @@ func writeFixture(t *testing.T) *namespacesFixture {
 			Resource: permissions.All,
 		},
 	))
-	// dana may write on every repository, so a missing repository is reached by the lookup
-	// instead of being refused at the authorization gate.
-	f.authz.attachStatements(t, "write-all-repositories", "dana", append(
-		namespacesAllRepositoriesStatements(),
-		model.Statement{
-			Effect:   model.StatementEffectAllow,
-			Action:   []string{permissions.WriteObjectAction},
-			Resource: permissions.All,
-		},
-	))
+	// dana may write on every repository (catalog:* on every catalog ARN), so a missing repository
+	// is reached by the lookup instead of being refused at the authorization gate.
+	f.authz.attachStatements(t, "write-all-repositories", "dana", namespacesAllRepositoriesStatements())
 	return f
 }
 

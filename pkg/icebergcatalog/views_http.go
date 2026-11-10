@@ -39,10 +39,10 @@ package icebergcatalog
 // (arn:lakefs:catalog:::view/<repo>/<namespace>/<view>, permissions.CatalogViewArn):
 // catalog:ListViews for the listing (filtered per view by catalog:ViewName), catalog:ReadView for
 // load and head, catalog:CreateView for create, catalog:UpdateView for replace and
-// catalog:DeleteView for drop - plus the fs:ReadRepository every catalog request needs and the
-// fs:WriteObject on the reserved _lakefs_iceberg/ area every write needs. All four are actions the
-// lakeFS permission catalogue already publishes, so a policy written for the catalog covers views
-// without a new action name.
+// catalog:DeleteView for drop. The catalog action on the view ARN is the whole permission
+// (authz.go: catalog permissions supersede object permissions), so no fs: grant is needed. All
+// four are actions the lakeFS permission catalogue already publishes, so a policy written for the
+// catalog covers views without a new action name.
 //
 // Clean-room note: written from ICEBERG_CATALOG_PLAN.md, the Apache Iceberg REST OpenAPI spec
 // (https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml, listViews /

@@ -24,9 +24,10 @@ package icebergcatalog
 //     all refused before the blockstore is asked to sign anything.
 //  2. the caller needs catalog:ReadTableData for a read (GET, HEAD) and catalog:WriteTableData
 //     for a write (PUT, POST, DELETE, PATCH, OPTIONS), exactly the §7.2 row for vended data
-//     access. A write additionally needs a branch ref (Q-I4), so a tag or commit ref is refused
-//     as read-only. The Authorizer also adds fs:ReadRepository and, for a write,
-//     fs:WriteObject on the reserved _lakefs_iceberg/ area.
+//     access, and that catalog action is the whole permission: no fs: grant is needed (authz.go,
+//     the public Iceberg documentation's "catalog permissions supersede object permissions").
+//     A write additionally needs a branch ref (Q-I4), so a tag or commit ref is refused as
+//     read-only.
 //  3. a write must not name a namespace a table resolver reserved (§5.4, METADATA_SEARCH_DESIGN.md:
 //     the system namespace of a data repository belongs to the virtual table). The check runs on
 //     the address the caller named and on the address the resolver sends the table read to, so a

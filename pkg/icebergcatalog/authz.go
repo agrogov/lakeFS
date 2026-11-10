@@ -22,19 +22,30 @@ package icebergcatalog
 // enforced separately - reads are allowed on any ref, writes only on a branch (the Q-I4 rule of
 // Authorize, refused as *ReadOnlyRefError).
 //
-// On top of the catalog action, every request needs fs:ReadRepository on the repository, and
-// every write additionally needs fs:WriteObject on ObjectArn(repo, "_lakefs_iceberg/*"). The
-// second one is what makes the existing lakeFS denies apply to catalog writes without any new
-// policy:
+// The catalog action on the catalog ARN is the whole permission. That is the rule of the public
+// Iceberg documentation (https://docs.lakefs.io/iceberg/, "Authorization"): "When using lakeFS
+// with Iceberg, permissions must be managed through Iceberg RBAC - repository or object-level
+// permissions alone are not sufficient", and "Iceberg catalog permissions supersede any related
+// object permissions", and every example policy the page gives grants catalog:* actions on
+// catalog ARNs only. So a request needs exactly the catalog action of its operation on its
+// catalog ARN and no fs:* action: a principal holding the documented catalog-only policy is
+// allowed, and a principal holding fs:* and no catalog:* is refused
+// (TestAuthzDocExamplePolicies).
 //
-//   - a datasets repository is guarded by the dataset-<name>-immutable deny policy
-//     (pkg/datasets/authz.go, ImmutabilityPolicy), which denies fs:WriteObject - among the
-//     catalog:Create*/Update*/Delete* actions it already lists - on the repository ARN and on
-//     repository/<name>/*. Denying fs:WriteObject on repository/<name>/* matches the requested
-//     repository/<name>/object/_lakefs_iceberg/* and so denies the whole And node;
-//   - a deny of fs:* on a repository ARN blocks the catalog for that repository;
-//   - the reserved _lakefs_iceberg/ prefix cannot be written through the fs: API by a principal
-//     that lacks it, because it is the very permission the catalog requires.
+// The consequences are deliberate:
+//
+//   - a grant of fs:ReadRepository, fs:WriteObject or fs:* on the repository neither adds nor
+//     removes catalog access, and a deny of them does not refuse a catalog request either. The
+//     reserved _lakefs_iceberg/ prefix stays protected at the fs: layer by the installation-wide
+//     deny policy (iceberg-reserved-prefix-protect, gc.go), which denies fs:WriteObject and
+//     fs:DeleteObject on the prefix's object ARNs;
+//   - dataset immutability still reaches the catalog, through the SEC-2 guard
+//     (pkg/datasets/immutability_guard.go, ImmutabilityAuthService), which refuses the catalog
+//     write actions named in immutabilityDeniedActions on catalog ARNs before the wrapped auth
+//     service is consulted - not through an fs:WriteObject leaf of this file;
+//   - branch protection and a read-only repository are not permissions at all: every catalog
+//     write goes through pkg/catalog's CreateEntry without Force, so the catalog layer refuses
+//     them itself (store.go, files.go).
 //
 // This file only builds and evaluates permission nodes; it performs no I/O, resolves no ref and
 // never reads a repository. The HTTP layer (http.go, errors.go) maps the typed errors below onto
@@ -89,13 +100,6 @@ const (
 	// ErrorTypeInternal is the Iceberg error type of a failure to decide. It is never used for
 	// a refusal.
 	ErrorTypeInternal = "InternalServerError"
-
-	// icebergWriteObjectKey is the object key the catalog's write permission is granted on,
-	// §7.2: every catalog write reaches the reserved _lakefs_iceberg/ area of the branch, so the
-	// write permission of the catalog is fs:WriteObject on ObjectArn(repo, "_lakefs_iceberg/*").
-	// Unqualified, the glob also covers the reserved namespace markers, the table pointers and
-	// the staged table files.
-	icebergWriteObjectKey = "_lakefs_iceberg/*"
 )
 
 // Refusal sentinels. They exist so a caller can classify an error with errors.Is without
@@ -255,9 +259,8 @@ var viewOperations = map[Operation]struct{}{
 	OpDeleteView: {},
 }
 
-// writeOperations are the operations that change the repository, and therefore need both a
-// branch (Q-I4) and fs:WriteObject on the reserved _lakefs_iceberg/ area (§7.2). Reads of a tag
-// or a commit are not in the set: §5 allows them on any ref.
+// writeOperations are the operations that change the repository, and therefore need a branch
+// (Q-I4). Reads of a tag or a commit are not in the set: §5 allows them on any ref.
 var writeOperations = map[Operation]struct{}{
 	OpCreateNamespace: {},
 	OpUpdateNamespace: {},
@@ -293,8 +296,7 @@ func (op Operation) IsViewOperation() bool {
 	return ok
 }
 
-// IsWrite reports whether op changes the branch, and so needs a branch ref and fs:WriteObject on
-// the reserved _lakefs_iceberg/ area (§7.2, Q-I4).
+// IsWrite reports whether op changes the branch, and so needs a branch ref (Q-I4).
 func (op Operation) IsWrite() bool {
 	_, ok := writeOperations[op]
 	return ok
@@ -513,11 +515,10 @@ func (a *Authorizer) authorizePermission(ctx context.Context, caller Caller, req
 // RequiredNode builds the §7.2 permission node of req:
 //
 //	catalog:<Action>   on CatalogTableArn(repo, ns, t) or CatalogNamespaceArn(repo, ns)  (§7.2)
-//	fs:ReadRepository  on RepoArn(repo)                                                  (§7.2)
-//	fs:WriteObject     on ObjectArn(repo, "_lakefs_iceberg/*")          writes only      (§7.2)
 //
-// joined with And, so that a Deny on any of them refuses the request: that is how the existing
-// dataset, repository and fs: denies reach the catalog without a catalog-shaped deny statement.
+// One leaf, not a conjunction: the catalog action on the catalog ARN is the whole requirement
+// (see the file comment), so the catalog-only policies of the public Iceberg documentation are
+// enough for every request here.
 //
 // The one address without a repository is the root of the namespace listing ("GET namespaces with
 // no parent lists repositories the caller can read", §5). That level is a lakeFS repository list,
@@ -543,10 +544,7 @@ func RequiredNode(req Request) (permissions.Node, error) {
 			return permissions.Node{}, fmt.Errorf("%w: %s without a repository cannot name a ref, "+
 				"namespace or table", ErrInvalidAuthzRequest, req.Op)
 		}
-		return permissions.Node{
-			Type:  permissions.NodeTypeAnd,
-			Nodes: []permissions.Node{leaf(permissions.ListRepositoriesAction, permissions.All)},
-		}, nil
+		return leaf(permissions.ListRepositoriesAction, permissions.All), nil
 	}
 
 	switch {
@@ -598,15 +596,7 @@ func RequiredNode(req Request) (permissions.Node, error) {
 	case req.Op.IsViewOperation():
 		resource = permissions.CatalogViewArn(addr.Repo, addr.Namespace.Dotted(), addr.View)
 	}
-	nodes := []permissions.Node{
-		leaf(action, resource),
-		leaf(permissions.ReadRepositoryAction, permissions.RepoArn(addr.Repo)),
-	}
-	if req.Op.IsWrite() {
-		nodes = append(nodes, leaf(permissions.WriteObjectAction,
-			permissions.ObjectArn(addr.Repo, icebergWriteObjectKey)))
-	}
-	return permissions.Node{Type: permissions.NodeTypeAnd, Nodes: nodes}, nil
+	return leaf(action, resource), nil
 }
 
 // leaf builds one permission leaf of a Node.
