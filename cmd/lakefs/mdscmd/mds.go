@@ -1,6 +1,10 @@
 // Package mdscmd registers the Metadata Search indexer command, `mds run`, on the root command of
 // the lakeFS binaries.
 //
+// Both binaries need it: the upstream chart runs the command on the `lakefs` binary
+// (`lakefs mds run`), and this repository's deployments run the `lakefs-sso` binary built by the
+// Makefile (`LAKEFS_SSO_BINARY_NAME`), where the same command is `lakefs-sso mds run`.
+//
 // It is its own package, and not a file in cmd/lakefs/cmd, because of an import cycle: the command
 // builds the indexer service (pkg/mds -> pkg/mds/indexer), and pkg/mds/indexer imports
 // pkg/icebergcatalog, which imports cmd/lakefs/cmd for the server dependency struct. The command

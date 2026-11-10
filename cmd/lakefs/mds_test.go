@@ -6,8 +6,8 @@ package main
 // The fixture is a real lakeFS catalog over a local (in-memory) KV store and the local block
 // adapter, the production Iceberg catalog routes over HTTP, a data repository with one commit, and
 // a configuration file that names the same database, blockstore and auth key the server uses. The
-// command is then executed the way the official chart invokes it - `mds run --config <file>`
-// through the server binary's root command - so the test covers the whole wiring: the server
+// command is then executed the way the chart invokes it - `mds run --config <file>` through the
+// server binary's root command - so the test covers the whole wiring: the server
 // configuration loader, the KV store opened from database.*, the catalog built over blockstore.*,
 // the in-process repository reads and the REST table writes.
 //

@@ -120,7 +120,7 @@ sync.
 
 ### 3. Indexer configuration
 
-`lakefs mds run` runs on the **server binary and the server configuration** (design §4.1): it opens the KV store
+`lakefs-sso mds run` runs on the **server binary and the server configuration** (design §4.1): it opens the KV store
 of `database.*`, builds the catalog over the `blockstore.*` adapter and reads the data repositories in process.
 So the guide's `metadata_search` section lives in the same file as the server's configuration, and the
 object-store credentials it writes with are the server's `blockstore.*` settings - there is no
@@ -279,14 +279,14 @@ A container-root namespace (`https://myaccount.blob.core.windows.net/my-containe
 ### 4. Run the indexer
 
 ```bash
-lakefs mds run --config /etc/lakefs/config.yaml
+lakefs-sso mds run --config /etc/lakefs/config.yaml
 ```
 
-`mds run` is a subcommand of the server binary itself, so the image that runs the server runs the
-indexer too: the official `lakefs` image and the chart's
-`args: [mds, run, --config, /app/config.yaml]` need no second image. (This repository's own
-test binary, which also carries the Iceberg catalog and the SSO features, exposes the same command
-as `lakefs-sso mds run`; it is the same code on the same configuration.)
+`mds run` is a subcommand of the server binary, so the `lakefs-sso` image that serves lakeFS runs
+the indexer too: `args: [mds, run, --config, /etc/lakefs/config.yaml]` on the same image needs no
+second image. The upstream `lakefs` server binary exposes the same command as `lakefs mds run`;
+this repository's deployments run the `lakefs-sso` binary (`LAKEFS_SSO_BINARY_NAME` in the
+`Makefile`), which is the spelling used here.
 
 `--config` is required. The process loads the whole lakeFS configuration - the file plus `LAKEFS_*` -
 opens the KV store of `database.*` and the blockstore of `blockstore.*`, reads the `metadata_search`
@@ -747,8 +747,7 @@ requires the same rows as `system.metadata.<repo>.<ref>.objects`.
 ### What was verified
 
 The suite [`../esti/mds_test.go`](../esti/mds_test.go) runs the PyIceberg and DuckDB recipes above
-against a real `lakefs-sso` and a real `lakefs-sso mds run` (this repository's own binary, not the
-server image's `lakefs mds run`) on SeaweedFS. Every read takes four paths -
+against a real `lakefs-sso` and a real `lakefs-sso mds run` on SeaweedFS. Every read takes four paths -
 PyIceberg and DuckDB, each through `/iceberg/api` with `("system", "metadata", "<repo>", "<ref>",
 "objects")` and through `/iceberg/relative_to/system.metadata/api` with `("<repo>", "<ref>",
 "objects")` - and requires them to agree on path, `commit_id`, etag, `size_bytes` and user metadata.
@@ -760,10 +759,9 @@ merge, a tag, a short commit ID, a hard reset and an indexer restart in the cras
 rows as the root-tree address, and requires the lakeFS catalog to answer the old identifier with
 `404 NoSuchTableException`.
 
-The `lakefs-sso mds run` process of this repository's test binary runs on the server
-configuration, so the suite starts a PostgreSQL container for the two processes to share (a local
-Badger database cannot be opened twice) and configures no credential for the sync at all: it writes
-as `mds-service-user`.
+The `lakefs-sso mds run` process runs on the server configuration, so the suite starts a PostgreSQL
+container for the two processes to share (a local Badger database cannot be opened twice) and
+configures no credential for the sync at all: it writes as `mds-service-user`.
 
 The recorded run (2026-11-10, RA8): SeaweedFS 4.50 on `:8333`, a locally built `esti-iceberg-client`
 image (`ESTI_ICEBERG_CLIENT_IMAGE`, so no step installs its clients), and the throw-away PostgreSQL
