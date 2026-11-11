@@ -1,6 +1,8 @@
 # Repository deletion with storage: specification
 
-Status: draft, 2026-11-10. Companion documents: `REPO_DELETE_STORAGE_DESIGN.md` (how), `REPO_DELETE_STORAGE_PLAN.md` (tasks).
+Status: implemented, 2026-11-11, as tasks D1–D9 of `REPO_DELETE_STORAGE_PLAN.md`. D10 (the hr2
+rollout and real-Azure verification) is not started. Companion documents:
+`REPO_DELETE_STORAGE_DESIGN.md` (how), `REPO_DELETE_STORAGE_PLAN.md` (tasks).
 
 ## 1. Problem
 

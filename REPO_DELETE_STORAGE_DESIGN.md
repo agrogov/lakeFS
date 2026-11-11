@@ -1,7 +1,10 @@
 # Repository deletion with storage: design
 
-Status: draft, 2026-11-10. Implements `REPO_DELETE_STORAGE_SPEC.md` (requirements R1–R25 are referenced by number).
-Tasks: `REPO_DELETE_STORAGE_PLAN.md`.
+Status: implemented, 2026-11-11, as tasks D1–D9 of `REPO_DELETE_STORAGE_PLAN.md`. D10 (the hr2
+rollout and real-Azure verification) is not started, so the Azure HNS directory-deletion path is
+unit-tested but not yet verified on a real HNS account (§11). Implements
+`REPO_DELETE_STORAGE_SPEC.md` (requirements R1–R25 are referenced by number). Tasks:
+`REPO_DELETE_STORAGE_PLAN.md`.
 
 ## 1. Overview
 

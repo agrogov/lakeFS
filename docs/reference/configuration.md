@@ -1,4 +1,4 @@
-# lakeFS configuration: Iceberg and Metadata Search
+# lakeFS configuration: repository deletion, Iceberg and Metadata Search
 
 Configuration is a YAML file and/or environment variables. The server reads its file with
 `lakefs-sso run --config <file>`; the Metadata Search indexer runs on the same server binary and
@@ -16,9 +16,10 @@ The full lakeFS server reference is published with the documentation site:
 repository; this page records the sections the code in this repository adds, so that the feature
 and its configuration stay together.
 
-Related guides: [`../iceberg.md`](../iceberg.md) for the catalog and
+Related guides: [`../iceberg.md`](../iceberg.md) for the catalog,
 [`../metadata-search.md`](../metadata-search.md) for setup, engine recipes, semantics and
-maintenance.
+maintenance, and [`../repository-deletion.md`](../repository-deletion.md) for deleting a
+repository's storage.
 
 ## Iceberg catalog (server)
 
@@ -37,6 +38,45 @@ The catalog is off by default. `iceberg.enabled: true` mounts `/iceberg/api` and
   ABFS driver refuses a non-HNS account over the `dfs` host. The scheme stays `abfs[s]`. It changes
   what every engine sees, so it is one server-wide setting.
   Environment: `LAKEFS_ICEBERG_AZURE_LOCATION_HOST`.
+
+## Repository deletion with storage
+
+`DELETE /api/v1/repositories/{repository}?delete_storage=true` and `lakectl repo delete
+--delete-storage` delete a repository's metadata and every object under its storage namespace
+(see [`../repository-deletion.md`](../repository-deletion.md)). The server reads this section at
+startup; changing it needs a restart. The defaults are in `pkg/config/defaults.go`.
+
+* `repository_deletion.storage.enabled` `(bool : true)` - allow the request path and start the
+  background worker. With `false`, a delete that asks for storage is refused with `400
+  not_supported`, and no worker runs, so a record left from an earlier run is not advanced.
+  Environment: `LAKEFS_REPOSITORY_DELETION_STORAGE_ENABLED`.
+* `repository_deletion.storage.interval` `(duration : 30s)` - delay between worker scans (plus up
+  to a third of jitter). It is also the base of the retry backoff,
+  `min(interval * 2^attempts, 10m)`. A non-positive value falls back to the default. Environment:
+  `LAKEFS_REPOSITORY_DELETION_STORAGE_INTERVAL`.
+* `repository_deletion.storage.batch_size` `(int : 1000)` - maximum number of objects one
+  namespace-delete page lists and deletes. Adapters cap it to their provider limit: S3 1000 per
+  `DeleteObjects`, Azure 256 per Blob Batch, GCS one request per object with at most 32 in flight.
+  A non-positive value falls back to the default. Environment:
+  `LAKEFS_REPOSITORY_DELETION_STORAGE_BATCH_SIZE`.
+* `repository_deletion.storage.max_attempts` `(int : 10)` - failed attempts after which the
+  deletion record becomes `failed` with `last_error`. Repeating the delete request resets the
+  counter. A non-positive value falls back to the default. Environment:
+  `LAKEFS_REPOSITORY_DELETION_STORAGE_MAX_ATTEMPTS`.
+
+The section, as a file:
+
+```yaml
+repository_deletion:
+  storage:
+    enabled: true
+    interval: 30s
+    batch_size: 1000
+    max_attempts: 10
+```
+
+The object-store permissions the deletion needs, the status API, retries and the RBAC action are in
+[`../repository-deletion.md`](../repository-deletion.md).
 
 ## Metadata Search indexer (`metadata_search`)
 

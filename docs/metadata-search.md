@@ -1140,6 +1140,31 @@ refuses a default-branch delete, so the indexer keeps it and logs the skip once.
 `/_health` entry and `lakefs_mds_lag_commits` series are dropped, so a failed last attempt of the
 deleted branch cannot keep `/_health` at `503`.
 
+### Deleting a data repository
+
+Deleting `my-repo` with `delete_storage` also deletes the companion `my-repo-metadata` and the
+companion's storage, in the same request. The cascade is installed only on a server with the
+catalog and Metadata Search enabled (`iceberg.enabled` and `iceberg.metadata_search.enabled`), and
+it fires only when `my-repo-metadata` exists and passes
+the init-commit proof described under [`Limits and known deviations`](#limits-and-known-deviations):
+a repository you created yourself under that name is never cascaded. The companion's namespace is
+read from its own record, so a `metadata_search.repositories.my-repo.storage_namespace` override is
+honoured. The caller's permissions on `my-repo` cover the companion too — it is derived data of
+`my-repo`, and no separate authorization is checked. Each repository gets its own deletion record,
+so `my-repo-metadata` has its own status; see
+[`repository-deletion.md`](repository-deletion.md#metadata-search).
+
+If either `my-repo` or its companion fails a refusal check (read-only, bucket-root namespace, a
+namespace shared with another repository, a deletion already pending), nothing is deleted and the
+response names the repository that refused.
+
+Deleting `my-repo` **without** `delete_storage` leaves the companion and its index exactly as
+before: `my-repo-metadata` stays, and the indexer reports `my-repo` as failing while it remains
+configured. After a cascade, the indexer does not recreate the companion — a tick reads `my-repo`
+first and finds it missing, and a tick that raced the deletion is refused by the pending deletion
+record. If `my-repo` is later re-created, the next tick creates a fresh companion and writes a new
+`mds: init` commit.
+
 ### Upgrades and restarts
 
 - Restarting the indexer is safe and is part of normal operation; it resumes at the recorded

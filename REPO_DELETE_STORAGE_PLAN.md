@@ -3,6 +3,9 @@
 Spec: [`REPO_DELETE_STORAGE_SPEC.md`](REPO_DELETE_STORAGE_SPEC.md) (R*, A*). Design:
 [`REPO_DELETE_STORAGE_DESIGN.md`](REPO_DELETE_STORAGE_DESIGN.md) (§ numbers below refer to it).
 
+Status: D1–D9 implemented, 2026-11-11. D10 (the hr2 rollout and real-Azure verification) is not
+started; it is the only task left and the only test of HNS directory deletion on real Azure.
+
 ## Branching
 
 Base `feature/metadata-search`. Each task is one commit (or one card) with the test that proves it. Tasks run in the
@@ -25,18 +28,18 @@ Shared-file rules:
 
 ## Status
 
-| Task | State |
-|---|---|
-| D1 adapter method | Not started |
-| D2 deletion record, config, conflict check | Not started |
-| D3 worker | Not started |
-| D4 API, authorization, codegen | Not started |
-| D5 lakectl | Not started |
-| D6 web UI | Not started |
-| D7 MDS cascade and indexer cache fix | Not started |
-| D8 esti | Not started |
-| D9 docs | Not started |
-| D10 hr2 rollout and verification | Not started |
+| Task | State | Commit |
+|---|---|---|
+| D1 adapter method | Done | `f0a97958b` |
+| D2 deletion record, config, conflict check | Done | `7b6e28aa1` |
+| D3 worker | Done | `4cacc6a35` |
+| D4 API, authorization, codegen | Done | `4202719b1` |
+| D5 lakectl | Done | `a16ded56c` |
+| D6 web UI | Done | `461d9dfec` |
+| D7 MDS cascade and indexer cache fix | Done | `835d47f8b` |
+| D8 esti | Done | `8187c2ad1` |
+| D9 docs | Done | This commit |
+| D10 hr2 rollout and verification | Not started | — |
 
 ## Tasks
 
