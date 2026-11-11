@@ -3,8 +3,9 @@
 Spec: [`REPO_DELETE_STORAGE_SPEC.md`](REPO_DELETE_STORAGE_SPEC.md) (R*, A*). Design:
 [`REPO_DELETE_STORAGE_DESIGN.md`](REPO_DELETE_STORAGE_DESIGN.md) (§ numbers below refer to it).
 
-Status: D1–D10 done, 2026-11-11. D10 was the only test of HNS directory deletion on real Azure; it
-passed on hr2 (output in the status row below).
+Status: D1–D10 done, 2026-11-11. D10 passed on hr2 (output in the status row below), but hr2's
+account `cpaasailakefs` has **no** hierarchical namespace (see the correction under the D10 result), so
+HNS directory deletion has still not run on a real HNS account.
 
 ## Branching
 
@@ -41,7 +42,7 @@ Shared-file rules:
 | D9 docs | Done | This commit |
 | D10 hr2 rollout and verification | Done | This commit — passed on hr2, see below |
 
-### D10 result — hr2, Azure `cpaasailakefs` (HNS), 2026-11-11
+### D10 result — hr2, Azure `cpaasailakefs` (flat, no HNS: see the correction below), 2026-11-11
 
 Image `docker.ib-ci.com/lakefs:dev-mds-delete` (`sha256:f697681c…`), rolled by ArgoCD at 11:12Z; the server
 reports `dev-mds-delete`, `storage_config.delete_namespace_support=true`, no `repository_deletion.*` override (so the
@@ -128,6 +129,22 @@ Two facts this run established that the plan assumed otherwise:
   therefore **not exercised**: the namespace contained no `hdi_isfolder` blobs, and explicit directories created via
   the DFS API were not tested. That remains the one part of the HNS story covered only by the unit test with the
   fake pager.
+
+**Correction, 2026-11-11 (after D10 landed).** The account has no hierarchical namespace. Blob service Get Account
+Information, read only, with the account key from `lakefs-secrets`:
+
+```
+$ go run <probe calling service.Client.GetAccountInfo>   # azblob v1.8.0
+sku=Standard_LRS kind=StorageV2 isHierarchicalNamespaceEnabled=false
+```
+
+A listing with metadata agrees: `az storage blob list -c lakefs --prefix jeff-training/ --include m` returns 369
+blobs, none with `hdi_isfolder` and none with a `resourceType`. On an HNS account every directory is listed as a
+0-byte blob with `hdi_isfolder=true`. So the "HNS" labels above are wrong. The `az storage fs` reads did not prove
+HNS. The "directories" listed before the run were virtual prefixes of a flat container, which is also why they
+"disappeared with their last blob". D10 still verified on real Azure that a flat namespace is deleted completely,
+and that nothing outside it is touched. It did not test HNS directory deletion (design §2.3 and §11). That needs an
+account with `isHierarchicalNamespaceEnabled=true`.
 
 ## Tasks
 

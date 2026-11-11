@@ -1,8 +1,9 @@
 # Repository deletion with storage: design
 
-Status: implemented, 2026-11-11, as tasks D1–D9 of `REPO_DELETE_STORAGE_PLAN.md`. D10 (the hr2
-rollout and real-Azure verification) is not started, so the Azure HNS directory-deletion path is
-unit-tested but not yet verified on a real HNS account (§11). Implements
+Status: implemented, 2026-11-11, as tasks D1–D10 of `REPO_DELETE_STORAGE_PLAN.md`. D10 (the hr2
+rollout and real-Azure verification) passed on hr2's Azure account. That account has no hierarchical
+namespace (`isHierarchicalNamespaceEnabled=false`, see the plan's D10 correction), so the
+directory-deletion path of §2.3 is still covered only by the unit test with a fake pager (§11). Implements
 `REPO_DELETE_STORAGE_SPEC.md` (requirements R1–R25 are referenced by number). Tasks:
 `REPO_DELETE_STORAGE_PLAN.md`.
 
@@ -373,7 +374,7 @@ repository_deletion:
 | Shared namespace | R10 overlap scan over every repository state and every pending record |
 | Late writes from another replica's cache | SETTLE step + VERIFY pass |
 | Breaking imported or linked entries in other repositories (L1) | Documented and shown in prompts; not detectable cheaply |
-| Azurite has no HNS, so directory deletion is untested in CI | Unit test with a fake pager; one manual run on an HNS account before rollout |
+| Azurite has no HNS, so directory deletion is untested in CI | Unit test with a fake pager; one manual run on an HNS account before rollout. Still open: hr2's account (D10) is flat, so no HNS account has been tested yet |
 | Upstream merge conflicts | The new method touches every adapter. It's additive, and upstream removed `Remove` but has no method by this name. |
 
 ## 12. Sources

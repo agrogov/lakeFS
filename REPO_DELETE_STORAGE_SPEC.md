@@ -1,7 +1,7 @@
 # Repository deletion with storage: specification
 
-Status: implemented, 2026-11-11, as tasks D1–D9 of `REPO_DELETE_STORAGE_PLAN.md`. D10 (the hr2
-rollout and real-Azure verification) is not started. Companion documents:
+Status: implemented, 2026-11-11, as tasks D1–D10 of `REPO_DELETE_STORAGE_PLAN.md`. D10 (the hr2
+rollout and real-Azure verification) passed; its raw output is in the plan's status table. Companion documents:
 `REPO_DELETE_STORAGE_DESIGN.md` (how), `REPO_DELETE_STORAGE_PLAN.md` (tasks).
 
 ## 1. Problem
