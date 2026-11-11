@@ -3,8 +3,8 @@
 Spec: [`REPO_DELETE_STORAGE_SPEC.md`](REPO_DELETE_STORAGE_SPEC.md) (R*, A*). Design:
 [`REPO_DELETE_STORAGE_DESIGN.md`](REPO_DELETE_STORAGE_DESIGN.md) (§ numbers below refer to it).
 
-Status: D1–D9 implemented, 2026-11-11. D10 (the hr2 rollout and real-Azure verification) is not
-started; it is the only task left and the only test of HNS directory deletion on real Azure.
+Status: D1–D10 done, 2026-11-11. D10 was the only test of HNS directory deletion on real Azure; it
+passed on hr2 (output in the status row below).
 
 ## Branching
 
@@ -39,7 +39,95 @@ Shared-file rules:
 | D7 MDS cascade and indexer cache fix | Done | `835d47f8b` |
 | D8 esti | Done | `8187c2ad1` |
 | D9 docs | Done | This commit |
-| D10 hr2 rollout and verification | Not started | — |
+| D10 hr2 rollout and verification | Done | This commit — passed on hr2, see below |
+
+### D10 result — hr2, Azure `cpaasailakefs` (HNS), 2026-11-11
+
+Image `docker.ib-ci.com/lakefs:dev-mds-delete` (`sha256:f697681c…`), rolled by ArgoCD at 11:12Z; the server
+reports `dev-mds-delete`, `storage_config.delete_namespace_support=true`, no `repository_deletion.*` override (so the
+§9 defaults applied: `enabled`, `30s`, `1000`, `10`). Throwaway namespace `…/lakefs/rds-6266ce/`. Fixture: 300
+objects in nested paths committed through lakeFS, plus 4 blobs written straight to storage at depth 5 so that HNS
+directories exist (see the note below on why lakeFS's own writes do not create them).
+
+Before: 608 blobs under the prefix; directories `rds-6266ce/{_lakefs/,data/,manual/}`,
+`rds-6266ce/data/{ftdbamb8b51s73b3cok0/,ftdbank2r8ac73acrdb0/}`, `rds-6266ce/manual/deep/l1/→l2/→l3/`; container
+total 466 blobs. Command under test:
+
+```
+$ /tmp/lakectl-d10 repo delete lakefs://rds-6266ce --delete-storage --wait --yes
+Repository: lakefs://rds-6266ce
+Warning: Deleting repository 'rds-6266ce' also deletes every object under 'https://cpaasailakefs.blob.core.windows.net/lakefs/rds-6266ce/'. Objects referenced from other repositories will break.
+
+Repository 'rds-6266ce' storage deletion requested
+repository: rds-6266ce
+storage namespace: https://cpaasailakefs.blob.core.windows.net/lakefs/rds-6266ce/
+state: done
+objects deleted: 608
+requested by: 4ac0477c-488a-44ae-af4c-b6c747cb693e
+requested at: 2026-11-11 12:20:11 +0100 CET
+updated at: 2026-11-11 12:20:41 +0100 CET
+attempts: 0
+
+real	0m30.250s        (start 12:20:11 CET, end 12:20:41 CET, exit 0)
+```
+
+Verification (`az storage blob list --container-name lakefs`, container is `lakefs`, key from `lakefs-secrets`):
+
+```
+$ /tmp/lakectl-d10 repo deletion-status lakefs://rds-6266ce
+state: done / objects deleted: 608 / attempts: 0
+
+$ /tmp/lakectl-d10 repo list | grep -c rds-6266ce          -> 0
+$ /tmp/lakectl-d10 fs ls lakefs://rds-6266ce/main/         -> repository not found, 404 Not Found
+
+$ az storage blob list --prefix rds-6266ce/                          -> (no output), count 0
+$ az storage blob list --prefix rds-6266ce/ --delimiter /            -> (no output), count 0
+$ az storage blob list --prefix rds-6266ce/manual/deep/ --delimiter / -> count 0
+
+$ az storage blob list --delimiter /                       # siblings untouched
+_lakefs/
+destination-scoring-modeling-metadata/
+destination-scoring-modeling/
+jeff-training-metadata/
+jeff-training/
+
+$ az storage blob list --num-results 5000 | length(@)      -> 466   (== the pre-test baseline)
+$ per prefix: jeff-training/ 369, jeff-training-metadata/ 88, destination-scoring-modeling/ 1,
+                destination-scoring-modeling-metadata/ 7, _lakefs/ 1  (all unchanged; `_lakefs/dummy` still there)
+
+# The blob API cannot show directories that hold no blobs, so the same prefix was also walked at the
+# HNS namespace level (dfs endpoint; it sits behind a TLS-intercepting proxy, so the two reads below
+# ran with AZURE_CLI_DISABLE_CONNECTION_VERIFICATION=1, read only):
+$ az storage fs file list -f lakefs --path ""                        -> 5 entries, no rds-6266ce
+$ az storage fs file list -f lakefs --path rds-6266ce --recursive true
+ERROR: The specified path does not exist.
+$ az storage fs file list -f lakefs --path jeff-training --recursive true   -> 369 (control: the command works)
+
+$ kubectl -n lakefs logs deploy/lakefs | grep rds-6266ce
+11:20:39Z "Repository storage deletion started"  step=SETTLE objects_deleted=0   repository=rds-6266ce
+11:20:41Z "Repository storage deletion finished" step=FINISHED objects_deleted=608 repository=rds-6266ce
+
+$ curl /api/v1/repository_deletions
+{"attempts":0,"objects_deleted":608,"repository":"rds-6266ce","state":"done",
+ "storage_namespace":"https://cpaasailakefs.blob.core.windows.net/lakefs/rds-6266ce/", ...}
+```
+
+`objects_deleted=608` equals the blob count measured before the delete, and the container is back to its exact
+baseline. Nothing outside `rds-6266ce/` was touched (A2 on a real account). No MDS companion existed or was created:
+the indexer only knows `jeff-training` and `destination-scoring-modeling`.
+
+Two facts this run established that the plan assumed otherwise:
+
+- **Nested logical paths do not create nested HNS directories on Azure.** lakeFS's Azure adapter stores object data
+  under opaque keys, `<namespace>/data/<id>/<id>`, so a few hundred objects in `fixture/dNN/sMM/…` produce exactly
+  the directories `_lakefs/` and `data/<id>/`. The depth-5 `manual/deep/l1/l2/l3/` tree therefore had to be written
+  straight to storage to make the directory part of R12 non-vacuous.
+- **Empty HNS directories disappear with their last blob.** Deleting every blob removed `manual/`, `data/` and
+  `_lakefs/` as well: after the run the whole `rds-6266ce/` prefix is gone from the delimiter listing, not just
+  empty. The design §2.3 path for `hdi_isfolder` blobs (skip during file passes, delete deepest-first on `Done`) was
+  therefore **not exercised**: the namespace contained no `hdi_isfolder` blobs, and explicit directories created via
+  the DFS API were not tested. That remains the one part of the HNS story covered only by the unit test with the
+  fake pager.
 
 ## Tasks
 
