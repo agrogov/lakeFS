@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check-out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # The guard fails closed on a shallow clone, so it needs complete history.
           # Nothing is fetched from upstream: a BSL commit that became part of this
@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-24.04-8-cores
     steps:
       - name: Check-out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # make checks-validator runs scripts/check-license-base.sh, which fails
           # closed unless it can see complete history.
@@ -34,7 +34,7 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version-file: 'go.mod'
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "22.17.x"
           cache: "npm"
@@ -62,7 +62,7 @@ jobs:
     runs-on: ubuntu-24.04-16-cores
     steps:
       - name: Check-out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         
       - name: Setup Go
         uses: actions/setup-go@v6
@@ -83,9 +83,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check-out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: Setup NodeJS
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version-file: webui/package.json
           cache: npm
